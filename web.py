@@ -1,22 +1,26 @@
 """
-web.py — local dashboard.
+web.py — the dashboard.
 
     python3 main.py serve          # then open http://127.0.0.1:8765
 
 Zero new dependencies: stdlib http.server plus one self-contained HTML page.
 No npm, no build step, nothing fetched from a CDN.
 
-The design point that matters is the split between two very different actions:
+Three things happen here, and they cost very different amounts:
 
-  * "Search collected" reads results.db. Free, instant, unlimited. This is the
-    default, and it is what you should be doing 99% of the time.
-  * "Fetch from X" goes out to X's GraphQL endpoint. That costs one request per
-    page from a budget of ~50 per 15 minutes PER ACCOUNT — the same budget the
-    watcher needs to keep streams fresh. So it is never automatic, never fires
-    on keystroke, and the remaining budget is shown before you spend it.
+  * Searching saved tweets reads results.db. Free, instant, unlimited. It is
+    the default and what you should be doing nearly all the time.
+  * Getting new tweets goes out to X. One request per page from a budget of
+    ~50 per 15 minutes per account — the same budget the watcher needs to stay
+    fresh. So it is never automatic, never fires on a keystroke, and the
+    remaining budget is shown before you spend it.
+  * Signing an account in runs a real browser on the server and streams its
+    screen into the page. The browser exists only long enough to get a session;
+    it is thrown away the moment X reports the account as signed in.
 
-Binds to 127.0.0.1 by default. This serves your collected data and can spend
-your rate-limit budget; it has no authentication, so do not expose it.
+Binds to 127.0.0.1 by default. It serves your collected data, can spend your
+rate-limit budget, and can add accounts — so it refuses to bind anywhere else
+until DASH_USER and DASH_PASSWORD are set.
 """
 
 import asyncio
@@ -25,7 +29,6 @@ import hashlib
 import hmac
 import json
 import os
-import re
 import secrets
 import sqlite3
 import threading
@@ -294,17 +297,16 @@ def _status():
     except Exception as e:
         out["accounts_error"] = f"{type(e).__name__}: {e}"
 
-    known = {a["username"].lower() for a in out["accounts"]}
     by_label = {a.get("label") for a in out["accounts"]}
     for acct in _CFG.accounts:
         if acct.label not in by_label:
-            # In config.toml but never logged in. Showing it is the point:
-            # otherwise "I added an account" and "it is collecting" look the same.
+            # Added but never signed in. Showing it is the point: otherwise
+            # "I added an account" and "it is collecting" look the same.
             out["accounts"].append({
                 "username": acct.username or acct.label, "label": acct.label,
                 "active": False, "status": "unknown",
-                "reasons": ["configured but never logged in"],
-                "action": f"python3 main.py login --account {acct.label}",
+                "reasons": ["added, but not signed in to X yet"],
+                "action": "Use the Sign in to X button below.",
                 "requests": 0, "proxy": bool(acct.proxy), "never_logged_in": True,
             })
 
@@ -323,12 +325,22 @@ def _status():
                     "SELECT * FROM polls WHERE stream_id = ? ORDER BY started_ms DESC LIMIT 1",
                     (s["stream_id"],),
                 ).fetchone()
+                # Lag only means "how fresh are we" for a stream a watcher has
+                # actually polled on a timer. A one-off sweep pulls in tweets
+                # that are already hours or days old, so its lag_ms is the AGE
+                # of what it scooped up — reporting that as freshness reads as
+                # "usually saved 8240s after posting", which is both alarming
+                # and meaningless.
+                watched = con.execute(
+                    "SELECT 1 FROM polls WHERE stream_id = ? AND kind IN ('poll','seed') LIMIT 1",
+                    (s["stream_id"],),
+                ).fetchone() is not None
                 lag = con.execute(
                     "SELECT t.lag_ms FROM tweet_hits h JOIN tweets t USING(tweet_id) "
                     "WHERE h.stream_id = ? AND t.created_ms >= COALESCE(?, 0) "
                     "ORDER BY h.first_seen_ms DESC LIMIT 200",
                     (s["stream_id"], s["first_poll_ms"]),
-                ).fetchall()
+                ).fetchall() if watched else []
                 lags = sorted(x["lag_ms"] for x in lag)
                 out["streams"].append({
                     "label": s["label"], "query": s["query"], "tab": s["tab"],
@@ -454,14 +466,34 @@ def _fetch_live(query, tab="Latest", pages=1, ack=False, list_id=""):
         return _run(run())
 
 
+def _reload_config():
+    """
+    Re-read config.toml into the process.
+
+    Adding an account writes config.toml, and everything downstream — the login
+    session, the account panel, the guard — looks the account up through _CFG.
+    Without this the account exists on disk and nowhere in memory, so opening
+    the sign-in window straight after saving failed with "No account labelled
+    ...". That is what used to force the operator back to a terminal.
+
+    Failure is deliberately not swallowed: a config the server cannot parse must
+    surface here, at the write that caused it, not three actions later.
+    """
+    global _CFG
+    import config as config_mod
+
+    fresh = config_mod.load_config(root=_CFG.root)
+    fresh._behind_proxy = getattr(_CFG, "_behind_proxy", False)
+    _CFG = fresh
+    return _CFG
+
+
 def _add_account(body):
     """
-    Append an account to config.toml (and its password to .env).
+    Append an account to config.toml (and its password to .env), then make it
+    live in this process so the sign-in window can open immediately.
 
-    Writes secrets to disk, so it is localhost-only by contract — see the
-    banner in serve(). It deliberately does NOT log in: that needs a real
-    browser window a human can see, which a server process cannot assume it
-    has. It writes the config and hands back the exact command to run.
+    Writes secrets to disk, so the endpoint is behind the dashboard login.
     """
     import re as _re
 
@@ -469,23 +501,22 @@ def _add_account(body):
     if not _re.fullmatch(r"[A-Za-z0-9_-]{1,32}", label):
         return {"error": "label must be 1-32 chars: letters, digits, _ or -"}
 
-    # Every value below is written verbatim into a line-oriented file (.env) or
-    # a quoted TOML string. Unvalidated, a newline in `password` appends extra
-    # .env lines — including a fresh DASH_PASSWORD, which hands the dashboard
-    # to whoever submitted it — and a quote in `username` breaks out of the
-    # TOML string. Reject rather than escape: these fields have narrow legal
-    # shapes, and escaping invites a second bug in the escaper.
+    # Every value below is written verbatim into a quoted TOML string, so a
+    # stray quote would break out of it. Reject rather than escape: these
+    # fields have narrow legal shapes, and an escaper is just a second place
+    # for a bug to live.
+    #
+    # No password is accepted here. The operator types it into the real x.com
+    # form in the sign-in window, so this server never receives, stores or logs
+    # one. config.toml still names an env var for it, which is only used by the
+    # command-line `login` path.
     username = (body.get("username") or "").strip().lstrip("@")
-    password = body.get("password") or ""
     proxy = (body.get("proxy") or "").strip()
 
     if username and not _re.fullmatch(r"[A-Za-z0-9_]{1,15}", username):
-        return {"error": "username must be 1-15 chars: letters, digits or underscore "
-                         "(that is all X allows)"}
-    if any(c in password for c in "\n\r\x00"):
-        return {"error": "password cannot contain newlines or null bytes"}
+        return {"error": "An X username is 1-15 letters, digits or underscores."}
     if proxy and not _re.fullmatch(r"[A-Za-z0-9+.\-]+://[^\s\"'\\\x00-\x1f]{1,200}", proxy):
-        return {"error": "proxy must look like scheme://host:port, with no spaces or quotes"}
+        return {"error": "A proxy looks like scheme://host:port, with no spaces or quotes."}
 
     cfg_path = _CFG.root / "config.toml"
     if not cfg_path.exists():
@@ -506,42 +537,161 @@ def _add_account(body):
     existing = {str(a.get("label", "")).strip()
                 for a in parsed.get("accounts", []) if isinstance(a, dict)}
     if label in existing:
-        return {"error": f"an account labelled {label!r} is already in config.toml"}
+        return {"error": f"There is already an account called {label!r}."}
 
-    env_key = f"X_PASSWORD_{label.upper().replace('-', '_')}"
     block = (
         f'\n[[accounts]]\n'
         f'label              = "{label}"\n'
         f'username           = "{username}"\n'
-        f'password_env       = "{env_key}"\n'
+        f'password_env       = "X_PASSWORD_{label.upper().replace("-", "_")}"\n'
         f'profile_dir        = "profiles/{label}"\n'
         f'proxy              = "{proxy}"\n'
         f'enabled            = true\n'
     )
     cfg_path.write_text(text.rstrip() + "\n" + block)
 
-    wrote_pw = False
-    if password:
-        env_path = _CFG.root / ".env"
-        cur = env_path.read_text() if env_path.exists() else ""
-        # Only ACTIVE assignments count. .env ships with commented templates
-        # like `# X_PASSWORD_ACCT_B=`, and a naive substring check treats those
-        # as "already set" — the password is then silently not written and the
-        # login fails later with no clue why.
-        already = any(
-            ln.strip().startswith(f"{env_key}=")
-            for ln in cur.splitlines()
-        )
-        if not already:
-            env_path.write_text(cur.rstrip() + f"\n{env_key}={password}\n")
-            wrote_pw = True
+    # Make it real in this process. If the file we just wrote does not parse,
+    # say so here rather than letting the sign-in window fail with a confusing
+    # "no such account".
+    try:
+        _reload_config()
+    except Exception as e:
+        return {"error": f"Saved to config.toml, but the file no longer loads: "
+                         f"{type(e).__name__}: {e}"}
 
-    return {
-        "ok": True, "label": label, "env_key": env_key, "wrote_password": wrote_pw,
-        "next": f"python3 main.py login --account {label}",
-        "note": "A Chrome window opens so you can clear the captcha / 2FA once. "
-                "Restart `serve` afterwards to pick up the new config.",
-    }
+    return {"ok": True, "label": label}
+
+
+# --------------------------------------------------------------------------
+# interactive login
+# --------------------------------------------------------------------------
+#
+# One at a time, deliberately. Each session holds a Chrome process open against
+# an account's profile directory, and two Chromes on one profile corrupt it.
+_LOGIN = {"session": None, "label": None}
+_LOGIN_LOCK = threading.RLock()
+
+
+def _login_drop():
+    """Shut the browser down and forget the session. Safe to call twice."""
+    with _LOGIN_LOCK:
+        s = _LOGIN["session"]
+        _LOGIN["session"] = _LOGIN["label"] = None
+    if s is not None:
+        try:
+            _run(s.close(), timeout=30)
+        except Exception:
+            pass
+
+
+def _login_reap():
+    """Close a window the operator opened and then walked away from."""
+    import auth
+
+    with _LOGIN_LOCK:
+        s = _LOGIN["session"]
+        if s is None or s.idle_s <= auth.LOGIN_IDLE_TIMEOUT_S:
+            return
+    _login_drop()
+
+
+def _login_start(label):
+    import auth
+
+    _login_reap()
+    with _LOGIN_LOCK:
+        if _LOGIN["session"] is not None:
+            return {"error": f"A sign-in window is already open for "
+                             f"'{_LOGIN['label']}'. Finish or close that one first."}
+        try:
+            acct = _CFG.account(label)
+        except Exception as e:
+            return {"error": str(e)}
+
+        try:
+            sess = _run(auth.InteractiveLogin(acct).start(), timeout=180)
+        except ImportError:
+            return {"error": "The browser this needs is not installed on the "
+                             "server. Ask whoever set it up to run: "
+                             "deploy/setup.sh"}
+        except Exception as e:
+            return {"error": f"Could not open a browser: {type(e).__name__}: {e}"}
+
+        _LOGIN["session"], _LOGIN["label"] = sess, label
+        return {"ok": True, "label": label, "state": sess.state,
+                "screen_name": sess.screen_name,
+                "width": auth.LOGIN_VIEWPORT["width"],
+                "height": auth.LOGIN_VIEWPORT["height"]}
+
+
+def _login_act(body):
+    """Forward one interaction, then report the current state."""
+    s = _LOGIN["session"]
+    if s is None:
+        return {"error": "The sign-in window is closed.", "closed": True}
+    act = body.get("act")
+    try:
+        if act == "click":
+            _run(s.click(int(body["x"]), int(body["y"])), timeout=30)
+        elif act == "type":
+            _run(s.type_text(str(body.get("text") or "")), timeout=60)
+        elif act == "key":
+            _run(s.press(str(body.get("key") or "Enter")), timeout=30)
+        elif act == "scroll":
+            _run(s.scroll(int(body.get("dy") or 0)), timeout=30)
+        state = _run(s.refresh_state(), timeout=30)
+    except Exception as e:
+        return {"error": f"{type(e).__name__}: {e}"}
+
+    out = {"ok": True, "state": state, "screen_name": s.screen_name}
+    if state == "logged_in":
+        out.update(_login_capture())
+    return out
+
+
+def _login_capture():
+    """
+    Signed in — copy the session out of the browser, then close the browser.
+
+    The browser is disposable; the session is the asset. Everything the HTTP
+    collector needs (cookies plus the real user-agent) is taken here, checked
+    against X with one real request, and written to accounts.db. Chrome is then
+    shut down cleanly, which is also what flushes the profile that keeps this
+    device trusted for next time.
+    """
+    import auth
+
+    s, label = _LOGIN["session"], _LOGIN["label"]
+    if s is None:
+        return {"error": "The sign-in window is closed."}
+    try:
+        harvest = _run(s.harvest(), timeout=60)
+        if not harvest.has_required:
+            # Do NOT close the browser here: X sets these a moment after the
+            # redirect, so the next poll usually succeeds. Tearing the window
+            # down would make the operator start over for a timing blip.
+            return {"error": "Signed in, but X has not finished setting up the "
+                             "session yet. Give it a moment."}
+
+        async def save():
+            api = auth.open_api(_CFG.db_accounts)
+            return await auth.upsert_session(api, harvest, _CFG.account(label))
+
+        username, res = _run(save(), timeout=120)
+        if res.ok:
+            auth.write_identity(_CFG.account(label), username)
+    except Exception as e:
+        _login_drop()
+        return {"error": f"Could not save the session: {type(e).__name__}: {e}"}
+
+    _login_drop()
+    return {"captured": True, "username": username, "active": res.ok,
+            "detail": "" if res.ok else res.error}
+
+
+def _login_cancel():
+    _login_drop()
+    return {"ok": True}
 
 
 # --------------------------------------------------------------------------
@@ -576,7 +726,7 @@ LOGIN_PAGE = """<!doctype html>
 </style></head><body>
 <form method="POST" action="/login">
   <h1>X Collector</h1>
-  <p class="sub">Sign in to continue.</p>
+  <p class="sub">Sign in to see your collected tweets.</p>
   <label for="u">Username</label>
   <input id="u" name="username" autocomplete="username" autofocus required>
   <label for="p">Password</label>
@@ -633,7 +783,7 @@ class Handler(BaseHTTPRequestHandler):
         wait = _locked_out(ip)
         if wait:
             return self._send(429, self._login_html(
-                f"Too many attempts. Try again in {wait // 60 + 1} minute(s)."),
+                f"Too many tries. Wait {wait // 60 + 1} minute(s) and try again."),
                 "text/html; charset=utf-8")
 
         n = int(self.headers.get("Content-Length") or 0)
@@ -645,8 +795,9 @@ class Handler(BaseHTTPRequestHandler):
             _record_failure(ip)
             left = MAX_ATTEMPTS - len(_attempts.get(ip, []))
             return self._send(401, self._login_html(
-                "Wrong username or password."
-                + (f" {left} attempt(s) left." if left <= 3 else "")),
+                "That username or password is not right."
+                + (f" {left} more tr{'y' if left == 1 else 'ies'} before this "
+                   f"page locks for a few minutes." if left <= 3 else "")),
                 "text/html; charset=utf-8")
 
         _clear_failures(ip)
@@ -670,18 +821,38 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("Content-Length", "0")
         self.end_headers()
 
+    _head_only = False
+
     def _send(self, code, body, ctype="application/json; charset=utf-8", extra=None):
         if isinstance(body, (dict, list)):
             body = json.dumps(body, ensure_ascii=False)
         data = body.encode("utf-8") if isinstance(body, str) else body
         self.send_response(code)
         self.send_header("Content-Type", ctype)
+        # Content-Length still describes the body a GET would return; that is
+        # what HEAD is for. Only the bytes are withheld.
         self.send_header("Content-Length", str(len(data)))
         self.send_header("Cache-Control", "no-store")
         for k, v in (extra or {}).items():
             self.send_header(k, v)
         self.end_headers()
-        self.wfile.write(data)
+        if not self._head_only:
+            self.wfile.write(data)
+
+    def do_HEAD(self):
+        """
+        Same headers as GET, no body.
+
+        BaseHTTPRequestHandler answers 501 for anything it has no do_* method
+        for, so `curl -I https://…` reported the dashboard as broken while it
+        was serving fine — and that is the first check anyone runs against a
+        deployment. Uptime monitors do the same thing.
+        """
+        self._head_only = True
+        try:
+            self.do_GET()
+        finally:
+            self._head_only = False
 
     def do_GET(self):
         u = urllib.parse.urlparse(self.path)
@@ -712,6 +883,15 @@ class Handler(BaseHTTPRequestHandler):
                 if not _CFG.db_results.exists():
                     return self._send(200, {"total": 0, "rows": []})
                 return self._send(200, _query_tweets(q))
+            if u.path == "/api/login/frame":
+                s = _LOGIN["session"]
+                if s is None:
+                    return self._send(409, {"error": "The sign-in window is closed."})
+                try:
+                    png = _run(s.frame(), timeout=30)
+                except Exception as e:
+                    return self._send(500, {"error": f"{type(e).__name__}: {e}"})
+                return self._send(200, png, "image/jpeg")
             if u.path == "/api/export":
                 return self._export(q)
             return self._send(404, {"error": "not found"})
@@ -729,6 +909,12 @@ class Handler(BaseHTTPRequestHandler):
                 return
             n = int(self.headers.get("Content-Length") or 0)
             body = json.loads(self.rfile.read(n) or "{}")
+            if u.path == "/api/login/start":
+                return self._send(200, _login_start((body.get("label") or "").strip()))
+            if u.path == "/api/login/act":
+                return self._send(200, _login_act(body))
+            if u.path == "/api/login/cancel":
+                return self._send(200, _login_cancel())
             if u.path == "/api/account":
                 # Writes an X password into .env, so it needs a real gate.
                 # The old check was "is the socket on 127.0.0.1", which is
@@ -900,6 +1086,21 @@ PAGE = r"""<!doctype html>
   .banner.err{border-color:var(--warn);color:var(--warn)}
   .banner.ok{border-color:var(--ok);color:var(--ok)}
   a{color:var(--accent)}
+  /* The remote browser. The image IS the page: clicks and keys are forwarded
+     to a real Chrome running on the server, so this behaves like a window. */
+  #loginwrap{position:fixed;inset:0;background:rgba(0,0,0,.6);z-index:50;
+             display:none;place-items:center}
+  #loginwrap.on{display:grid}
+  #loginbox{background:var(--bg);border:1px solid var(--line);border-radius:12px;
+            overflow:hidden;max-width:96vw;max-height:94vh;display:flex;flex-direction:column}
+  #loginhead{display:flex;align-items:center;gap:12px;padding:10px 14px;
+             border-bottom:1px solid var(--line)}
+  #loginhead b{font-size:14px}
+  #loginmsg{color:var(--dim);font-size:13px;flex:1}
+  #loginstage{position:relative;overflow:auto;background:#000}
+  #loginimg{display:block;max-width:100%;cursor:crosshair}
+  #loginhint{padding:7px 14px;font-size:12px;color:var(--dim);
+             border-top:1px solid var(--line);background:var(--panel)}
   .livetog{display:flex;align-items:center;gap:6px;font-size:13px;color:var(--dim);
            border:1px solid var(--line);border-radius:8px;padding:4px 9px;cursor:pointer}
   .livetog select{padding:2px 4px;font-size:12px;border:0;background:transparent}
@@ -921,44 +1122,44 @@ PAGE = r"""<!doctype html>
 
 <header>
   <h1>X Collector</h1>
-  <select id="src" title="Where 'Fetch from X' pulls from">
-    <option value="search">Search</option>
-    <option value="list">List</option>
+  <select id="src" title="What the Get new tweets button should fetch">
+    <option value="search">words</option>
+    <option value="list">a list</option>
   </select>
-  <input id="q" placeholder="Search collected tweets — text, @author, keywords…" autofocus>
-  <button class="primary" id="go">Search collected</button>
-  <select id="pages" title="How many pages to pull from X. 1 request each.">
-    <option value="1">1 page · ~20 tweets · 1 req</option>
-    <option value="3">3 pages · ~60 tweets · 3 req</option>
-    <option value="5" selected>5 pages · ~100 tweets · 5 req</option>
-    <option value="10">10 pages · ~200 tweets · 10 req</option>
-    <option value="25">25 pages · ~500 tweets · 25 req</option>
+  <input id="q" placeholder="Type words to find in the tweets you have saved…" autofocus>
+  <button class="primary" id="go">Search</button>
+  <select id="pages" title="How many tweets to ask X for">
+    <option value="1">about 20 tweets</option>
+    <option value="3">about 60 tweets</option>
+    <option value="5" selected>about 100 tweets</option>
+    <option value="10">about 200 tweets</option>
+    <option value="25">about 500 tweets</option>
   </select>
-  <button id="live" title="Spends rate-limit budget">Fetch from X</button>
-  <button id="csv">Export CSV</button>
-  <label class="livetog" title="Re-read the local database every few seconds.
-Free — the watcher is what talks to X.">
-    <input type="checkbox" id="live" checked>
-    <span id="livedot"></span>Live
+  <button id="getnew" title="Asks X for tweets you do not have yet">Get new tweets</button>
+  <button id="csv">Download</button>
+  <label class="livetog" title="Checks for tweets the collector has saved since you loaded this page.
+It does not contact X, so it is free.">
+    <input type="checkbox" id="autorefresh" checked>
+    <span id="livedot"></span>Auto-update
     <select id="everysec">
-      <option value="15" selected>15s</option>
-      <option value="30">30s</option>
-      <option value="60">60s</option>
+      <option value="15" selected>every 15s</option>
+      <option value="30">every 30s</option>
+      <option value="60">every 60s</option>
     </select>
   </label>
   <a href="/logout" class="muted" style="font-size:13px;margin-left:auto">Sign out</a>
 </header>
 
 <div class="filters">
-  <input id="author" placeholder="@author" size="12">
+  <input id="author" placeholder="from @someone" size="14">
   <select id="since">
-    <option value="">any time</option><option value="1h">last hour</option>
-    <option value="6h">last 6h</option><option value="24h">last 24h</option>
-    <option value="7d">last 7 days</option>
+    <option value="">any time</option><option value="1h">past hour</option>
+    <option value="6h">past 6 hours</option><option value="24h">past day</option>
+    <option value="7d">past week</option>
   </select>
-  <input id="minlikes" type="number" placeholder="min likes" size="8" style="width:110px">
-  <input id="lang" placeholder="lang" size="4" style="width:70px">
-  <label class="muted"><input type="checkbox" id="media"> media only</label>
+  <input id="minlikes" type="number" placeholder="at least ? likes" style="width:140px">
+  <input id="lang" placeholder="language" style="width:90px" title="Two-letter code, e.g. en or hi">
+  <label class="muted"><input type="checkbox" id="media"> only with pictures or video</label>
   <select id="order"><option value="desc">newest first</option><option value="asc">oldest first</option></select>
   <span class="muted" id="count"></span>
 </div>
@@ -972,41 +1173,62 @@ Free — the watcher is what talks to X.">
   </main>
   <aside>
     <div class="box" id="riskbox" hidden>
-      <h2>Risks</h2>
+      <h2>Needs your attention</h2>
       <div id="risks"></div>
     </div>
     <div class="box">
-      <h2>Streams</h2>
+      <h2>What we are watching</h2>
       <div id="streams"><span class="muted">—</span></div>
     </div>
     <div class="box">
-      <h2>Accounts</h2>
+      <h2>X accounts</h2>
       <div id="accounts"><span class="muted">—</span></div>
       <button id="acctnew" style="width:100%;margin-top:8px;padding:5px;font-size:13px">
-        + Add account</button>
+        + Add an account</button>
       <div id="acctform" hidden style="margin-top:8px;display:grid;gap:5px">
-        <input id="a_label" placeholder="label (e.g. acct_b)">
-        <input id="a_user"  placeholder="@username">
-        <input id="a_pass"  type="password" placeholder="password (stored in .env)">
-        <input id="a_proxy" placeholder="proxy (optional)">
+        <p class="muted" style="margin:0 0 2px">
+          Give it a short name, then sign in. A window opens where you type your
+          X password directly into x.com.</p>
+        <input id="a_label" placeholder="short name, e.g. acct_b">
+        <input id="a_user"  placeholder="X username (optional)">
+        <input id="a_proxy" placeholder="proxy (leave blank)">
         <div style="display:flex;gap:6px">
-          <button id="a_save" class="primary" style="flex:1;padding:5px;font-size:13px">Save</button>
+          <button id="a_save" class="primary" style="flex:1;padding:5px;font-size:13px">
+            Save and sign in</button>
           <button id="a_cancel" style="padding:5px 10px;font-size:13px">Cancel</button>
         </div>
       </div>
     </div>
     <div class="box">
-      <h2>Collected</h2>
+      <h2>Saved so far</h2>
       <div id="totals"><span class="muted">—</span></div>
     </div>
     <div class="box">
-      <h2>Query syntax</h2>
-      <p class="muted" style="margin:0 0 6px">Fetching from X accepts its advanced-search operators:</p>
-      <p class="muted" style="margin:0"><code>from:user</code> <code>min_faves:50</code>
-      <code>lang:en</code> <code>-filter:replies</code> <code>filter:images</code>
-      <code>since:2026-07-01</code></p>
+      <h2>Search tips</h2>
+      <p class="muted" style="margin:0 0 6px">Searching what you have saved takes plain
+      words. When you press <b>Get new tweets</b>, X also understands:</p>
+      <p class="muted" style="margin:0"><code>from:someone</code> — only their posts<br>
+      <code>-filter:replies</code> — skip replies<br>
+      <code>lang:en</code> — English only<br>
+      <code>min_faves:50</code> — at least 50 likes</p>
     </div>
   </aside>
+</div>
+
+<div id="loginwrap">
+  <div id="loginbox">
+    <div id="loginhead">
+      <b>Sign in to X</b>
+      <span id="loginmsg">Starting…</span>
+      <button id="logindone" hidden>Done</button>
+      <button id="loginx">Close</button>
+    </div>
+    <div id="loginstage">
+      <img id="loginimg" alt="The X sign-in page">
+      <div id="loginhint">This is a real browser. Click and type in it as you normally
+        would. Your password goes straight to x.com — this page never sees it.</div>
+    </div>
+  </div>
 </div>
 
 <script>
@@ -1025,6 +1247,14 @@ function ago(iso){
   return Math.round(s/86400)+"d ago";
 }
 const num = n => n == null ? "0" : n >= 1000 ? (n/1000).toFixed(1)+"K" : ""+n;
+
+// A duration in seconds, said the way a person would say it.
+function secs(s){
+  if (s < 90)    return Math.round(s) + " seconds";
+  if (s < 5400)  return Math.round(s/60) + " minutes";
+  if (s < 86400) return Math.round(s/3600) + " hours";
+  return Math.round(s/86400) + " days";
+}
 
 function banner(msg, kind){
   $("#banner").innerHTML = msg ? `<div class="banner ${kind||''}">${msg}</div>` : "";
@@ -1055,9 +1285,8 @@ async function api(url, opts){
   try {
     r = await fetch(url, opts);
   } catch (e) {
-    throw new Error(
-      "Cannot reach the server. Is it still running?\n" +
-      "Start it with:  python3 main.py serve");
+    throw new Error("Cannot reach the collector. It may have stopped — " +
+                    "reload the page in a moment.");
   }
   const d = await r.json().catch(() => ({error: `HTTP ${r.status}`}));
   if (!r.ok) throw new Error(d.error || `HTTP ${r.status}`);
@@ -1078,11 +1307,11 @@ async function search(append){
   lastTotal = d.total || 0;
   loaded += (d.rows || []).length;
   $("#count").textContent = lastTotal
-    ? `showing ${loaded} of ${lastTotal}` : "0 matching";
+    ? `showing ${loaded} of ${lastTotal}` : "nothing found";
 
   if (!d.rows || !d.rows.length){
-    if (!append) $("#results").innerHTML = `<p class="muted">Nothing in the local database matches.
-      ${$("#q").value.trim() ? 'Use <b>Fetch from X</b> to pull this query live.' : ''}</p>`;
+    if (!append) $("#results").innerHTML = `<p class="muted">No saved tweets match that.
+      ${$("#q").value.trim() ? 'Press <b>Get new tweets</b> to ask X for them.' : ''}</p>`;
     return;
   }
   const html = d.rows.map(card).join("");
@@ -1097,7 +1326,7 @@ async function search(append){
 
   if (loaded < lastTotal){
     $("#results").insertAdjacentHTML("beforeend",
-      `<button id="more" style="width:100%;padding:10px">Load ${
+      `<button id="more" style="width:100%;padding:10px">Show ${
         Math.min(PAGE_SIZE, lastTotal - loaded)} more (${lastTotal - loaded} left)</button>`);
     $("#more").onclick = () => { offset += PAGE_SIZE; search(true); };
   }
@@ -1124,7 +1353,7 @@ function mediaHtml(t){
                         playsinline muted loop></video>`);
     else if (/\.m3u8(\?|$)/i.test(u))
       bits.push(`<a class="medialink" href="${esc(u)}" target="_blank" rel="noopener">
-                   <b>HLS stream</b><span>not playable inline — open externally</span></a>`);
+                   <b>Video stream</b><span>cannot play here — opens in a new tab</span></a>`);
   }
 
   for (const u of (t.urls || [])){
@@ -1135,8 +1364,8 @@ function mediaHtml(t){
                   referrerpolicy="strict-origin-when-cross-origin"></iframe>`);
     } else if (/x\.com\/i\/broadcasts\//.test(u) || /pscp\.tv/.test(u)){
       bits.push(`<a class="medialink live" href="${esc(u)}" target="_blank" rel="noopener">
-                   <b>● LIVE broadcast</b>
-                   <span>X blocks embedding these — opens on x.com</span></a>`);
+                   <b>● Live broadcast</b>
+                   <span>X does not allow these to play here — opens on x.com</span></a>`);
     }
   }
   return bits.length ? `<div class="media">${bits.join("")}</div>` : "";
@@ -1158,8 +1387,8 @@ function card(t){
       <span>⟳ ${num(t.retweet_count)}</span>
       <span>↩ ${num(t.reply_count)}</span>
       ${t.view_count ? `<span>👁 ${num(t.view_count)}</span>` : ""}
-      ${t.lag_ms != null ? `<span title="time from posted to collected">⏱ ${(t.lag_ms/1000).toFixed(1)}s</span>` : ""}
-      <a href="${esc(t.url)}" target="_blank" rel="noopener">open ↗</a>
+      ${t.lag_ms != null ? `<span title="how long after it was posted we saved it">⏱ ${(t.lag_ms/1000).toFixed(1)}s</span>` : ""}
+      <a href="${esc(t.url)}" target="_blank" rel="noopener">see on X ↗</a>
     </div>
   </article>`;
 }
@@ -1173,52 +1402,64 @@ async function status(){
   }
 
   $("#streams").innerHTML = (d.streams||[]).length
-    ? `<button class="streambtn ${activeStream?'':'active'}" data-s="">All streams</button>` +
+    ? `<button class="streambtn ${activeStream?'':'active'}" data-s="">Everything</button>` +
       d.streams.map(s => `<button class="streambtn ${activeStream===s.label?'active':''}"
         data-s="${esc(s.label)}" title="${esc(s.query)}">
-        ${esc(s.label)} <span class="muted">· ${s.count}</span>
-        ${s.lag_p50!=null ? `<span class="muted">· p50 ${s.lag_p50.toFixed(0)}s</span>`:''}
+        ${esc(s.label)} <span class="muted">· ${s.count} tweets</span>
+        ${s.lag_p50!=null ? `<span class="muted">· usually saved ${secs(s.lag_p50)} after posting</span>`:''}
         </button>`).join("")
-    : '<span class="muted">none yet</span>';
+    : '<span class="muted">nothing yet</span>';
   document.querySelectorAll(".streambtn").forEach(b =>
     b.onclick = () => { activeStream = b.dataset.s; status(); search(); });
 
   $("#accounts").innerHTML = (d.accounts||[]).length
     ? d.accounts.map(a => {
         const st = a.status || (a.active ? "live" : "dead");
-        const label = {live:"LIVE", warning:"WARN", dead:"DEAD", unknown:"?"}[st] || st;
+        // The word repeats what the colour says, for anyone who cannot rely on
+        // colour — and says it in words rather than status codes.
+        const label = {live:"Working", warning:"Check this", dead:"Signed out",
+                       unknown:"Not set up"}[st] || st;
         const reasons = (a.reasons||[]).length
           ? `<div class="muted" style="margin:1px 0 5px 2px">`
             + a.reasons.map(r => `• ${esc(r)}`).join("<br>")
             + (a.action ? `<br><span style="opacity:.85">→ ${esc(a.action)}</span>` : "")
             + `</div>`
           : "";
+        const needs = st === "dead" || st === "unknown";
         return `<div class="row">
-            <span class="k">@${esc(a.username)}${a.proxy?' <span title="has a proxy">⛓</span>':''}</span>
+            <span class="k">@${esc(a.username)}${a.proxy?' <span title="uses a proxy">⛓</span>':''}</span>
             <span class="flag ${st}">${label}</span>
-          </div>${reasons}`;
+          </div>${reasons}
+          ${needs ? `<button data-signin="${esc(a.label||a.username)}"
+             style="width:100%;margin:2px 0 8px;padding:4px;font-size:12px">
+             Sign in to X</button>` : ""}`;
       }).join("")
-    : '<span class="muted">no accounts — run <code>login</code></span>';
+    : '<span class="muted">none yet — add one below</span>';
+
+  // Wire the sign-in buttons this pass just drew. status() replaces the whole
+  // panel every 15s, so anything bound before now is gone with the old nodes.
+  document.querySelectorAll("[data-signin]").forEach(b =>
+    b.onclick = () => loginOpen(b.dataset.signin));
 
   const s0 = (d.streams||[]).find(s => s.rl_limit);
   $("#totals").innerHTML =
     `<div class="row"><span class="k">tweets</span><span>${d.totals.tweets ?? 0}</span></div>` +
-    (s0 ? `<div class="row"><span class="k">rate limit left</span>
-           <span>${s0.rl_remaining}/${s0.rl_limit}</span></div>` : "") +
+    (s0 ? `<div class="row"><span class="k">requests left this 15 min</span>
+           <span>${s0.rl_remaining} of ${s0.rl_limit}</span></div>` : "") +
     (d.totals.note ? `<div class="muted">${esc(d.totals.note)}</div>` : "");
 }
 
 $("#src").onchange = () => {
   const isList = $("#src").value === "list";
   $("#q").placeholder = isList
-    ? "Paste an X List URL or id — https://x.com/i/lists/1234567890"
-    : "Search collected tweets — text, @author, keywords…";
-  /* Lists get 500 requests per 15 min against search's 50, so the same page
-     count is a far smaller share of the budget. Say so where it is decided. */
+    ? "Paste an X list link — https://x.com/i/lists/1234567890"
+    : "Type words to find in the tweets you have saved…";
+  /* Lists get 500 requests per 15 min against search's 50, so the same number
+     of tweets is a far smaller share of the budget. Say so where it is chosen. */
   [...$("#pages").options].forEach(o => {
     const n = parseInt(o.value, 10);
-    o.textContent = `${n} page${n>1?'s':''} · ~${n*20} tweets · ${n} req`
-      + (isList ? " (of 500)" : " (of 50)");
+    o.textContent = `about ${n*20} tweets · uses ${n} of your `
+      + (isList ? "500" : "50") + " requests";
   });
 };
 $("#src").onchange();
@@ -1230,12 +1471,12 @@ $("#q").addEventListener("keydown", e => { if (e.key === "Enter") search(); });
 
 $("#csv").onclick = () => { location = "/api/export?" + params(); };
 
-$("#live").onclick = async () => {
+$("#getnew").onclick = async () => {
   const raw = $("#q").value.trim();
   const isList = $("#src").value === "list";
   if (!raw) return banner(isList
-      ? "Paste an X List URL or id first."
-      : "Type a query first. Fetching from X uses X's advanced-search syntax.", "err");
+      ? "Paste an X list link first."
+      : "Type what to look for first.", "err");
   const query = isList ? "" : raw, listId = isList ? raw : "";
   const pages = parseInt($("#pages").value, 10);
 
@@ -1250,45 +1491,46 @@ $("#live").onclick = async () => {
 
   if (blocks.length){
     return banner(
-      `<b>Blocked — ${esc(blocks[0].title)}</b><br>${esc(blocks[0].detail)}` +
-      (blocks[0].remedy ? `<br><b>Fix:</b> ${esc(blocks[0].remedy)}` : ""), "err");
+      `<b>Cannot do that right now — ${esc(blocks[0].title)}</b><br>${esc(blocks[0].detail)}` +
+      (blocks[0].remedy ? `<br><b>What to do:</b> ${esc(blocks[0].remedy)}` : ""), "err");
   }
 
-  let msg = `Fetch from X — ${pages} page${pages>1?'s':''} (~${pages*20} tweets), ` +
-            `${pages} request${pages>1?'s':''}.\n\n${query}\n`;
+  let msg = `Ask X for about ${pages*20} tweets matching:\n\n${raw}\n\n` +
+            `This uses ${pages} of your ${isList ? 500 : 50} requests ` +
+            `for the next 15 minutes.\n`;
   if (warns.length){
-    msg += "\n⚠  " + warns.map(w => w.title + (w.remedy ? `\n   → ${w.remedy}` : "")).join("\n⚠  ") + "\n";
+    msg += "\nWorth knowing first:\n  • "
+         + warns.map(w => w.title + (w.remedy ? `\n    ${w.remedy}` : "")).join("\n  • ") + "\n";
   }
-  msg += "\nResults are saved into your database. Proceed?";
+  msg += "\nAnything found is saved. Go ahead?";
   if (!confirm(msg)) return;
 
-  $("#live").disabled = true;
-  banner(`Fetching ${pages} page${pages>1?'s':''} from X…`);
+  $("#getnew").disabled = true;
+  banner("Asking X…");
   try {
     const d = await api("/api/fetch", {
       method:"POST", headers:{"Content-Type":"application/json"},
       body: JSON.stringify({query, list_id:listId, tab:"Latest", pages, ack:true})
     });
 
-    if (d.error) banner("X returned an error: " + esc(d.error), "err");
+    if (d.error) banner("X said: " + esc(d.error), "err");
     else if (d.hint) banner(esc(d.hint), "err");
     else if (d.stop === "no_account_or_abort")
-      banner("No account was available — the pool is starved, not the stream. " +
-             "Check Accounts, or wait for the rate-limit window to reset.", "err");
+      banner("No X account was free to do this. Check the accounts panel, or " +
+             "wait a few minutes for the request allowance to reset.", "err");
     else {
-      let msg = `Fetched ${d.results} results over ${d.pages} page(s) — ` +
-                `${d.new} new, ${d.dup} already had. ` +
-                `Rate limit now ${d.rl_remaining}/${d.rl_limit}.`;
+      let msg = `Found ${d.results} tweets — ${d.new} new, ${d.dup} you already had. ` +
+                `${d.rl_remaining} of ${d.rl_limit} requests left for the next 15 minutes.`;
       if (d.stop === "exhausted" && d.pages < pages)
-        msg += ` X ran out of results after ${d.pages} page(s) — that is everything it has for this query.`;
+        msg += ` That is everything X has for this.`;
       banner(msg, "ok");
       activeStream = d.stream;
-      $("#q").value = "";        // the query now lives as a stream filter
+      $("#q").value = "";        // the search now lives as a filter on the left
     }
     await status(); await search();
   } catch (e) {
     banner(esc(e.message).replace(/\n/g,"<br>"), "err");
-  } finally { $("#live").disabled = false; }
+  } finally { $("#getnew").disabled = false; }
 };
 
 /* Standing risk panel. The costly mistakes here are the silent ones, so the
@@ -1305,7 +1547,7 @@ async function risks(){
     <div style="margin-bottom:9px">
       <span class="pill ${f.level==='block'?'bad':''}"
             style="${f.level==='warn'?'background:rgba(224,168,0,.18);color:#b8860b':''}">
-        ${f.level==='block'?'BLOCK':'WARN'}</span>
+        ${f.level==='block'?'Stops work':'Worth fixing'}</span>
       <div style="margin-top:3px">${esc(f.title)}</div>
       ${f.remedy?`<div class="muted" style="margin-top:2px">→ ${esc(f.remedy)}</div>`:''}
     </div>`).join("");
@@ -1316,26 +1558,30 @@ $("#a_cancel").onclick = () => { $("#acctform").hidden = true; };
 $("#a_save").onclick = async () => {
   const body = {
     label: $("#a_label").value.trim(), username: $("#a_user").value.trim(),
-    password: $("#a_pass").value, proxy: $("#a_proxy").value.trim(),
+    proxy: $("#a_proxy").value.trim(),
   };
-  if (!body.label) return banner("A label is required.", "err");
+  if (!body.label) return banner("Give the account a short name first.", "err");
+  $("#a_save").disabled = true;
   try {
     const d = await api("/api/account", {
       method:"POST", headers:{"Content-Type":"application/json"},
       body: JSON.stringify(body)
     });
     if (d.error) return banner(esc(d.error), "err");
-    banner(`Added <b>${esc(d.label)}</b> to config.toml`
-      + (d.wrote_password ? ` (password saved as ${esc(d.env_key)})` : "")
-      + `.<br>Now run: <code>${esc(d.next)}</code><br>${esc(d.note)}`, "ok");
-    ["#a_label","#a_user","#a_pass","#a_proxy"].forEach(s => $(s).value = "");
+    ["#a_label","#a_user","#a_proxy"].forEach(s => $(s).value = "");
     $("#acctform").hidden = true;
+    banner("");
     await status();
+    // Straight into signing in. An account that is saved but not signed in
+    // collects nothing, so there is no reason to make that a second step —
+    // and no reason to send anyone to a terminal for it.
+    await loginOpen(d.label);
   } catch (e) { banner(esc(e.message), "err"); }
+  finally { $("#a_save").disabled = false; }
 };
 
 /* ------------------------------------------------------------------
-   Live view.
+   Auto-update.
 
    This re-reads the LOCAL DATABASE on a timer. It never calls X — the
    watcher service already polls X continuously on its own adaptive
@@ -1345,7 +1591,12 @@ $("#a_save").onclick = async () => {
    hour. Reading the database is free and shows the same tweets.
 
    New rows are PREPENDED rather than replacing the list, so scroll
-   position, "Load more" pages and reading position all survive a refresh.
+   position, "Show more" pages and reading position all survive a refresh.
+
+   The checkbox is #autorefresh, NOT #live. It used to share the id "live"
+   with the fetch button, so $("#live") returned the button, .checked was
+   undefined, and tick() bailed on its first line every single time — the
+   dot pulsed and nothing ever refreshed.
    ------------------------------------------------------------------ */
 let liveTimer = null, pending = [], topId = null;
 
@@ -1369,7 +1620,7 @@ function showPending(){
 }
 
 async function tick(){
-  if (!$("#live").checked || document.hidden) return;
+  if (!$("#autorefresh").checked || document.hidden) return;
   let d;
   try {
     const p = params(); p.set("limit", PAGE_SIZE); p.set("offset", 0);
@@ -1385,7 +1636,7 @@ async function tick(){
   if (window.scrollY < 80) {
     showPending();
   } else {
-    $("#newbtn").textContent = `${pending.length} new tweet${pending.length>1?'s':''} — show`;
+    $("#newbtn").textContent = `${pending.length} new tweet${pending.length>1?'s':''} — show them`;
     $("#newbar").style.display = "block";
   }
 }
@@ -1395,11 +1646,138 @@ function setLive(on){
   if (liveTimer) clearInterval(liveTimer);
   liveTimer = on ? setInterval(tick, parseInt($("#everysec").value, 10) * 1000) : null;
 }
-$("#live").onchange    = () => setLive($("#live").checked);
-$("#everysec").onchange = () => setLive($("#live").checked);
+$("#autorefresh").onchange = () => setLive($("#autorefresh").checked);
+$("#everysec").onchange    = () => setLive($("#autorefresh").checked);
 $("#newbtn").onclick    = () => { showPending(); window.scrollTo({top: 0, behavior: "smooth"}); };
 // A hidden tab should not keep querying; catch up the moment it is visible.
 document.addEventListener("visibilitychange", () => { if (!document.hidden) tick(); });
+
+/* ------------------------------------------------------------------
+   The sign-in window.
+
+   The <img> is a live picture of a real Chrome running on the server.
+   Clicks are scaled from the displayed size back to the real window size
+   and forwarded; keystrokes go straight through. The password is typed
+   into the genuine x.com form — this page never reads or stores it.
+
+   As soon as X reports the account as signed in, the session is copied
+   out and the browser is shut down. It exists only to get past the
+   captcha and device checks that a plain script cannot clear.
+   ------------------------------------------------------------------ */
+let loginTimer = null, loginW = 1100, loginH = 780, loginDone = false;
+
+function loginMsg(text, bad){
+  $("#loginmsg").textContent = text;
+  $("#loginmsg").style.color = bad ? "var(--warn)" : "var(--dim)";
+}
+
+function loginStopFrames(){
+  if (loginTimer) { clearInterval(loginTimer); loginTimer = null; }
+}
+
+async function loginOpen(label){
+  $("#loginwrap").classList.add("on");
+  loginMsg("Starting a browser…");
+  $("#logindone").hidden = true;
+  loginDone = false;
+  let d;
+  try {
+    d = await api("/api/login/start", {
+      method:"POST", headers:{"Content-Type":"application/json"},
+      body: JSON.stringify({label})
+    });
+  } catch (e) { return loginMsg(e.message, true); }
+  if (d.error){ loginMsg(d.error, true); return; }
+
+  loginW = d.width; loginH = d.height;
+  loginMsg("Type your X username and password in the window below.");
+  loginFrame();
+  loginTimer = setInterval(loginFrame, 900);
+
+  // The profile may already be signed in, in which case there is nothing for
+  // anyone to do — capture it and close.
+  if (d.state === "logged_in") loginAct({act:"none"});
+}
+
+function loginFrame(){
+  if (loginDone) return;   // the browser is gone; asking again just 409s
+  // Cache-buster: the URL is constant but the picture changes every frame.
+  $("#loginimg").src = "/api/login/frame?t=" + Date.now();
+}
+
+async function loginAct(payload){
+  if (loginDone) return;
+  let d;
+  try {
+    d = await api("/api/login/act", {
+      method:"POST", headers:{"Content-Type":"application/json"},
+      body: JSON.stringify(payload)
+    });
+  } catch (e) { return loginMsg(e.message, true); }
+
+  if (d.error)  return loginMsg(d.error, true);
+  if (d.closed) return loginClose();
+
+  if (d.state === "challenge")
+    loginMsg("X wants a code or a puzzle solved — do it in the window below.");
+  else if (d.state === "needs_login")
+    loginMsg("Type your X username and password in the window below.");
+
+  if (d.captured){
+    // The browser has already been shut down server-side at this point.
+    loginDone = true;
+    loginStopFrames();
+    $("#logindone").hidden = false;
+    if (d.active){
+      loginMsg(`Signed in as @${d.username}. This account is ready to collect.`);
+      banner(`@${esc(d.username)} is connected and collecting.`, "ok");
+      await status();
+    } else {
+      loginMsg(`Signed in as @${d.username}, but the session could not be saved: `
+               + d.detail, true);
+    }
+    return;
+  }
+  setTimeout(loginFrame, 250);
+}
+
+$("#loginimg").onclick = (e) => {
+  const r = e.target.getBoundingClientRect();
+  // The image is displayed scaled; clicks must land on the real pixels.
+  const x = Math.round((e.clientX - r.left) * (loginW / r.width));
+  const y = Math.round((e.clientY - r.top)  * (loginH / r.height));
+  loginAct({act:"click", x, y});
+};
+$("#loginimg").onwheel = (e) => { e.preventDefault(); loginAct({act:"scroll", dy: e.deltaY}); };
+
+document.addEventListener("keydown", (e) => {
+  if (!$("#loginwrap").classList.contains("on")) return;
+  if (e.key === "Escape") { e.preventDefault(); return loginClose(); }
+  e.preventDefault();
+  if (e.key.length === 1)        loginAct({act:"type", text:e.key});
+  else if (["Enter","Backspace","Tab","ArrowLeft","ArrowRight","ArrowUp","ArrowDown","Delete"].includes(e.key))
+    loginAct({act:"key", key:e.key});
+});
+// Pasting a password is normal and safer than typing it.
+document.addEventListener("paste", (e) => {
+  if (!$("#loginwrap").classList.contains("on")) return;
+  const text = (e.clipboardData || window.clipboardData).getData("text");
+  if (text) { e.preventDefault(); loginAct({act:"type", text}); }
+});
+
+async function loginClose(){
+  loginStopFrames();
+  $("#loginwrap").classList.remove("on");
+  // Always tell the server, even after a successful capture: the call is
+  // idempotent, and a browser left running holds the account's profile
+  // directory open, which blocks the next sign-in.
+  try { await api("/api/login/cancel", {method:"POST",
+        headers:{"Content-Type":"application/json"}, body:"{}"}); } catch {}
+  loginDone = false;
+  await status();
+}
+$("#loginx").onclick = loginClose;
+$("#logindone").onclick = loginClose;
 
 status(); search().then(() => setLive(true)); risks();
 setInterval(() => { status(); risks(); }, 15000);

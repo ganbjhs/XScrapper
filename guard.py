@@ -26,7 +26,6 @@ Run it standalone at any time:
 """
 
 import json
-import os
 import sqlite3
 import time
 from dataclasses import asdict, dataclass, field
@@ -234,28 +233,31 @@ def classify_account(a) -> dict:
         status = STATUS_DEAD
         msg = (a.error_msg or "").strip()
         hit = next((d for c, d in FATAL_CODES.items() if f"({c})" in msg), "")
-        reasons.append(hit or (msg[:120] if msg else "marked inactive, no reason recorded"))
+        reasons.append(hit or (msg[:120] if msg else "X stopped accepting it, no reason given"))
         return {"status": status, "reasons": reasons,
-                "action": "python3 main.py login --account <label> --force"}
+                "action": "Press Sign in to X below."}
 
     if not a.real_user_agent:
         status = STATUS_WARN
-        reasons.append("placeholder user-agent — re-login to capture the browser's real one")
+        reasons.append("we are not sending the same browser details X saw at sign-in — "
+                       "sign in again to fix it")
     if not a.has_known_device:
         status = STATUS_WARN
-        reasons.append("no kdt cookie: X does not treat this as a trusted device")
+        reasons.append("X does not treat this as a known device yet, so it may ask "
+                       "for a code next time")
     if not a.proxy:
         status = STATUS_WARN
-        reasons.append("no proxy — shares this machine's IP with every other account")
+        reasons.append("no proxy, so this account shares an internet address with "
+                       "everything else here")
     if getattr(a, "requests", 0) > HEAVY_REQUESTS:
         status = STATUS_WARN
-        reasons.append(f"{a.requests} requests served — heavy usage on one account")
+        reasons.append(f"{a.requests} requests made so far — that is heavy for one account")
     if a.error_msg:
         status = STATUS_WARN
-        reasons.append(f"last error: {a.error_msg[:100]}")
+        reasons.append(f"last problem: {a.error_msg[:100]}")
 
     return {"status": status, "reasons": reasons,
-            "action": "" if status == STATUS_LIVE else "Add more accounts, or set a per-account proxy."}
+            "action": "" if status == STATUS_LIVE else "Add another account, or give this one a proxy."}
 
 
 @dataclass
@@ -401,35 +403,36 @@ def assess(cfg, action: str = "", cost: int = 0, host: str = "",
         ))
     elif not accounts:
         add(Finding(
-            BLOCK, "account.none", "No accounts in the session store",
-            "Nothing can talk to X until an account is logged in.",
-            "python3 main.py login --all",
+            BLOCK, "account.none", "No X account has been set up",
+            "Nothing can be collected until one X account is signed in.",
+            "Add one in the dashboard's X accounts panel, or run "
+            "`python3 main.py login --all`.",
         ))
     elif not live:
         add(Finding(
-            BLOCK, "account.none_active", "No active account",
+            BLOCK, "account.none_active", "No X account is signed in",
             "; ".join(f"@{a.username}: {(a.error_msg or 'inactive')[:70]}" for a in dead[:3]),
-            "python3 main.py login --all --refresh-only   (silent) "
-            "or  --force  if the session is genuinely gone.",
+            "Press Sign in to X in the dashboard's accounts panel, or run "
+            "`python3 main.py login --all --refresh-only`.",
         ))
     else:
         if dead:
             add(Finding(
                 WARN, "account.some_dead",
-                f"{len(dead)} of {len(accounts)} accounts are inactive",
+                f"{len(dead)} of {len(accounts)} X accounts are signed out",
                 "; ".join(f"@{a.username}: {(a.error_msg or 'inactive')[:60]}" for a in dead[:3]),
-                "Check `doctor --accounts`. Code (32) means the session expired — "
-                "re-login. (326)/(88) suggest the account is restricted.",
+                "Press Sign in to X for those accounts. Code (32) just means the "
+                "session expired; (326) or (88) means X has restricted the account.",
             ))
         if len(live) == 1:
             add(Finding(
                 WARN, "account.single",
-                "Only one active account — a single point of failure",
-                f"@{live[0].username} carries all traffic. If X restricts it, "
-                f"collection stops entirely, and one account has the smallest "
-                f"rate budget available.",
-                "Add 2-4 more throwaway accounts in config.toml. Losing one then "
-                "costs a fraction of throughput instead of everything.",
+                "Only one X account — everything stops if it is lost",
+                f"@{live[0].username} does all the work. If X restricts it, "
+                f"collection stops completely, and one account also has the "
+                f"smallest request allowance available.",
+                "Add 2-4 more throwaway accounts. Losing one then costs some "
+                "speed instead of everything.",
             ))
         no_proxy = [a for a in live if not a.proxy]
         if len(live) > 1 and len(no_proxy) > 1:
@@ -446,11 +449,11 @@ def assess(cfg, action: str = "", cost: int = 0, host: str = "",
             if not a.has_known_device:
                 add(Finding(
                     INFO, "account.no_kdt",
-                    f"@{a.username} is not on X's trusted-device path",
-                    "The kdt (known-device) cookie is absent, so X is likelier "
-                    "to challenge this account on future logins.",
-                    "Harmless day to day. Keep profiles/ backed up so the "
-                    "browser profile itself stays trusted.",
+                    f"X does not yet treat @{a.username} as a known device",
+                    "The known-device cookie is missing, so X is more likely to "
+                    "ask for a code the next time this account signs in.",
+                    "Harmless day to day. Keep the profiles/ folder backed up — "
+                    "that is what keeps this device trusted.",
                 ))
                 break
 
@@ -477,7 +480,6 @@ def assess(cfg, action: str = "", cost: int = 0, host: str = "",
         remaining = b["remaining"] or 0
         reserve = max(HARD_FLOOR, int(b["limit"] * RESERVE_FRACTION))
         after = remaining - cost
-        per_account = max(1, len(live) or 1)
 
         if cost and after < 0:
             add(Finding(
@@ -494,9 +496,9 @@ def assess(cfg, action: str = "", cost: int = 0, host: str = "",
                 WARN, "rate.reserve",
                 f"This would leave {after} of {b['limit']} requests — below the "
                 f"{reserve} kept in reserve",
-                f"That headroom exists so the watcher can keep streams fresh "
-                f"and so a burst does not trigger 429s. Spending it is not fatal, "
-                f"but it is the same budget collection depends on.",
+                "That headroom exists so the watcher can keep collecting and so "
+                "a burst does not trigger 429s. Spending it is not fatal, but it "
+                "is the same allowance the collector depends on.",
                 f"Fetch fewer pages, or wait {_reset_in(b)} for the reset.",
             ))
         elif remaining <= reserve and not cost:
