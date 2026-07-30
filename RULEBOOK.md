@@ -254,8 +254,12 @@ target, port, headers — lives in an `include`d snippet with no `server` or
 
 ### R18 — On a shared machine, claim only names scoped to this app
 
+**This server also runs `namo.vedictech.in` and `report.vedictech.in`.** They
+are not ours. Nothing here may touch their vhosts, certificates, units or
+ports — see §6.
+
 Every resource this deployment creates is named for the app or for its own
-domain: `sites-available/<domain>`, `snippets/xscraper-app.conf`,
+domain: `sites-available/scraper.vedictech.in`, `snippets/xscraper-app.conf`,
 `xscraper-web`, `/opt/xscraper`, and a port confirmed free before use. It never
 takes a port, never edits another vhost, never removes `sites-enabled/default`.
 
@@ -267,6 +271,11 @@ The failure this guards against is quiet in the worst way: nothing errors, the
 site keeps answering on port 80, and only HTTPS breaks — because nginx, finding
 no server block for the requested name, falls through to another app's block
 and serves **that app's certificate**. See §9, "the neighbour's certificate".
+
+When our site and a neighbour's cannot both be right, **ours loses**. setup.sh
+disables the scraper rather than fight for a contested hostname. A scraper
+that is down is a nuisance we can fix; a neighbour that is down is someone
+else's outage caused by our deploy.
 
 ### R19 — The dashboard speaks plain language
 
@@ -525,16 +534,22 @@ Then add an account in the dashboard and press **Save and sign in**.
 
 ### On a server
 
-Target here is `scraper.vedictech.in` on `200.97.175.12`.
+Target here is `scraper.vedictech.in` on `200.97.175.12` — **a shared box that
+also serves `namo.vedictech.in` and `report.vedictech.in`.** Read "sharing a
+server with other sites" below before changing anything in `deploy/`.
 
 ```
-internet ──HTTPS──▶ nginx :443 ──HTTP──▶ 127.0.0.1:8765
-                    (TLS, certbot)        (or the next free port)
-                                          login required
+                                     ┌─▶ namo.vedictech.in     (not ours)
+internet ──HTTPS──▶ nginx :443 ──────┼─▶ report.vedictech.in   (not ours)
+                    (TLS, certbot)   │
+                                     └─▶ 127.0.0.1:8765  scraper.vedictech.in
+                                         (or the next free port)
+                                         login required
 ```
 
-nginx holds the certificate and is the only thing exposed. The Python server
-binds to loopback, so even a misconfigured firewall cannot expose it directly.
+One nginx, one certbot, three certificates. nginx is the only thing exposed;
+the Python server binds to loopback, so even a misconfigured firewall cannot
+reach it directly.
 
 **1. Point DNS.** An A record for `scraper` → the server's IP. Verify with
 `dig +short scraper.vedictech.in` before continuing — `setup.sh` skips HTTPS if
@@ -569,17 +584,39 @@ SKIP_BROWSER=1              bash deploy/setup.sh   # skip the ~400 MB Chromium
 
 ### Sharing a server with other sites
 
-This box already runs `namo.vedictech.in`, and the two must not interfere.
-Everything is namespaced so they cannot (R18):
+**`200.97.175.12` is not ours alone.** As of 2026-07-31 it serves:
+
+| hostname | whose | notes |
+|---|---|---|
+| `namo.vedictech.in` | another app | own certificate, own vhost |
+| `report.vedictech.in` | another app | own certificate, own vhost |
+| `scraper.vedictech.in` | **this project** | own certificate, own vhost |
+
+All three share one nginx and one certbot. That is the entire reason §9's
+"neighbour's certificate" failure was possible, and why the rules below are not
+optional politeness — they are what keeps three apps on one box from taking
+each other down.
+
+**Never touch a hostname that is not `scraper.vedictech.in`.** Not its vhost,
+not its certificate, not its systemd unit, not its port. If a change seems to
+require it, the change is wrong.
+
+Everything this deployment claims is namespaced so it cannot collide (R18):
 
 | resource | this app takes | never touches |
 |---|---|---|
-| nginx vhost | `sites-available/<domain>` | any file it did not create |
+| nginx vhost | `sites-available/scraper.vedictech.in` | any file it did not create |
 | nginx include | `snippets/xscraper-app.conf` | — |
 | systemd | `xscraper-web`, `xscraper-watch` | any other unit |
 | user / files | `xscraper`, `/opt/xscraper` | — |
-| certificate | one for its own domain | — |
-| port | first free from 8765 up | any port in use |
+| certificate | one, for its own domain only | the other two certificates |
+| port | first free from 8765 up | any port already in use |
+
+Note the vhost filename. It was once just `sites-available/scraper`, which
+names no host at all and invites exactly one question — "is this the scraper
+app, or the scraper subdomain, or something else?" — at the moment someone is
+deciding whether it is safe to overwrite. Naming it for the host it serves
+removes the question.
 
 Port selection is stable and non-invasive: `XS_PORT` if you set it, otherwise
 whatever this deployment already uses, otherwise the first free port. If
@@ -589,10 +626,73 @@ unit and the nginx snippet, so the two can never disagree.
 Before enabling its site it asks `nginx -T` whether another block already
 claims the hostname, and after reloading it fails loudly if nginx reports a
 conflicting server name — disabling **our** site rather than fighting for the
-name.
+name. Losing our own site is recoverable; breaking `namo` or `report` is
+someone else's outage.
 
 `sites-enabled/default` is left alone. Removing it on a shared server is how
 you take down someone else's site by accident.
+
+### What a healthy deployment looks like
+
+Confirmed working 2026-07-31. If you are ever unsure whether the site is
+actually fine, this is the target state — all four must hold:
+
+```bash
+# 1. our vhost is the one enabled, named for its host
+ls /etc/nginx/sites-enabled/scraper.vedictech.in
+
+# 2. certbot's TLS lines are in it, and the :80 redirect block exists
+nginx -T | grep -n scraper.vedictech.in
+#   ...sites-enabled/scraper.vedictech.in:
+#   server_name scraper.vedictech.in;
+#   ssl_certificate     /etc/letsencrypt/live/scraper.vedictech.in/fullchain.pem;
+#   ssl_certificate_key /etc/letsencrypt/live/scraper.vedictech.in/privkey.pem;
+#   if ($host = scraper.vedictech.in) {        <- the redirect certbot added
+#   server_name scraper.vedictech.in;
+
+# 3. the host serves ITS OWN certificate      <- the check that matters
+echo | openssl s_client -servername scraper.vedictech.in \
+       -connect scraper.vedictech.in:443 2>/dev/null | openssl x509 -noout -subject
+#   subject=CN = scraper.vedictech.in          <- NOT namo, NOT report
+
+# 4. and it answers
+curl -sI https://scraper.vedictech.in/ | head -1     #   HTTP/1.1 200 OK
+```
+
+Check 3 is the one people skip, and it is the only one that would have caught
+the outage. Checks 1, 2 and 4 all passed while the site was serving
+`namo.vedictech.in`'s certificate to every visitor.
+
+### If HTTPS breaks again
+
+The recovery that worked, in order. Stop at the first step that fixes it.
+
+```bash
+# Is the certificate still there? (it usually is — the loss is nginx's use of
+# it, not the certificate itself, so do NOT start by re-issuing)
+ls /etc/letsencrypt/live/scraper.vedictech.in/
+
+# Re-install it into nginx. --reinstall, not a fresh issue: re-issuing burns a
+# Let's Encrypt rate-limit slot to solve a problem that is not about expiry.
+certbot --nginx -d scraper.vedictech.in --redirect --reinstall
+
+# Then re-run the deploy, which is idempotent and will verify the result
+cd /opt/xscraper/app && git pull && bash deploy/setup.sh
+```
+
+`setup.sh` does all of this itself now, including the `--reinstall` branch and
+the certificate-identity check. Running it is the normal fix; the manual
+commands are for when you want to see each step.
+
+**Before running `git pull` on the server, confirm the commit is actually on
+`origin`.** A pull that reports "Already up to date" and then runs the *old*
+script looks identical to a successful deploy — same output, same success
+message, nothing fixed. This cost a full round trip once. From the machine you
+committed on:
+
+```bash
+git log --oneline -1 origin/main     # must be the commit you expect
+```
 
 **3. Add an account in the dashboard.** Not on the server's command line —
 there is no screen there. The sign-in window is exactly for this.
@@ -656,7 +756,7 @@ nginx -T | grep -n 'scraper.vedictech.in'
 
 | symptom | almost always |
 |---|---|
-| HTTP works, HTTPS shows a certificate for **another site** | our vhost has no 443 block; nginx fell through to a neighbour. `certbot --nginx -d DOMAIN --redirect --reinstall` |
+| HTTP works, HTTPS shows the certificate for **`namo` or `report`** | our vhost has no 443 block; nginx fell through to a neighbour. `certbot --nginx -d DOMAIN --redirect --reinstall` |
 | Browser says "Not secure", no certificate error | no certificate at all yet — DNS was wrong when setup.sh ran. Fix DNS, re-run it |
 | 502 Bad Gateway | nginx and systemd disagree about the port. Re-run setup.sh; it writes both from one value |
 | 404 / someone else's app | two server blocks claim the name. `nginx -T \| grep` for it |
@@ -816,6 +916,25 @@ Three fixes, because one would not have been enough:
 
 **The lesson generalises: when a tool edits your config file, that file is no
 longer yours to overwrite.** Own an include, not the whole thing.
+
+**Resolved 2026-07-31.** The deploy detected the certificate present but unused,
+ran `certbot --reinstall`, and the identity check then confirmed
+`subject=CN = scraper.vedictech.in`. The vhost is now
+`sites-enabled/scraper.vedictech.in` with certbot's TLS block intact and its
+`:80` redirect alongside. See §6, "what a healthy deployment looks like", for
+the exact state to compare against next time.
+
+Two smaller things this cost, both worth remembering:
+
+- **The old vhost had to be migrated, not replaced.** A file still called
+  `sites-available/scraper` and a new one called `scraper.vedictech.in` would
+  both have declared `server_name scraper.vedictech.in` — a second conflict on
+  top of the first. setup.sh moves the old file into the new name so certbot's
+  work travels with it, rather than deleting it and re-issuing.
+- **The fix was described before it was pushed.** The server was told to
+  `git pull`, correctly reported "Already up to date", and ran the old script —
+  whose output is a plausible success. Nothing distinguishes "deployed" from
+  "pulled nothing" except checking `origin` first.
 
 ### The phantom account
 
