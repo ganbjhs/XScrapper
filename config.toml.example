@@ -1,95 +1,94 @@
-# Copy to config.toml. Declares accounts and the queries to monitor.
-# Secrets live in .env and are referenced here BY NAME, never by value — so
-# this file is safe to back up and .env is not.
+# Copy this to config.toml and edit it.
+#
+#     cp config.toml.example config.toml
+#
+# Passwords are NOT written here. This file only names the environment variable
+# that holds each password; the values themselves live in .env. That way this
+# file is safe to copy or back up, and .env is the only thing to guard.
 
 [defaults]
-db_accounts  = "accounts.db"      # twscrape's session store (cookies + UA)
-db_results   = "results.db"       # collected tweets, watermarks, poll history
-profiles_dir = "profiles"         # one persistent Chrome profile per account
+db_accounts  = "accounts.db"      # where the X login session is stored
+db_results   = "results.db"       # where collected tweets are stored
+profiles_dir = "profiles"         # one browser profile per account
 
-page_size          = 20           # tweets requested per GraphQL page
-max_pages_per_poll = 5            # ceiling on one poll; hitting it means the
-                                  # stream outran us, and is recorded as such
-min_interval_s     = 5            # never poll a stream faster than this
-max_interval_s     = 900          # never let a quiet stream go longer than this
-overlap_ms         = 60000        # re-read this far past the watermark each
-                                  # poll, to catch tweets X indexed late
+page_size          = 20           # tweets fetched per request (X caps this ~20)
+max_pages_per_poll = 5            # most requests one check may spend
+min_interval_s     = 5            # fastest we re-check
+max_interval_s     = 900          # slowest, when things have gone quiet
+overlap_ms         = 60000        # re-read this far back, to catch late posts
+
+# The raw timeline wrapper around each tweet is about 60% of the database size
+# and nothing reads it. Leave this off unless you specifically need it.
+keep_entry_json    = false
 
 
-# ------------------------------------------------------------------
-# Accounts. Add one block per throwaway account.
+# ---------------------------------------------------------------------------
+# Accounts
 #
-# `username` is left BLANK on purpose — `login` fills it in from the real
-# screen_name X reports. accounts.db keys on username COLLATE NOCASE, so a
-# guessed-wrong value silently creates an orphan row.
-# ------------------------------------------------------------------
+# Use throwaway accounts, never a personal one — automating an account is
+# against X's rules and accounts do get locked.
+#
+# You do not have to edit this by hand. In the dashboard, open "X accounts",
+# press "+ Add an account", and it writes a block like this one for you, then
+# opens a browser window so you can sign in.
+#
+# Leave `username` blank. Signing in fills it in with the real name X reports,
+# which avoids a mismatch if you type it slightly differently.
+# ---------------------------------------------------------------------------
 [[accounts]]
 label              = "acct_a"
 username           = ""
-password_env       = "X_PASSWORD_ACCT_A"
+password_env       = "X_PASSWORD_ACCT_A"     # the NAME of a variable in .env
 email              = ""
 email_password_env = "X_EMAIL_PASSWORD_ACCT_A"
+
+# The browser profile. X remembers it as a known device, which is what keeps
+# later sign-ins silent. One per account, and back the folder up.
 profile_dir        = "profiles/acct_a"
+
 proxy              = ""                      # e.g. "http://user:pass@host:port"
 locale             = "en-US"
 timezone           = "Asia/Kolkata"
 enabled            = true
 
-# [[accounts]]
-# label              = "acct_b"
-# username           = ""
-# password_env       = "X_PASSWORD_ACCT_B"
-# email              = ""
-# email_password_env = "X_EMAIL_PASSWORD_ACCT_B"
-# profile_dir        = "profiles/acct_b"
-# proxy              = ""
-# locale             = "en-US"
-# timezone           = "Asia/Kolkata"
-# enabled            = true
 
-
-# ------------------------------------------------------------------
-# Streams. Each is one query polled on its own adaptive interval.
+# ---------------------------------------------------------------------------
+# What to watch
 #
-# `query` takes X advanced-search operators verbatim:
-#   from:nasa since:2026-01-01 min_faves:500 -filter:replies
-#   "data breach" (bank OR fintech) lang:en filter:links
+# Each block is one thing checked over and over. A block has EITHER a `list_id`
+# OR a `query` — never both.
 #
-# tab must be "Latest" for watermarking to be correct — it is the only
-# time-ordered tab. "Top" is algorithmically ranked, so stopping early on it
-# would drop results silently. Set watermark = false to sweep a ranked tab
-# instead (bounded pages, dedup, no early stop).
-# ------------------------------------------------------------------
+# Prefer a list. A list is a set of accounts someone has grouped together on
+# x.com, and anyone can watch a public one. X allows 500 list requests every 15
+# minutes against 50 for searches, so a list updates about ten times faster and
+# never drags in unrelated posts.
+#
+# `list_id` takes the number from the list's URL, or the whole URL.
+# ---------------------------------------------------------------------------
 [[streams]]
-label   = "india_markets"
-query   = '(RBI OR "repo rate" OR "monetary policy") lang:en -filter:replies'
-tab     = "Latest"
+label   = "politicians"
+list_id = "https://x.com/i/lists/1234567890123456789"
 enabled = true
 
-# [[streams]]
-# label              = "breaking_intl"
-# query              = '(breaking OR urgent) (election OR summit) lang:en min_faves:50'
-# tab                = "Latest"
-# min_interval_s     = 10        # per-stream overrides of [defaults]
-# max_pages_per_poll = 8
-# enabled            = true
 
-
-# --- X List stream -------------------------------------------------------
-# A stream has ONE source: `query` OR `list_id`, never both.
+# A keyword search. `query` uses X's own search syntax — the same thing you
+# would type into the search box on x.com:
 #
-# Lists run on the ListLatestTweetsTimeline queue, which is a SEPARATE and much
-# larger rate-limit budget than search (measured: 500 per 15 min vs 50). They
-# are the lowest-lag option available — put the accounts you care about in a
-# list and watch that.
+#   from:someone          only posts by that account
+#   -filter:replies       skip replies
+#   lang:en               English only
+#   min_faves:50          at least 50 likes
+#   "exact phrase"        those words together, in that order
 #
-# The trade-off: X does no server-side filtering on a list timeline. There is
-# no min_faves or lang to pass, so any narrowing happens locally after the
-# tweets are already collected.
+# Be specific. A search for a common abbreviation collects whatever else uses
+# it — a stream here for "RBI" (India's central bank) filled up with baseball,
+# because RBI is also "runs batted in".
 #
-# list_id accepts a bare id or the URL you copied from the address bar.
 # [[streams]]
-# label   = "tech_leaders"
-# list_id = "https://x.com/i/lists/1234567890123456789"
+# label   = "leaders"
+# query   = '(from:narendramodi OR from:AmitShah OR from:PMOIndia) -filter:replies'
 # enabled = true
-# min_interval_s = 5      # the big budget allows a much tighter floor
+
+
+# To stop watching something, set enabled = false. Tweets already collected
+# stay in the database — nothing here ever deletes them.

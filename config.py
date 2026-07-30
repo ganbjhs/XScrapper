@@ -5,9 +5,9 @@ Secrets are referenced by env-var NAME, never stored here, so config.toml is
 safe to back up while .env is not. Uses stdlib tomllib (3.11+), so no new
 dependency.
 
-If config.toml is absent, a single account is synthesized from the legacy
-X_USERNAME/X_PASSWORD/X_COOKIES env vars, so the original
-`python3 main.py --query '...'` invocation keeps working.
+config.toml is required. There is deliberately no fallback that invents one:
+a config guessed from stray environment variables is how an account ends up
+collecting under a label nobody chose.
 """
 
 import os
@@ -28,7 +28,6 @@ PY = Path(sys.executable).name
 CLI = f"{PY} main.py"
 
 CONFIG_FILENAME = "config.toml"
-LEGACY_LABEL = "legacy"
 
 # Only the time-ordered tab can be watermarked. See StreamCfg.validate.
 TABS = ("Latest", "Top", "Media")
@@ -110,7 +109,7 @@ class Config:
     defaults: Defaults
     accounts: list[AccountCfg]
     streams: list[StreamCfg]
-    source: Path | None  # None when synthesized from legacy env vars
+    source: Path       # the config.toml this came from
 
     @property
     def db_accounts(self) -> Path:
@@ -316,31 +315,6 @@ def _validate(cfg: Config) -> None:
         )
 
 
-def _legacy_config(root: Path) -> Config:
-    """
-    Synthesize a one-account config from the original .env variables, so the
-    prototype's `python3 main.py --query '...'` keeps working without a
-    config.toml.
-    """
-    defaults = Defaults()
-    username = os.getenv("X_USERNAME", "").strip()
-    if not username and os.getenv("X_COOKIES", "").strip():
-        username = "cookie_account"
-
-    acct = AccountCfg(
-        label=LEGACY_LABEL,
-        username=username,
-        password_env="X_PASSWORD",
-        email=os.getenv("X_EMAIL", "").strip(),
-        email_password_env="X_EMAIL_PASSWORD",
-        profile_dir=f"{defaults.profiles_dir}/{LEGACY_LABEL}",
-    )
-    cfg = Config(root=root, defaults=defaults, accounts=[acct], streams=[], source=None)
-    acct.profile_path = cfg._resolve(acct.profile_dir)
-    _validate(cfg)
-    return cfg
-
-
 def find_config(root: Path, explicit: str | None = None) -> Path | None:
     if explicit:
         p = Path(explicit).expanduser()
@@ -368,16 +342,28 @@ def find_config(root: Path, explicit: str | None = None) -> Path | None:
 
 def load_config(explicit: str | None = None, root: Path | None = None) -> Config:
     """
-    Load config.toml, falling back to the legacy single-account env vars.
+    Load config.toml.
 
     Always calls load_dotenv() first so `password_env` lookups resolve.
+
+    A missing config.toml is an error, not something to paper over. This used to
+    synthesize a one-account config named "legacy" from bare env vars, and the
+    result was exactly the confusion R6 exists to prevent: the account that was
+    really doing the collecting lived under a label nobody had written down,
+    with a profile directory nobody had chosen, invisible to config.toml. Say
+    what is missing instead.
     """
     root = (root or Path.cwd()).resolve()
     load_dotenv(root / ".env")
 
     path = find_config(root, explicit)
     if path is None:
-        return _legacy_config(root)
+        raise ConfigError(
+            f"No {CONFIG_FILENAME} in {root}.\n"
+            f"  Create one from the template:\n"
+            f"      cp {CONFIG_FILENAME}.example {CONFIG_FILENAME}\n"
+            f"  Then edit it to name your account and what you want to watch."
+        )
 
     try:
         with path.open("rb") as f:
