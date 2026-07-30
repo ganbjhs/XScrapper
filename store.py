@@ -467,7 +467,8 @@ class Store:
         but quietly lack the field.
         """
         wanted = {"polls": {"rl_reset": "INTEGER"},
-                  "streams": {"list_id": "TEXT"}}
+                  "streams": {"list_id": "TEXT",
+                              "hidden": "INTEGER NOT NULL DEFAULT 0"}}
         for table, cols in wanted.items():
             have = {r["name"] for r in self.db.execute(f"PRAGMA table_info({table})")}
             for name, decl in cols.items():
@@ -507,6 +508,25 @@ class Store:
              _iso_ms(int(time.time() * 1000))),
         )
         return cur.lastrowid
+
+    async def set_hidden(self, label: str, hidden: bool) -> bool:
+        """
+        Take a stream out of the dashboard, or put it back.
+
+        HIDING IS NOT DELETING, and the difference is the whole point. Every
+        tweet stays in the database, every watermark stays intact, and unhiding
+        restores the view exactly. Nothing in this project deletes a collected
+        tweet (R16): X's index only reaches back about 7 days, so a delete a
+        week later is unrecoverable in a way a hide never is.
+
+        What this is for: every ad-hoc "get new tweets" in the dashboard leaves
+        a permanent `ui:<whatever you typed>` stream behind. Try a few searches
+        and the sidebar fills with them. This is how you clear them away without
+        touching what they collected.
+        """
+        cur = self.db.execute(
+            "UPDATE streams SET hidden = ? WHERE label = ?", (int(hidden), label))
+        return bool(cur.rowcount)
 
     async def mark_first_poll(self, stream_id: int, ms: int) -> None:
         self.db.execute(

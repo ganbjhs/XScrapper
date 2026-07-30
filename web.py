@@ -212,6 +212,19 @@ def _query_tweets(p):
         joins = "JOIN tweet_hits h USING(tweet_id) JOIN streams s USING(stream_id)"
         where.append("s.label = ?")
         params.append(p["stream"])
+    elif not p.get("show_hidden"):
+        # Show a tweet if ANY stream still showing it matched it.
+        #
+        # Deliberately not "hide anything a hidden stream matched": a tweet can
+        # belong to several streams, so that phrasing would make hiding a junk
+        # stream also hide the good stream's tweets wherever the two overlap —
+        # silently losing rows from a view the operator did not touch.
+        #
+        # EXISTS rather than a JOIN because a tweet with three matching streams
+        # would otherwise come back three times.
+        where.append(
+            "EXISTS (SELECT 1 FROM tweet_hits h2 JOIN streams s2 USING(stream_id) "
+            "        WHERE h2.tweet_id = t.tweet_id AND s2.hidden = 0)")
 
     if p.get("q"):
         # Free text across the tweet and its author.
@@ -343,6 +356,7 @@ def _status():
                 ).fetchall() if watched else []
                 lags = sorted(x["lag_ms"] for x in lag)
                 out["streams"].append({
+                    "hidden": bool(s["hidden"]) if "hidden" in s.keys() else False,
                     "label": s["label"], "query": s["query"], "tab": s["tab"],
                     "count": hits,
                     "lag_p50": lags[len(lags) // 2] / 1000 if lags else None,
@@ -915,6 +929,23 @@ class Handler(BaseHTTPRequestHandler):
                 return self._send(200, _login_act(body))
             if u.path == "/api/login/cancel":
                 return self._send(200, _login_cancel())
+            if u.path == "/api/stream/hide":
+                label = (body.get("label") or "").strip()
+                hide = bool(body.get("hidden"))
+                if not label:
+                    return self._send(400, {"error": "which stream?"})
+
+                async def _hide():
+                    st = store_mod.Store(_CFG.db_results, _CFG.defaults.keep_entry_json)
+                    await st.open()
+                    try:
+                        return await st.set_hidden(label, hide)
+                    finally:
+                        await st.close()
+
+                if not _run(_hide()):
+                    return self._send(404, {"error": f"no stream called {label!r}"})
+                return self._send(200, {"ok": True, "label": label, "hidden": hide})
             if u.path == "/api/account":
                 # Writes an X password into .env, so it needs a real gate.
                 # The old check was "is the socket on 127.0.0.1", which is
@@ -1137,8 +1168,17 @@ PAGE = r"""<!doctype html>
   #newbar{position:sticky;top:52px;z-index:8;display:none;margin-bottom:10px}
   #newbar button{width:100%;padding:7px;background:var(--accent);color:#fff;
                  border-color:var(--accent);font-weight:600}
-  .streambtn{display:block;width:100%;text-align:left;margin-bottom:5px;font-size:13px}
+  .streamrow{display:flex;gap:4px;margin-bottom:5px}
+  /* "Everything" is a direct child with no row wrapper, so it carries its own
+     spacing; the ones inside a row get theirs from .streamrow. */
+  #streams > .streambtn{margin-bottom:5px}
+  .streambtn{display:block;width:100%;text-align:left;font-size:13px}
   .streambtn.active{border-color:var(--accent);background:rgba(29,155,240,.1)}
+  .streambtn.off{opacity:.5}
+  .streamx{flex:0 0 auto;padding:4px 8px;font-size:12px;color:var(--dim)}
+  .streamx:hover{border-color:var(--warn);color:var(--warn)}
+  .linky{width:100%;border:0;background:none;color:var(--dim);font-size:12px;
+         text-align:left;padding:2px 0;text-decoration:underline;cursor:pointer}
   code{background:var(--bg);padding:1px 5px;border-radius:5px;font-size:12px;
        border:1px solid var(--line)}
 </style></head><body>
@@ -1258,6 +1298,7 @@ It does not contact X, so it is free.">
 <script>
 const $ = s => document.querySelector(s);
 let activeStream = "";
+let showHidden = false;
 
 const esc = s => (s||"").replace(/[&<>"']/g, c =>
   ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
@@ -1425,16 +1466,54 @@ async function status(){
     return banner(esc(e.message).replace(/\n/g,"<br>"), "err");
   }
 
-  $("#streams").innerHTML = (d.streams||[]).length
+  const all    = d.streams || [];
+  const hidden = all.filter(s => s.hidden);
+  const shown  = all.filter(s => !s.hidden);
+  const list   = showHidden ? all : shown;
+
+  $("#streams").innerHTML = all.length
     ? `<button class="streambtn ${activeStream?'':'active'}" data-s="">Everything</button>` +
-      d.streams.map(s => `<button class="streambtn ${activeStream===s.label?'active':''}"
-        data-s="${esc(s.label)}" title="${esc(s.query)}">
-        ${esc(s.label)} <span class="muted">· ${s.count} tweets</span>
-        ${s.lag_p50!=null ? `<span class="muted">· usually saved ${secs(s.lag_p50)} after posting</span>`:''}
-        </button>`).join("")
+      list.map(s => `<div class="streamrow">
+        <button class="streambtn ${activeStream===s.label?'active':''} ${s.hidden?'off':''}"
+          data-s="${esc(s.label)}" title="${esc(s.query || s.label)}">
+          ${esc(s.label)} <span class="muted">· ${s.count} tweets</span>
+          ${s.lag_p50!=null ? `<span class="muted">· usually saved ${secs(s.lag_p50)} after posting</span>`:''}
+        </button>
+        <button class="streamx" data-hide="${esc(s.label)}" data-to="${s.hidden?0:1}"
+          title="${s.hidden ? 'Show this again' : 'Hide this. The tweets are kept — nothing is deleted.'}"
+        >${s.hidden ? '↩' : '✕'}</button>
+      </div>`).join("") +
+      // Only offer the toggle while there is actually something hidden —
+      // otherwise unhiding the last stream leaves a "hide them again" link
+      // that refers to nothing.
+      (hidden.length
+        ? `<button id="showhidden" class="linky">${showHidden
+             ? "stop showing hidden ones" : `show ${hidden.length} hidden`}</button>`
+        : "")
     : '<span class="muted">nothing yet</span>';
+
   document.querySelectorAll(".streambtn").forEach(b =>
     b.onclick = () => { activeStream = b.dataset.s; status(); search(); });
+
+  // Bind in the same pass that draws them: status() replaces this whole panel
+  // every 15s, so anything bound earlier belongs to nodes that no longer exist.
+  document.querySelectorAll(".streamx").forEach(b => b.onclick = async () => {
+    const label = b.dataset.hide, to = b.dataset.to === "1";
+    try {
+      await api("/api/stream/hide", {
+        method:"POST", headers:{"Content-Type":"application/json"},
+        body: JSON.stringify({label, hidden: to})
+      });
+    } catch (e) { return banner(esc(e.message), "err"); }
+    // Hiding the stream you are filtered to would leave you staring at an
+    // empty list with no obvious way back.
+    if (to && activeStream === label) activeStream = "";
+    banner(to ? `Hid <b>${esc(label)}</b>. Its ${'tweets are still saved'} — use
+                 <b>show hidden</b> to bring it back.` : `<b>${esc(label)}</b> is back.`, "ok");
+    await status(); await search();
+  });
+  const sh = $("#showhidden");
+  if (sh) sh.onclick = () => { showHidden = !showHidden; status(); };
 
   $("#accounts").innerHTML = (d.accounts||[]).length
     ? d.accounts.map(a => {
