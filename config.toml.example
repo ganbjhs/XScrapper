@@ -1,0 +1,95 @@
+# Copy to config.toml. Declares accounts and the queries to monitor.
+# Secrets live in .env and are referenced here BY NAME, never by value — so
+# this file is safe to back up and .env is not.
+
+[defaults]
+db_accounts  = "accounts.db"      # twscrape's session store (cookies + UA)
+db_results   = "results.db"       # collected tweets, watermarks, poll history
+profiles_dir = "profiles"         # one persistent Chrome profile per account
+
+page_size          = 20           # tweets requested per GraphQL page
+max_pages_per_poll = 5            # ceiling on one poll; hitting it means the
+                                  # stream outran us, and is recorded as such
+min_interval_s     = 5            # never poll a stream faster than this
+max_interval_s     = 900          # never let a quiet stream go longer than this
+overlap_ms         = 60000        # re-read this far past the watermark each
+                                  # poll, to catch tweets X indexed late
+
+
+# ------------------------------------------------------------------
+# Accounts. Add one block per throwaway account.
+#
+# `username` is left BLANK on purpose — `login` fills it in from the real
+# screen_name X reports. accounts.db keys on username COLLATE NOCASE, so a
+# guessed-wrong value silently creates an orphan row.
+# ------------------------------------------------------------------
+[[accounts]]
+label              = "acct_a"
+username           = ""
+password_env       = "X_PASSWORD_ACCT_A"
+email              = ""
+email_password_env = "X_EMAIL_PASSWORD_ACCT_A"
+profile_dir        = "profiles/acct_a"
+proxy              = ""                      # e.g. "http://user:pass@host:port"
+locale             = "en-US"
+timezone           = "Asia/Kolkata"
+enabled            = true
+
+# [[accounts]]
+# label              = "acct_b"
+# username           = ""
+# password_env       = "X_PASSWORD_ACCT_B"
+# email              = ""
+# email_password_env = "X_EMAIL_PASSWORD_ACCT_B"
+# profile_dir        = "profiles/acct_b"
+# proxy              = ""
+# locale             = "en-US"
+# timezone           = "Asia/Kolkata"
+# enabled            = true
+
+
+# ------------------------------------------------------------------
+# Streams. Each is one query polled on its own adaptive interval.
+#
+# `query` takes X advanced-search operators verbatim:
+#   from:nasa since:2026-01-01 min_faves:500 -filter:replies
+#   "data breach" (bank OR fintech) lang:en filter:links
+#
+# tab must be "Latest" for watermarking to be correct — it is the only
+# time-ordered tab. "Top" is algorithmically ranked, so stopping early on it
+# would drop results silently. Set watermark = false to sweep a ranked tab
+# instead (bounded pages, dedup, no early stop).
+# ------------------------------------------------------------------
+[[streams]]
+label   = "india_markets"
+query   = '(RBI OR "repo rate" OR "monetary policy") lang:en -filter:replies'
+tab     = "Latest"
+enabled = true
+
+# [[streams]]
+# label              = "breaking_intl"
+# query              = '(breaking OR urgent) (election OR summit) lang:en min_faves:50'
+# tab                = "Latest"
+# min_interval_s     = 10        # per-stream overrides of [defaults]
+# max_pages_per_poll = 8
+# enabled            = true
+
+
+# --- X List stream -------------------------------------------------------
+# A stream has ONE source: `query` OR `list_id`, never both.
+#
+# Lists run on the ListLatestTweetsTimeline queue, which is a SEPARATE and much
+# larger rate-limit budget than search (measured: 500 per 15 min vs 50). They
+# are the lowest-lag option available — put the accounts you care about in a
+# list and watch that.
+#
+# The trade-off: X does no server-side filtering on a list timeline. There is
+# no min_faves or lang to pass, so any narrowing happens locally after the
+# tweets are already collected.
+#
+# list_id accepts a bare id or the URL you copied from the address bar.
+# [[streams]]
+# label   = "tech_leaders"
+# list_id = "https://x.com/i/lists/1234567890123456789"
+# enabled = true
+# min_interval_s = 5      # the big budget allows a much tighter floor

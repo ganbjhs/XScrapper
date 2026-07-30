@@ -1,0 +1,10 @@
+# Pinned exactly: this project reaches into twscrape's private internals
+# (search_raw cursor injection, QueueClient's __username attr, to_old_rep,
+# AccountsPool._order_by). compat.py asserts every one of them at startup, so
+# an accidental upgrade fails loudly instead of silently corrupting results.
+# To upgrade: bump this pin, run `python3 main.py doctor --selftest`, fix what
+# it reports.
+twscrape==0.19.2
+
+python-dotenv>=1.0
+playwright>=1.49

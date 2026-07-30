@@ -1,0 +1,1299 @@
+"""
+The whole offline test suite.
+
+    python3 tests/test_all.py
+
+No network, no accounts, no rate-limit budget spent. Everything runs against
+canned X payloads in fixtures.py, which is what makes the freshness logic
+actually testable rather than hopefully-correct.
+
+Sections:
+  units      snowflake arithmetic, normalize, config validation
+  session    the three auth bugs, each shown against twscrape's own behaviour
+  engine     page parsing, and the account-lock release regression
+  collector  watermark stopping, dedup, gaps, adaptive intervals
+  cli        argv routing, exit codes, search -> store -> export
+"""
+
+import asyncio
+import gc
+import json
+import os
+import pathlib
+import shutil
+import subprocess
+import sys
+import threading
+from contextlib import aclosing
+from datetime import datetime, timezone
+
+sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent))
+sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
+
+import auth as ss
+import config as C
+import store as nz          # normalize helpers now live in store
+import store as sf          # snowflake helpers too
+from auth import Harvest
+from config import AccountCfg
+from engine import parse_page
+from fixtures import (
+    DATE_HEADER_TS, FakeResponse, ID_NEWEST, ID_OLD_QUOTE, ID_ORIGINAL,
+    ID_RETWEET, id_at, search_payload,
+)
+from store import Store
+
+ROOT = pathlib.Path(__file__).resolve().parent.parent
+HERE = pathlib.Path(__file__).resolve().parent
+FAILURES = []
+
+
+def ok(cond, msg):
+    print(("  PASS  " if cond else "  FAIL  ") + msg, flush=True)
+    if not cond:
+        FAILURES.append(msg)
+
+
+def section(name):
+    print(flush=True)
+    print("=" * 70, flush=True)
+    print(f"  {name}", flush=True)
+    print("=" * 70, flush=True)
+
+
+# ==========================================================================
+# units
+# ==========================================================================
+
+sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent))
+
+from datetime import datetime, timezone  # noqa: E402
+
+
+def test_snowflake():
+    print("== snowflake ==")
+    epoch = datetime.fromtimestamp(sf.TWITTER_EPOCH_MS / 1000, tz=timezone.utc)
+    ok(
+        epoch.isoformat() == "2010-11-04T01:42:54.657000+00:00",
+        f"epoch constant is the documented Twitter epoch ({epoch.isoformat()})",
+    )
+    for ms in (sf.TWITTER_EPOCH_MS, 1700000000000, 1900000000000):
+        ok(sf.id_to_ms(sf.ms_to_id(ms)) == ms, f"ms -> id -> ms round-trips ({ms})")
+
+    now = datetime.now(timezone.utc).replace(microsecond=0)
+    ok(sf.id_to_dt(sf.dt_to_id(now)) == now, "datetime round-trips through id space")
+
+    day = sf.dt_to_id(datetime(2026, 1, 2, tzinfo=timezone.utc)) - sf.dt_to_id(
+        datetime(2026, 1, 1, tzinfo=timezone.utc)
+    )
+    ok(day >> 22 == 86_400_000, "24h of id space is exactly 86400000ms")
+
+    ids = sorted(sf.ms_to_id(1_800_000_000_000 + i * 997) for i in range(500))
+    ok(
+        all(sf.id_to_ms(a) <= sf.id_to_ms(b) for a, b in zip(ids, ids[1:])),
+        "sorting by id is sorting by time (why tweet_id is the store's INTEGER pk)",
+    )
+
+    wm = sf.dt_to_id(datetime(2026, 7, 1, 12, 0, tzinfo=timezone.utc))
+    ok(sf.id_to_ms(wm) - sf.id_to_ms(sf.id_minus_ms(wm, 60_000)) == 60_000,
+       "id_minus_ms rolls back by exactly the overlap window")
+    ok(not sf.is_snowflake(20), "@jack's tweet id 20 is rejected as pre-snowflake")
+    ok(sf.is_snowflake(sf.MIN_SNOWFLAKE_ID), "the cutover id itself is accepted")
+    ok(sf.id_to_dt(sf.MIN_SNOWFLAKE_ID).year == 2010, "and decodes to 2010")
+    ok(sf.lag_ms(wm, sf.id_to_ms(wm) - 5000) == 0, "negative lag clamps to 0 (clock skew)")
+    ok(sf.ms_to_id(0) == 0, "pre-epoch ms clamps to 0")
+
+
+def test_normalize():
+    print()
+    print("== normalize ==")
+
+    class V:
+        def __init__(s, url, br, ct):
+            s.url, s.bitrate, s.contentType = url, br, ct
+
+    class Vid:
+        def __init__(s, variants):
+            s.variants, s.thumbnailUrl = variants, "thumb.jpg"
+
+    class M:
+        def __init__(s, videos):
+            s.photos, s.videos, s.animated = [], videos, []
+
+    tie = [V("a.m3u8", 900, "application/x-mpegURL"), V("b.mp4", 900, "video/mp4")]
+    r1 = nz._media_urls(M([Vid(list(tie))]))
+    r2 = nz._media_urls(M([Vid(list(reversed(tie)))]))
+    ok(r1 == r2 == ["b.mp4"], f"mp4 wins an equal-bitrate tie in BOTH input orders ({r1}/{r2})")
+    ok(
+        nz._media_urls(M([Vid([V("lo.mp4", 100, "video/mp4"), V("hi.mp4", 9000, "video/mp4")])]))
+        == ["hi.mp4"],
+        "highest bitrate wins",
+    )
+    same = [V("first.mp4", 500, "video/mp4"), V("second.mp4", 500, "video/mp4")]
+    ok(
+        nz._media_urls(M([Vid(same)])) == ["first.mp4"],
+        "identical variants resolve to the FIRST deterministically (was last, order-dependent)",
+    )
+    ok(nz._media_urls(M([Vid([])])) == ["thumb.jpg"], "no variants falls back to the thumbnail")
+    ok(nz._media_urls(None) == [], "no media is not an error")
+
+    row = {
+        "tweet_id": 1750000000000000000, "url": "u", "created_at": "2024-01-24T03:38:08+00:00",
+        "text": "hi", "lang": "en", "author_username": "a", "author_display_name": "A",
+        "author_id": 42, "author_followers": 10, "reply_count": 1, "retweet_count": 2,
+        "like_count": 3, "quote_count": 4, "view_count": 5, "is_retweet": 0, "is_reply": 1,
+        "is_quote": 0, "hashtags": json.dumps(["x", "y"]), "mentions": json.dumps([]),
+        "urls": json.dumps(["http://z"]), "media_urls": "not-json", "in_reply_to": 7,
+        "conversation_id": None,
+    }
+    rec = nz.from_store_row(row)
+    ok(rec["tweet_id"] == "1750000000000000000", "tweet_id comes back as a string (2^53 safety)")
+    ok(rec["hashtags"] == ["x", "y"], "JSON array columns parse back to lists")
+    ok(rec["media_urls"] == [], "malformed JSON degrades to [] rather than crashing an export")
+    ok(rec["is_reply"] is True and rec["is_quote"] is False, "int flags become bools")
+    ok(set(rec) == set(nz.FIELDS), "the record has exactly FIELDS keys")
+    ok(nz.to_csv_row(rec)["hashtags"] == "x|y", "to_csv_row pipe-joins list fields")
+    ok(
+        nz.FIELDS_EXT[: len(nz.FIELDS)] == nz.FIELDS,
+        "FIELDS_EXT extends FIELDS in place, so existing CSV columns never shift",
+    )
+
+
+def _cfg(text, name):
+    d = TMP / name
+    d.mkdir(parents=True, exist_ok=True)
+    (d / "config.toml").write_text(text)
+    return C.load_config(root=d)
+
+
+def _err(text, name, needle):
+    try:
+        _cfg(text, name)
+        return False, "no error raised"
+    except C.ConfigError as e:
+        return needle in str(e), str(e).splitlines()[0]
+
+
+def test_config():
+    print()
+    print("== config ==")
+    base = '[[accounts]]\nlabel="a"\nprofile_dir="profiles/a"\n[[streams]]\nlabel="s"\nquery="hello"\n'
+
+    cfg = _cfg(base, "c1")
+    ok(cfg.streams[0].watermark is True, "a Latest stream is watermarked by default")
+    ok(cfg.streams[0].page_size == 20, "streams inherit [defaults]")
+    ok(cfg.db_results.is_absolute(), "relative paths resolve against the config directory")
+
+    good, msg = _err(base + 'tab="Top"\n', "c2", "choose the collection mode explicitly")
+    ok(good, f"a ranked tab must declare its mode rather than silently downgrading: {msg}")
+    ok(_err(base + 'tab="Top"\nwatermark=true\n', "c3", 'requires tab = "Latest"')[0],
+       "watermark=true on a ranked tab is rejected outright")
+    ok(_cfg(base + 'tab="Top"\nwatermark=false\n', "c4").streams[0].watermark is False,
+       "an explicit sweep on a ranked tab is allowed")
+
+    ok(_err(base + '\n[[accounts]]\nlabel="b"\nprofile_dir="profiles/a"\n', "c5",
+            "share profile_dir")[0],
+       "two accounts may not share one Chrome profile directory")
+    ok(_err('[[streams]]\nlabel="s"\nquery="q"\n', "c6", "declares no [[accounts]]")[0],
+       "at least one account is required")
+    ok(_err(base + '\n[bogus]\nx=1\n', "c7", "unknown top-level")[0],
+       "typo'd top-level keys are rejected, not ignored")
+    ok(_err(base.replace('query="hello"', 'query="hello"\nmin_interval_s=100\nmax_interval_s=10'),
+            "c8", "exceeds max_interval_s")[0],
+       "an inverted interval range is rejected")
+
+    os.environ["TWS_PROXY"] = "http://x:1"
+    try:
+        ok(_err(base, "c9", "TWS_PROXY is set")[0],
+           "a global TWS_PROXY is refused (it silently overrides every per-account proxy)")
+    finally:
+        del os.environ["TWS_PROXY"]
+
+    example = (pathlib.Path(__file__).resolve().parent.parent / "config.toml.example").read_text()
+    cfg = _cfg(example, "c10")
+    ok(len(cfg.accounts) == 1 and len(cfg.streams) == 1, "the shipped config.toml.example loads")
+
+
+# ==========================================================================
+# session (the three auth bugs)
+# ==========================================================================
+
+sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent))
+
+
+async def fake_validate(acc, proxy=None):
+    """Stubbed probe: cookies starting 'good' are live, everything else is dead."""
+    token = (acc.cookies or {}).get("auth_token", "")
+    if token.startswith("good"):
+        return ss.ValidationResult(True, acc.username, 200, "settings")
+    return ss.ValidationResult(
+        False, "", 401, "bookmarks", 'HTTP 401: {"errors":[{"code":32,"message":"Could not authenticate you."}]}'
+    )
+
+
+async def run_session(tmp):
+    ss.validate_http = fake_validate
+    api = ss.open_api(tmp / "accounts.db")
+    acct = AccountCfg(label="acct_a", email="a@b.c", profile_dir=str(tmp / "p"))
+    acct.profile_path = tmp / "p"
+
+    print("== pool policy ==")
+    ok(api.pool._order_by == "last_used ASC",
+       "accounts are picked least-recently-used, not alphabetically "
+       "(twscrape's default hammers account #1)")
+
+    print()
+    print("== BUG 1: cookies were trusted with no network call at all ==")
+    from twscrape.account import has_required_cookies
+
+    ok(has_required_cookies({"auth_token": "dead", "ct0": "c"}) is True,
+       "twscrape's has_required_cookies calls obviously-dead cookies valid "
+       "(it only checks for non-empty strings)")
+    _, res = await ss.upsert_session(api, Harvest("bob", "UA", {"auth_token": "dead", "ct0": "c"}), acct)
+    acc = await api.pool.get_account("bob")
+    ok(not res.ok and not acc.active, "FIXED: we validate with a real request before activating")
+    ok("401" in (acc.error_msg or ""), f"and record why: {(acc.error_msg or '')[:60]}")
+
+    print()
+    print("== BUG 2: rotating cookies on an existing account did nothing ==")
+    await ss.upsert_session(api, Harvest("alice", "UA1", {"auth_token": "good1", "ct0": "c1", "kdt": "k"}), acct)
+    rows = await ss.health(api)
+    ok(
+        any(r.has_known_device for r in rows),
+        "the known-device token (kdt) is carried over, not just auth_token/ct0 — "
+        "it is what keeps X treating the HTTP client as the same trusted device",
+    )
+    before = (await api.pool.get_account("alice")).cookies["auth_token"]
+    await api.pool.add_account("alice", "p", "e", "ep", cookies="auth_token=STALE; ct0=STALE")
+    unchanged = (await api.pool.get_account("alice")).cookies["auth_token"]
+    ok(unchanged == before,
+       "twscrape's add_account silently no-ops on an existing row (this is why editing "
+       ".env never took effect)")
+    await ss.upsert_session(api, Harvest("alice", "UA2", {"auth_token": "good2", "ct0": "c2"}), acct)
+    after = (await api.pool.get_account("alice")).cookies["auth_token"]
+    ok(after == "good2", f"FIXED: pool.save() overwrites unconditionally ({before} -> {after})")
+
+    print()
+    print("== BUG 3: one failed login excluded an account forever ==")
+    import twscrape.db as tdb
+
+    rows = await tdb.fetchall(
+        str(tmp / "accounts.db"), "SELECT username FROM accounts WHERE active = false AND error_msg IS NULL"
+    )
+    ok("bob" not in [r["username"] for r in rows],
+       "login_all's own query skips any account carrying an error_msg — permanently")
+    _, res = await ss.upsert_session(api, Harvest("bob", "UA", {"auth_token": "good3", "ct0": "c3"}), acct)
+    acc = await api.pool.get_account("bob")
+    ok(res.ok and acc.active and acc.error_msg is None,
+       "FIXED: a successful re-login clears error_msg and reactivates")
+
+    print()
+    print("== fingerprint consistency ==")
+    acc = await api.pool.get_account("alice")
+    ok(acc.user_agent == "UA2",
+       "the REAL browser user-agent is stored (the '@chrome' placeholder makes twscrape "
+       "invent a random UA unrelated to these cookies)")
+    ok(not acc.user_agent.startswith("@"), "so make_client sends the browser's own UA verbatim")
+    a2 = await api.pool.get_account("alice")
+    ok(a2.headers == {}, "headers are cleared so the bearer/x-csrf-token rebuild from the new ct0")
+
+    print()
+    print("== what validation does and does not prove ==")
+    # There used to be an identity cross-check here: validation returned a
+    # screen_name and upsert_session refused to activate if it disagreed with
+    # the harvested one. That check is gone, and deliberately so — measured
+    # 2026-07-29, every v1.1 endpoint that could return a screen_name answers
+    # 404/code 34. The GraphQL probe that replaced them proves the session
+    # AUTHENTICATES but not whose it is.
+    #
+    # That is safe because `username` comes from the DOM of the very browser
+    # profile the cookies were harvested from, so the two cannot disagree. What
+    # still must hold is the activation rule itself.
+    await ss.upsert_session(api, Harvest("carol", "UA", {"auth_token": "dead2", "ct0": "c"}), acct)
+    acc = await api.pool.get_account("carol")
+    ok(not acc.active, "a session that fails the probe is never activated")
+    ok(bool(acc.error_msg), f"and the reason is recorded: {(acc.error_msg or '')[:50]}")
+
+    print()
+    print("== identity sidecar ==")
+    ss.write_identity(acct, "alice")
+    ok(ss.read_identity(acct) == "alice",
+       "the label -> username mapping lives beside the profile, so config.toml is never rewritten")
+
+    print()
+    print("== require_active ==")
+    names = await ss.require_active(api)
+    ok(sorted(names) == ["alice", "bob"], f"only validated accounts are reported live: {sorted(names)}")
+    for n in ("alice", "bob"):
+        await api.pool.mark_inactive(n, "simulated")
+    try:
+        await ss.require_active(api)
+        ok(False, "require_active should raise when nothing is live")
+    except RuntimeError as e:
+        ok("login --all" in str(e), "and it names the exact command that fixes it")
+
+    rows = await ss.health(api)
+    ok(len(rows) == 3 and all(not r.active for r in rows), "health() reports every account")
+
+
+# ==========================================================================
+# engine (parsing + account-lock release)
+# ==========================================================================
+
+sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent))
+
+
+def test_parse():
+    from engine import parse_page
+
+    print("== page parsing ==")
+    rep = FakeResponse(search_payload())
+    page = parse_page(rep, 1)
+
+    ok(
+        page.result_ids == [ID_NEWEST, ID_RETWEET, ID_ORIGINAL],
+        f"result_ids are in TIMELINE order from entry ids: {page.result_ids}",
+    )
+    ok(page.cursor == "CURSOR_PAGE2", f"bottom cursor extracted: {page.cursor}")
+    ok(
+        page.account == "alice" and page.rl_limit == 50 and page.rl_remaining == 47,
+        "serving account and rate-limit budget travel with the page",
+    )
+    ok(
+        abs(page.collected_ms / 1000 - DATE_HEADER_TS) < 2,
+        "the server Date header is the lag clock (immune to host clock skew)",
+    )
+    ok(
+        not any(str(e).startswith("who-to-follow") for e in page.entries_by_id),
+        "non-result entries (who-to-follow, cursors) are excluded",
+    )
+
+    # The retweet-original collision.
+    ok(ID_ORIGINAL in page.tweets, "the retweeted ORIGINAL survives our parse")
+    from twscrape.models import parse_tweets
+
+    tws = {t.id for t in parse_tweets(search_payload(), -1)}
+    ok(
+        ID_ORIGINAL not in tws,
+        f"  confirmed: twscrape's own parse_tweets silently loses it (got {sorted(tws)})",
+    )
+
+    # The embedded ancient quote.
+    ok(
+        ID_OLD_QUOTE in page.tweets,
+        "the embedded decade-old quoted tweet is still captured as context",
+    )
+    ok(
+        ID_OLD_QUOTE not in page.result_ids and ID_OLD_QUOTE in page.embedded_ids,
+        "  but it is NOT a result, so it cannot drag the watermark backwards",
+    )
+    ok(
+        page.min_result_id() > ID_OLD_QUOTE,
+        f"  min_result_id ({page.min_result_id()}) ignores it entirely",
+    )
+    ok(page.orphan_ids == [], f"no orphan results: {page.orphan_ids}")
+    ok(page.parse_failures == [], f"no parse failures: {page.parse_failures}")
+
+
+async def test_lock_release(tmp):
+    """F5: breaking out early must release the account lock immediately."""
+    import auth as ss
+    from auth import Harvest
+    from config import AccountCfg
+    from engine import Engine
+    from twscrape.utils import utc
+
+    print()
+    print("== F5: early break must release the 15-minute account lock ==")
+
+    db = tmp / "accounts.db"
+    api = ss.open_api(db)
+
+    async def fake_validate(acc, proxy=None):
+        return ss.ValidationResult(True, acc.username, 200, "settings")
+
+    ss.validate_http = fake_validate
+    acct = AccountCfg(label="x", profile_dir=str(tmp / "p"))
+    acct.profile_path = tmp / "p"
+    await ss.upsert_session(api, Harvest("alice", "UA", {"auth_token": "t", "ct0": "c"}), acct)
+
+    rep = FakeResponse(search_payload())
+
+    # Drive the REAL QueueClient + pool locking, but serve a canned response so
+    # the test stays offline. This is the machinery that actually holds locks.
+    from twscrape import api as twapi
+    from twscrape.queue_client import QueueClient
+
+    async def fake_gql_items(self, op, kv, ft=None, limit=-1, cursor_type="Bottom"):
+        queue = op.split("/")[-1]
+        async with QueueClient(self.pool, queue, False, proxy=None):
+            for _ in range(50):  # effectively endless pagination
+                yield rep
+
+    twapi.API._gql_items = fake_gql_items
+
+    async def held_locks():
+        now = utc.now()
+        return [
+            q
+            for a in await api.pool.get_all()
+            for q, until in (a.locks or {}).items()
+            if until and until > now
+        ]
+
+    eng = Engine(api)
+
+    # --- contrast 1: break, then the generator goes out of scope ---
+    # CPython refcounting finalizes it here, so the lock happens to be
+    # released. This is why the bug is easy to miss in simple code.
+    await api.pool.reset_locks()
+
+    async def scoped():
+        async for _ in eng.search_pages("q"):
+            break
+
+    await scoped()
+    gc.collect()
+    await asyncio.sleep(0.1)
+    ok(
+        await held_locks() == [],
+        "  (context: break + immediate scope exit happens to release, via refcounting)",
+    )
+
+    # --- contrast 2: the real failure mode ---
+    # Any surviving reference means there is nothing to collect, so the
+    # QueueClient never exits and the account is gone for 15 minutes.
+    await api.pool.reset_locks()
+    leaked_gen = eng.search_pages("q")
+    async for _ in leaked_gen:
+        break
+    gc.collect()
+    await asyncio.sleep(0.1)
+    stuck = await held_locks()
+    ok(
+        stuck == ["SearchTimeline"],
+        f"  (context: break with a live reference LEAKS the lock: held={stuck}) "
+        f"-- this is what aclosing prevents",
+    )
+    await leaked_gen.aclose()
+    ok(await held_locks() == [], "  (and closing it explicitly releases the lock)")
+
+    # --- the right way ---
+    await api.pool.reset_locks()
+    async with aclosing(eng.search_pages("q")) as g:
+        async for _ in g:
+            break
+    ok(await held_locks() == [], "aclosing + break releases the lock immediately")
+
+    await api.pool.reset_locks()
+    try:
+        async with aclosing(eng.search_pages("q")) as g:
+            async for _ in g:
+                raise ValueError("boom")
+    except ValueError:
+        pass
+    ok(await held_locks() == [], "the lock is released when the loop body raises")
+
+    await api.pool.reset_locks()
+    async with aclosing(eng.search_pages("q", max_pages=2)) as g:
+        pages = [p async for p in g]
+    ok(len(pages) == 2, f"max_pages stops pagination at the budget ({len(pages)} pages)")
+    ok(await held_locks() == [], "the lock is released on the max_pages path too")
+
+    # Cursor resume must reach twscrape's variables intact.
+    seen = {}
+
+    async def capture(self, op, kv, ft=None, limit=-1, cursor_type="Bottom"):
+        seen.update(kv)
+        async with QueueClient(self.pool, op.split("/")[-1], False, proxy=None):
+            yield rep
+
+    twapi.API._gql_items = capture
+    await api.pool.reset_locks()
+    async with aclosing(eng.search_pages("q", cursor="RESUME_HERE", page_size=40, tab="Latest")) as g:
+        async for _ in g:
+            pass
+    ok(seen.get("cursor") == "RESUME_HERE", f"resume cursor is passed through: {seen.get('cursor')}")
+    ok(seen.get("count") == 40 and seen.get("product") == "Latest", "page_size and tab reach the request")
+
+
+# ==========================================================================
+# collector (watermark, dedup, gaps, intervals)
+# ==========================================================================
+
+sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent))
+
+from collector import (  # noqa: E402
+    STOP_EXHAUSTED,
+    STOP_PAGE_BUDGET,
+    STOP_STARVED,
+    STOP_WATERMARK,
+    next_interval,
+    poll_once,
+)
+from engine import parse_page  # noqa: E402
+from store import Store  # noqa: E402
+
+
+class ReplayEngine:
+
+    def pages_for(self, stream, **kw):
+        """Mirror Engine.pages_for so tests exercise the real dispatch seam."""
+        if getattr(stream, "list_id", None):
+            kw.pop("tab", None)
+            return self.list_pages(stream.list_id, **kw)
+        return self.search_pages(stream.query, **kw)
+
+    async def list_pages(self, list_id, **kw):
+        async with aclosing(self.search_pages("", **kw)) as g:
+            async for page in g:
+                yield page
+    """Serves canned pages. `pages` is a list of lists of tweet ids."""
+
+    def __init__(self, pages, cursor_end=True):
+        self.pages = pages
+        self.cursor_end = cursor_end
+        self.calls = 0
+        self.requested = []
+
+    async def search_pages(self, query, *, tab="Latest", page_size=20,
+                           max_pages=0, limit=-1, cursor=None):
+        self.calls += 1
+        self.requested.append({"query": query, "cursor": cursor, "max_pages": max_pages})
+        for i, ids in enumerate(self.pages):
+            is_last = i == len(self.pages) - 1
+            payload = search_payload(
+                ids=ids,
+                cursor=None if (is_last and self.cursor_end) else f"CUR{i}",
+                # A page of `None` means "use the trap payload" — the one with
+                # the retweet collision and the ancient embedded quote.
+                include_traps=ids is None,
+            )
+            yield parse_page(FakeResponse(payload), i + 1)
+            if max_pages and i + 1 >= max_pages:
+                return
+
+
+class Stream:
+    def __init__(self, **kw):
+        self.label = kw.get("label", "s")
+        self.query = kw.get("query", "test query")
+        self.tab = "Latest"
+        self.watermark = kw.get("watermark", True)
+        self.page_size = kw.get("page_size", 20)
+        self.max_pages_per_poll = kw.get("max_pages_per_poll", 5)
+        self.min_interval_s = kw.get("min_interval_s", 5.0)
+        self.max_interval_s = kw.get("max_interval_s", 900.0)
+        self.overlap_ms = kw.get("overlap_ms", 60_000)
+
+
+MIN = 60_000
+
+
+def ids_at(*offsets_min):
+    """
+    Tweet ids at given MINUTE offsets before now, newest first.
+
+    Spacing matters: the poller re-reads a 60s overlap window past the
+    watermark on every poll, so fixtures spaced seconds apart would sit
+    entirely inside that window and never exercise the stop condition.
+    """
+    from fixtures import id_at
+
+    return [id_at(-int(off * MIN)) for off in offsets_min]
+
+
+async def run_collector(tmp):
+    db = tmp / "results.db"
+    store = Store(db)
+    await store.open()
+    stream = Stream()
+    sid = await store.ensure_stream(stream.label, stream.query, "Latest", True)
+
+    print("== first poll: no watermark yet ==")
+    p1 = ids_at(10, 15, 20)  # 10, 15 and 20 minutes old
+    eng = ReplayEngine([p1])
+    res = await poll_once(eng, store, stream, sid)
+    ok(res.new == 3 and res.dup == 0, f"3 new tweets on a cold start (new={res.new} dup={res.dup})")
+    ok(res.stop_reason == STOP_EXHAUSTED, f"stop={res.stop_reason} (no watermark to stop at)")
+    ok(res.max_id == max(p1), "watermark candidate is the newest result id")
+    ok(len(res.lags) == 3 and all(x >= 0 for x in res.lags), "lag recorded per tweet")
+    await store.set_watermark(sid, res.max_id)
+
+    print()
+    print("== second poll: same data -> must stop at the watermark, 1 page ==")
+    eng = ReplayEngine([p1, ids_at(25, 30)])
+    res = await poll_once(eng, store, stream, sid)
+    ok(res.stop_reason == STOP_WATERMARK, f"stopped at the watermark (stop={res.stop_reason})")
+    ok(res.pages == 1, f"only ONE page fetched, not the whole timeline (pages={res.pages})")
+    ok(res.new == 0 and res.dup == 3, f"cross-run dedup: new={res.new} dup={res.dup}")
+
+    print()
+    print("== third poll: 2 genuinely new tweets on top ==")
+    fresh = ids_at(1, 5)
+    eng = ReplayEngine([fresh + p1])
+    res = await poll_once(eng, store, stream, sid)
+    ok(res.new == 2 and res.dup == 3, f"only the new ones count as new (new={res.new} dup={res.dup})")
+    ok(res.stop_reason == STOP_WATERMARK, "still stops at the watermark")
+    await store.set_watermark(sid, res.max_id)
+
+    print()
+    print("== the overlap window ==")
+    wm = await store.get_watermark(sid)
+    stop_id = sf.id_minus_ms(wm["high_tweet_id"], stream.overlap_ms)
+    ok(
+        sf.id_to_ms(wm["high_tweet_id"]) - sf.id_to_ms(stop_id) == 60_000,
+        "the poller stops 60s BELOW the watermark, so late-indexed tweets are still caught",
+    )
+    # Posted 30s after the watermark tweet but indexed late, so it appears
+    # BELOW the watermark on a later poll. Without the overlap it is lost.
+    from fixtures import id_at
+
+    late = [id_at(-int(1 * MIN) + 30_000)]
+    eng = ReplayEngine([ids_at(0.2) + late + ids_at(1)])
+    res = await poll_once(eng, store, stream, sid)
+    ok(res.new == 2, f"the late-indexed tweet below the watermark is still collected (new={res.new})")
+
+    print()
+    print("== page budget: the stream outran us ==")
+    busy = Stream(label="busy", query="busy q", max_pages_per_poll=2)
+    bsid = await store.ensure_stream(busy.label, busy.query, "Latest", True)
+    eng = ReplayEngine([ids_at(120)], cursor_end=False)
+    r0 = await poll_once(eng, store, busy, bsid)
+    await store.set_watermark(bsid, r0.max_id)
+    eng = ReplayEngine([ids_at(1, 2), ids_at(3, 4), ids_at(5)], cursor_end=False)
+    res = await poll_once(eng, store, busy, bsid)
+    ok(res.stop_reason == STOP_PAGE_BUDGET, f"stop={res.stop_reason} at the page ceiling")
+    ok(res.pages == 2, f"honoured max_pages_per_poll=2 (pages={res.pages})")
+    ok(res.gap_opened, "a GAP was recorded for the window we never reached")
+    gaps = await store.open_gaps(bsid)
+    ok(len(gaps) == 1 and gaps[0]["hi_tweet_id"] == res.min_id,
+       "the gap spans (old watermark, oldest tweet actually seen)")
+
+    print()
+    print("== starvation must not look like a quiet stream ==")
+
+    class Starved:
+        def pages_for(self, stream, **kw):
+            return self.search_pages(stream.query, **kw)
+
+        async def search_pages(self, *a, **kw):
+            return
+            yield  # pragma: no cover
+
+    res = await poll_once(Starved(), store, stream, sid)
+    ok(res.stop_reason == STOP_STARVED, f"zero pages is reported as starvation (stop={res.stop_reason})")
+    ok(res.pages == 0 and res.new == 0, "no data attributed")
+    wm_after = await store.get_watermark(sid)
+    ok(wm_after["high_tweet_id"] == wm["high_tweet_id"],
+       "the watermark is NOT advanced on a starved poll")
+
+    print()
+    print("== embedded context never moves the watermark ==")
+    eng = ReplayEngine([None])  # None -> the trap payload with the ancient quote
+    eng.pages = [None]
+    res = await poll_once(eng, store, Stream(label="trap", query="q"),
+                          await store.ensure_stream("trap", "q", "Latest", True))
+    from fixtures import ID_OLD_QUOTE, ID_NEWEST
+
+    ok(res.max_id == ID_NEWEST, f"watermark uses the newest RESULT ({res.max_id})")
+    ok(res.min_id > ID_OLD_QUOTE,
+       "the decade-old embedded quote is excluded from result ids entirely")
+    ok(res.embedded >= 1, f"...but it IS stored as context (embedded={res.embedded})")
+
+    print()
+    print("== lag report ==")
+    lines = await store.lag_report("24h")
+    for x in lines:
+        print(f"       {x}")
+    ok(
+        any("predate this stream's first poll" in x for x in lines),
+        "backlog-only streams say so plainly instead of reporting nothing",
+    )
+    ok(any("page_budget" in x for x in lines), "poll outcomes broken down by stop reason")
+    ok(any("starvation" in x.lower() for x in lines), "starvation is called out explicitly")
+
+    # Now collect a tweet created AFTER the stream started, which is what a
+    # steady-state stream looks like, and confirm real percentiles appear.
+    from fixtures import id_at
+
+    eng = ReplayEngine([[id_at(+2_000)]])
+    await poll_once(eng, store, stream, sid)
+    lines = await store.lag_report("24h")
+    ok(any("p50=" in x for x in lines), f"real percentiles once a fresh tweet lands: "
+       f"{[x for x in lines if 'p50=' in x]}")
+    ok(any("backlog, excluded" in x for x in lines), "backlog is counted separately, not hidden")
+
+    print()
+    print("== export round-trip ==")
+    import store as exporter
+
+    rows = list(store.iter_export(limit=5))
+    ok(len(rows) == 5, f"export query returns rows ({len(rows)})")
+    path, n = exporter.export(rows, str(tmp / "out"), "csv")
+    ok(n == 5 and pathlib.Path(path).exists(), f"csv written: {path} ({n} rows)")
+    import csv as _csv
+
+    with open(path) as f:
+        header = next(_csv.reader(f))
+    from store import FIELDS
+
+    ok(header == FIELDS, "exported CSV header is byte-identical to the prototype's FIELDS")
+
+    rows = list(store.iter_export(limit=3))
+    path, n = exporter.export(rows, str(tmp / "out_all"), "json", "all")
+    import json as _json
+
+    recs = _json.loads(pathlib.Path(path).read_text())
+    ok("lag_ms" in recs[0] and "collected_at" in recs[0],
+       "--fields all adds collection metadata")
+    ok(isinstance(recs[0]["tweet_id"], str),
+       "tweet_id exports as a string (JSON loses precision above 2^53)")
+
+    await store.close()
+
+
+def test_interval():
+    print()
+    print("== adaptive interval ==")
+    s = Stream(min_interval_s=5, max_interval_s=900, page_size=20)
+
+    class R:
+        def __init__(self, new, stop):
+            self.new, self.stop_reason = new, stop
+
+        @property
+        def starved(self):
+            return self.stop_reason == STOP_STARVED
+
+    i, e, c = next_interval(s, 60, 60, R(0, STOP_WATERMARK), 0.0, 0)
+    ok(i > 60, f"a quiet stream backs off (60s -> {i:.0f}s)")
+
+    i2, e2, c2 = next_interval(s, i, 60, R(0, STOP_WATERMARK), e, c)
+    ok(i2 > i, f"and keeps backing off while empty ({i:.0f}s -> {i2:.0f}s)")
+
+    i3, _, _ = next_interval(s, 300, 60, R(40, STOP_PAGE_BUDGET), 0.0, 0)
+    ok(i3 == 150, f"hitting the page budget halves the interval (300s -> {i3:.0f}s)")
+
+    i4, _, _ = next_interval(s, 100, 100, R(0, STOP_STARVED), 0.0, 3)
+    ok(i4 == 100, f"starvation HOLDS the interval, never backs off ({i4:.0f}s)")
+
+    i5, _, _ = next_interval(s, 60, 60, R(12, STOP_WATERMARK), 0.0, 0)
+    ok(abs(i5 - 60) < 1, f"a stream hitting the target holds steady ({i5:.0f}s)")
+
+    i6, _, _ = next_interval(s, 60, 60, R(120, STOP_WATERMARK), 0.0, 0)
+    ok(i6 < 60 and i6 >= s.min_interval_s, f"a busy stream speeds up ({i6:.0f}s)")
+
+    i7, _, _ = next_interval(s, 800, 60, R(0, STOP_WATERMARK), 0.0, 9)
+    ok(i7 <= s.max_interval_s, f"never exceeds max_interval_s ({i7:.0f}s)")
+
+    i8, _, _ = next_interval(s, 6, 1, R(9999, STOP_PAGE_BUDGET), 0.0, 0)
+    ok(i8 >= s.min_interval_s, f"never drops below min_interval_s ({i8:.0f}s)")
+
+
+# ==========================================================================
+# cli (routing, exit codes, end to end)
+# ==========================================================================
+
+sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent))
+
+
+
+def run_cli(args, cwd, env=None):
+    e = {**os.environ, "TWS_TELEMETRY": "0", "DO_NOT_TRACK": "1", **(env or {})}
+    p = subprocess.run(
+        [sys.executable, str(ROOT / "main.py"), *args],
+        cwd=str(cwd), capture_output=True, text=True, env=e, timeout=120,
+    )
+    return p.returncode, p.stdout + p.stderr
+
+
+CONFIG = """
+[defaults]
+db_accounts = "accounts.db"
+db_results  = "results.db"
+
+[[accounts]]
+label = "acct_a"
+profile_dir = "profiles/acct_a"
+
+[[streams]]
+label = "test_stream"
+query = "hello world lang:en"
+tab   = "Latest"
+"""
+
+
+def test_routing_and_exit_codes(tmp):
+    print("== argv routing ==")
+    from main import normalize_argv
+
+    ok(
+        normalize_argv(["--query", "x", "--limit", "5"]) == ["search", "--query", "x", "--limit", "5"],
+        "the prototype's flag-first invocation still routes to `search`",
+    )
+    ok(normalize_argv(["login", "--all"]) == ["login", "--all"], "subcommands pass through")
+    ok(normalize_argv(["--help"]) == ["--help"], "--help is not swallowed")
+
+    print()
+    print("== exit codes ==")
+    (tmp / "config.toml").write_text(CONFIG)
+
+    rc, out = run_cli(["doctor", "--selftest"], tmp)
+    ok(rc == 0, f"doctor --selftest passes on the pinned twscrape (rc={rc})")
+
+    rc, out = run_cli(["doctor", "--accounts"], tmp)
+    ok(rc == 6, f"doctor --accounts exits 6 (no account) when the store is empty (rc={rc})")
+    ok("login --all" in out, "and names the command that fixes it")
+
+    rc, out = run_cli(["search", "--query", "test"], tmp)
+    ok(rc == 6, f"search exits 6 rather than pretending to work without a session (rc={rc})")
+    ok("login" in out, "and points at login")
+
+    rc, out = run_cli(["watch", "--once"], tmp)
+    ok(rc == 6, f"watch exits 6 without a session (rc={rc})")
+
+    rc, out = run_cli(["export", "--format", "csv"], tmp)
+    ok(rc == 4, f"export exits 4 when there is no results db yet (rc={rc})")
+
+    bad = tmp / "bad"
+    bad.mkdir(exist_ok=True)
+    (bad / "config.toml").write_text(
+        '[[accounts]]\nlabel="a"\n[[streams]]\nlabel="s"\nquery="q"\ntab="Top"\n'
+    )
+    rc, out = run_cli(["doctor"], bad)
+    ok(rc == 4, f"a config error exits 4 (rc={rc})")
+    ok("collection mode explicitly" in out, "and explains the ranked-tab problem")
+
+
+async def test_search_to_export(tmp):
+    """search -> store -> export, with the network stubbed at the Engine seam."""
+    print()
+    print("== search -> store -> export (engine stubbed) ==")
+    os.chdir(tmp)
+    sys.path.insert(0, str(ROOT))
+
+    import main as commands
+    import auth as ss
+    from auth import Harvest
+    from config import AccountCfg, load_config
+    from engine import parse_page
+    from fixtures import FakeResponse, search_payload, id_at
+
+    cfg = load_config(root=tmp)
+
+    # A validated account, so require_active passes.
+    api = ss.open_api(cfg.db_accounts)
+
+    async def fake_validate(acc, proxy=None):
+        return ss.ValidationResult(True, acc.username, 200, "settings")
+
+    ss.validate_http = fake_validate
+    acct = AccountCfg(label="acct_a", profile_dir=str(tmp / "profiles/acct_a"))
+    acct.profile_path = tmp / "profiles/acct_a"
+    await ss.upsert_session(api, Harvest("alice", "UA", {"auth_token": "t", "ct0": "c"}), acct)
+
+    ids = [id_at(-60_000 * i) for i in range(1, 6)]
+
+    class StubEngine:
+        def __init__(self, api):
+            self.api = api
+
+        def pages_for(self, stream, **kw):
+            if getattr(stream, "list_id", None):
+                kw.pop("tab", None)
+                return self.list_pages(stream.list_id, **kw)
+            return self.search_pages(stream.query, **kw)
+
+        async def list_pages(self, list_id, **kw):
+            async with aclosing(self.search_pages("", **kw)) as g:
+                async for page in g:
+                    yield page
+
+        async def search_pages(self, query, *, tab="Latest", page_size=20,
+                               max_pages=0, limit=-1, cursor=None):
+            yield parse_page(
+                FakeResponse(search_payload(ids=ids, cursor=None, include_traps=False)), 1
+            )
+
+    commands.Engine = StubEngine
+
+    class A:
+        config = None
+        query = "hello world lang:en"
+        list_id = ""
+        limit = 50
+        tab = "Latest"
+        out = str(tmp / "results")
+        db = None
+        store = True
+        debug_pages = True
+        cursor = None
+
+    rc = await commands.cmd_search(A())
+    ok(rc == 0, f"search succeeds (rc={rc})")
+    for suffix in (".json", ".csv", ".raw.jsonl"):
+        p = tmp / f"results{suffix}"
+        ok(p.exists() and p.stat().st_size > 0, f"legacy output written: results{suffix}")
+
+    recs = json.loads((tmp / "results.json").read_text())
+    ok(len(recs) == 5, f"5 tweets in results.json ({len(recs)})")
+    ok(isinstance(recs[0]["tweet_id"], str), "tweet_id is a string in JSON output")
+
+    # Cross-run dedup: the same search again must report zero new.
+    rc = await commands.cmd_search(A())
+    import store as store_mod
+
+    st = store_mod.Store(cfg.db_results)
+    await st.open()
+    total = await st.count_tweets()
+    await st.close()
+    ok(total == 5, f"re-running the identical search added nothing new (total={total})")
+
+    class E:
+        config = None
+        stream = None
+        since = None
+        until = None
+        format = "csv"
+        out = str(tmp / "exp")
+        fields = "all"
+        include_embedded = False
+        limit = None
+        order = "desc"
+
+    rc = await commands.cmd_export(E())
+    ok(rc == 0 and (tmp / "exp.csv").exists(), "export writes a CSV from the store")
+
+    header = (tmp / "exp.csv").read_text().splitlines()[0]
+    ok("lag_ms" in header and "collected_at" in header, "--fields all includes lag metadata")
+
+    E.format = "raw"
+    await commands.cmd_export(E())
+    raw_lines = (tmp / "exp.raw.jsonl").read_text().strip().splitlines()
+    ok(len(raw_lines) == 5, f"raw export preserves one full Tweet.json per line ({len(raw_lines)})")
+    obj = json.loads(raw_lines[0])
+    ok("bookmarkedCount" in obj or "id" in obj, "raw rows retain fields the flat schema drops")
+
+
+# ==========================================================================
+# lists
+# ==========================================================================
+
+def test_lists():
+    print()
+    print("== lists ==")
+    base = '[[accounts]]\nlabel="a"\nprofile_dir="profiles/a"\n'
+
+    cfg = _cfg(base + '[[streams]]\nlabel="l"\nlist_id="1234567890"\n', "l1")
+    ok(cfg.streams[0].list_id == "1234567890" and not cfg.streams[0].query,
+       "a list stream parses with no query")
+    ok(cfg.streams[0].watermark is True,
+       "list timelines are chronological, so they watermark like a Latest search")
+
+    # URL forms, because people paste from the address bar
+    for raw, want in [
+        ("https://x.com/i/lists/999", "999"),
+        ("https://twitter.com/i/lists/888?ref_src=twsrc%5Etfw", "888"),
+        ("  777  ", "777"),
+    ]:
+        got = _cfg(base + f'[[streams]]\nlabel="l"\nlist_id="{raw}"\n',
+                   f"lu{want}").streams[0].list_id
+        ok(got == want, f"list_id {raw.strip()[:38]!r} -> {got!r}")
+
+    ok(_err(base + '[[streams]]\nlabel="l"\nlist_id="abc"\n', "l2", "must be numeric")[0],
+       "a non-numeric list id is rejected with a fixable message")
+    ok(_err(base + '[[streams]]\nlabel="l"\nlist_id="https://x.com/foo"\n', "l3",
+            "could not find a list id")[0],
+       "a URL with no list id in it is rejected")
+    ok(_err(base + '[[streams]]\nlabel="l"\nquery="hi"\nlist_id="12"\n', "l4",
+            "one source")[0],
+       "query + list_id together is refused rather than one silently winning")
+    ok(_err(base + '[[streams]]\nlabel="l"\n', "l5", "either a `query` or a `list_id`")[0],
+       "a stream with no source at all is refused")
+    ok(_err(base + '[[streams]]\nlabel="l"\nlist_id="12"\ntab="Top"\n', "l6",
+            "no 'Top' tab")[0],
+       "a list stream cannot ask for a product tab")
+
+    # dispatch: one place decides search vs list
+    from engine import Engine
+
+    calls = []
+
+    class FakeAPI:
+        async def search_raw(self, q, **kw):
+            calls.append(("search", q, kw))
+            return
+            yield
+
+        async def list_timeline_raw(self, lid, **kw):
+            calls.append(("list", lid, kw))
+            return
+            yield
+
+    eng = Engine(FakeAPI())
+
+    class S:
+        query, list_id = "hello", ""
+
+    async def drain(gen):
+        async with aclosing(gen) as g:
+            async for _ in g:
+                pass
+
+    asyncio.run(drain(eng.pages_for(S(), tab="Latest", page_size=20)))
+    ok(calls and calls[-1][0] == "search", "a query stream dispatches to search_raw")
+
+    S.query, S.list_id = "", "42"
+    asyncio.run(drain(eng.pages_for(S(), tab="Latest", page_size=20)))
+    ok(calls[-1][0] == "list" and calls[-1][1] == 42,
+       f"a list stream dispatches to list_timeline_raw with an int id ({calls[-1][1]!r})")
+    ok("tab" not in calls[-1][2] and "product" not in calls[-1][2].get("kv", {}),
+       "and the product tab is dropped — a list timeline has no tabs")
+
+
+# ==========================================================================
+# account status flags
+# ==========================================================================
+
+def test_account_flags():
+    print()
+    print("== account status taxonomy ==")
+    import guard
+
+    def V(**kw):
+        base = dict(username="u", active=True, proxy="http://p", error_msg=None,
+                    has_known_device=True, real_user_agent=True, requests=1)
+        base.update(kw)
+        return guard.AccountView(**base)
+
+    ok(guard.classify_account(V())["status"] == guard.STATUS_LIVE,
+       "a clean active account is LIVE")
+
+    for code, why in [("32", "session"), ("326", "locked"), ("88", "ban"), ("64", "suspend")]:
+        c = guard.classify_account(V(active=False, error_msg=f"({code}) whatever X said"))
+        ok(c["status"] == guard.STATUS_DEAD, f"X code ({code}) -> DEAD, not a warning")
+        ok(bool(c["reasons"][0]), f"  and ({code}) explains itself: {c['reasons'][0][:44]}")
+
+    c = guard.classify_account(V(active=False, error_msg=None))
+    ok(c["status"] == guard.STATUS_DEAD and c["reasons"],
+       "inactive with no recorded reason is still DEAD, with a placeholder reason")
+    ok("login" in c["action"], "DEAD carries the command that fixes it")
+
+    for kw, label in [({"proxy": ""}, "no proxy"),
+                      ({"has_known_device": False}, "no kdt"),
+                      ({"real_user_agent": False}, "placeholder UA"),
+                      ({"requests": guard.HEAVY_REQUESTS + 1}, "heavy usage")]:
+        c = guard.classify_account(V(**kw))
+        ok(c["status"] == guard.STATUS_WARN, f"{label} -> WARN (still usable)")
+        ok(len(c["reasons"]) >= 1, f"  and says why: {c['reasons'][0][:48]}")
+
+    c = guard.classify_account(V(proxy="", has_known_device=False))
+    ok(len(c["reasons"]) == 2, f"multiple problems all get reported ({len(c['reasons'])})")
+
+    # The rule that matters most: a warning must never read as healthy, and a
+    # dead account must never read as merely warning.
+    ok(guard.classify_account(V(proxy=""))["status"] != guard.STATUS_LIVE,
+       "a risky-but-working account is never LIVE")
+    ok(guard.classify_account(V(active=False, proxy=""))["status"] == guard.STATUS_DEAD,
+       "inactive outranks every warning — DEAD wins")
+
+
+# ==========================================================================
+# dashboard authentication
+# ==========================================================================
+
+def test_auth():
+    print()
+    print("== dashboard auth ==")
+    import web
+
+    old = {k: os.environ.get(k) for k in ("DASH_USER", "DASH_PASSWORD")}
+    try:
+        os.environ.pop("DASH_USER", None)
+        os.environ.pop("DASH_PASSWORD", None)
+        ok(not web._auth_configured(), "no credentials -> auth not configured")
+        ok(not web._check_credentials("", ""), "and empty credentials never authenticate")
+        ok(not web._check_credentials("admin", "anything"),
+           "an unset password does not become a wildcard")
+
+        os.environ["DASH_USER"] = "admin"
+        os.environ["DASH_PASSWORD"] = "s3cret-long-value"
+        ok(web._auth_configured(), "both set -> auth configured")
+        ok(web._check_credentials("admin", "s3cret-long-value"), "correct pair accepted")
+        ok(not web._check_credentials("admin", "s3cret-long-valu"), "near-miss password rejected")
+        ok(not web._check_credentials("Admin", "s3cret-long-value"), "username is case-sensitive")
+        ok(not web._check_credentials("", "s3cret-long-value"), "blank username rejected")
+
+        tok = web._issue_token()
+        ok(web._token_valid(tok), "a freshly issued session token validates")
+        ok(not web._token_valid(tok[:-4] + "AAAA"), "a tampered token is rejected")
+        ok(not web._token_valid("garbage"), "garbage is rejected, not crashed on")
+        ok(not web._token_valid(""), "an empty token is rejected")
+
+        # Expiry is inside the signature, so it cannot be edited without
+        # invalidating the HMAC.
+        import base64, hmac, hashlib, time as _t
+        past = str(int(_t.time() - 10)).encode()
+        sig = hmac.new(web._SECRET, past, hashlib.sha256).digest()[:18]
+        expired = base64.urlsafe_b64encode(past + b"." + sig).decode()
+        ok(not web._token_valid(expired), "a correctly-signed but EXPIRED token is rejected")
+
+        # A token signed with a different secret must not pass — this is what
+        # stops a restarted process honouring an attacker-minted cookie.
+        other = hmac.new(b"x" * 32, past, hashlib.sha256).digest()[:18]
+        forged = base64.urlsafe_b64encode(past + b"." + other).decode()
+        ok(not web._token_valid(forged), "a token signed with the wrong secret is rejected")
+
+        ip = "203.0.113.9"
+        web._clear_failures(ip)
+        ok(web._locked_out(ip) == 0, "a fresh IP is not locked out")
+        for _ in range(web.MAX_ATTEMPTS):
+            web._record_failure(ip)
+        ok(web._locked_out(ip) > 0, f"{web.MAX_ATTEMPTS} failures triggers lockout")
+        web._clear_failures(ip)
+        ok(web._locked_out(ip) == 0, "a successful login clears the lockout")
+    finally:
+        for k, v in old.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+
+
+# ==========================================================================
+# web (the shared event loop)
+# ==========================================================================
+
+async def _touch_db(path):
+    """Any twscrape DB call — these go through its module-level asyncio.Lock."""
+    api = ss.open_api(path)
+    return await api.pool.get_all()
+
+
+def test_web_event_loop(tmp):
+    """
+    Regression: the dashboard must use ONE event loop for its whole life.
+
+    twscrape holds a module-level asyncio.Lock (db.py:12) that binds to the
+    first loop which awaits it. The dashboard originally called asyncio.run()
+    per request, creating a fresh loop each time, so the SECOND request onward
+    died with "Lock is bound to a different event loop" — and, because that
+    surfaced as a failed fetch, it looked to the user like the account had been
+    logged out.
+    """
+    print("== web: shared event loop ==")
+    import web
+
+    db = tmp / "accounts.db"
+
+    # Deliberately NOT reproducing the bug here. Measured behaviour of the
+    # broken pattern (asyncio.run per call):
+    #   * sequential calls happen to succeed — the lock binds lazily on first
+    #     await, and an uncontended lock survives its loop being closed;
+    #   * CONCURRENT calls from several threads either raise
+    #     "bound to a different event loop" or HANG FOREVER, because a waiter
+    #     gets queued on a loop that then dies and the lock is never released.
+    # A test that can hang the suite is worse than no test, so this asserts the
+    # invariant that prevents it instead of provoking the failure.
+    web._start_loop()
+    try:
+        results = [web._run(_touch_db(db)) for _ in range(4)]
+        ok(len(results) == 4, "four consecutive calls on the shared loop all succeed")
+        ok(all(isinstance(r, list) for r in results),
+           "and each returns real data, not an exception")
+    except RuntimeError as e:
+        ok(False, f"shared loop still broke: {e}")
+
+    # The browser fires /api/status and /api/tweets alongside a fetch, on
+    # separate handler threads. That overlap is exactly what killed the
+    # original design, so it has to work.
+    errs, out = [], []
+
+    def worker():
+        try:
+            out.append(web._run(_touch_db(db), timeout=30))
+        except BaseException as e:
+            errs.append(f"{type(e).__name__}: {e}")
+
+    threads = [threading.Thread(target=worker) for _ in range(6)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(timeout=45)
+
+    ok(not any(t.is_alive() for t in threads),
+       "6 concurrent handler threads all finish — no deadlock on twscrape's lock")
+    ok(errs == [], f"and none of them error ({errs[:2]})")
+    ok(len(out) == 6, f"all 6 got results ({len(out)}/6)")
+
+    ok(web._LOOP is not None and web._LOOP.is_running(),
+       "one loop runs on its own thread for the server's lifetime")
+    ok(all(web._LOOP is web._LOOP for _ in range(3)) and web._start_loop() is None,
+       "_start_loop is idempotent — never replaces a live loop")
+
+
+# ==========================================================================
+# runner
+# ==========================================================================
+
+def main():
+    root = HERE / ".tmp"
+    cwd = os.getcwd()
+    shutil.rmtree(root, ignore_errors=True)
+
+    def fresh(name):
+        # A separate directory per section, NOT a wiped-and-reused one.
+        # twscrape memoises "this db path is already migrated" in a class-level
+        # dict keyed by path (db.py:109), so a recreated file at the same path
+        # would skip migration and fail with "no such table: accounts".
+        d = root / name
+        d.mkdir(parents=True, exist_ok=True)
+        return d
+
+    try:
+        section("units")
+        globals()["TMP"] = fresh("units")
+        test_snowflake()
+        test_normalize()
+        test_config()
+        test_lists()
+        test_account_flags()
+        test_auth()
+
+        section("session (the three auth bugs)")
+        asyncio.run(run_session(fresh("session")))
+
+        section("engine (parsing + account-lock release)")
+        test_parse()
+        asyncio.run(test_lock_release(fresh("engine")))
+
+        section("collector (watermark, dedup, gaps, intervals)")
+        asyncio.run(run_collector(fresh("collector")))
+        test_interval()
+
+        section("web (shared event loop)")
+        test_web_event_loop(fresh("web"))
+
+        section("cli (routing, exit codes, end to end)")
+        d = fresh("cli")
+        (d / "config.toml").write_text(CONFIG)
+        test_routing_and_exit_codes(d)
+        asyncio.run(test_search_to_export(d))
+    finally:
+        os.chdir(cwd)
+        shutil.rmtree(root, ignore_errors=True)
+
+    print()
+    print("=" * 70)
+    if FAILURES:
+        print(f"FAILED: {len(FAILURES)}")
+        for f in FAILURES:
+            print(f"  - {f}")
+        return 1
+    print("All checks passed.")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

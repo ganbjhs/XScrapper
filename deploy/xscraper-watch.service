@@ -1,0 +1,33 @@
+[Unit]
+Description=X Collector stream watcher
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=xscraper
+Group=xscraper
+WorkingDirectory=/opt/xscraper/app
+Environment=TWS_TELEMETRY=0
+Environment=DO_NOT_TRACK=1
+ExecStart=/opt/xscraper/app/.venv/bin/python3 main.py watch --all
+
+# A long-lived process matters here: twscrape rebuilds its request-signing
+# generator on every start, and frequent restarts are themselves a ban signal.
+# Back off hard rather than hot-looping on a broken session.
+Restart=always
+RestartSec=60
+StartLimitIntervalSec=600
+StartLimitBurst=5
+
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/opt/xscraper/app
+ProtectKernelTunables=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+
+[Install]
+WantedBy=multi-user.target

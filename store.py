@@ -1,0 +1,950 @@
+"""
+store.py — data shape and persistence.
+
+Four concerns that all answer "what do we keep, and in what form":
+
+  * snowflake helpers   — tweet ids encode their own creation time
+  * normalize           — a Tweet object becomes a flat record
+  * Store               — the results database
+  * export writers      — JSON / CSV / JSONL / raw output
+
+The store's job beyond plain storage is cross-run dedup (the prototype deduped
+in memory, per run, so re-running rewrote the same tweets), watermarks (so a
+poll can stop at known ground), and an audit trail recording WHY each poll
+stopped — "nothing new" and "the account pool was starved" look identical from
+the outside and demand opposite responses.
+
+tweet_id is an INTEGER primary key on purpose: snowflake ids are time-ordered,
+so `ORDER BY tweet_id` is chronological with no date parsing and no index on a
+text column.
+"""
+
+import csv
+import json
+import re
+import sqlite3
+import time
+from dataclasses import dataclass
+from datetime import datetime, timezone
+
+
+# ==========================================================================
+# snowflake — tweet id <-> time
+# ==========================================================================
+
+# 2010-11-04T01:42:54.657Z — the epoch Twitter's snowflake generator counts from.
+TWITTER_EPOCH_MS = 1288834974657
+
+# Bits reserved for worker id + sequence. The timestamp lives above these.
+_TIMESTAMP_SHIFT = 22
+
+# Tweets posted before the Nov 2010 cutover use sequential ids, not snowflakes,
+# so their creation time cannot be recovered from the id. This is the first
+# snowflake id Twitter issued; anything below it is sequential. Search results
+# are always modern, so this only guards against embedded quotes of very old
+# tweets, whose ids would otherwise decode to a bogus 2010 timestamp.
+MIN_SNOWFLAKE_ID = 29_700_859_247
+
+
+def is_snowflake(tweet_id: int) -> bool:
+    """False for pre-cutover sequential ids, whose time cannot be recovered."""
+    return tweet_id >= MIN_SNOWFLAKE_ID
+
+
+def id_to_ms(tweet_id: int) -> int:
+    """Tweet id -> creation time in epoch milliseconds."""
+    return (tweet_id >> _TIMESTAMP_SHIFT) + TWITTER_EPOCH_MS
+
+
+def ms_to_id(ms: int) -> int:
+    """
+    Epoch milliseconds -> the smallest tweet id at that millisecond.
+
+    Useful as an exclusive-lower-bound sentinel: every tweet created at or
+    after `ms` has an id >= ms_to_id(ms).
+    """
+    return max(0, (ms - TWITTER_EPOCH_MS) << _TIMESTAMP_SHIFT)
+
+
+def id_to_dt(tweet_id: int) -> datetime:
+    """Tweet id -> timezone-aware UTC datetime."""
+    return datetime.fromtimestamp(id_to_ms(tweet_id) / 1000.0, tz=timezone.utc)
+
+
+def dt_to_id(dt: datetime) -> int:
+    """Datetime -> the smallest tweet id at that instant. Naive input is UTC."""
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return ms_to_id(int(dt.timestamp() * 1000))
+
+
+def id_minus_ms(tweet_id: int, delta_ms: int) -> int:
+    """
+    Roll an id backwards in time by delta_ms.
+
+    This is the overlap window: the poller stops at id_minus_ms(watermark, 60s)
+    rather than at the watermark itself, so every poll re-reads a minute past
+    the boundary and picks up tweets X indexed late.
+    """
+    return ms_to_id(id_to_ms(tweet_id) - delta_ms)
+
+
+def lag_ms(tweet_id: int, collected_ms: int) -> int:
+    """
+    Milliseconds between a tweet being posted and us collecting it.
+
+    Clamped at 0: X's clock and ours are not the same clock, and a small
+    negative would otherwise poison the percentiles.
+    """
+    return max(0, collected_ms - id_to_ms(tweet_id))
+
+# ==========================================================================
+# normalize — Tweet object -> flat record
+# ==========================================================================
+
+# Column order used for the CSV output. Frozen — the exporter and any
+# downstream consumer depend on it. New fields go in FIELDS_EXT.
+FIELDS = [
+    "tweet_id", "url", "created_at", "text", "lang",
+    "author_username", "author_display_name", "author_id", "author_followers",
+    "reply_count", "retweet_count", "like_count", "quote_count", "view_count",
+    "is_retweet", "is_reply", "is_quote",
+    "hashtags", "mentions", "urls", "media_urls",
+    "in_reply_to", "conversation_id",
+]
+
+# Opt-in export profile (`export --fields all`). Adds the collection metadata
+# that only exists once a tweet has been through the store.
+FIELDS_EXT = FIELDS + [
+    "collected_at", "lag_ms", "stream_label", "bookmark_count", "source",
+]
+
+# Columns the store persists as JSON arrays.
+LIST_FIELDS = ("hashtags", "mentions", "urls", "media_urls")
+
+
+def _g(obj, name, default=None):
+    """Safe getattr."""
+    return getattr(obj, name, default) if obj is not None else default
+
+
+def _iso(dt):
+    """datetime -> ISO string, tolerant of already-string or None."""
+    if dt is None:
+        return None
+    try:
+        return dt.isoformat()
+    except AttributeError:
+        return str(dt)
+
+
+def _best_variant(variants):
+    """
+    Pick one video variant deterministically: prefer mp4, then highest bitrate.
+
+    Ranking on the tuple (is_mp4, bitrate) with a STRICT `>` means the first
+    maximum wins, so the same payload always yields the same URL. The previous
+    `>=` comparison picked the last of any tie, which made output depend on
+    dict ordering.
+
+    The mp4 preference matters because HLS `.m3u8` playlist variants carry no
+    bitrate. twscrape 0.19.2 happens to filter those out upstream
+    (models.py:384), but this module is engine-agnostic by design and another
+    engine will not.
+    """
+    best, best_key = None, None
+    for var in variants:
+        url = _g(var, "url")
+        if not url:
+            continue
+        ctype = (_g(var, "contentType", "") or "").lower()
+        key = (ctype == "video/mp4", _g(var, "bitrate", 0) or 0)
+        if best_key is None or key > best_key:
+            best_key, best = key, url
+    return best
+
+
+def _media_urls(media):
+    """Extract best-effort media URLs from twscrape's media object."""
+    out = []
+    if media is None:
+        return out
+    # photos
+    for p in _g(media, "photos", []) or []:
+        u = _g(p, "url")
+        if u:
+            out.append(u)
+    # videos -> best variant, else thumbnail
+    for v in _g(media, "videos", []) or []:
+        out.append(_best_variant(_g(v, "variants", []) or []) or _g(v, "thumbnailUrl"))
+    # gifs / animated
+    for a in _g(media, "animated", []) or []:
+        out.append(_g(a, "videoUrl") or _g(a, "thumbnailUrl"))
+    return [u for u in out if u]
+
+
+def normalize_tweet(t) -> dict:
+    user = _g(t, "user")
+    return {
+        "tweet_id": str(_g(t, "id", "")) or None,
+        "url": _g(t, "url"),
+        "created_at": _iso(_g(t, "date")),
+        "text": _g(t, "rawContent"),
+        "lang": _g(t, "lang"),
+
+        "author_username": _g(user, "username"),
+        "author_display_name": _g(user, "displayname"),
+        "author_id": str(_g(user, "id", "")) or None,
+        "author_followers": _g(user, "followersCount"),
+
+        "reply_count": _g(t, "replyCount"),
+        "retweet_count": _g(t, "retweetCount"),
+        "like_count": _g(t, "likeCount"),
+        "quote_count": _g(t, "quoteCount"),
+        "view_count": _g(t, "viewCount"),
+
+        "is_retweet": _g(t, "retweetedTweet") is not None,
+        "is_reply": _g(t, "inReplyToTweetId") is not None,
+        "is_quote": _g(t, "quotedTweet") is not None,
+
+        "hashtags": list(_g(t, "hashtags", []) or []),
+        "mentions": [_g(u, "username") for u in (_g(t, "mentionedUsers", []) or [])],
+        "urls": [_g(l, "url") for l in (_g(t, "links", []) or [])],
+        "media_urls": _media_urls(_g(t, "media")),
+
+        "in_reply_to": str(_g(t, "inReplyToTweetId")) if _g(t, "inReplyToTweetId") else None,
+        "conversation_id": str(_g(t, "conversationId")) if _g(t, "conversationId") else None,
+    }
+
+
+def to_csv_row(rec: dict) -> dict:
+    """Flatten list fields to pipe-joined strings for CSV."""
+    row = dict(rec)
+    for k in LIST_FIELDS:
+        vals = [str(v) for v in (row.get(k) or []) if v is not None]
+        row[k] = "|".join(vals)
+    return row
+
+
+def _loads_list(val):
+    """Parse a stored JSON array back to a list, tolerating junk."""
+    if isinstance(val, list):
+        return val
+    if not val:
+        return []
+    try:
+        parsed = json.loads(val)
+    except (TypeError, ValueError):
+        return []
+    return parsed if isinstance(parsed, list) else []
+
+
+def from_store_row(row, fields=None) -> dict:
+    """
+    Inverse of the store's write path: a sqlite row -> a record shaped like
+    normalize_tweet() output, so to_csv_row() can be reused verbatim.
+
+    tweet_id is stored as INTEGER (so ORDER BY is chronological) and comes back
+    out as a string, because JSON consumers lose precision above 2^53.
+    """
+    src = dict(row)
+    out = {}
+    for k in (fields or FIELDS):
+        val = src.get(k)
+        if k in LIST_FIELDS:
+            out[k] = _loads_list(val)
+        elif k in ("tweet_id", "author_id", "in_reply_to", "conversation_id"):
+            out[k] = str(val) if val not in (None, "") else None
+        elif k in ("is_retweet", "is_reply", "is_quote"):
+            out[k] = bool(val)
+        else:
+            out[k] = val
+    return out
+
+# ==========================================================================
+# Store — the results database
+# ==========================================================================
+
+SCHEMA_VERSION = 1
+
+SCHEMA = """
+CREATE TABLE IF NOT EXISTS meta (
+  key TEXT PRIMARY KEY,
+  value TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS streams (
+  stream_id     INTEGER PRIMARY KEY AUTOINCREMENT,
+  label         TEXT NOT NULL UNIQUE,
+  query         TEXT NOT NULL,
+  tab           TEXT NOT NULL DEFAULT 'Latest',
+  watermarked   INTEGER NOT NULL DEFAULT 1,
+  first_poll_ms INTEGER,
+  created_at    TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS tweets (
+  tweet_id            INTEGER PRIMARY KEY,   -- snowflake: ORDER BY == chronological
+  created_at          TEXT,
+  created_ms          INTEGER NOT NULL,      -- from the snowflake (ms precision)
+  collected_at        TEXT NOT NULL,         -- frozen at first sight
+  collected_ms        INTEGER NOT NULL,
+  last_seen_at        TEXT NOT NULL,
+  lag_ms              INTEGER NOT NULL,      -- frozen at first sight
+  url                 TEXT,
+  text                TEXT,
+  lang                TEXT,
+  author_username     TEXT,
+  author_display_name TEXT,
+  author_id           TEXT,
+  author_followers    INTEGER,
+  reply_count         INTEGER,
+  retweet_count       INTEGER,
+  like_count          INTEGER,
+  quote_count         INTEGER,
+  view_count          INTEGER,
+  bookmark_count      INTEGER,
+  is_retweet          INTEGER,
+  is_reply            INTEGER,
+  is_quote            INTEGER,
+  hashtags            TEXT,                  -- JSON array
+  mentions            TEXT,
+  urls                TEXT,
+  media_urls          TEXT,
+  in_reply_to         TEXT,
+  conversation_id     TEXT,
+  source              TEXT NOT NULL DEFAULT 'result',  -- result | embedded
+  raw_json            TEXT,                  -- Tweet.json(): nothing is lost
+  raw_entry_json      TEXT
+);
+CREATE INDEX IF NOT EXISTS ix_tweets_created   ON tweets(created_ms DESC);
+CREATE INDEX IF NOT EXISTS ix_tweets_collected ON tweets(collected_ms DESC);
+CREATE INDEX IF NOT EXISTS ix_tweets_author    ON tweets(author_username, created_ms DESC);
+
+-- A tweet can match several streams; this is the many-to-many edge.
+CREATE TABLE IF NOT EXISTS tweet_hits (
+  stream_id     INTEGER NOT NULL,
+  tweet_id      INTEGER NOT NULL,
+  poll_id       INTEGER,
+  first_seen_ms INTEGER NOT NULL,
+  PRIMARY KEY (stream_id, tweet_id)
+) WITHOUT ROWID;
+CREATE INDEX IF NOT EXISTS ix_hits_stream ON tweet_hits(stream_id, tweet_id DESC);
+
+CREATE TABLE IF NOT EXISTS watermarks (
+  stream_id         INTEGER PRIMARY KEY,
+  high_tweet_id     INTEGER NOT NULL,
+  high_created_ms   INTEGER NOT NULL,
+  interval_s        REAL NOT NULL DEFAULT 30,
+  ewma_rate         REAL NOT NULL DEFAULT 0,
+  consecutive_empty INTEGER NOT NULL DEFAULT 0,
+  next_poll_ms      INTEGER NOT NULL DEFAULT 0,
+  updated_at        TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS polls (
+  poll_id       INTEGER PRIMARY KEY AUTOINCREMENT,
+  stream_id     INTEGER NOT NULL,
+  kind          TEXT NOT NULL,          -- poll | seed | oneshot | sweep
+  started_ms    INTEGER NOT NULL,
+  finished_ms   INTEGER,
+  account       TEXT,
+  pages         INTEGER NOT NULL DEFAULT 0,
+  results       INTEGER NOT NULL DEFAULT 0,
+  new_tweets    INTEGER NOT NULL DEFAULT 0,
+  dup_tweets    INTEGER NOT NULL DEFAULT 0,
+  orphans       INTEGER NOT NULL DEFAULT 0,
+  max_id        INTEGER,
+  min_id        INTEGER,
+  stop_reason   TEXT,                   -- watermark | exhausted | page_budget
+                                        -- | no_account_or_abort | error
+  rl_limit      INTEGER,
+  rl_remaining  INTEGER,
+  rl_reset      INTEGER,                -- unix ts the budget refills; the guard
+                                        -- needs it to tell "spent" from "stale"
+  lag_p50_ms    INTEGER,
+  lag_p95_ms    INTEGER,
+  error         TEXT
+);
+CREATE INDEX IF NOT EXISTS ix_polls_stream ON polls(stream_id, started_ms DESC);
+
+-- Recorded, never silently dropped: the window between the old watermark and
+-- the oldest tweet a poll actually reached. Backfilling these is Phase 6; for
+-- now they are surfaced by `doctor` so under-collection is visible.
+CREATE TABLE IF NOT EXISTS gaps (
+  gap_id        INTEGER PRIMARY KEY AUTOINCREMENT,
+  stream_id     INTEGER NOT NULL,
+  lo_tweet_id   INTEGER NOT NULL,       -- open interval (lo, hi)
+  hi_tweet_id   INTEGER NOT NULL,
+  lo_ms         INTEGER NOT NULL,
+  hi_ms         INTEGER NOT NULL,
+  resume_cursor TEXT,
+  cursor_ms     INTEGER,
+  status        TEXT NOT NULL DEFAULT 'open',
+  detected_poll INTEGER,
+  created_at    TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS ix_gaps_open ON gaps(status, stream_id, hi_tweet_id DESC);
+"""
+
+
+@dataclass
+class UpsertCounts:
+    new: int = 0
+    dup: int = 0
+    embedded: int = 0
+
+
+def _iso_ms(ms: int) -> str:
+    import datetime as _dt
+
+    return _dt.datetime.fromtimestamp(ms / 1000, tz=_dt.timezone.utc).isoformat()
+
+
+def parse_window(spec: str | None) -> int | None:
+    """'6h' / '3d' / '30m' / an ISO timestamp -> epoch ms. None passes through."""
+    if not spec:
+        return None
+    s = str(spec).strip()
+    units = {"s": 1, "m": 60, "h": 3600, "d": 86400, "w": 604800}
+    if len(s) > 1 and s[-1].lower() in units and s[:-1].replace(".", "", 1).isdigit():
+        return int((time.time() - float(s[:-1]) * units[s[-1].lower()]) * 1000)
+    import datetime as _dt
+
+    try:
+        dt = _dt.datetime.fromisoformat(s)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=_dt.timezone.utc)
+        return int(dt.timestamp() * 1000)
+    except ValueError as e:
+        raise ValueError(f"Cannot parse time {spec!r}. Use ISO, or 30m / 6h / 3d.") from e
+
+
+def _percentile(values: list[int], pct: float) -> int:
+    if not values:
+        return 0
+    ordered = sorted(values)
+    idx = min(len(ordered) - 1, max(0, int(round((pct / 100.0) * (len(ordered) - 1)))))
+    return ordered[idx]
+
+
+class Store:
+    """
+    Synchronous sqlite3 behind an async-shaped facade.
+
+    Deliberately not aiosqlite: every write here is a sub-millisecond local
+    operation, and the collector is I/O-bound on X's API by orders of
+    magnitude. WAL keeps `export` and `doctor` readable while a watcher writes.
+    """
+
+    def __init__(self, path):
+        self.path = str(path)
+        self.db: sqlite3.Connection | None = None
+
+    async def open(self):
+        self.db = sqlite3.connect(self.path, isolation_level=None)
+        self.db.row_factory = sqlite3.Row
+        self.db.execute("PRAGMA journal_mode = WAL")
+        self.db.execute("PRAGMA synchronous = NORMAL")
+        self.db.execute("PRAGMA busy_timeout = 5000")
+        self.db.executescript(SCHEMA)
+        self._migrate()
+        self.db.execute(
+            "INSERT INTO meta(key, value) VALUES('schema_version', ?) "
+            "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            (str(SCHEMA_VERSION),),
+        )
+        return self
+
+    def _migrate(self):
+        """
+        Add columns that appeared after a database was first created.
+
+        CREATE TABLE IF NOT EXISTS silently does nothing on an existing table,
+        so new columns need an explicit ALTER or older databases keep working
+        but quietly lack the field.
+        """
+        wanted = {"polls": {"rl_reset": "INTEGER"},
+                  "streams": {"list_id": "TEXT"}}
+        for table, cols in wanted.items():
+            have = {r["name"] for r in self.db.execute(f"PRAGMA table_info({table})")}
+            for name, decl in cols.items():
+                if name not in have:
+                    self.db.execute(f"ALTER TABLE {table} ADD COLUMN {name} {decl}")
+
+    async def close(self):
+        if self.db is not None:
+            self.db.close()
+            self.db = None
+
+    async def __aenter__(self):
+        return await self.open()
+
+    async def __aexit__(self, *exc):
+        await self.close()
+
+    # ---------------- streams ----------------
+
+    async def ensure_stream(self, label: str, query: str, tab: str = "Latest",
+                            watermarked: bool = True, list_id: str = "") -> int:
+        cur = self.db.execute("SELECT stream_id FROM streams WHERE label = ?", (label,))
+        row = cur.fetchone()
+        if row:
+            # Changing a stream's source changes what its watermark means, so
+            # keep the stored definition in sync and let doctor surface it.
+            self.db.execute(
+                "UPDATE streams SET query = ?, tab = ?, watermarked = ?, list_id = ? "
+                "WHERE stream_id = ?",
+                (query, tab, int(watermarked), list_id or None, row["stream_id"]),
+            )
+            return row["stream_id"]
+        cur = self.db.execute(
+            "INSERT INTO streams(label, query, tab, watermarked, list_id, created_at) "
+            "VALUES(?,?,?,?,?,?)",
+            (label, query, tab, int(watermarked), list_id or None,
+             _iso_ms(int(time.time() * 1000))),
+        )
+        return cur.lastrowid
+
+    async def mark_first_poll(self, stream_id: int, ms: int) -> None:
+        self.db.execute(
+            "UPDATE streams SET first_poll_ms = COALESCE(first_poll_ms, ?) WHERE stream_id = ?",
+            (ms, stream_id),
+        )
+
+    async def first_poll_ms(self, stream_id: int) -> int | None:
+        row = self.db.execute(
+            "SELECT first_poll_ms FROM streams WHERE stream_id = ?", (stream_id,)
+        ).fetchone()
+        return row["first_poll_ms"] if row else None
+
+    # ---------------- tweets ----------------
+
+    async def upsert_tweets(self, rows, stream_id: int | None, poll_id: int | None) -> UpsertCounts:
+        """
+        rows: iterable of (tweet, page, source, entry).
+
+        collected_at / collected_ms / lag_ms are written once and never
+        updated — a tweet re-seen on a later poll must not look fresher than it
+        was. Engagement counters and raw_json DO update, because those change.
+        """
+        counts = UpsertCounts()
+        for tweet, page, source, entry in rows:
+            tid = int(tweet.id)
+            rec = normalize_tweet(tweet)
+            collected_ms = page.collected_ms
+            created_ms = id_to_ms(tid) if is_snowflake(tid) else collected_ms
+            lag = lag_ms(tid, collected_ms) if is_snowflake(tid) else 0
+
+            try:
+                raw_json = tweet.json()
+            except Exception:
+                raw_json = None
+
+            payload = {
+                "tweet_id": tid,
+                "created_at": rec["created_at"],
+                "created_ms": created_ms,
+                "collected_at": _iso_ms(collected_ms),
+                "collected_ms": collected_ms,
+                "last_seen_at": _iso_ms(collected_ms),
+                "lag_ms": lag,
+                "url": rec["url"],
+                "text": rec["text"],
+                "lang": rec["lang"],
+                "author_username": rec["author_username"],
+                "author_display_name": rec["author_display_name"],
+                "author_id": rec["author_id"],
+                "author_followers": rec["author_followers"],
+                "reply_count": rec["reply_count"],
+                "retweet_count": rec["retweet_count"],
+                "like_count": rec["like_count"],
+                "quote_count": rec["quote_count"],
+                "view_count": rec["view_count"],
+                "bookmark_count": getattr(tweet, "bookmarkedCount", None),
+                "is_retweet": int(bool(rec["is_retweet"])),
+                "is_reply": int(bool(rec["is_reply"])),
+                "is_quote": int(bool(rec["is_quote"])),
+                "in_reply_to": rec["in_reply_to"],
+                "conversation_id": rec["conversation_id"],
+                "source": source,
+                "raw_json": raw_json,
+                "raw_entry_json": json.dumps(entry) if entry else None,
+                **{k: json.dumps(rec[k] or []) for k in LIST_FIELDS},
+            }
+
+            # ON CONFLICT DO UPDATE reports rowcount 1 for both branches, so
+            # newness has to be established before the write.
+            existed = (
+                self.db.execute(
+                    "SELECT 1 FROM tweets WHERE tweet_id = ?", (tid,)
+                ).fetchone()
+                is not None
+            )
+
+            cols = list(payload)
+            self.db.execute(
+                f"INSERT INTO tweets ({','.join(cols)}) "
+                f"VALUES ({','.join(':' + c for c in cols)}) "
+                "ON CONFLICT(tweet_id) DO UPDATE SET "
+                "  last_seen_at   = excluded.last_seen_at,"
+                "  reply_count    = excluded.reply_count,"
+                "  retweet_count  = excluded.retweet_count,"
+                "  like_count     = excluded.like_count,"
+                "  quote_count    = excluded.quote_count,"
+                "  view_count     = excluded.view_count,"
+                "  bookmark_count = excluded.bookmark_count,"
+                "  raw_json       = COALESCE(excluded.raw_json, tweets.raw_json),"
+                # A tweet first seen as quoted context can later turn up as a
+                # real search hit. Promote it; never demote.
+                "  source = CASE WHEN tweets.source = 'embedded' AND excluded.source = 'result' "
+                "                THEN 'result' ELSE tweets.source END",
+                payload,
+            )
+
+            if source == "embedded":
+                counts.embedded += 1
+                continue
+
+            if stream_id is None:
+                # One-shot search: newness is global.
+                counts.new += 0 if existed else 1
+                counts.dup += 1 if existed else 0
+                continue
+
+            # Normal path: "new" means new TO THIS STREAM. A tweet already
+            # collected by another stream is still new here, and the hit edge
+            # is what the watermark and the lag report key off.
+            hit = self.db.execute(
+                "INSERT OR IGNORE INTO tweet_hits(stream_id, tweet_id, poll_id, first_seen_ms) "
+                "VALUES(?,?,?,?)",
+                (stream_id, tid, poll_id, collected_ms),
+            )
+            if hit.rowcount == 1:
+                counts.new += 1
+            else:
+                counts.dup += 1
+        return counts
+
+    async def has_tweet(self, tweet_id: int) -> bool:
+        return (
+            self.db.execute("SELECT 1 FROM tweets WHERE tweet_id = ?", (tweet_id,)).fetchone()
+            is not None
+        )
+
+    async def count_tweets(self, stream_id: int | None = None) -> int:
+        if stream_id is None:
+            row = self.db.execute("SELECT COUNT(*) c FROM tweets").fetchone()
+        else:
+            row = self.db.execute(
+                "SELECT COUNT(*) c FROM tweet_hits WHERE stream_id = ?", (stream_id,)
+            ).fetchone()
+        return row["c"]
+
+    # ---------------- watermarks ----------------
+
+    async def get_watermark(self, stream_id: int):
+        return self.db.execute(
+            "SELECT * FROM watermarks WHERE stream_id = ?", (stream_id,)
+        ).fetchone()
+
+    async def set_watermark(self, stream_id: int, high_tweet_id: int, **state) -> None:
+        high_ms = id_to_ms(high_tweet_id) if is_snowflake(high_tweet_id) else 0
+        now = int(time.time() * 1000)
+        cols = {
+            "stream_id": stream_id,
+            "high_tweet_id": high_tweet_id,
+            "high_created_ms": high_ms,
+            "interval_s": state.get("interval_s", 30.0),
+            "ewma_rate": state.get("ewma_rate", 0.0),
+            "consecutive_empty": state.get("consecutive_empty", 0),
+            "next_poll_ms": state.get("next_poll_ms", now),
+            "updated_at": _iso_ms(now),
+        }
+        names = list(cols)
+        self.db.execute(
+            f"INSERT INTO watermarks ({','.join(names)}) "
+            f"VALUES ({','.join(':' + n for n in names)}) "
+            "ON CONFLICT(stream_id) DO UPDATE SET "
+            # max() guards against a watermark ever moving backwards, which
+            # would silently re-collect and re-report old tweets as new.
+            "  high_tweet_id     = max(watermarks.high_tweet_id, excluded.high_tweet_id),"
+            "  high_created_ms   = max(watermarks.high_created_ms, excluded.high_created_ms),"
+            "  interval_s        = excluded.interval_s,"
+            "  ewma_rate         = excluded.ewma_rate,"
+            "  consecutive_empty = excluded.consecutive_empty,"
+            "  next_poll_ms      = excluded.next_poll_ms,"
+            "  updated_at        = excluded.updated_at",
+            cols,
+        )
+
+    # ---------------- polls ----------------
+
+    async def begin_poll(self, stream_id: int, kind: str = "poll") -> int:
+        cur = self.db.execute(
+            "INSERT INTO polls(stream_id, kind, started_ms) VALUES(?,?,?)",
+            (stream_id, kind, int(time.time() * 1000)),
+        )
+        return cur.lastrowid
+
+    async def finish_poll(self, poll_id: int, **fields) -> None:
+        lags = fields.pop("lags", None)
+        if lags:
+            fields["lag_p50_ms"] = _percentile(lags, 50)
+            fields["lag_p95_ms"] = _percentile(lags, 95)
+        fields["finished_ms"] = int(time.time() * 1000)
+        sets = ",".join(f"{k} = :{k}" for k in fields)
+        self.db.execute(
+            f"UPDATE polls SET {sets} WHERE poll_id = :poll_id", {**fields, "poll_id": poll_id}
+        )
+
+    async def recent_polls(self, stream_id: int, limit: int = 20):
+        return self.db.execute(
+            "SELECT * FROM polls WHERE stream_id = ? ORDER BY started_ms DESC LIMIT ?",
+            (stream_id, limit),
+        ).fetchall()
+
+    # ---------------- gaps ----------------
+
+    async def open_gap(self, stream_id, lo, hi, cursor=None, poll_id=None) -> int:
+        now = int(time.time() * 1000)
+        cur = self.db.execute(
+            "INSERT INTO gaps(stream_id, lo_tweet_id, hi_tweet_id, lo_ms, hi_ms, "
+            "resume_cursor, cursor_ms, detected_poll, created_at) VALUES(?,?,?,?,?,?,?,?,?)",
+            (
+                stream_id, lo, hi,
+                id_to_ms(lo) if is_snowflake(lo) else 0,
+                id_to_ms(hi) if is_snowflake(hi) else 0,
+                cursor, now, poll_id, _iso_ms(now),
+            ),
+        )
+        return cur.lastrowid
+
+    async def open_gaps(self, stream_id: int | None = None):
+        if stream_id is None:
+            return self.db.execute(
+                "SELECT g.*, s.label FROM gaps g JOIN streams s USING(stream_id) "
+                "WHERE g.status = 'open' ORDER BY g.hi_tweet_id DESC"
+            ).fetchall()
+        return self.db.execute(
+            "SELECT * FROM gaps WHERE status = 'open' AND stream_id = ? ORDER BY hi_tweet_id DESC",
+            (stream_id,),
+        ).fetchall()
+
+    # ---------------- reporting ----------------
+
+    async def lag_report(self, since: str = "24h") -> list[str]:
+        since_ms = parse_window(since) or 0
+        out: list[str] = []
+
+        rows = self.db.execute(
+            "SELECT s.label, s.first_poll_ms, COUNT(*) n "
+            "FROM tweet_hits h "
+            "JOIN tweets t USING(tweet_id) JOIN streams s USING(stream_id) "
+            "WHERE h.first_seen_ms >= ? "
+            "GROUP BY s.label ORDER BY s.label",
+            (since_ms,),
+        ).fetchall()
+
+        if not rows:
+            out.append("(no tweets collected in this window)")
+
+        for r in rows:
+            # Tweets that already existed when this stream started watching are
+            # backlog, not a freshness signal: their "lag" is however long they
+            # happened to predate us. Counting them would make p95 meaningless.
+            # They are still reported, just separately.
+            lags = [
+                x["lag_ms"]
+                for x in self.db.execute(
+                    "SELECT t.lag_ms FROM tweet_hits h JOIN tweets t USING(tweet_id) "
+                    "JOIN streams s USING(stream_id) "
+                    "WHERE s.label = ? AND h.first_seen_ms >= ? "
+                    "  AND t.created_ms >= COALESCE(s.first_poll_ms, 0)",
+                    (r["label"], since_ms),
+                ).fetchall()
+            ]
+            backlog = r["n"] - len(lags)
+            if lags:
+                out.append(
+                    f"{r['label']}: n={len(lags)}  "
+                    f"p50={_percentile(lags, 50) / 1000:.1f}s  "
+                    f"p95={_percentile(lags, 95) / 1000:.1f}s  "
+                    f"max={max(lags) / 1000:.1f}s"
+                    + (f"   (+{backlog} backlog, excluded)" if backlog else "")
+                )
+            else:
+                out.append(
+                    f"{r['label']}: n={r['n']} collected, but none measurable for lag yet "
+                    f"— all of them predate this stream's first poll. "
+                    f"Expected right after starting; real numbers appear once new "
+                    f"tweets arrive."
+                )
+
+        stops = self.db.execute(
+            "SELECT s.label, p.stop_reason, COUNT(*) n, AVG(p.pages) pages "
+            "FROM polls p JOIN streams s USING(stream_id) "
+            "WHERE p.started_ms >= ? AND p.stop_reason IS NOT NULL "
+            "GROUP BY s.label, p.stop_reason ORDER BY s.label, n DESC",
+            (since_ms,),
+        ).fetchall()
+        if stops:
+            out.append("")
+            out.append("poll outcomes:")
+            for r in stops:
+                note = ""
+                if r["stop_reason"] == "no_account_or_abort":
+                    note = "   <-- pool starvation, NOT a quiet stream"
+                elif r["stop_reason"] == "page_budget":
+                    note = "   <-- stream outran the poller; raise max_pages or poll faster"
+                out.append(
+                    f"  {r['label']}: {r['stop_reason']} x{r['n']} "
+                    f"(avg {r['pages']:.1f} pages){note}"
+                )
+
+        gaps = await self.open_gaps()
+        if gaps:
+            out.append("")
+            out.append(f"open gaps: {len(gaps)} (windows the poller did not reach)")
+        return out
+
+    # ---------------- export ----------------
+
+    def iter_export(self, stream=None, since=None, until=None, limit=None,
+                    order="desc", include_embedded=False):
+        where, params = [], []
+        joins = ""
+        if stream:
+            joins = "JOIN tweet_hits h USING(tweet_id) JOIN streams s USING(stream_id)"
+            where.append("s.label = ?")
+            params.append(stream)
+        if not include_embedded:
+            where.append("t.source = 'result'")
+        if since is not None:
+            where.append("t.created_ms >= ?")
+            params.append(since)
+        if until is not None:
+            where.append("t.created_ms <= ?")
+            params.append(until)
+
+        sql = f"SELECT t.* FROM tweets t {joins}"
+        if where:
+            sql += " WHERE " + " AND ".join(where)
+        sql += f" ORDER BY t.tweet_id {'ASC' if order == 'asc' else 'DESC'}"
+        if limit:
+            sql += " LIMIT ?"
+            params.append(int(limit))
+        return self.db.execute(sql, params)
+
+# ==========================================================================
+# export writers
+# ==========================================================================
+
+# Columns that only exist once a tweet has been through the store.
+_EXTRA = [f for f in FIELDS_EXT if f not in FIELDS]
+
+
+def _fields_for(profile: str) -> list[str]:
+    return FIELDS_EXT if profile == "all" else FIELDS
+
+
+def _record(row, fields):
+    rec = from_store_row(row, fields)
+    keys = row.keys()
+    for k in _EXTRA:
+        if k in fields:
+            rec[k] = row[k] if k in keys else None
+    return rec
+
+
+def write_json(rows, path, profile="default"):
+    fields = _fields_for(profile)
+    records = [_record(r, fields) for r in rows]
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(records, f, ensure_ascii=False, indent=2)
+    return len(records)
+
+
+def write_jsonl(rows, path, profile="default"):
+    fields = _fields_for(profile)
+    n = 0
+    with open(path, "w", encoding="utf-8") as f:
+        for row in rows:
+            f.write(json.dumps(_record(row, fields), ensure_ascii=False) + "\n")
+            n += 1
+    return n
+
+
+def write_csv(rows, path, profile="default"):
+    fields = _fields_for(profile)
+    n = 0
+    with open(path, "w", encoding="utf-8", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=fields)
+        writer.writeheader()
+        for row in rows:
+            writer.writerow(to_csv_row(_record(row, fields)))
+            n += 1
+    return n
+
+
+def write_raw(rows, path):
+    """
+    The untouched Tweet.json() for each tweet, one per line.
+
+    This is the source of truth. It carries every field the normalizer drops
+    (bookmarkedCount, cashtags, place, source, card, edit history), which is
+    what makes it possible to reparse history after X changes its schema
+    instead of having to re-scrape it.
+    """
+    n = 0
+    with open(path, "w", encoding="utf-8") as f:
+        for row in rows:
+            raw = row["raw_json"] if "raw_json" in row.keys() else None
+            if raw:
+                f.write(raw + "\n")
+                n += 1
+    return n
+
+
+def export(rows, out_prefix, fmt="csv", profile="default"):
+    """Write `rows` in `fmt`. Returns (path, count)."""
+    writers = {
+        "json": (f"{out_prefix}.json", write_json),
+        "jsonl": (f"{out_prefix}.jsonl", write_jsonl),
+        "csv": (f"{out_prefix}.csv", write_csv),
+    }
+    if fmt == "raw":
+        path = f"{out_prefix}.raw.jsonl"
+        return path, write_raw(rows, path)
+    path, fn = writers[fmt]
+    return path, fn(rows, path, profile)
+
+
+def write_legacy_outputs(records, raw_tweets, out_prefix):
+    """
+    The prototype's three-file output, byte-compatible.
+
+    Kept so `search --no-store` behaves exactly as before for anyone with
+    scripts pointed at results.json / results.csv / results.raw.jsonl.
+    """
+    json_path = f"{out_prefix}.json"
+    csv_path = f"{out_prefix}.csv"
+    raw_path = f"{out_prefix}.raw.jsonl"
+
+    with open(json_path, "w", encoding="utf-8") as f:
+        json.dump(records, f, ensure_ascii=False, indent=2)
+
+    with open(csv_path, "w", encoding="utf-8", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=FIELDS)
+        writer.writeheader()
+        for rec in records:
+            writer.writerow(to_csv_row(rec))
+
+    with open(raw_path, "w", encoding="utf-8") as f:
+        for tweet in raw_tweets:
+            try:
+                f.write(tweet.json() + "\n")
+            except Exception:
+                f.write(json.dumps(getattr(tweet, "__dict__", str(tweet)), default=str) + "\n")
+
+    return json_path, csv_path, raw_path

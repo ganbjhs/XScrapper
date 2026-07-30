@@ -1,0 +1,32 @@
+[Unit]
+Description=X Collector dashboard
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=xscraper
+Group=xscraper
+WorkingDirectory=/opt/xscraper/app
+Environment=TWS_TELEMETRY=0
+Environment=DO_NOT_TRACK=1
+# Loopback only. nginx terminates TLS and proxies in; the app is never
+# reachable from outside even if the firewall is wrong.
+ExecStart=/opt/xscraper/app/.venv/bin/python3 main.py serve \
+          --host 127.0.0.1 --port 8765 --behind-proxy
+Restart=always
+RestartSec=5
+
+# The dashboard reads databases and writes .env/config.toml when you add an
+# account. Nothing else on the box is its business.
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/opt/xscraper/app
+ProtectKernelTunables=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+
+[Install]
+WantedBy=multi-user.target
