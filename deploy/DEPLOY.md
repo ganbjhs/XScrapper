@@ -45,9 +45,23 @@ dig +short scraper.vedictech.in     # must print 200.97.175.12
 
 ## 2. Server setup
 
+**Use the script.** A pasted block that lands in an ssh password prompt does
+nothing at all and looks like it worked; one that fails halfway leaves you
+guessing which half ran. `setup.sh` is idempotent, fails loudly, and is safe on
+a server already hosting other sites — it never touches an nginx vhost it did
+not create.
+
 ```bash
 ssh root@200.97.175.12
+# wait for the prompt, THEN:
+apt update && apt install -y git
+git clone https://github.com/ganbjhs/XScrapper.git /opt/xscraper/app
+bash /opt/xscraper/app/deploy/setup.sh
 ```
+
+Re-run it any time — after a `git pull`, or after a partial failure.
+
+<details><summary>What it does, if you would rather run the steps by hand</summary>
 
 ```bash
 apt update && apt install -y python3 python3-venv python3-pip git nginx certbot python3-certbot-nginx
@@ -66,8 +80,14 @@ python3 -m venv .venv
 chown -R xscraper:xscraper /opt/xscraper
 ```
 
+</details>
+
 Playwright's browser is **not** installed: the server never logs in, so it
 never needs Chrome. That saves ~400 MB and a pile of system libraries.
+
+**On a shared server**, note what `setup.sh` deliberately does NOT do: it does
+not remove `sites-enabled/default`, does not reload anything but nginx, and
+refuses to start if port 8765 is already taken.
 
 ## 3. Configure
 
@@ -128,7 +148,6 @@ systemctl status xscraper-web --no-pager
 ```bash
 cp /opt/xscraper/app/deploy/nginx-scraper.conf /etc/nginx/sites-available/scraper
 ln -sf /etc/nginx/sites-available/scraper /etc/nginx/sites-enabled/scraper
-rm -f /etc/nginx/sites-enabled/default
 nginx -t && systemctl reload nginx
 
 certbot --nginx -d scraper.vedictech.in --redirect --agree-tos -m you@vedictech.in
