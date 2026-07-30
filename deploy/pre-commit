@@ -1,0 +1,49 @@
+#!/usr/bin/env bash
+# Refuse to commit real secrets in tracked template files.
+#
+# This has already happened twice: real credentials edited into .env.example
+# (committed, public) instead of .env (gitignored). A password in git history
+# cannot be unpublished — only rotated. So block it at commit time rather than
+# discovering it after a push.
+#
+# Install:  ln -sf ../../deploy/pre-commit .git/hooks/pre-commit
+
+set -euo pipefail
+
+PLACEHOLDERS='^(changeme|CHANGE_ME_TO_A_LONG_RANDOM_STRING|admin|password|your-password-here|xxx|todo|)$'
+fail=0
+
+for f in $(git diff --cached --name-only --diff-filter=ACM); do
+  case "$f" in
+    *.example|*.sample|*.template) ;;
+    *) continue ;;
+  esac
+  while IFS= read -r line; do
+    key=${line%%=*}; val=${line#*=}
+    case "$key" in
+      DASH_PASSWORD|DASH_USER|*_PASSWORD|*_SECRET|*_TOKEN|*_KEY) ;;
+      *) continue ;;
+    esac
+    if ! printf '%s' "$val" | grep -qE "$PLACEHOLDERS"; then
+      echo "BLOCKED: $f sets $key to a real-looking value."
+      fail=1
+    fi
+  done < <(git show ":$f" | grep -E '^[A-Z_]+=' || true)
+done
+
+if [ "$fail" = 1 ]; then
+  cat >&2 <<'MSG'
+
+  Template files are COMMITTED AND PUBLIC. Put real values in .env, which is
+  gitignored — not in .env.example.
+
+    keep .env.example as:   DASH_PASSWORD=CHANGE_ME_TO_A_LONG_RANDOM_STRING
+    put the real one in:    .env
+
+  A secret committed here is in git history permanently; removing the file
+  later does not unpublish it, so it has to be rotated instead.
+
+  To override anyway:  git commit --no-verify
+MSG
+  exit 1
+fi
