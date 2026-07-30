@@ -1,27 +1,40 @@
 # Rulebook
 
-Everything about this project: what it is for, what it must never do, what has
-already gone wrong and why, and how it would be rebuilt if you started again.
+The whole system in one file: what it is for, how it is built, what it must
+never do, what has already gone wrong, and how you would rebuild it from
+nothing.
 
-`README.md` tells you how to *use* it. This file tells you how to *reason* about
-it — read it before changing anything structural.
+If you read only one file, read this one. `README.md` is a quickstart and
+nothing more; everything it says is repeated here in more detail.
+
+Last reviewed: 2026-07-30.
 
 ---
 
 ## 1. Goal
 
-**Get tweets matching a query into a local database as fast as possible after
-they are posted, without an X API, without getting the account banned.**
+**Get tweets matching what you care about into a local database as fast as
+possible after they are posted, without X's official API, and without getting
+the account banned.**
 
 The single metric is **lag**: seconds between a tweet being posted and it
 landing in `results.db`. Not coverage, not volume, not history.
 
-Measured on one account: **p50 15.4s, p95 18.2s.**
+**Measured: p50 15.4s, p95 18.2s** — on one account, one watched stream,
+`watch` running continuously. That last condition matters and is the most
+common way to misread this number: the figure only means anything for a stream
+being polled on a timer. A one-off "get new tweets" sweep pulls in tweets that
+are already hours or days old, and its `lag_ms` column measures how old they
+were when first seen, not how fresh the system is.
+
+> As of this writing `results.db` contains only sweeps — no watcher has run
+> against it yet — so its lag column is backfill age. Start `watch` and let it
+> run before quoting a freshness number from it.
 
 ### Non-goals
 
-Naming these matters as much as the goal, because each one would pull the
-design somewhere else:
+Naming these matters as much as the goal, because each would pull the design
+somewhere else:
 
 | Not a goal | Why |
 |---|---|
@@ -34,12 +47,14 @@ design somewhere else:
 
 ## 2. The rules
 
-Numbered so they can be cited in review. Ordered by how expensive breaking them is.
+Numbered so they can be cited in review. Ordered by how expensive breaking them
+is.
 
 ### R1 — Auth is never a side effect
 
-`search` and `watch` never log in. They report a missing session and exit 6.
-Only `login` authenticates.
+`search` and `watch` never sign in. They report a missing session and exit 6.
+Only an explicit sign-in authenticates: `main.py login`, or the sign-in window
+in the dashboard.
 
 *Why:* the original prototype logged in from inside its search path. An expired
 cookie surfaced three steps later as an unrelated-looking search error. Failures
@@ -88,11 +103,14 @@ problem is capacity, not lack of data.
 
 A failed read must surface, not silently become an empty list or a `False`.
 
-*Why:* broken twice in this project. The guard's account check swallowed an
-exception into `[]` and reported a confident **"No accounts"** for a healthy
-account. Then `_budget()` swallowed a missing-column error and silently
-disabled the rate-limit rule — the single most important check — while still
-reporting "no risks".
+*Why:* broken three times in this project. The guard's account check swallowed
+an exception into `[]` and reported a confident **"No accounts"** for a healthy
+account. `_budget()` swallowed a missing-column error and silently disabled the
+rate-limit rule — the single most important check — while still reporting "no
+risks". And `load_config` invented a whole account out of stray environment
+variables when `config.toml` was missing, which is how the only real account on
+this machine ended up collecting under a label nobody had chosen (§9, "the
+phantom account").
 
 **A confidently wrong answer is worse than an error.**
 
@@ -138,27 +156,28 @@ nothing.
 
 ### R12 — Account status has four states, and unknown is never green
 
-| flag | colour | meaning | what to do |
+| shown as | colour | meaning | what to do |
 |---|---|---|---|
-| `LIVE` | green | Active, no complaints | nothing |
-| `WARN` | amber | Works, but something raises ban risk or will bite later | act before it becomes red |
-| `DEAD` | red | X rejected it — collects nothing right now | re-login, or replace the account |
-| `?` | grey | Present but unclassifiable, usually a failed read | investigate; **never assume healthy** |
+| `Working` | green | Active, no complaints | nothing |
+| `Check this` | amber | Works, but something raises ban risk or will bite later | act before it becomes red |
+| `Signed out` | red | X rejected it — collects nothing right now | sign in again, or replace the account |
+| `Not set up` | grey | Present but unclassifiable, usually a failed read | investigate; **never assume healthy** |
 
 Amber is **not** a weaker red. Red means "this account is not collecting".
-Amber means "it works, and here is what will hurt you": no proxy, no `kdt`
-cookie, a placeholder user-agent, locked queues, or an unusually heavy request
-count. They demand different responses, so they get different colours.
+Amber means "it works, and here is what will hurt you": no proxy, no
+known-device cookie, a placeholder user-agent, locked queues, or an unusually
+heavy request count. They demand different responses, so they get different
+colours.
 
 Red is only ever set by X's own verdict — codes `(32)` session expired, `(326)`
 locked, `(88)` rate-limit ban heuristic, `(64)` suspended. Never by our guess.
 
 Grey exists because of R6. An account we cannot classify must not render as
 green; a confident wrong "healthy" is exactly the failure this taxonomy is for.
-An account in `config.toml` that has never logged in is grey too — otherwise
+An account in `config.toml` that has never signed in is grey too — otherwise
 "I added it" and "it is collecting" look identical.
 
-Every non-green flag carries its reasons and a remedy. A coloured dot with no
+Every non-green state carries its reasons and a remedy. A coloured dot with no
 explanation just moves the debugging problem somewhere else.
 
 ### R13 — Preview what can be previewed; link what cannot, and say why
@@ -168,145 +187,485 @@ Images and `.mp4` play inline — the URL in `media_urls` is the direct file.
 **X broadcasts cannot be embedded.** Measured: `x.com` sends
 `x-frame-options: SAMEORIGIN` and `frame-ancestors 'self' https://x.com`, so an
 iframe from the dashboard is refused by the browser. They render as a labelled
-link that says embedding is blocked, rather than an embed that would silently
-be a blank box. A broken player is worse than an honest link.
+link that says so, rather than an embed that would silently be a blank box. A
+broken player is worse than an honest link.
 
-### R14 — Endpoints that write secrets are loopback-only
+### R14 — Adding an account and signing it in are one action
 
-`/api/account` writes a password into `.env` and an account into `config.toml`.
-It refuses outright unless the server is bound to `127.0.0.1`, checked
-server-side, not by hiding the button.
+`/api/account` writes `config.toml`, **reloads the config into the running
+process**, and the dashboard goes straight into the sign-in window. It never
+ends by printing a command to run.
 
-It also does **not** attempt the login itself: that needs a browser window a
-human can see, which a server process cannot assume exists. It writes the
-config and returns the exact command to run.
+*Why:* it used to do exactly that — write the config, then hand back
+`python3 main.py login --account X` and a note saying to restart the server.
+That is a dead end for anyone using the dashboard over the internet, which is
+the only way it is used in production. It also could not work: `_CFG` was read
+once at startup, so the account existed on disk and nowhere in memory, and the
+login would have failed with "No account labelled ...".
+
+The endpoint is gated on the dashboard login being configured, not on the bind
+address — behind nginx every connection appears to come from `127.0.0.1`, so a
+loopback check would have passed on a public box.
+
+**No password is ever sent to this server.** It is typed into the real x.com
+form inside the sign-in window. `config.toml` still names an env var for one,
+used only by the command-line `login` path.
 
 ### R15 — Local reads are free; going to X is not
 
-The dashboard defaults to querying the local database. Fetching from X is an
-explicit, confirmed, budgeted action that never fires on a keystroke.
+The dashboard defaults to querying the local database. Getting new tweets from
+X is an explicit, confirmed, budgeted action that never fires on a keystroke.
+Auto-update re-reads the local database only.
+
+### R16 — Collected tweets are never deleted
+
+There is no delete button, no delete endpoint, and no delete command. Streams
+can be disabled; their tweets stay.
+
+*Why:* X's Latest index only reaches back ~7 days, so anything deleted more than
+a week after collection is unrecoverable. Storage is cheap and the data is not.
+
+The one-time cleanup in §9 was done by hand, against a backup, with the exact
+rows named. That is the only way this should ever happen: deliberately, once,
+with a copy kept.
+
+### R17 — HTTPS is not a manual step, and re-deploying can never turn it off
+
+`deploy/setup.sh` obtains the certificate itself, and nothing it does on a
+later run can remove one.
+
+*Why, part one:* it used to end by printing "next, run certbot", and the result
+was a dashboard sitting on plain HTTP with a password field on it, which every
+browser labels **Not secure** — while the setup script reported success. A
+manual step after a script that says "done" is a step that does not happen.
+
+*Why, part two:* the first fix introduced a worse bug. `certbot --nginx` edits
+the vhost **in place** to add the TLS block, and setup.sh copied its own
+template over that file on every run — deleting HTTPS. The check that should
+have caught it asked the wrong question ("does a certificate exist?" — yes, in
+`/etc/letsencrypt`, untouched) instead of the right one ("is nginx serving this
+name on 443?" — no). So each re-run silently reverted the site to plain HTTP
+and reported success.
+
+The structure that prevents it: the vhost is **written once and then owned by
+certbot**, and everything that legitimately changes between deploys — proxy
+target, port, headers — lives in an `include`d snippet with no `server` or
+`listen` line in it, rewritten freely. See §9, "the neighbour's certificate".
+
+### R18 — On a shared machine, claim only names scoped to this app
+
+Every resource this deployment creates is named for the app or for its own
+domain: `sites-available/<domain>`, `snippets/xscraper-app.conf`,
+`xscraper-web`, `/opt/xscraper`, and a port confirmed free before use. It never
+takes a port, never edits another vhost, never removes `sites-enabled/default`.
+
+*Why:* a generic name is a collision waiting to happen. The vhost was once just
+`sites-available/scraper`, which says nothing about which host it serves and
+invites a second app to overwrite it.
+
+The failure this guards against is quiet in the worst way: nothing errors, the
+site keeps answering on port 80, and only HTTPS breaks — because nginx, finding
+no server block for the requested name, falls through to another app's block
+and serves **that app's certificate**. See §9, "the neighbour's certificate".
+
+### R19 — The dashboard speaks plain language
+
+No jargon in anything a user sees: no "rate-limit budget", no "watermark", no
+"stream", no error codes without an explanation, no shell commands as remedies.
+Say "requests left this 15 minutes", "what we are watching", "press Sign in
+to X".
+
+*Why:* the person operating this is not the person who wrote it. A message they
+cannot act on is the same as no message. The code and comments stay precise —
+this rule is about the screen.
 
 ---
 
-## 3. Problems and solutions
+## 3. Architecture
 
-Everything that has actually gone wrong, with the fix. This is the highest-value
-section — each entry cost real debugging time.
+### Shape
 
-### Auth
+```
+                    config.toml + .env
+                            │
+                            ▼
+                      ┌──────────┐
+                      │  config  │  what you declared
+                      └────┬─────┘
+                           │
+        ┌──────────┬───────┼────────┬──────────┐
+        ▼          ▼       ▼        ▼          ▼
+   ┌────────┐ ┌────────┐ ┌─────┐ ┌───────┐ ┌───────┐
+   │  auth  │ │ engine │ │store│ │ guard │ │  web  │
+   │session │ │ X wire │ │ db  │ │ risk  │ │  UI   │
+   └───┬────┘ └───┬────┘ └──┬──┘ └───┬───┘ └───┬───┘
+       │          │         │        │         │
+       │          └────┬────┘        │         │
+       │               ▼             │         │
+       │        ┌─────────────┐      │         │
+       │        │  collector  │      │         │
+       │        │ when to poll│      │         │
+       │        └──────┬──────┘      │         │
+       └───────────────┼─────────────┴─────────┘
+                       ▼
+                   ┌───────┐
+                   │ main  │  the CLI
+                   └───────┘
+```
 
-| Problem | Root cause | Solution |
+Dependencies run one way, `config` (leaf) to `main` (root). No cycles.
+
+### The two seams that matter
+
+**`engine.py` is the only module that knows X's wire format.** That is what
+lets the tests swap in a replay engine and exercise the whole poll loop
+offline, with no network and no rate-limit budget spent. 140+ assertions run
+that way.
+
+**`auth.py` is the only module that imports Playwright.** Collection therefore
+never pulls in a browser. A collector process has no Chrome in it at all.
+
+### What each file owns
+
+| file | owns | key surface |
 |---|---|---|
-| `accounts.db` stayed empty; login never succeeded | HTTP password login is X's most captcha-gated path | Real browser (Playwright) for login only; harvest cookies for HTTP collection |
-| Expired cookies reported success, failed at search | twscrape sets `active=True` on non-empty cookie strings, no network call | Validate with a real request before activating (R2) |
-| Editing cookies in `.env` had no effect | `add_account` early-returns when the row exists (`accounts_pool.py:93-97`) | Use `pool.save()` — a full upsert |
-| One failed login excluded an account forever | `login_all` filters `WHERE error_msg IS NULL` | Clear `error_msg` on every successful re-auth |
-| Login detection hung on a logged-in browser | v1.1 REST endpoints **all return 404/code 34** — measured on `api.x.com`, `x.com/i/api`, `api.twitter.com` | Read identity from the DOM; validate via GraphQL Bookmarks |
-| Headless login saw "unknown" state | `no_viewport=True` gave a narrow window; X hides the left nav below ~1000px | Pin a 1440×900 viewport when headless |
+| `config.py` | what you declared | `load_config()`, `Config.account()`, `Config.stream()` |
+| `auth.py` | getting and keeping a session | `harvest_session()`, `InteractiveLogin`, `upsert_session()`, `health()` |
+| `engine.py` | talking to X | `Engine.search_pages()`, `parse_page()`, `check()` |
+| `collector.py` | when to poll, and when to stop | `poll_once()`, `next_interval()`, `Collector` |
+| `store.py` | what is kept, and its shape | snowflake helpers, `normalize_tweet()`, `Store`, export writers |
+| `guard.py` | what not to do | `assess()`, `classify_account()` |
+| `web.py` | the dashboard | `serve()`, the single-page `PAGE` |
+| `main.py` | the CLI | `login doctor guard serve search export watch` |
 
-### Collection
+### Data flow, one poll
 
-| Problem | Root cause | Solution |
+```
+collector.poll_once(engine, store, stream, stream_id)
+  │
+  ├─ store.watermark(stream_id)          → the highest tweet id already seen
+  ├─ stop_below = id_minus_ms(hw, 60s)   → overlap window (R4, and §9)
+  │
+  ├─ async with aclosing(engine.search_pages(...)) as gen:      ← R3
+  │    for each page:
+  │      engine.parse_page()  → results (from timeline entryIds)  ← R4
+  │                           + embedded (quotes, reply parents)
+  │      store.upsert_tweets(results, source='result')
+  │      store.upsert_tweets(embedded, source='embedded')
+  │      store.link_hits(stream_id, result ids)
+  │      stop when: any result id <= stop_below  → 'watermark'
+  │                 no cursor                    → 'exhausted'
+  │                 page count hit the cap       → 'page_budget'
+  │
+  ├─ store.set_watermark(max result id)          ← never an embedded id
+  └─ store.record_poll(...)  → the audit row: pages, results, new, dup,
+                                stop_reason, rate-limit headers, lag p50/p95
+```
+
+`stop_reason` is the whole point of the audit row. "Nothing new" and "the
+account pool was starved" look identical from the outside and demand opposite
+responses (R5).
+
+---
+
+## 4. Data model
+
+Two SQLite databases, deliberately separate.
+
+### `accounts.db` — twscrape owns this schema
+
+Cookies, user-agent, per-queue locks, request stats, `active`, `error_msg`. We
+never create it ourselves; we drive it through `pool.save()` (§9, "editing
+cookies had no effect").
+
+**It holds a live `auth_token`, which is full control of the X account.**
+Treat the file as the credential it is: `chmod 600`, never in git, never on a
+machine you do not control.
+
+### `results.db` — ours
+
+```sql
+tweets              -- one row per tweet ever seen
+  tweet_id            INTEGER PRIMARY KEY   -- snowflake: ORDER BY == chronological
+  created_ms          INTEGER NOT NULL      -- decoded from the id, ms precision
+  collected_at/_ms    -- frozen at FIRST sight, never updated
+  last_seen_at        -- updated on every re-observation
+  lag_ms              -- frozen at first sight: collected_ms - created_ms
+  url text lang author_* reply_count retweet_count like_count quote_count
+  view_count bookmark_count is_retweet is_reply is_quote
+  hashtags mentions urls media_urls   -- JSON arrays
+  in_reply_to conversation_id
+  source              TEXT   -- 'result' (a real hit) | 'embedded' (quote/parent)
+  raw_json            TEXT   -- complete Tweet.json()          ← R9
+  raw_entry_json      TEXT   -- the timeline wrapper; off by default, ~60% of size
+
+streams             -- one row per thing being watched
+  stream_id label query list_id tab watermarked first_poll_ms created_at
+
+tweet_hits          -- which stream matched which tweet, and when we first saw it
+  (stream_id, tweet_id) PRIMARY KEY, poll_id, first_seen_ms   -- WITHOUT ROWID
+
+watermarks          -- per stream: how far we have got, and the adaptive interval
+  stream_id high_tweet_id high_created_ms
+  interval_s ewma_rate consecutive_empty next_poll_ms
+
+polls               -- the audit trail: one row per poll, why it stopped
+  poll_id stream_id kind started_ms finished_ms account
+  pages results new_tweets dup_tweets orphans max_id min_id
+  stop_reason rl_limit rl_remaining rl_reset lag_p50_ms lag_p95_ms error
+
+gaps                -- detected discontinuities. Recorded, never yet backfilled.
+  gap_id stream_id lo_tweet_id hi_tweet_id lo_ms hi_ms resume_cursor status
+```
+
+Three decisions worth defending:
+
+**`tweet_id` is an INTEGER primary key.** Snowflake ids encode their creation
+time in the high bits, so `ORDER BY tweet_id` is chronological for free — no
+date parsing, no index on a text column, and millisecond precision where
+`created_at` gives seconds.
+
+**`tweets` and `tweet_hits` are separate.** A tweet can match several streams;
+storing it once and linking N times keeps one row of truth and makes
+"everything" a query over `tweets` rather than a union.
+
+**`collected_at` and `lag_ms` are frozen at first sight.** Re-observing a tweet
+updates its engagement counts and `last_seen_at`, never its freshness. A lag
+that drifted on re-observation would make the one metric this project exists
+for meaningless.
+
+**JS loses integer precision above 2^53 and tweet ids are well past it**, so
+every id crossing into JSON is a string. Comparisons in the browser use
+`BigInt`.
+
+---
+
+## 5. The dashboard
+
+`python3 main.py serve` → one stdlib `http.server`, one self-contained HTML
+page. No npm, no build step, nothing fetched from a CDN.
+
+Three actions, costing wildly different amounts, and the UI's job is to make
+that obvious:
+
+| action | cost | when |
 |---|---|---|
-| Tweets silently missing | twscrape's parser drops any tweet whose ID is in `retweeted_ids` — a tweet that is both a hit and retweeted on the same page vanishes | Parse with `to_old_rep` + `Tweet.parse`, bypassing `_parse_items` |
-| Watermark logic would stop on page 1 | `api.search()` yields dict-insertion order with embedded old quotes mixed in | Key off timeline `entryId`s, which are true timeline order (R4) |
-| Tweets indexed late were lost forever | Stopping exactly at the watermark leaves a blind spot | Stop 60s *below* the watermark (overlap window) |
-| Accounts vanished for 15 minutes | Generator not closed on early break | `aclosing` everywhere (R3) |
+| Search saved tweets | free, local | nearly always |
+| Auto-update | free, local | on by default, every 15s |
+| Get new tweets from X | 1 request per 20 tweets | explicit, confirmed, guarded (R15) |
+| Sign in to X | a browser, briefly | when an account is added or drops out |
 
-### Runtime
+### The sign-in window
 
-| Problem | Root cause | Solution |
+X gates login behind captcha and device verification that no scripted HTTP
+replay clears, so a human has to see the page and click. On a server there is
+no screen to show them.
+
+So the browser runs headless **on the server**, its screen is streamed out as
+JPEG frames roughly once a second, and clicks, keystrokes, scrolls and pastes
+are forwarded back:
+
+```
+browser                          server
+  │  POST /api/login/start  ───▶  launch Chrome on profiles/<label>/, goto x.com
+  │  ◀───  {state, width, height}
+  │  GET  /api/login/frame  ───▶  page.screenshot(jpeg)     (repeats ~1/s)
+  │  POST /api/login/act    ───▶  mouse.click / keyboard.type / wheel
+  │  ◀───  {state}                 …and detect_state() every time
+  │
+  │                    state == logged_in
+  │  ◀───  {captured, username}   harvest cookies + real UA
+  │                               validate with ONE real request  ← R2
+  │                               write accounts.db, close Chrome  ← disposed
+```
+
+Click coordinates are scaled from the displayed image size back to the real
+viewport, so `LOGIN_VIEWPORT` is fixed at 1100×780 — a viewport that changed
+size would land clicks in the wrong place.
+
+**The browser is disposable; the session is the asset.** It is closed the moment
+the session is captured, on cancel, on close, and after
+`LOGIN_IDLE_TIMEOUT_S` (5 min) if someone walks away. Closing the *context*
+rather than killing the process is what makes Chrome flush the profile to disk,
+and the profile is what keeps the device trusted.
+
+One session at a time, under a lock: two Chromes on one profile directory
+corrupt it.
+
+### Session and login
+
+The dashboard's own login is a signed cookie — HMAC over an expiry stamp with a
+secret generated at startup. No session table, nothing to leak, and a restart
+signs everyone out. `Secure` is set only behind a TLS-terminating proxy;
+setting it on a plain-HTTP localhost run would make the browser drop the cookie
+and produce an unexplainable login loop.
+
+**The server refuses to bind anywhere but loopback unless `DASH_USER` and
+`DASH_PASSWORD` are both set** to something that is not a placeholder and is at
+least 12 characters. Refusing to start is the only reliable prevention; a
+warning would scroll past.
+
+---
+
+## 6. Setting it up
+
+### On your own machine
+
+```bash
+python3 -m pip install -r requirements.txt
+python3 -m playwright install chromium
+
+cp config.toml.example config.toml     # required — there is no fallback (R6)
+cp .env.example .env                   # set DASH_USER / DASH_PASSWORD
+
+python3 main.py serve                  # open http://127.0.0.1:8765
+```
+
+Then add an account in the dashboard and press **Save and sign in**.
+
+### On a server
+
+Target here is `scraper.vedictech.in` on `200.97.175.12`.
+
+```
+internet ──HTTPS──▶ nginx :443 ──HTTP──▶ 127.0.0.1:8765
+                    (TLS, certbot)        (or the next free port)
+                                          login required
+```
+
+nginx holds the certificate and is the only thing exposed. The Python server
+binds to loopback, so even a misconfigured firewall cannot expose it directly.
+
+**1. Point DNS.** An A record for `scraper` → the server's IP. Verify with
+`dig +short scraper.vedictech.in` before continuing — `setup.sh` skips HTTPS if
+the name does not resolve to that machine, because a failed certbot attempt
+counts against Let's Encrypt's rate limit.
+
+**2. Run the script.**
+
+```bash
+ssh root@200.97.175.12
+apt update && apt install -y git
+git clone https://github.com/ganbjhs/XScrapper.git /opt/xscraper/app
+bash /opt/xscraper/app/deploy/setup.sh
+```
+
+It is idempotent — re-run it after any `git pull`, or after a partial failure.
+It installs packages, creates the `xscraper` system user, builds the venv,
+downloads headless Chromium, generates a dashboard password if the placeholder
+is still there, picks a free port, renders and installs both systemd units and
+the nginx config, **obtains the TLS certificate** (R17), allows 80/443 through
+ufw if ufw is already active, and finally checks that the domain serves *its
+own* certificate.
+
+Useful overrides:
+
+```bash
+DOMAIN=other.example.com    bash deploy/setup.sh   # a different hostname
+CERT_EMAIL=you@example.com  bash deploy/setup.sh   # where expiry warnings go
+XS_PORT=8790                bash deploy/setup.sh   # pin the loopback port
+SKIP_BROWSER=1              bash deploy/setup.sh   # skip the ~400 MB Chromium
+```
+
+### Sharing a server with other sites
+
+This box already runs `namo.vedictech.in`, and the two must not interfere.
+Everything is namespaced so they cannot (R18):
+
+| resource | this app takes | never touches |
 |---|---|---|
-| `RuntimeError: Lock is bound to a different event loop` | twscrape holds a module-level `asyncio.Lock` (`db.py:12`); the dashboard called `asyncio.run()` per request | One persistent loop on a background thread; handlers submit via `run_coroutine_threadsafe` |
-| Dashboard froze permanently | Same cause. Concurrent calls across dead loops **deadlock** rather than erroring — reproduction had to be killed at 2 minutes | Same fix. Regression test asserts 6 concurrent threads all complete |
-| "Failed to fetch" with no explanation | Server not running | Error text now names the cause and the command that fixes it |
-| Guard reported "No accounts" for a healthy account | Swallowed exception (R6) | Read `accounts.db` directly with sqlite3 — no event loop, no nesting |
-| Rate-limit rule silently disabled | `rl_reset` column missing on older databases; error swallowed (R6) | Column-aware query + explicit migration + surface read failures |
+| nginx vhost | `sites-available/<domain>` | any file it did not create |
+| nginx include | `snippets/xscraper-app.conf` | — |
+| systemd | `xscraper-web`, `xscraper-watch` | any other unit |
+| user / files | `xscraper`, `/opt/xscraper` | — |
+| certificate | one for its own domain | — |
+| port | first free from 8765 up | any port in use |
 
-### Known and unfixed
+Port selection is stable and non-invasive: `XS_PORT` if you set it, otherwise
+whatever this deployment already uses, otherwise the first free port. If
+something else holds 8765 it takes 8766 and writes that into both the systemd
+unit and the nginx snippet, so the two can never disagree.
 
-| Limitation | Status |
+Before enabling its site it asks `nginx -T` whether another block already
+claims the hostname, and after reloading it fails loudly if nginx reports a
+conflicting server name — disabling **our** site rather than fighting for the
+name.
+
+`sites-enabled/default` is left alone. Removing it on a shared server is how
+you take down someone else's site by accident.
+
+**3. Add an account in the dashboard.** Not on the server's command line —
+there is no screen there. The sign-in window is exactly for this.
+
+**4. Start collecting.**
+
+```bash
+systemctl start xscraper-watch
+journalctl -u xscraper-watch -f
+```
+
+### Two risks the deployment does not remove
+
+1. **`accounts.db` holds a live `auth_token`.** Anyone with root on that box
+   owns the X account — posting, DMs, settings. Use a throwaway you can afford
+   to lose, never a personal account.
+2. **A datacenter IP is a ban signal.** X treats VPS ranges with more suspicion
+   than residential ones. Expect a shorter account life than on a laptop.
+
+Neither blocks deployment. Both are worth knowing before filing the account
+under "working".
+
+### Updating
+
+```bash
+cd /opt/xscraper/app && bash deploy/setup.sh    # pulls, reinstalls, restarts
+```
+
+### Backups
+
+`results.db` is the only thing that is not reproducible, and `profiles/` is the
+only thing that keeps X treating this machine as a known device.
+
+```bash
+sudo -u xscraper sqlite3 /opt/xscraper/app/results.db ".backup /tmp/results-$(date +%F).db"
+cp -r profiles profiles.backup          # with the browser closed
+```
+
+Use `.backup`, never `cp`, for the databases: both run in WAL mode and a plain
+copy can land mid-transaction.
+
+---
+
+### When the site is wrong but the app is fine
+
+Work outside in. Most "the site is broken" reports are nginx, not Python.
+
+```bash
+# 1. Is the app itself up?
+curl -sI http://127.0.0.1:$(sed -n 's/.*--port \([0-9]*\).*/\1/p' \
+     /etc/systemd/system/xscraper-web.service)/ | head -1
+
+# 2. Does the hostname serve ITS OWN certificate?  <- the one people skip
+echo | openssl s_client -servername scraper.vedictech.in \
+       -connect scraper.vedictech.in:443 2>/dev/null \
+     | openssl x509 -noout -subject
+
+# 3. Who else claims this name?
+nginx -T | grep -n 'scraper.vedictech.in'
+```
+
+| symptom | almost always |
 |---|---|
-| No global rate governor | **Biggest gap.** Each stream self-paces; nothing enforces a total ceiling across streams. |
-| Gaps detected but not backfilled | Recorded in `gaps`, reported by `doctor`. Nothing fills them. |
-| Proxies untested | Config supports `proxy` per account; never exercised. |
-| TLS fingerprint mismatch | httpx sends Python TLS with a Chrome UA. `curl_cffi` fixes it but strips our real UA — a real trade, not a free win. |
-| `xclid` UA inconsistency | twscrape fetches `x.com/tesla` with a random UA. Cached per process, so long-lived processes minimise it. |
-| Latest index ~7-day horizon | X-side. Unfixable. |
-| High-volume queries sampled | X-side. Narrower queries are more complete. |
+| HTTP works, HTTPS shows a certificate for **another site** | our vhost has no 443 block; nginx fell through to a neighbour. `certbot --nginx -d DOMAIN --redirect --reinstall` |
+| Browser says "Not secure", no certificate error | no certificate at all yet — DNS was wrong when setup.sh ran. Fix DNS, re-run it |
+| 502 Bad Gateway | nginx and systemd disagree about the port. Re-run setup.sh; it writes both from one value |
+| 404 / someone else's app | two server blocks claim the name. `nginx -T \| grep` for it |
+| Requests hang, sign-in window never paints | `proxy_buffering off` missing from the snippet |
 
----
+Re-running `bash deploy/setup.sh` is the fix for most of these and is always
+safe. It cannot remove a certificate (R17) or touch another site (R18).
 
-## 4. If you rebuilt it
-
-What would stay, what would change.
-
-### Keep
-
-- **The six-module split.** Each has one reason to exist and dependencies run
-  one way (`config` leaf → `main` root). No cycles.
-- **The `engine` seam.** Only `engine.py` knows X's wire format — which is what
-  lets the tests swap in a replay engine and exercise the whole poll loop
-  offline, with no network and no rate-limit budget.
-- **The `auth` seam.** Only `auth.py` imports Playwright, so collection never
-  pulls in a browser.
-- **Snowflake IDs as the ordering key.** `ORDER BY tweet_id` is chronological
-  for free; millisecond precision where `created_at` gives seconds.
-- **Raw payload retention** (R9).
-- **Offline-first tests.** 140+ assertions, no network. This is why the
-  freshness logic is verifiable rather than hopefully-correct.
-
-### Change
-
-1. **Build the rate governor first, not last.** A global token bucket sized from
-   measured `rl_limit`, shared across streams and accounts. Currently each
-   stream self-paces and nothing enforces the total. This is the one structural
-   gap that actually raises ban risk.
-
-2. **Make the guard a hard gate from day one.** It was added last; it should
-   have been the second thing built, right after auth. Every action that spends
-   budget or touches an account should have gone through it from the start.
-
-3. **Do not depend on any REST endpoint.** All four v1.1 endpoints died. Assume
-   GraphQL only, and assume every `/i/api` request needs
-   `x-client-transaction-id` — a 404 means a signing problem, not a missing
-   endpoint.
-
-4. **Consider owning the GraphQL client.** twscrape's value is almost entirely
-   `xclid.py` (the transaction-id generator) and doc_id maintenance. Everything
-   else — the pool, the parser — this project already works around. A thin
-   client plus a vendored signer would remove the private-API coupling that
-   `compat.check()` exists to police.
-
-5. **Reach for lists before more accounts.** An extra account multiplies the
-   search budget by 1. Moving a query to an X List multiplies it by 10, on the
-   same account, with no extra ban surface. This was found by measuring rather
-   than assumed, and it inverts the obvious scaling instinct.
-
-6. **Store engagement history, not just latest.** Counts are overwritten on
-   re-observation. A `tweet_metrics(tweet_id, observed_ms, likes, …)` table
-   would make virality analysis possible for one extra row per sighting.
-
-7. **Separate the fetch worker from the HTTP handler.** A long fetch currently
-   blocks the dashboard because it holds `_FETCH_LOCK` for its duration. A job
-   queue with progress streaming would fix the UI freeze.
-
-### Do not
-
-- **Do not scrape the DOM for tweets.** Counts come back truncated (`1.2K`),
-  selectors break constantly, and it is slower than every alternative. The
-  browser is for login only.
-- **Do not run the browser during collection.** It is the single biggest
-  resource cost and buys nothing once you hold the cookies.
-- **Do not add per-keystroke live search.** It would drain the budget the
-  watcher needs (R12).
-- **Do not unpin twscrape** without running `doctor --selftest`.
-- **Do not set `TWS_PROXY`.** It silently overrides every per-account proxy,
-  collapsing the pool onto one IP. Config rejects it.
-
----
-
-## 5. Operating rules
+## 7. Operating
 
 **Daily**
 
@@ -319,59 +678,279 @@ python3 main.py doctor     # accounts, streams, lag
 
 1. Throwaways only, never a personal account.
 2. Run 3–5. One account is a single point of failure and has the smallest budget.
-3. Warm new accounts up — log in, browse, follow a few things over a couple of
+3. Warm new accounts up — sign in, browse, follow a few things over a couple of
    days. A day-old account making 200 requests/hour is the obvious pattern.
 4. Give each its own proxy. Residential beats datacenter.
 5. **Back up `profiles/`** with Chrome closed. That directory *is* the
-   trusted-device asset; losing it means redoing headed logins and facing
-   new-device challenges everywhere.
+   trusted-device asset; losing it means facing new-device challenges everywhere.
 
 **When an account dies**
 
 twscrape auto-deactivates on `(32)` session expired, `(326)` access denied,
 `(88)` rate limit with budget remaining. The pool skips it and keeps going.
 
-```bash
-python3 main.py doctor --accounts             # which and why
-python3 main.py login --account X --force     # recover if it was just expiry
-```
-
-If genuinely suspended, that account is gone. Swap in another — **the design
-assumes accounts die.**
+Press **Sign in to X** in the dashboard. If X has genuinely suspended the
+account, it is gone — swap in another. **The design assumes accounts die.**
 
 **When X changes**
 
-- *Sudden 404 on every search* → doc_id rotated. `pip3 install -U twscrape`, or
-  set `X_SEARCH_DOC_ID` in `.env` from DevTools to unblock immediately.
+- *Sudden 404 on every search* → the GraphQL doc_id rotated.
+  `pip3 install -U twscrape`, or set `X_SEARCH_DOC_ID` in `.env` from DevTools
+  to unblock immediately.
 - *Fields going null* → schema drift. Fix the parser, then **replay** from the
   raw payloads (R9).
 - *`doctor --selftest` failing* → twscrape internals moved. Do not ignore it.
 
 ---
 
-## 6. Reference
+## 8. Choosing what to watch
 
-**Budget is per GraphQL operation, not per account.** Measured 2026-07-29:
+**Prefer a list.** Measured on this database: `ListLatestTweetsTimeline` is
+allowed **500 requests per 15 minutes**, `SearchTimeline` **50**. They are
+separate budgets, so adding a list raises total capacity instead of dividing
+it. A list is the lowest-lag source available.
+
+The trade-off: X does no server-side filtering on a list timeline — no
+`min_faves`, no `lang` — so narrowing happens locally, after the tweets are
+already paid for.
+
+**Be specific with keyword searches.** This is not a style note; it is the
+single biggest source of junk in this database. A stream defined as
+`(RBI OR "repo rate" OR "monetary policy")` — intended to catch India's central
+bank — collected almost entirely baseball, because RBI is also "runs batted
+in". A `world_news` stream on `(breaking OR urgent) news` collected wildfires,
+crypto spam and a TV-serial murder case.
+
+Every ad-hoc "Get new tweets" search in the dashboard also becomes a permanent
+stream row named `ui:<what you typed>`. That is how you end up with eighteen
+streams, fourteen of them junk. Watch deliberately; search ad-hoc sparingly.
+
+---
+
+## 9. Problems and solutions
+
+Everything that has actually gone wrong, with the fix. This is the
+highest-value section — each entry cost real debugging time.
+
+### Auth
+
+| Problem | Root cause | Solution |
+|---|---|---|
+| `accounts.db` stayed empty; login never succeeded | HTTP password login is X's most captcha-gated path | Real browser (Playwright) for login only; harvest cookies for HTTP collection |
+| Expired cookies reported success, failed at search | twscrape sets `active=True` on non-empty cookie strings, no network call | Validate with a real request before activating (R2) |
+| Editing cookies in `.env` had no effect | `add_account` early-returns when the row exists (`accounts_pool.py:93-97`) | Use `pool.save()` — a full upsert |
+| One failed login excluded an account forever | `login_all` filters `WHERE error_msg IS NULL` | Clear `error_msg` on every successful re-auth |
+| Login detection hung on a logged-in browser | v1.1 REST endpoints **all return 404/code 34** — measured on `api.x.com`, `x.com/i/api`, `api.twitter.com` | Read identity from the DOM; validate via GraphQL Bookmarks |
+| Headless login saw "unknown" state | `no_viewport=True` gave a narrow window; X hides the left nav below ~1000px | Pin a 1440×900 viewport when headless |
+| Adding an account in the dashboard ended in "now run this command" | `/api/account` deliberately did not log in, and `_CFG` was read once at startup so the new account was invisible in-process anyway | Reload the config on write and open the sign-in window immediately (R14) |
+| "Sign in to X" button did nothing | The button was rendered but no click handler was ever bound — and `status()` redraws the whole panel every 15s, so anything bound once would have been discarded anyway | Bind the handler in the same pass that draws the buttons |
+
+### Collection
+
+| Problem | Root cause | Solution |
+|---|---|---|
+| Tweets silently missing | twscrape's parser drops any tweet whose ID is in `retweeted_ids` — a tweet that is both a hit and retweeted on the same page vanishes | Parse with `to_old_rep` + `Tweet.parse`, bypassing `_parse_items` |
+| Watermark logic would stop on page 1 | `api.search()` yields dict-insertion order with embedded old quotes mixed in | Key off timeline `entryId`s, which are true timeline order (R4) |
+| Tweets indexed late were lost forever | Stopping exactly at the watermark leaves a blind spot | Stop 60s *below* the watermark (overlap window) |
+| Accounts vanished for 15 minutes | Generator not closed on early break | `aclosing` everywhere (R3) |
+| A database of 1,853 tweets, ~1,455 of them junk | Broad keyword streams (§8) plus every ad-hoc dashboard search becoming a permanent stream | One-time manual purge against a backup, keeping four political streams; config narrowed to a single curated list |
+
+### Runtime
+
+| Problem | Root cause | Solution |
+|---|---|---|
+| `RuntimeError: Lock is bound to a different event loop` | twscrape holds a module-level `asyncio.Lock` (`db.py:12`); the dashboard called `asyncio.run()` per request | One persistent loop on a background thread; handlers submit via `run_coroutine_threadsafe` |
+| Dashboard froze permanently | Same cause. Concurrent calls across dead loops **deadlock** rather than erroring — reproduction had to be killed at 2 minutes | Same fix. Regression test asserts 6 concurrent threads all complete |
+| Guard reported "No accounts" for a healthy account | Swallowed exception (R6) | Read `accounts.db` directly with sqlite3 — no event loop, no nesting |
+| Rate-limit rule silently disabled | `rl_reset` column missing on older databases; error swallowed (R6) | Column-aware query + explicit migration + surface read failures |
+| Auto-update never refreshed, but its indicator pulsed | The "Get new tweets" button and the auto-update checkbox both had `id="live"`. `$("#live")` returns the first match — the button — so `.checked` was `undefined` and `tick()` returned on its first line, every time | Renamed to `#getnew` and `#autorefresh`. A duplicate-id scan is worth running on any page this size |
+| `curl -I https://…` reported the site broken while it served fine | `BaseHTTPRequestHandler` answers 501 to any method with no `do_*` method, and HEAD had none — the exact check the deploy docs told you to run | `do_HEAD` delegates to `do_GET` and suppresses the body |
+| Browser fails to start under systemd | Chromium's sandbox needs to gain privileges, which `NoNewPrivileges=true` forbids; `/dev/shm` is also too small under `PrivateTmp` | Dropped `NoNewPrivileges` from the web unit, added `--disable-dev-shm-usage`, and `_launch` falls back to an unsandboxed browser — announced, never silent |
+
+### The neighbour's certificate
+
+The most instructive failure so far, because every individual piece looked
+healthy.
+
+This server also hosts `namo.vedictech.in`. One afternoon `scraper.vedictech.in`
+started showing a certificate error in the browser. What was actually true:
+
+| checked | result |
+|---|---|
+| DNS | correct, → the right server |
+| the Python app | running, healthy |
+| `http://scraper.vedictech.in/` | **200, serving our login page** |
+| `/etc/letsencrypt/live/scraper.vedictech.in/` | present, valid, not expired |
+| `https://scraper.vedictech.in/` | served the certificate for **`namo.vedictech.in`** |
+
+Chain of causes:
+
+1. `setup.sh` did `cp deploy/nginx-scraper.conf /etc/nginx/sites-available/scraper`
+   on **every** run.
+2. `certbot --nginx` had earlier edited that same file in place to add
+   `listen 443 ssl` and the certificate paths.
+3. So a routine re-deploy deleted the TLS block. Our vhost went back to
+   HTTP-only — which is why port 80 kept working perfectly.
+4. A browser asking for `scraper.vedictech.in` over HTTPS now matched **no**
+   server block. nginx falls back to the first SSL block it loaded, which was
+   the neighbouring app's, and served that app's certificate.
+5. The guard against this — "if the certificate already exists, skip" — asked
+   the wrong question. The certificate did exist. It was nginx that was not
+   using it. So every subsequent run reported success and changed nothing.
+
+Three fixes, because one would not have been enough:
+
+- **Split the config.** The vhost (`sites-available/<domain>`) is written once
+  and then belongs to certbot. Everything that changes between deploys lives in
+  `snippets/xscraper-app.conf`, which contains no `server` or `listen`
+  directive and is rewritten freely. Re-running can no longer reach the TLS
+  block. (R17)
+- **Ask the right question.** The condition is now "does the vhost actually
+  contain a 443/ssl_certificate line", not "does a certificate exist". Cert
+  present but nginx not using it → `certbot --reinstall`, which re-installs
+  into nginx without burning a rate-limit slot on a needless re-issue.
+- **Verify who answered.** setup.sh ends by opening a TLS connection with SNI
+  and comparing the served certificate's CN to the domain. A 200 over HTTP
+  proves nothing about HTTPS; this is the check that would have caught it on
+  day one.
+
+**The lesson generalises: when a tool edits your config file, that file is no
+longer yours to overwrite.** Own an include, not the whole thing.
+
+### The phantom account
+
+Worth its own entry, because it is R6 doing real damage.
+
+`load_config()` used to synthesize a one-account config from bare
+`X_USERNAME` / `X_PASSWORD` / `X_COOKIES` environment variables whenever
+`config.toml` was absent, labelling it `legacy`. Nothing ever failed. The result:
+
+- `config.toml` declared `acct_a` → `profiles/acct_a`, a directory that did not exist;
+- the account actually collecting was `@HanaMal93`, under `profiles/legacy`;
+- the dashboard showed both — one grey "never signed in", one green — and
+  neither line was wrong, which is what made it hard to see;
+- `auth.health()` could not join the real account back to any configured label.
+
+The fallback is gone. A missing `config.toml` is now an error that says to copy
+the template. **A config guessed from stray environment variables is how an
+account ends up collecting under a label nobody chose.**
+
+### Known and unfixed
+
+| Limitation | Status |
+|---|---|
+| No global rate governor | **Biggest gap.** Each stream self-paces; nothing enforces a total ceiling across streams. |
+| Gaps detected but not backfilled | Recorded in `gaps`, reported by `doctor`. Nothing fills them. |
+| Proxies untested | Config supports `proxy` per account; never exercised. |
+| TLS fingerprint mismatch | httpx sends Python TLS with a Chrome UA. `curl_cffi` fixes it but strips our real UA — a real trade, not a free win. |
+| `xclid` UA inconsistency | twscrape fetches `x.com/tesla` with a random UA. Cached per process, so long-lived processes minimise it. |
+| A long fetch blocks the dashboard | `_FETCH_LOCK` is held for the whole fetch. A job queue would fix it. |
+| Latest index ~7-day horizon | X-side. Unfixable. |
+| High-volume queries sampled | X-side. Narrower queries are more complete. |
+
+---
+
+## 10. If you rebuilt it
+
+### Keep
+
+- **The module split.** Each has one reason to exist and dependencies run one
+  way. No cycles.
+- **The `engine` seam.** Only `engine.py` knows X's wire format — which is what
+  lets the tests exercise the whole poll loop offline.
+- **The `auth` seam.** Only `auth.py` imports Playwright, so collection never
+  pulls in a browser.
+- **Snowflake IDs as the ordering key.**
+- **Raw payload retention** (R9).
+- **Offline-first tests.** 140+ assertions, no network. This is why the
+  freshness logic is verifiable rather than hopefully-correct.
+- **The sign-in window.** It is the difference between a system an operator can
+  run and one that needs its author.
+
+### Change
+
+1. **Build the rate governor first, not last.** A global token bucket sized from
+   measured `rl_limit`, shared across streams and accounts. This is the one
+   structural gap that actually raises ban risk.
+
+2. **Make the guard a hard gate from day one.** It was added last; it should
+   have been second, right after auth.
+
+3. **Do not depend on any REST endpoint.** All four v1.1 endpoints died. Assume
+   GraphQL only, and assume every `/i/api` request needs
+   `x-client-transaction-id` — a 404 means a signing problem, not a missing
+   endpoint.
+
+4. **Consider owning the GraphQL client.** twscrape's value is almost entirely
+   `xclid.py` (the transaction-id generator) and doc_id maintenance. Everything
+   else — the pool, the parser — this project already works around.
+
+5. **Reach for lists before more accounts.** An extra account multiplies the
+   search budget by 1. Moving a query to an X List multiplies it by 10, on the
+   same account, with no extra ban surface. This was found by measuring, and it
+   inverts the obvious scaling instinct.
+
+6. **Separate ad-hoc searches from watched streams in the schema.** Every
+   dashboard search becoming a permanent `ui:` stream is what turned this
+   database into eighteen streams of mostly junk (§8).
+
+7. **Store engagement history, not just latest.** A
+   `tweet_metrics(tweet_id, observed_ms, likes, …)` table would make virality
+   analysis possible for one extra row per sighting.
+
+8. **Separate the fetch worker from the HTTP handler.** A job queue with
+   progress streaming would fix the UI freeze.
+
+### Do not
+
+- **Do not scrape the DOM for tweets.** Counts come back truncated (`1.2K`),
+  selectors break constantly, and it is slower than every alternative. The
+  browser is for signing in only.
+- **Do not run the browser during collection.** It is the single biggest
+  resource cost and buys nothing once you hold the cookies.
+- **Do not add per-keystroke live search.** It would drain the budget the
+  watcher needs.
+- **Do not add a delete button** (R16).
+- **Do not unpin twscrape** without running `doctor --selftest`.
+- **Do not set `TWS_PROXY`.** It silently overrides every per-account proxy,
+  collapsing the pool onto one IP. Config rejects it.
+
+---
+
+## 11. Reference
+
+**Rate budget is per GraphQL operation, not per account.** Confirmed against
+this database:
 
 | queue | limit / 15 min | floor, 1 account |
 |---|---|---|
 | `SearchTimeline` | 50 | ~24 s |
 | `ListLatestTweetsTimeline` | 500 | ~2.5 s |
 
-Search and list streams never draw from the same pool, so adding lists raises
-total capacity instead of dividing it. Minus a 25% reserve, search sustains one
-poll every ~24s per account; lists sustain one every ~2.5s. **A list is the
-lowest-lag source available** — the trade-off is no server-side filtering, so
-narrowing happens locally after the tweets are already paid for.
+Minus the 25% reserve (R11), search sustains one poll every ~24s per account;
+lists sustain one every ~2.5s.
 
 **Costs:** local search 0 · steady-state poll 1 · cold poll ≤ `max_pages_per_poll`
-· dashboard fetch 1 per page (cap 25).
+· dashboard fetch 1 per page (cap 25, refused above — R8).
 
 **Exit codes:** 0 ok · 2 auth · 3 search · 4 config · 6 no account.
 
 **Guard levels:** `BLOCK` will damage something, refuse · `WARN` proceed only
 knowingly, needs `ack` over HTTP · `note` informational.
 
-**Files:** `config` what you declare · `auth` how you get a session · `engine`
+**Commands**
+
+```bash
+python3 main.py login   --account LABEL [--refresh-only] [--force] [--debug-detect]
+python3 main.py doctor  [--accounts] [--streams] [--selftest] [--lag] [--since 24h]
+python3 main.py guard   [--action fetch --cost 5] [--json]
+python3 main.py serve   [--host H] [--port P] [--behind-proxy]
+python3 main.py watch   [--stream LABEL | --all] [--once]
+python3 main.py search  --query '...' | --list URL  [--limit N]
+python3 main.py export  [--stream LABEL] [--since 6h] [--format csv|json|jsonl|raw]
+python3 tests/test_all.py
+```
+
+**Files:** `config` what you declared · `auth` how you get a session · `engine`
 how we talk to X · `collector` when to poll · `store` what we keep · `guard`
 what not to do · `web` how you look at it · `main` how you drive it.

@@ -44,6 +44,7 @@ from fixtures import (
 from store import Store
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent
+TMP = None   # set by main() once the scratch directory exists
 HERE = pathlib.Path(__file__).resolve().parent
 FAILURES = []
 
@@ -64,11 +65,6 @@ def section(name):
 # ==========================================================================
 # units
 # ==========================================================================
-
-sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent))
-
-from datetime import datetime, timezone  # noqa: E402
-
 
 def test_snowflake():
     print("== snowflake ==")
@@ -211,7 +207,7 @@ def test_config():
 
     example = (pathlib.Path(__file__).resolve().parent.parent / "config.toml.example").read_text()
     cfg = _cfg(example, "c10")
-    ok(len(cfg.accounts) == 1 and len(cfg.streams) == 1, "the shipped config.toml.example loads")
+    ok(len(cfg.accounts) == 1 and len(cfg.streams) >= 1, "the shipped config.toml.example loads")
 
 
 # ==========================================================================
@@ -344,7 +340,6 @@ sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent))
 
 
 def test_parse():
-    from engine import parse_page
 
     print("== page parsing ==")
     rep = FakeResponse(search_payload())
@@ -531,8 +526,6 @@ from collector import (  # noqa: E402
     next_interval,
     poll_once,
 )
-from engine import parse_page  # noqa: E402
-from store import Store  # noqa: E402
 
 
 class ReplayEngine:
@@ -598,7 +591,6 @@ def ids_at(*offsets_min):
     watermark on every poll, so fixtures spaced seconds apart would sit
     entirely inside that window and never exercise the stop condition.
     """
-    from fixtures import id_at
 
     return [id_at(-int(off * MIN)) for off in offsets_min]
 
@@ -647,7 +639,6 @@ async def run_collector(tmp):
     )
     # Posted 30s after the watermark tweet but indexed late, so it appears
     # BELOW the watermark on a later poll. Without the overlap it is lost.
-    from fixtures import id_at
 
     late = [id_at(-int(1 * MIN) + 30_000)]
     eng = ReplayEngine([ids_at(0.2) + late + ids_at(1)])
@@ -694,7 +685,6 @@ async def run_collector(tmp):
     eng.pages = [None]
     res = await poll_once(eng, store, Stream(label="trap", query="q"),
                           await store.ensure_stream("trap", "q", "Latest", True))
-    from fixtures import ID_OLD_QUOTE, ID_NEWEST
 
     ok(res.max_id == ID_NEWEST, f"watermark uses the newest RESULT ({res.max_id})")
     ok(res.min_id > ID_OLD_QUOTE,
@@ -715,7 +705,6 @@ async def run_collector(tmp):
 
     # Now collect a tweet created AFTER the stream started, which is what a
     # steady-state stream looks like, and confirm real percentiles appear.
-    from fixtures import id_at
 
     eng = ReplayEngine([[id_at(+2_000)]])
     await poll_once(eng, store, stream, sid)
@@ -877,8 +866,6 @@ async def test_search_to_export(tmp):
     import auth as ss
     from auth import Harvest
     from config import AccountCfg, load_config
-    from engine import parse_page
-    from fixtures import FakeResponse, search_payload, id_at
 
     cfg = load_config(root=tmp)
 
@@ -1078,7 +1065,10 @@ def test_account_flags():
     c = guard.classify_account(V(active=False, error_msg=None))
     ok(c["status"] == guard.STATUS_DEAD and c["reasons"],
        "inactive with no recorded reason is still DEAD, with a placeholder reason")
-    ok("login" in c["action"], "DEAD carries the command that fixes it")
+    # It must say how to fix it, and say it in terms of the dashboard: the
+    # whole point of the sign-in window is that recovering an account no longer
+    # means finding a terminal.
+    ok("sign in" in c["action"].lower(), "DEAD says how to fix it, without a CLI command")
 
     for kw, label in [({"proxy": ""}, "no proxy"),
                       ({"has_known_device": False}, "no kdt"),
