@@ -349,7 +349,21 @@ def find_config(root: Path, explicit: str | None = None) -> Path | None:
             raise ConfigError(f"Config file not found: {p}")
         return p
     p = root / CONFIG_FILENAME
-    return p if p.exists() else None
+    try:
+        return p if p.exists() else None
+    except PermissionError:
+        # Path.exists() raises rather than returning False when the DIRECTORY
+        # is unreadable. Running `sudo -u xscraper main.py doctor` from /root
+        # crashed with a raw traceback about '/root/config.toml' — technically
+        # accurate, useless as guidance. Say what actually went wrong.
+        raise ConfigError(
+            f"Cannot look for {CONFIG_FILENAME} in {root} — permission denied.\n"
+            f"  You are probably running as a different user than owns this "
+            f"directory.\n"
+            f"  Fix: cd to the app directory first, or pass --config explicitly:\n"
+            f"      cd /opt/xscraper/app && {CLI} doctor\n"
+            f"      {CLI} doctor --config /opt/xscraper/app/config.toml"
+        ) from None
 
 
 def load_config(explicit: str | None = None, root: Path | None = None) -> Config:
