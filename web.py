@@ -1091,15 +1091,38 @@ PAGE = r"""<!doctype html>
   #loginwrap{position:fixed;inset:0;background:rgba(0,0,0,.6);z-index:50;
              display:none;place-items:center}
   #loginwrap.on{display:grid}
+  /* A DEFINITE height, not max-height. A flex column sized by its content
+     gives its children an indefinite height, and `max-height:100%` on the
+     image inside then resolves to nothing at all — the image stayed 780px tall
+     in a 700px window and the fix silently did nothing. Pinning the height is
+     what makes the percentage below mean something.
+     The cap is the natural size (780px of page + 92px of chrome), so on a tall
+     screen the picture is 1:1 with no letterboxing, and on a short one the box
+     is the window and the picture scales down to fit it. */
   #loginbox{background:var(--bg);border:1px solid var(--line);border-radius:12px;
-            overflow:hidden;max-width:96vw;max-height:94vh;display:flex;flex-direction:column}
+            overflow:hidden;width:min(96vw,1100px);height:min(96vh,872px);
+            display:flex;flex-direction:column}
   #loginhead{display:flex;align-items:center;gap:12px;padding:10px 14px;
-             border-bottom:1px solid var(--line)}
+             border-bottom:1px solid var(--line);flex:0 0 auto}
   #loginhead b{font-size:14px}
   #loginmsg{color:var(--dim);font-size:13px;flex:1}
-  #loginstage{position:relative;overflow:auto;background:#000}
-  #loginimg{display:block;max-width:100%;cursor:crosshair}
-  #loginhint{padding:7px 14px;font-size:12px;color:var(--dim);
+  /* The remote page must ALWAYS fit. It is a fixed 1100x780 screenshot, and it
+     used to be dropped in at full size inside a scrolling box — so on a laptop
+     the bottom of X's login card, Continue button included, was simply below
+     the fold. You cannot press a button you cannot see, and it is not obvious
+     the window scrolls.
+     flex:1 + min-height:0 lets the stage take the leftover height and shrink;
+     max-height:100% on the image scales it down to match. Both max-* on a
+     replaced element preserve the aspect ratio, so the element's box stays
+     exactly the drawn image — which is what keeps click mapping honest. */
+  /* flex, NOT grid. A grid row sized `auto` grows to fit its item, so the
+     image's `max-height:100%` resolved against the image's own height — a
+     circular constraint that clamps to nothing. A flex item's percentage
+     cross-size resolves against the container's definite height instead. */
+  #loginstage{flex:1;min-height:0;display:flex;align-items:center;
+              justify-content:center;overflow:hidden;background:#000}
+  #loginimg{display:block;max-width:100%;max-height:100%;cursor:crosshair}
+  #loginhint{padding:7px 14px;font-size:12px;color:var(--dim);flex:0 0 auto;
              border-top:1px solid var(--line);background:var(--panel)}
   .livetog{display:flex;align-items:center;gap:6px;font-size:13px;color:var(--dim);
            border:1px solid var(--line);border-radius:8px;padding:4px 9px;cursor:pointer}
@@ -1225,9 +1248,10 @@ It does not contact X, so it is free.">
     </div>
     <div id="loginstage">
       <img id="loginimg" alt="The X sign-in page">
-      <div id="loginhint">This is a real browser. Click and type in it as you normally
-        would. Your password goes straight to x.com — this page never sees it.</div>
     </div>
+    <div id="loginhint">This is a real browser. Click and type in it as you normally
+      would. Your password goes straight to x.com — this page never sees it.
+      Scrolling works too.</div>
   </div>
 </div>
 
