@@ -378,14 +378,21 @@ async def _launch(pw, acct, headless: bool, log):
     profile_dir.mkdir(parents=True, exist_ok=True)
     clear_stale_locks(profile_dir, log)
 
+    args = [
+        "--disable-blink-features=AutomationControlled",
+        "--no-first-run",
+        "--no-default-browser-check",
+    ]
+    if headless:
+        # Chrome puts its shared-memory files in /dev/shm, which is 64 MB on a
+        # default container or a systemd unit with PrivateTmp. Loading x.com
+        # overruns that and the tab dies with no useful message.
+        args.append("--disable-dev-shm-usage")
+
     kwargs = dict(
         user_data_dir=str(profile_dir),
         headless=headless,
-        args=[
-            "--disable-blink-features=AutomationControlled",
-            "--no-first-run",
-            "--no-default-browser-check",
-        ],
+        args=args,
         ignore_default_args=["--enable-automation"],
         locale=acct.locale,
         timezone_id=acct.timezone,
@@ -404,18 +411,169 @@ async def _launch(pw, acct, headless: bool, log):
     if acct.proxy_or_none:
         kwargs["proxy"] = {"server": acct.proxy_or_none}
 
-    # Real Chrome ships the proprietary codecs and branding that fingerprinters
-    # look for. Fall back to the bundled Chromium if it is not installed.
-    try:
-        return await pw.chromium.launch_persistent_context(channel="chrome", **kwargs)
-    except Exception as e:
-        log(f"  Google Chrome unavailable ({type(e).__name__}); using bundled Chromium")
-        return await pw.chromium.launch_persistent_context(**kwargs)
+    # Tried in order, most faithful first:
+    #
+    #   1. real Chrome — ships the proprietary codecs and branding that
+    #      fingerprinters look for;
+    #   2. Playwright's bundled Chromium — what a server actually has;
+    #   3. the same, sandbox off.
+    #
+    # (3) exists because Chromium's sandbox needs unprivileged user namespaces,
+    # and a hardened systemd unit (NoNewPrivileges) or Ubuntu's AppArmor policy
+    # denies them. The failure is a launch error with no hint of the cause, and
+    # the whole browser is there to visit one site, so falling back beats
+    # reporting "could not open a browser" and stopping. It is announced, never
+    # silent, and only ever reached after the sandboxed attempt has failed.
+    attempts = (
+        ("Google Chrome", dict(kwargs, channel="chrome")),
+        ("bundled Chromium", kwargs),
+        ("bundled Chromium without its sandbox", dict(kwargs, args=[*args, "--no-sandbox"])),
+    )
+    last = None
+    for i, (what, kw) in enumerate(attempts):
+        try:
+            ctx = await pw.chromium.launch_persistent_context(**kw)
+            if i:
+                log(f"  using {what}")
+            return ctx
+        except Exception as e:
+            last = e
+            log(f"  {what} did not start ({type(e).__name__})")
+    raise LoginError(
+        f"No browser could be started. Last error: {type(last).__name__}: {last}\n"
+        f"  On a server, run: deploy/setup.sh   (it installs headless Chromium)"
+    )
 
 
 # --------------------------------------------------------------------------
 # entry point
 # --------------------------------------------------------------------------
+
+# --------------------------------------------------------------------------
+# interactive login, driven from the dashboard
+# --------------------------------------------------------------------------
+
+# The screen the operator sees. Fixed, because click coordinates are scaled
+# against it — a viewport that changed size would land clicks in the wrong place.
+LOGIN_VIEWPORT = {"width": 1100, "height": 780}
+
+# Abandoned sessions hold a Chrome process and the account's profile directory
+# open. Two Chromes on one profile corrupts it, so an idle one must not linger.
+LOGIN_IDLE_TIMEOUT_S = 300
+
+
+class InteractiveLogin:
+    """
+    A real browser, running on the server, that the operator drives remotely.
+
+    Why this exists: X gates login behind captcha and device verification that
+    no scripted HTTP replay clears, so a human has to see the page and click.
+    On a server there is no screen to show them. So the browser runs headless
+    here, its screen is streamed out as PNG frames, and clicks and keystrokes
+    are forwarded back. It is a browser, just with the glass somewhere else.
+
+    The session is captured the moment X reports the account as logged in;
+    nothing is scraped from the rendered page, and the password is typed by the
+    operator into the real x.com form, never handled by this code.
+    """
+
+    def __init__(self, acct):
+        self.acct = acct
+        self.pw = self.ctx = self.page = None
+        self.started = time.time()
+        self.touched = time.time()
+        self.state = UNKNOWN
+        self.screen_name = ""
+        self.error = ""
+
+    async def start(self, log=lambda m: None):
+        from playwright.async_api import async_playwright
+
+        self.pw = await async_playwright().start()
+        # Headless: nobody is at the server's console. The viewport is pinned so
+        # the operator's clicks map onto the same pixels we render.
+        self.ctx = await _launch(self.pw, self.acct, True, log)
+        self.page = self.ctx.pages[0] if self.ctx.pages else await self.ctx.new_page()
+        await self.page.set_viewport_size(LOGIN_VIEWPORT)
+        try:
+            await self.page.goto(HOME_URL, wait_until="domcontentloaded", timeout=45000)
+            await _wait_for_app(self.page)
+        except Exception as e:
+            self.error = f"{type(e).__name__}: {e}"
+        await self.refresh_state()
+        # Already signed in on this profile? Then there is nothing to drive.
+        if self.state != LOGGED_IN:
+            try:
+                await self.page.goto("https://x.com/i/flow/login",
+                                     wait_until="domcontentloaded", timeout=45000)
+                await _wait_for_app(self.page)
+            except Exception:
+                pass
+        return self
+
+    def _alive(self):
+        if self.page is None:
+            raise RuntimeError("login session is closed")
+        self.touched = time.time()
+
+    @property
+    def idle_s(self):
+        return time.time() - self.touched
+
+    async def refresh_state(self):
+        try:
+            self.state, name = await detect_state(self.page, self.ctx)
+            if name:
+                self.screen_name = name
+        except Exception as e:
+            self.state, self.error = UNKNOWN, f"{type(e).__name__}: {e}"
+        return self.state
+
+    async def frame(self) -> bytes:
+        self._alive()
+        return await self.page.screenshot(type="jpeg", quality=68)
+
+    async def click(self, x: int, y: int):
+        self._alive()
+        await self.page.mouse.click(x, y)
+
+    async def type_text(self, text: str):
+        self._alive()
+        # delay: X's login form is a React app that ignores instantaneous
+        # programmatic input on some fields.
+        await self.page.keyboard.type(text, delay=25)
+
+    async def press(self, key: str):
+        self._alive()
+        await self.page.keyboard.press(key)
+
+    async def scroll(self, dy: int):
+        self._alive()
+        await self.page.mouse.wheel(0, dy)
+
+    async def harvest(self) -> "Harvest":
+        """Capture the session. Only valid once state is LOGGED_IN."""
+        self._alive()
+        cookies = await _cookies_dict(self.ctx)
+        ua = await self.page.evaluate("() => navigator.userAgent")
+        return Harvest(screen_name=self.screen_name, user_agent=ua, cookies=cookies)
+
+    async def close(self):
+        # Closing the CONTEXT is what makes Chrome flush the profile to disk.
+        # Killing the process instead loses the trusted-device state that makes
+        # the next login silent.
+        for closer in (
+            lambda: self.ctx.close() if self.ctx else None,
+            lambda: self.pw.stop() if self.pw else None,
+        ):
+            try:
+                r = closer()
+                if r is not None:
+                    await r
+            except Exception:
+                pass
+        self.pw = self.ctx = self.page = None
+
 
 async def harvest_session(
     acct,
@@ -820,19 +978,6 @@ async def upsert_session(api: API, harvest, acct_cfg, *, clear_locks: bool = Tru
         await pool.mark_inactive(username, detail[:400])
         result = ValidationResult(False, "", result.status, result.probe, detail)
     return username, result
-
-
-async def clear_error(api: API, username: str) -> None:
-    """Put an account marked bad by twscrape's ban heuristic back into rotation."""
-    acc = await api.pool.get_account(username)
-    if acc is None:
-        return
-    acc.error_msg = None
-    await api.pool.save(acc)
-
-
-async def deactivate(api: API, username: str, reason: str) -> None:
-    await api.pool.mark_inactive(username, reason[:400])
 
 
 # --------------------------------------------------------------------------
