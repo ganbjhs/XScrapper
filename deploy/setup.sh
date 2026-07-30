@@ -55,6 +55,10 @@ else
 fi
 
 say "code"
+# The repo is owned by $APP_USER but this script runs as root, which git treats
+# as "dubious ownership" and refuses outright. Declaring it safe is correct
+# here: root already has full access, so the check protects nothing.
+git config --global --add safe.directory "$APP_DIR" 2>/dev/null || true
 if [ -d "$APP_DIR/.git" ]; then
   git -C "$APP_DIR" pull --ff-only
   ok "updated $(git -C "$APP_DIR" log --oneline -1)"
@@ -90,6 +94,14 @@ fi
 chmod 600 .env
 chown -R "$APP_USER:$APP_USER" /opt/xscraper
 ok "permissions set (.env is 600)"
+
+say "ownership"
+# git pull ran as root, so anything new is root-owned. The service runs as
+# $APP_USER and would fail to read it — silently, on the next restart.
+chown -R "$APP_USER:$APP_USER" /opt/xscraper
+chmod 600 "$APP_DIR/.env"
+[ -f "$APP_DIR/accounts.db" ] && chmod 600 "$APP_DIR"/*.db 2>/dev/null || true
+ok "re-owned to $APP_USER after pull"
 
 say "systemd"
 cp deploy/xscraper-web.service deploy/xscraper-watch.service /etc/systemd/system/
