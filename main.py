@@ -260,7 +260,7 @@ async def cmd_doctor(args) -> int:
         _log("")
 
     if args.lag:
-        st = store_mod.Store(cfg.db_results)
+        st = store_mod.Store(cfg.db_results, cfg.defaults.keep_entry_json)
         await st.open()
         try:
             _log(f"== lag ({args.since}) ==")
@@ -571,7 +571,7 @@ async def cmd_search(args) -> int:
 
     stored = None
     if args.store:
-        st = store_mod.Store(cfg.db_results)
+        st = store_mod.Store(cfg.db_results, cfg.defaults.keep_entry_json)
         await st.open()
         try:
             sid = await st.ensure_stream(
@@ -613,7 +613,7 @@ async def cmd_export(args) -> int:
         print(f"  Collect something first: {CLI} watch --once")
         return EXIT_CONFIG
 
-    st = store_mod.Store(cfg.db_results)
+    st = store_mod.Store(cfg.db_results, cfg.defaults.keep_entry_json)
     await st.open()
     try:
         since = store_mod.parse_window(args.since)
@@ -693,7 +693,7 @@ async def cmd_watch(args) -> int:
     active = await auth.active_usernames(api)
     concurrency = args.max_concurrency or max(1, len(active))
 
-    st = store_mod.Store(cfg.db_results)
+    st = store_mod.Store(cfg.db_results, cfg.defaults.keep_entry_json)
     await st.open()
     lock = cfg.root / auth.WATCHER_LOCKFILE
     lock.write_text(json.dumps({"pid": os.getpid(), "started": time.time()}))
@@ -752,7 +752,7 @@ async def cmd_watch(args) -> int:
         lock.unlink(missing_ok=True)
         total = "?"
         try:
-            st2 = store_mod.Store(cfg.db_results)
+            st2 = store_mod.Store(cfg.db_results, cfg.defaults.keep_entry_json)
             await st2.open()
             total = await st2.count_tweets()
             await st2.close()

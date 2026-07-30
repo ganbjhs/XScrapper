@@ -49,6 +49,13 @@ class Defaults:
     max_interval_s: float = 900.0
     overlap_ms: int = 60_000
 
+    # The timeline-entry wrapper around each tweet. Measured on a real store it
+    # is 60% of the database and nothing in this project reads it — raw_json
+    # already satisfies "keep the payload so a parser fix can be replayed"
+    # (RULEBOOK R9). Off by default; turn it on only if you need X's own
+    # sortIndex for ordering forensics.
+    keep_entry_json: bool = False
+
 
 @dataclass
 class AccountCfg:

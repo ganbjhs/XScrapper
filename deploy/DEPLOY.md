@@ -186,3 +186,82 @@ this itself.
 ```bash
 sudo -u xscraper sqlite3 /opt/xscraper/app/results.db ".backup /tmp/results-$(date +%F).db"
 ```
+
+---
+
+## Reusing an existing Playwright install
+
+The server does **not** need Playwright for normal collection — login happens
+on your Mac. Install it only if you want `login --refresh-only` to run on the
+server (silent session refresh, no file copying).
+
+Check what is already there:
+
+```bash
+python3 -c "import playwright, sys; print('package:', playwright.__file__)" 2>/dev/null || echo "package: NOT installed"
+ls -d ~/.cache/ms-playwright/chromium-* 2>/dev/null || echo "browsers: none for this user"
+ls -d /usr/lib/playwright /opt/playwright /ms-playwright 2>/dev/null
+find / -maxdepth 4 -type d -name "ms-playwright" 2>/dev/null | head
+```
+
+Two separate things, and they are reused differently:
+
+| | reuse how |
+|---|---|
+| the `playwright` **pip package** | per-venv. Ours is isolated, so install it in ours. |
+| the **browser binaries** (~400 MB) | shared. Point `PLAYWRIGHT_BROWSERS_PATH` at the existing directory. |
+
+If another project already downloaded chromium, share the binaries:
+
+```bash
+# whatever the find above reported, e.g. /root/.cache/ms-playwright
+export PLAYWRIGHT_BROWSERS_PATH=/root/.cache/ms-playwright
+/opt/xscraper/app/.venv/bin/pip install playwright
+/opt/xscraper/app/.venv/bin/python3 -c "
+from playwright.sync_api import sync_playwright
+with sync_playwright() as p:
+    b = p.chromium.launch(headless=True); print('reusing existing chromium:', b.version); b.close()"
+```
+
+Make it permanent for the services:
+
+```bash
+mkdir -p /etc/systemd/system/xscraper-web.service.d
+cat > /etc/systemd/system/xscraper-web.service.d/playwright.conf <<'CONF'
+[Service]
+Environment=PLAYWRIGHT_BROWSERS_PATH=/root/.cache/ms-playwright
+CONF
+systemctl daemon-reload && systemctl restart xscraper-web
+```
+
+The `xscraper` user must be able to read that directory:
+
+```bash
+chmod -R a+rX /root/.cache/ms-playwright        # or move it somewhere neutral:
+# mv /root/.cache/ms-playwright /opt/ms-playwright && chmod -R a+rX /opt/ms-playwright
+```
+
+**If it is not installed, or the version does not match:**
+
+```bash
+/opt/xscraper/app/.venv/bin/pip install playwright
+PLAYWRIGHT_BROWSERS_PATH=/opt/ms-playwright /opt/xscraper/app/.venv/bin/python3 -m playwright install chromium
+PLAYWRIGHT_BROWSERS_PATH=/opt/ms-playwright /opt/xscraper/app/.venv/bin/python3 -m playwright install-deps chromium
+chmod -R a+rX /opt/ms-playwright
+```
+
+`install-deps` needs root and pulls the system libraries headless chromium
+links against. Verify:
+
+```bash
+sudo -u xscraper PLAYWRIGHT_BROWSERS_PATH=/opt/ms-playwright \
+  /opt/xscraper/app/.venv/bin/python3 -c "
+from playwright.sync_api import sync_playwright
+with sync_playwright() as p:
+    b = p.chromium.launch(headless=True); print('OK', b.version); b.close()"
+```
+
+A version mismatch between the pip package and the downloaded browsers shows up
+as *"Executable doesn't exist at .../chromium-XXXX"*. The number in that path is
+the build the package wants — run `playwright install chromium` in **our** venv
+and it fetches that exact build alongside the existing ones.

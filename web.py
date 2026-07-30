@@ -66,8 +66,35 @@ _attempts: dict[str, list] = {}
 _attempts_lock = threading.Lock()
 
 
+# .env ships with these filled in so the keys are visible and uncommented.
+# They must never count as real credentials: a placeholder that satisfies the
+# "is auth configured" check is worse than a blank, because it lets the server
+# bind publicly with a password that is written down in the repo.
+PLACEHOLDERS = {
+    "changeme", "change_me", "CHANGE_ME_TO_A_LONG_RANDOM_STRING",
+    "password", "admin", "your-password-here", "xxx", "todo",
+}
+MIN_PASSWORD_LEN = 12
+
+
+def _auth_problem() -> str:
+    """Return why the configured credentials are unusable, or '' if they are fine."""
+    user = os.getenv("DASH_USER", "").strip()
+    pwd = os.getenv("DASH_PASSWORD", "")
+    if not user or not pwd:
+        return "DASH_USER / DASH_PASSWORD are not set"
+    if user.lower() in {p.lower() for p in PLACEHOLDERS}:
+        return f"DASH_USER is still the placeholder {user!r}"
+    if pwd in PLACEHOLDERS or pwd.lower() in {p.lower() for p in PLACEHOLDERS}:
+        return "DASH_PASSWORD is still the placeholder from .env.example"
+    if len(pwd) < MIN_PASSWORD_LEN:
+        return (f"DASH_PASSWORD is {len(pwd)} characters; "
+                f"at least {MIN_PASSWORD_LEN} is required to expose the dashboard")
+    return ""
+
+
 def _auth_configured() -> bool:
-    return bool(os.getenv("DASH_USER") and os.getenv("DASH_PASSWORD"))
+    return _auth_problem() == ""
 
 
 def _check_credentials(user: str, password: str) -> bool:
@@ -393,7 +420,7 @@ def _fetch_live(query, tab="Latest", pages=1, ack=False, list_id=""):
         if not names:
             return {"error": "No active account. Run: python3 main.py login --all"}
 
-        st = store_mod.Store(_CFG.db_results)
+        st = store_mod.Store(_CFG.db_results, _CFG.defaults.keep_entry_json)
         await st.open()
         try:
             sid = await st.ensure_stream(s.label, s.query, s.tab,
@@ -442,9 +469,23 @@ def _add_account(body):
     if not _re.fullmatch(r"[A-Za-z0-9_-]{1,32}", label):
         return {"error": "label must be 1-32 chars: letters, digits, _ or -"}
 
+    # Every value below is written verbatim into a line-oriented file (.env) or
+    # a quoted TOML string. Unvalidated, a newline in `password` appends extra
+    # .env lines — including a fresh DASH_PASSWORD, which hands the dashboard
+    # to whoever submitted it — and a quote in `username` breaks out of the
+    # TOML string. Reject rather than escape: these fields have narrow legal
+    # shapes, and escaping invites a second bug in the escaper.
     username = (body.get("username") or "").strip().lstrip("@")
     password = body.get("password") or ""
     proxy = (body.get("proxy") or "").strip()
+
+    if username and not _re.fullmatch(r"[A-Za-z0-9_]{1,15}", username):
+        return {"error": "username must be 1-15 chars: letters, digits or underscore "
+                         "(that is all X allows)"}
+    if any(c in password for c in "\n\r\x00"):
+        return {"error": "password cannot contain newlines or null bytes"}
+    if proxy and not _re.fullmatch(r"[A-Za-z0-9+.\-]+://[^\s\"'\\\x00-\x1f]{1,200}", proxy):
+        return {"error": "proxy must look like scheme://host:port, with no spaces or quotes"}
 
     cfg_path = _CFG.root / "config.toml"
     if not cfg_path.exists():
@@ -754,10 +795,10 @@ def serve(cfg, host="127.0.0.1", port=8765, log=print, behind_proxy=False):
     if not loopback and not _auth_configured():
         log("[serve] REFUSING TO START")
         log(f"[serve]   You asked to bind {host}, which is reachable from other machines,")
-        log("[serve]   but DASH_USER / DASH_PASSWORD are not set, so there would be no login.")
-        log("[serve]   Add to .env:")
+        log(f"[serve]   but: {_auth_problem()}")
+        log("[serve]   Set real values in .env:")
         log("[serve]       DASH_USER=you")
-        log("[serve]       DASH_PASSWORD=<a long random string>")
+        log("[serve]       DASH_PASSWORD=$(python3 -c \"import secrets;print(secrets.token_urlsafe(24))\")")
         log("[serve]   Or bind --host 127.0.0.1 and reach it over an SSH tunnel.")
         return EXIT_REFUSED
 

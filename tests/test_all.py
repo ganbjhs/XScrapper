@@ -1117,12 +1117,25 @@ def test_auth():
         ok(not web._check_credentials("admin", "anything"),
            "an unset password does not become a wildcard")
 
-        os.environ["DASH_USER"] = "admin"
+        # Placeholder/weak credentials must not count as configured, or the
+        # server would bind publicly with a password that is in the repo.
+        os.environ["DASH_USER"] = "changeme"
+        os.environ["DASH_PASSWORD"] = "a-perfectly-long-password"
+        ok(not web._auth_configured(), "a placeholder USERNAME is not 'configured'")
+        os.environ["DASH_USER"] = "tilak"
+        os.environ["DASH_PASSWORD"] = "CHANGE_ME_TO_A_LONG_RANDOM_STRING"
+        ok(not web._auth_configured(), "the .env.example PASSWORD is not 'configured'")
+        os.environ["DASH_PASSWORD"] = "short"
+        ok(not web._auth_configured(),
+           f"a password under {web.MIN_PASSWORD_LEN} chars is not 'configured'")
+        ok("characters" in web._auth_problem(), f"and it says why: {web._auth_problem()[:52]}")
+
+        os.environ["DASH_USER"] = "tilak"
         os.environ["DASH_PASSWORD"] = "s3cret-long-value"
-        ok(web._auth_configured(), "both set -> auth configured")
-        ok(web._check_credentials("admin", "s3cret-long-value"), "correct pair accepted")
-        ok(not web._check_credentials("admin", "s3cret-long-valu"), "near-miss password rejected")
-        ok(not web._check_credentials("Admin", "s3cret-long-value"), "username is case-sensitive")
+        ok(web._auth_configured(), "a real username and long password -> configured")
+        ok(web._check_credentials("tilak", "s3cret-long-value"), "correct pair accepted")
+        ok(not web._check_credentials("tilak", "s3cret-long-valu"), "near-miss password rejected")
+        ok(not web._check_credentials("Tilak", "s3cret-long-value"), "username is case-sensitive")
         ok(not web._check_credentials("", "s3cret-long-value"), "blank username rejected")
 
         tok = web._issue_token()

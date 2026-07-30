@@ -437,7 +437,10 @@ class Store:
     magnitude. WAL keeps `export` and `doctor` readable while a watcher writes.
     """
 
-    def __init__(self, path):
+    def __init__(self, path, keep_entry_json: bool = False):
+        # See config.Defaults.keep_entry_json: off by default because the
+        # entry wrapper is ~60% of the database and nothing reads it.
+        self.keep_entry_json = keep_entry_json
         self.path = str(path)
         self.db: sqlite3.Connection | None = None
 
@@ -569,7 +572,7 @@ class Store:
                 "conversation_id": rec["conversation_id"],
                 "source": source,
                 "raw_json": raw_json,
-                "raw_entry_json": json.dumps(entry) if entry else None,
+                "raw_entry_json": (json.dumps(entry) if (entry and self.keep_entry_json) else None),
                 **{k: json.dumps(rec[k] or []) for k in LIST_FIELDS},
             }
 
