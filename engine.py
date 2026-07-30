@@ -65,7 +65,6 @@ from email.utils import parsedate_to_datetime
 from twscrape.models import Tweet
 from twscrape.utils import find_obj, get_by_path, to_old_rep
 
-from config import CLI
 
 
 # ==========================================================================
@@ -201,17 +200,6 @@ def check() -> Report:
 
     return r
 
-
-def assert_ok() -> None:
-    """Raise if anything this project depends on has moved."""
-    r = check()
-    if not r.ok:
-        broken = [x for x in r.lines if x.startswith("BROKEN")]
-        raise RuntimeError(
-            "twscrape compatibility check failed:\n  "
-            + "\n  ".join(broken)
-            + f"\n  Run `{CLI} doctor --selftest` for the full report."
-        )
 
 # ==========================================================================
 # page parsing and the Engine
