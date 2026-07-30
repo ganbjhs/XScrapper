@@ -118,6 +118,16 @@ between two very different actions:
   afterwards. It never fires on a keystroke, because that budget is the same one
   `watch` needs to keep streams fresh.
 
+**Live view.** The results list re-reads the local database every 15s (toggle
+and interval in the header) and prepends anything new, so tweets appear as the
+watcher collects them. It never calls X — the watcher already does that on its
+own adaptive interval. Auto-fetching from the browser every 15s would be ~240
+requests/hour against a ceiling of ~200, which would starve the watcher within
+the hour. Reading the database is free and shows the same tweets.
+
+If you are scrolled down it offers a "N new tweets" button rather than moving
+the page under you, and it pauses entirely while the tab is hidden.
+
 Binds to localhost only. It has no authentication and can spend your rate-limit
 budget, so don't expose it.
 

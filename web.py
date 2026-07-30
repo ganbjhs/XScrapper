@@ -900,6 +900,19 @@ PAGE = r"""<!doctype html>
   .banner.err{border-color:var(--warn);color:var(--warn)}
   .banner.ok{border-color:var(--ok);color:var(--ok)}
   a{color:var(--accent)}
+  .livetog{display:flex;align-items:center;gap:6px;font-size:13px;color:var(--dim);
+           border:1px solid var(--line);border-radius:8px;padding:4px 9px;cursor:pointer}
+  .livetog select{padding:2px 4px;font-size:12px;border:0;background:transparent}
+  #livedot{width:7px;height:7px;border-radius:50%;background:var(--dim);display:inline-block}
+  #livedot.on{background:var(--ok);animation:pulse 2s ease-in-out infinite}
+  @keyframes pulse{0%,100%{opacity:1}50%{opacity:.35}}
+  /* A brief tint on arrival, then it settles into the list. Permanent
+     highlighting would just accumulate into noise. */
+  @keyframes arrive{from{background:rgba(29,155,240,.16)}to{background:var(--panel)}}
+  .card.new{animation:arrive 2.5s ease-out}
+  #newbar{position:sticky;top:52px;z-index:8;display:none;margin-bottom:10px}
+  #newbar button{width:100%;padding:7px;background:var(--accent);color:#fff;
+                 border-color:var(--accent);font-weight:600}
   .streambtn{display:block;width:100%;text-align:left;margin-bottom:5px;font-size:13px}
   .streambtn.active{border-color:var(--accent);background:rgba(29,155,240,.1)}
   code{background:var(--bg);padding:1px 5px;border-radius:5px;font-size:12px;
@@ -923,6 +936,16 @@ PAGE = r"""<!doctype html>
   </select>
   <button id="live" title="Spends rate-limit budget">Fetch from X</button>
   <button id="csv">Export CSV</button>
+  <label class="livetog" title="Re-read the local database every few seconds.
+Free — the watcher is what talks to X.">
+    <input type="checkbox" id="live" checked>
+    <span id="livedot"></span>Live
+    <select id="everysec">
+      <option value="15" selected>15s</option>
+      <option value="30">30s</option>
+      <option value="60">60s</option>
+    </select>
+  </label>
   <a href="/logout" class="muted" style="font-size:13px;margin-left:auto">Sign out</a>
 </header>
 
@@ -943,7 +966,10 @@ PAGE = r"""<!doctype html>
 <div id="banner"></div>
 
 <div class="wrap">
-  <main id="results"><p class="muted">Loading…</p></main>
+  <main>
+    <div id="newbar"><button id="newbtn"></button></div>
+    <div id="results"><p class="muted">Loading…</p></div>
+  </main>
   <aside>
     <div class="box" id="riskbox" hidden>
       <h2>Risks</h2>
@@ -1061,7 +1087,13 @@ async function search(append){
   }
   const html = d.rows.map(card).join("");
   if (append) $("#more")?.remove(), $("#results").insertAdjacentHTML("beforeend", html);
-  else $("#results").innerHTML = html;
+  else {
+    // A fresh search resets the high-water mark, otherwise changing filters
+    // would suppress everything older than whatever the previous filter showed.
+    $("#results").innerHTML = html;
+    topId = null; pending = []; $("#newbar").style.display = "none";
+  }
+  noteTop(d.rows);
 
   if (loaded < lastTotal){
     $("#results").insertAdjacentHTML("beforeend",
@@ -1302,7 +1334,74 @@ $("#a_save").onclick = async () => {
   } catch (e) { banner(esc(e.message), "err"); }
 };
 
-status(); search(); risks();
+/* ------------------------------------------------------------------
+   Live view.
+
+   This re-reads the LOCAL DATABASE on a timer. It never calls X — the
+   watcher service already polls X continuously on its own adaptive
+   interval, and new tweets land in results.db as it goes. Auto-fetching
+   from the browser every 15s would be 240 requests/hour against a ceiling
+   of ~200, so it would rate-limit the watcher out of existence within the
+   hour. Reading the database is free and shows the same tweets.
+
+   New rows are PREPENDED rather than replacing the list, so scroll
+   position, "Load more" pages and reading position all survive a refresh.
+   ------------------------------------------------------------------ */
+let liveTimer = null, pending = [], topId = null;
+
+const bigger = (a, b) => {           // tweet ids exceed 2^53; compare as BigInt
+  try { return BigInt(a) > BigInt(b); } catch { return false; }
+};
+
+function noteTop(rows){
+  for (const r of rows) if (!topId || bigger(r.tweet_id, topId)) topId = r.tweet_id;
+}
+
+function showPending(){
+  if (!pending.length) return;
+  const html = pending.map(t => card(t).replace('class="card"', 'class="card new"')).join("");
+  $("#results").insertAdjacentHTML("afterbegin", html);
+  noteTop(pending);
+  loaded += pending.length; lastTotal += pending.length; offset += pending.length;
+  $("#count").textContent = `showing ${loaded} of ${lastTotal}`;
+  pending = [];
+  $("#newbar").style.display = "none";
+}
+
+async function tick(){
+  if (!$("#live").checked || document.hidden) return;
+  let d;
+  try {
+    const p = params(); p.set("limit", PAGE_SIZE); p.set("offset", 0);
+    d = await api("/api/tweets?" + p);
+  } catch { return; }            // a blip should not spam the banner
+
+  const fresh = (d.rows || []).filter(r => !topId || bigger(r.tweet_id, topId));
+  if (!fresh.length) return;
+
+  // At the top of the page, drop them straight in; otherwise offer a button so
+  // the page never jumps under someone who is reading.
+  pending = fresh.concat(pending);
+  if (window.scrollY < 80) {
+    showPending();
+  } else {
+    $("#newbtn").textContent = `${pending.length} new tweet${pending.length>1?'s':''} — show`;
+    $("#newbar").style.display = "block";
+  }
+}
+
+function setLive(on){
+  $("#livedot").classList.toggle("on", on);
+  if (liveTimer) clearInterval(liveTimer);
+  liveTimer = on ? setInterval(tick, parseInt($("#everysec").value, 10) * 1000) : null;
+}
+$("#live").onchange    = () => setLive($("#live").checked);
+$("#everysec").onchange = () => setLive($("#live").checked);
+$("#newbtn").onclick    = () => { showPending(); window.scrollTo({top: 0, behavior: "smooth"}); };
+// A hidden tab should not keep querying; catch up the moment it is visible.
+document.addEventListener("visibilitychange", () => { if (!document.hidden) tick(); });
+
+status(); search().then(() => setLive(true)); risks();
 setInterval(() => { status(); risks(); }, 15000);
 </script>
 </body></html>
