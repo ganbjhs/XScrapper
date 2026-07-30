@@ -10,7 +10,9 @@
 
 set -euo pipefail
 
-PLACEHOLDERS='^(changeme|CHANGE_ME_TO_A_LONG_RANDOM_STRING|admin|password|your-password-here|xxx|todo|)$'
+# An empty value is fine too, handled separately: an empty alternative in the
+# group makes BSD grep warn "empty (sub)expression".
+PLACEHOLDERS='^(changeme|CHANGE_ME_TO_A_LONG_RANDOM_STRING|admin|password|your-password-here|xxx|todo)$'
 fail=0
 
 for f in $(git diff --cached --name-only --diff-filter=ACM); do
@@ -24,6 +26,7 @@ for f in $(git diff --cached --name-only --diff-filter=ACM); do
       DASH_PASSWORD|DASH_USER|*_PASSWORD|*_SECRET|*_TOKEN|*_KEY) ;;
       *) continue ;;
     esac
+    [ -z "$val" ] && continue
     if ! printf '%s' "$val" | grep -qE "$PLACEHOLDERS"; then
       echo "BLOCKED: $f sets $key to a real-looking value."
       fail=1
