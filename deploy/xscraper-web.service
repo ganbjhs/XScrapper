@@ -12,14 +12,24 @@ Environment=TWS_TELEMETRY=0
 Environment=DO_NOT_TRACK=1
 # Loopback only. nginx terminates TLS and proxies in; the app is never
 # reachable from outside even if the firewall is wrong.
+#
+# __PORT__ is substituted by setup.sh with a port nothing else on the machine
+# is using, and the same value is written into the nginx snippet. Do not edit
+# it here alone — the two would disagree and nginx would proxy into nothing.
 ExecStart=/opt/xscraper/app/.venv/bin/python3 main.py serve \
-          --host 127.0.0.1 --port 8765 --behind-proxy
+          --host 127.0.0.1 --port __PORT__ --behind-proxy
 Restart=always
 RestartSec=5
 
-# The dashboard reads databases and writes .env/config.toml when you add an
-# account. Nothing else on the box is its business.
-NoNewPrivileges=true
+# The dashboard reads databases and writes config.toml when you add an account,
+# and runs a browser under its own profiles/ directory when you sign one in.
+# Nothing else on the box is its business.
+#
+# NOT NoNewPrivileges: Chromium's sandbox needs to gain privileges to build
+# itself, and denying that makes the browser refuse to start. auth.py falls
+# back to an unsandboxed browser when it must, but letting the sandbox work is
+# strictly better — the rest of the confinement below is what limits the blast
+# radius, and it is unchanged.
 PrivateTmp=true
 ProtectSystem=strict
 ProtectHome=true
