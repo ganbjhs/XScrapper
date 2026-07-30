@@ -29,11 +29,25 @@ die()  { printf '\n   FAIL %s\n\n' "$*" >&2; exit 1; }
 
 say "checking what is already here"
 command -v nginx >/dev/null && ok "nginx present (other sites will not be touched)" || warn "nginx missing"
+
+# Is the port free, or is it OUR service already holding it?
+#
+# The first version just asked "is $PORT in use" and died if so — which meant a
+# successful run made every LATER run fail, since xscraper-web was by then
+# listening on it. Idempotency is the entire point of this script, so the
+# question has to be "is someone ELSE on this port".
 if ss -lntp 2>/dev/null | grep -q ":$PORT "; then
-  die "port $PORT is already in use — another service has it. Edit PORT in this
-   script and in deploy/nginx-scraper.conf + the systemd unit, then re-run."
+  if systemctl is-active --quiet xscraper-web 2>/dev/null; then
+    ok "port $PORT held by our own xscraper-web (it gets restarted below)"
+  else
+    holder=$(ss -lntp 2>/dev/null | grep ":$PORT " | sed 's/.*users:((//' | cut -d'"' -f2 || true)
+    die "port $PORT is held by another service (${holder:-unknown}). Edit PORT in
+   this script, deploy/nginx-scraper.conf and deploy/xscraper-web.service, then
+   re-run."
+  fi
+else
+  ok "port $PORT is free"
 fi
-ok "port $PORT is free"
 
 say "packages"
 export DEBIAN_FRONTEND=noninteractive
