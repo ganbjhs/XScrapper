@@ -307,6 +307,9 @@ def _query_tweets(p):
     if p.get("has_media"):
         where.append("t.media_urls NOT IN ('[]', '')")
 
+    if p.get("no_retweets"):
+        where.append("t.is_retweet = 0")
+
     # Cursors, for programs syncing rather than people browsing.
     #
     # Two, because they answer different questions and one of them has a trap:
@@ -367,6 +370,10 @@ def _row_to_json(r):
             d[k] = json.loads(d.get(k) or "[]")
         except (TypeError, ValueError):
             d[k] = []
+    try:
+        d["media"] = json.loads(d.pop("media_json", None) or "[]")
+    except (TypeError, ValueError):
+        d["media"] = []
     # JS loses integer precision above 2^53, and tweet ids are well past it.
     d["tweet_id"] = str(d["tweet_id"])
     d.pop("raw_json", None)
@@ -1219,6 +1226,17 @@ PAGE = r"""<!doctype html>
   .media img,.media video{max-height:220px;max-width:100%;border-radius:8px;
        border:1px solid var(--line);background:#000}
   .media video{width:min(100%,380px)}
+  /* A video shows as its still until clicked. The button IS the thumbnail. */
+  .playwrap{position:relative;padding:0;border:0;background:none;cursor:pointer;
+            line-height:0;border-radius:8px}
+  .playwrap img{display:block;max-height:220px}
+  .playbtn{position:absolute;inset:0;margin:auto;width:52px;height:52px;
+           border-radius:50%;background:rgba(0,0,0,.62);color:#fff;font-size:20px;
+           display:grid;place-items:center;pointer-events:none;line-height:1;
+           padding-left:4px}
+  .playwrap:hover .playbtn{background:rgba(0,0,0,.82)}
+  .dur{position:absolute;right:6px;bottom:6px;background:rgba(0,0,0,.72);color:#fff;
+       font-size:11px;padding:1px 6px;border-radius:4px;pointer-events:none;line-height:1.6}
   .media .yt{width:min(100%,380px);height:214px;border:1px solid var(--line);
        border-radius:8px;background:#000}
   .medialink{display:flex;flex-direction:column;gap:2px;padding:9px 12px;
@@ -1356,6 +1374,8 @@ It does not contact X, so it is free.">
   <input id="minlikes" type="number" placeholder="at least ? likes" style="width:140px">
   <input id="lang" placeholder="language" style="width:90px" title="Two-letter code, e.g. en or hi">
   <label class="muted"><input type="checkbox" id="media"> only with pictures or video</label>
+  <label class="muted" title="A retweet is someone resharing another account's post.
+Tick this to see only original posts."><input type="checkbox" id="noretweets"> hide retweets</label>
   <select id="order"><option value="desc">newest first</option><option value="asc">oldest first</option></select>
   <span class="muted" id="count"></span>
 </div>
@@ -1454,6 +1474,14 @@ function secs(s){
   return Math.round(s/86400) + " days";
 }
 
+// A video's length, as a player shows it. X reports duration in MILLISECONDS —
+// feeding it to secs() above turns a 5-minute clip into "3 days".
+function clock(ms){
+  const t = Math.round(ms/1000), m = Math.floor(t/60), s = t % 60;
+  if (m < 60) return `${m}:${String(s).padStart(2,"0")}`;
+  return `${Math.floor(m/60)}:${String(m%60).padStart(2,"0")}:${String(s).padStart(2,"0")}`;
+}
+
 function banner(msg, kind){
   $("#banner").innerHTML = msg ? `<div class="banner ${kind||''}">${msg}</div>` : "";
 }
@@ -1472,6 +1500,7 @@ function params(){
   add("order", $("#order").value);
   add("stream", activeStream);
   if ($("#media").checked) p.set("has_media","1");
+  if ($("#noretweets").checked) p.set("no_retweets","1");
   return p;
 }
 
@@ -1540,18 +1569,44 @@ async function search(append){
 const YT = /(?:youtube\.com\/watch\?v=|youtu\.be\/)([A-Za-z0-9_-]{11})/;
 
 function mediaHtml(t){
-  const urls = t.media_urls || [];
   const bits = [];
 
-  for (const u of urls){
-    if (/\.(jpg|jpeg|png|webp)(\?|$)/i.test(u))
-      bits.push(`<img src="${esc(u)}" loading="lazy" alt="">`);
-    else if (/\.mp4(\?|$)/i.test(u))
-      bits.push(`<video src="${esc(u)}" controls preload="metadata"
-                        playsinline muted loop></video>`);
-    else if (/\.m3u8(\?|$)/i.test(u))
-      bits.push(`<a class="medialink" href="${esc(u)}" target="_blank" rel="noopener">
+  /* Videos show their THUMBNAIL until you click.
+
+     Every card used to mount a real <video> pointing at video.twimg.com.
+     Even with preload="metadata" that is a request per clip, so scrolling a
+     page of 100 tweets pulled dozens of videos nobody watched — and X's media
+     URLs are signed and expire, so most of them came back 403 and rendered as
+     black boxes. A still is a few tens of KB against several MB, and it cannot
+     expire into a broken player.
+
+     media[] carries {type,url,thumb}. Older rows have only the flat
+     media_urls, so fall back to the previous behaviour for those rather than
+     showing them nothing. */
+  const media = (t.media && t.media.length)
+    ? t.media
+    : (t.media_urls || []).map(u => ({
+        type: /\.(jpg|jpeg|png|webp)(\?|$)/i.test(u) ? "photo"
+            : /\.mp4(\?|$)/i.test(u) ? "video" : "other",
+        url: u, thumb: null }));
+
+  for (const m of media){
+    if (m.type === "photo"){
+      bits.push(`<img src="${esc(m.thumb || m.url)}" loading="lazy" alt="">`);
+    } else if (m.type === "video" || m.type === "gif"){
+      const dur = m.duration ? `<span class="dur">${clock(m.duration)}</span>` : "";
+      bits.push(m.thumb
+        ? `<button class="playwrap" data-play="${esc(m.url)}" data-kind="${esc(m.type)}"
+                   title="Play">
+             <img src="${esc(m.thumb)}" loading="lazy" alt="">
+             <span class="playbtn">▶</span>${dur}
+           </button>`
+        : `<video src="${esc(m.url)}" controls preload="none"
+                  playsinline muted loop></video>`);
+    } else if (/\.m3u8(\?|$)/i.test(m.url)){
+      bits.push(`<a class="medialink" href="${esc(m.url)}" target="_blank" rel="noopener">
                    <b>Video stream</b><span>cannot play here — opens in a new tab</span></a>`);
+    }
   }
 
   for (const u of (t.urls || [])){
@@ -1702,7 +1757,7 @@ $("#src").onchange();
 
 $("#go").onclick = search;
 $("#q").addEventListener("keydown", e => { if (e.key === "Enter") search(); });
-["author","since","minlikes","lang","order","media"].forEach(id =>
+["author","since","minlikes","lang","order","media","noretweets"].forEach(id =>
   $("#"+id).addEventListener("change", search));
 
 $("#csv").onclick = () => { location = "/api/export?" + params(); };
@@ -1768,6 +1823,31 @@ $("#getnew").onclick = async () => {
     banner(esc(e.message).replace(/\n/g,"<br>"), "err");
   } finally { $("#getnew").disabled = false; }
 };
+
+/* Click a thumbnail to fetch and play that one video.
+
+   Delegated from #results rather than bound per card: the list is re-rendered
+   on every search, every auto-update tick and every "show more", so handlers
+   attached to individual cards would belong to nodes that no longer exist. */
+$("#results").addEventListener("click", (e) => {
+  const btn = e.target.closest("[data-play]");
+  if (!btn) return;
+  const gif = btn.dataset.kind === "gif";
+  const v = document.createElement("video");
+  v.src = btn.dataset.play;
+  v.controls = !gif; v.autoplay = true; v.playsInline = true;
+  v.muted = gif; v.loop = gif;
+  // If the URL has expired — X signs them and they do expire — say so instead
+  // of leaving a black rectangle where the video was.
+  v.onerror = () => {
+    const a = document.createElement("a");
+    a.className = "medialink"; a.target = "_blank"; a.rel = "noopener";
+    a.href = btn.dataset.play;
+    a.innerHTML = "<b>Video unavailable</b><span>X's link has expired — opens on x.com</span>";
+    v.replaceWith(a);
+  };
+  btn.replaceWith(v);
+});
 
 /* Standing risk panel. The costly mistakes here are the silent ones, so the
    state that makes an action dangerous is always on screen — not only at the

@@ -127,6 +127,30 @@ def _g(obj, name, default=None):
     return getattr(obj, name, default) if obj is not None else default
 
 
+class _Attr:
+    """
+    Read a plain dict as if it were an object, recursively.
+
+    Lets the same extraction code run over a live twscrape Tweet and over the
+    stored `raw_json` of one, so replaying a parser fix across history is the
+    same code path as parsing it fresh — not a second implementation that can
+    drift from the first.
+    """
+
+    __slots__ = ("_d",)
+
+    def __init__(self, d):
+        self._d = d if isinstance(d, dict) else {}
+
+    def __getattr__(self, name):
+        v = self._d.get(name)
+        if isinstance(v, dict):
+            return _Attr(v)
+        if isinstance(v, list):
+            return [_Attr(x) if isinstance(x, dict) else x for x in v]
+        return v
+
+
 def _iso(dt):
     """datetime -> ISO string, tolerant of already-string or None."""
     if dt is None:
@@ -164,22 +188,48 @@ def _best_variant(variants):
 
 
 def _media_urls(media):
-    """Extract best-effort media URLs from twscrape's media object."""
+    """
+    Flat list of media URLs. Kept because FIELDS is frozen and both the CSV
+    export and the API publish this shape; `_media(media)` is the richer view.
+    """
+    return [m["url"] for m in _media(media) if m.get("url")]
+
+
+def _media(media) -> list:
+    """
+    Media as {type, url, thumb}, so a video can be shown without fetching it.
+
+    X gives every video a `thumbnailUrl` — a small still on pbs.twimg.com. We
+    used to throw it away and keep only the .mp4, which forced anything
+    displaying a tweet to pull the whole video just to show that one exists.
+    A 30-second clip is several megabytes; its thumbnail is a few tens of KB.
+
+    Nothing is downloaded here either way. These are X's own URLs, and whoever
+    renders them fetches from X directly — so the saving is in what a viewer
+    (and X) has to move, not in this database.
+    """
     out = []
     if media is None:
         return out
-    # photos
+
     for p in _g(media, "photos", []) or []:
-        u = _g(p, "url")
-        if u:
-            out.append(u)
-    # videos -> best variant, else thumbnail
+        if (u := _g(p, "url")):
+            out.append({"type": "photo", "url": u, "thumb": u})
+
     for v in _g(media, "videos", []) or []:
-        out.append(_best_variant(_g(v, "variants", []) or []) or _g(v, "thumbnailUrl"))
-    # gifs / animated
+        url = _best_variant(_g(v, "variants", []) or [])
+        thumb = _g(v, "thumbnailUrl")
+        if url or thumb:
+            out.append({"type": "video", "url": url or thumb, "thumb": thumb,
+                        "duration": _g(v, "duration")})
+
+    # Animated GIFs are mp4s on X, and always silent and looping.
     for a in _g(media, "animated", []) or []:
-        out.append(_g(a, "videoUrl") or _g(a, "thumbnailUrl"))
-    return [u for u in out if u]
+        url, thumb = _g(a, "videoUrl"), _g(a, "thumbnailUrl")
+        if url or thumb:
+            out.append({"type": "gif", "url": url or thumb, "thumb": thumb})
+
+    return out
 
 
 def normalize_tweet(t) -> dict:
@@ -210,18 +260,36 @@ def normalize_tweet(t) -> dict:
         "mentions": [_g(u, "username") for u in (_g(t, "mentionedUsers", []) or [])],
         "urls": [_g(l, "url") for l in (_g(t, "links", []) or [])],
         "media_urls": _media_urls(_g(t, "media")),
+        "media": _media(_g(t, "media")),
 
         "in_reply_to": str(_g(t, "inReplyToTweetId")) if _g(t, "inReplyToTweetId") else None,
         "conversation_id": str(_g(t, "conversationId")) if _g(t, "conversationId") else None,
     }
 
 
-def to_csv_row(rec: dict) -> dict:
-    """Flatten list fields to pipe-joined strings for CSV."""
-    row = dict(rec)
+def to_csv_row(rec: dict, fields=None) -> dict:
+    """
+    Flatten list fields to pipe-joined strings, keeping only `fields`.
+
+    Restricted deliberately: a new key appearing in normalize_tweet must not
+    silently become a new column, and must not blow DictWriter up either.
+    `media` is exactly that case — structured, useful over JSON and the API,
+    meaningless as a CSV cell.
+
+    `fields` MUST be the same list the DictWriter was built with. Hardcoding
+    FIELDS here instead cost a round of silent data loss: `--fields all` writes
+    FIELDS_EXT headers, every extended column fell outside the hardcoded list
+    and was dropped, and DictWriter fills a missing key with '' rather than
+    complaining — so the export still had collected_at, lag_ms, stream_label,
+    bookmark_count and source as headers, with nothing under them. The test
+    that should have caught it only checked the header row.
+    """
+    keep = FIELDS if fields is None else fields
+    row = {k: rec.get(k) for k in keep if k in rec}
     for k in LIST_FIELDS:
-        vals = [str(v) for v in (row.get(k) or []) if v is not None]
-        row[k] = "|".join(vals)
+        if k in row:
+            vals = [str(v) for v in (row.get(k) or []) if v is not None]
+            row[k] = "|".join(vals)
     return row
 
 
@@ -313,6 +381,8 @@ CREATE TABLE IF NOT EXISTS tweets (
   in_reply_to         TEXT,
   conversation_id     TEXT,
   source              TEXT NOT NULL DEFAULT 'result',  -- result | embedded
+  media_json          TEXT,                  -- [{type,url,thumb}] so a video
+                                             -- can be shown without fetching it
   raw_json            TEXT,                  -- Tweet.json(): nothing is lost
   raw_entry_json      TEXT
 );
@@ -483,13 +553,49 @@ class Store:
         but quietly lack the field.
         """
         wanted = {"polls": {"rl_reset": "INTEGER"},
+                  "tweets": {"media_json": "TEXT"},
                   "streams": {"list_id": "TEXT",
                               "hidden": "INTEGER NOT NULL DEFAULT 0"}}
+        added = []
         for table, cols in wanted.items():
             have = {r["name"] for r in self.db.execute(f"PRAGMA table_info({table})")}
             for name, decl in cols.items():
                 if name not in have:
                     self.db.execute(f"ALTER TABLE {table} ADD COLUMN {name} {decl}")
+                    added.append(name)
+
+        if "media_json" in added:
+            self._backfill_media()
+
+    def _backfill_media(self) -> int:
+        """
+        Fill media_json for tweets collected before the column existed.
+
+        This is R9 paying for itself. Video thumbnails were always in X's
+        payload and we simply never extracted them — and because every tweet
+        keeps its complete `Tweet.json()`, a parser change can be applied to
+        history instead of only to whatever arrives next. Without the raw
+        payloads this data would have been permanently lost for everything
+        already collected.
+
+        Runs once, inside the same migration that adds the column.
+        """
+        rows = self.db.execute(
+            "SELECT tweet_id, raw_json FROM tweets "
+            "WHERE media_json IS NULL AND raw_json IS NOT NULL").fetchall()
+        n = 0
+        for r in rows:
+            try:
+                raw = json.loads(r["raw_json"])
+            except (TypeError, ValueError):
+                continue
+            # The raw payload is plain dicts; _media reads attributes, so give
+            # it something that answers getattr.
+            media = _media(_Attr(raw.get("media")) if raw.get("media") else None)
+            self.db.execute("UPDATE tweets SET media_json = ? WHERE tweet_id = ?",
+                            (json.dumps(media), r["tweet_id"]))
+            n += 1
+        return n
 
     async def close(self):
         if self.db is not None:
@@ -711,6 +817,7 @@ class Store:
                 "source": source,
                 "raw_json": raw_json,
                 "raw_entry_json": (json.dumps(entry) if (entry and self.keep_entry_json) else None),
+                "media_json": json.dumps(rec.get("media") or []),
                 **{k: json.dumps(rec[k] or []) for k in LIST_FIELDS},
             }
 
@@ -968,7 +1075,14 @@ class Store:
             where.append("t.created_ms <= ?")
             params.append(until)
 
-        sql = f"SELECT t.* FROM tweets t {joins}"
+        # stream_label is declared in FIELDS_EXT, so `--fields all` writes the
+        # column — and nothing ever filled it, so every export carried a header
+        # with nothing beneath it. A tweet can match several streams, so this is
+        # a comma-joined list rather than a single label.
+        sql = ("SELECT t.*, (SELECT GROUP_CONCAT(s2.label, ',') "
+               "             FROM tweet_hits h2 JOIN streams s2 USING(stream_id) "
+               "             WHERE h2.tweet_id = t.tweet_id) AS stream_label "
+               f"FROM tweets t {joins}")
         if where:
             sql += " WHERE " + " AND ".join(where)
         sql += f" ORDER BY t.tweet_id {'ASC' if order == 'asc' else 'DESC'}"
@@ -1023,7 +1137,7 @@ def write_csv(rows, path, profile="default"):
         writer = csv.DictWriter(f, fieldnames=fields)
         writer.writeheader()
         for row in rows:
-            writer.writerow(to_csv_row(_record(row, fields)))
+            writer.writerow(to_csv_row(_record(row, fields), fields))
             n += 1
     return n
 

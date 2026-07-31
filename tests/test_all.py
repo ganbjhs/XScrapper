@@ -150,6 +150,33 @@ def test_normalize():
     ok(rec["is_reply"] is True and rec["is_quote"] is False, "int flags become bools")
     ok(set(rec) == set(nz.FIELDS), "the record has exactly FIELDS keys")
     ok(nz.to_csv_row(rec)["hashtags"] == "x|y", "to_csv_row pipe-joins list fields")
+    ok("media" not in nz.to_csv_row({**rec, "media": [{"type": "video"}]}),
+       "to_csv_row drops keys outside the frozen column list (media is JSON-only)")
+    wide = nz.to_csv_row({**rec, "lag_ms": 42, "source": "result"}, nz.FIELDS_EXT)
+    ok(wide.get("lag_ms") == 42 and wide.get("source") == "result",
+       "but keeps them when the caller asks for the wider profile")
+
+    print()
+    print("== media ==")
+
+    class _V:
+        def __init__(s, **k): s.__dict__.update(k)
+
+    vid = _V(variants=[_V(url="hi.mp4", bitrate=900, contentType="video/mp4")],
+             thumbnailUrl="thumb.jpg", duration=333040)
+    m = nz._media(_V(photos=[_V(url="p.jpg")], videos=[vid], animated=[]))
+    ok([x["type"] for x in m] == ["photo", "video"], "media keeps photos and videos apart")
+    ok(m[1]["thumb"] == "thumb.jpg" and m[1]["url"] == "hi.mp4",
+       "a video carries BOTH its thumbnail and its file, so it can be shown without being fetched")
+    ok(nz._media_urls(_V(photos=[_V(url="p.jpg")], videos=[vid], animated=[]))
+       == ["p.jpg", "hi.mp4"],
+       "the flat media_urls shape is unchanged (frozen CSV column)")
+
+    raw = {"media": {"photos": [], "videos": [{"thumbnailUrl": "t.jpg",
+            "variants": [{"url": "v.mp4", "bitrate": 1, "contentType": "video/mp4"}]}]}}
+    back = nz._media(nz._Attr(raw["media"]))
+    ok(back and back[0]["thumb"] == "t.jpg",
+       "the same extractor runs over stored raw_json, so a parser fix replays over history (R9)")
     ok(
         nz.FIELDS_EXT[: len(nz.FIELDS)] == nz.FIELDS,
         "FIELDS_EXT extends FIELDS in place, so existing CSV columns never shift",
@@ -953,8 +980,20 @@ async def test_search_to_export(tmp):
     rc = await commands.cmd_export(E())
     ok(rc == 0 and (tmp / "exp.csv").exists(), "export writes a CSV from the store")
 
+    # Assert VALUES, not just headers. Checking the header alone let a real
+    # regression through: to_csv_row briefly filtered to FIELDS while the writer
+    # used FIELDS_EXT, so every extended column was dropped — and DictWriter
+    # fills a missing key with '' instead of complaining, so the file still had
+    # all the right headers with nothing underneath them.
+    import csv as _csv
+    rows = list(_csv.DictReader((tmp / "exp.csv").open()))
     header = (tmp / "exp.csv").read_text().splitlines()[0]
     ok("lag_ms" in header and "collected_at" in header, "--fields all includes lag metadata")
+    empty = [k for k in ("collected_at", "lag_ms", "stream_label", "source")
+             if not (rows and rows[0].get(k))]
+    ok(not empty, f"--fields all POPULATES the extended columns, not just their headers "
+                  f"({'all present' if not empty else 'empty: ' + ', '.join(empty)})")
+    ok(all(r.get("tweet_id") for r in rows), "every exported row has its tweet_id")
 
     E.format = "raw"
     await commands.cmd_export(E())
