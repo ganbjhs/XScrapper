@@ -104,12 +104,33 @@ class StreamCfg:
 
 
 @dataclass
+class WebhookCfg:
+    """One place we POST new tweets to as they are collected."""
+    label: str
+    url: str
+    secret_env: str = ""
+    streams: list = field(default_factory=list)   # empty = every visible stream
+    batch_size: int = 50
+    timeout_s: float = 10.0
+    include_hidden: bool = False
+    enabled: bool = True
+
+    @property
+    def secret(self) -> str:
+        return os.getenv(self.secret_env, "") if self.secret_env else ""
+
+
+@dataclass
 class Config:
     root: Path
     defaults: Defaults
     accounts: list[AccountCfg]
     streams: list[StreamCfg]
     source: Path       # the config.toml this came from
+    webhooks: list = field(default_factory=list)
+
+    def enabled_webhooks(self) -> list:
+        return [w for w in self.webhooks if w.enabled]
 
     @property
     def db_accounts(self) -> Path:
@@ -275,8 +296,65 @@ def _parse_stream(raw: dict, idx: int, defaults: Defaults) -> StreamCfg:
     )
 
 
+def _parse_webhook(raw: dict, idx: int) -> WebhookCfg:
+    label = str(raw.get("label") or "").strip() or f"webhook_{idx + 1}"
+    url = str(raw.get("url") or "").strip()
+    if not url:
+        raise ConfigError(f"[[webhooks]] {label!r} is missing a `url`.")
+    if not re.match(r"^https?://", url):
+        raise ConfigError(
+            f"[[webhooks]] {label!r}: url must start with http:// or https://, got {url!r}."
+        )
+
+    secret_env = str(raw.get("secret_env") or "").strip()
+    if not secret_env:
+        raise ConfigError(
+            f"[[webhooks]] {label!r} has no `secret_env`.\n"
+            f"  Every delivery is signed so the receiver can prove it came from\n"
+            f"  you. Without a secret anyone who learns the URL can post fake\n"
+            f"  tweets into your system, and nothing downstream could tell.\n"
+            f"  Fix: put a long random value in .env and name it here:\n"
+            f"      secret_env = \"WEBHOOK_SECRET_{label.upper()}\""
+        )
+
+    streams = raw.get("streams") or []
+    if not isinstance(streams, list) or any(not isinstance(s, str) for s in streams):
+        raise ConfigError(
+            f"[[webhooks]] {label!r}: `streams` must be a list of stream labels, "
+            f"e.g. streams = [\"politicians\"]. Leave it out to send everything."
+        )
+
+    batch = int(_pick(raw, "batch_size", 50))
+    if not 1 <= batch <= 500:
+        raise ConfigError(f"[[webhooks]] {label!r}: batch_size must be 1-500, got {batch}.")
+
+    return WebhookCfg(
+        label=label,
+        url=url,
+        secret_env=secret_env,
+        streams=[str(s) for s in streams],
+        batch_size=batch,
+        timeout_s=float(_pick(raw, "timeout_s", 10.0)),
+        include_hidden=bool(_pick(raw, "include_hidden", False)),
+        enabled=bool(_pick(raw, "enabled", True)),
+    )
+
+
 def _validate(cfg: Config) -> None:
-    for kind, items in (("account", cfg.accounts), ("stream", cfg.streams)):
+    known_streams = {s.label for s in cfg.streams}
+    for w in cfg.webhooks:
+        # A typo here means a webhook that silently never fires, which is the
+        # worst possible outcome for something whose whole job is delivery.
+        missing = [s for s in w.streams if s not in known_streams]
+        if missing:
+            raise ConfigError(
+                f"[[webhooks]] {w.label!r} filters on stream(s) {missing} that are "
+                f"not declared.\n  Known streams: "
+                f"{', '.join(sorted(known_streams)) or '(none)'}"
+            )
+
+    for kind, items in (("account", cfg.accounts), ("stream", cfg.streams),
+                        ("webhook", cfg.webhooks)):
         seen: set[str] = set()
         for it in items:
             if it.label in seen:
@@ -371,7 +449,7 @@ def load_config(explicit: str | None = None, root: Path | None = None) -> Config
     except tomllib.TOMLDecodeError as e:
         raise ConfigError(f"{path} is not valid TOML: {e}") from e
 
-    known = {"defaults", "accounts", "streams"}
+    known = {"defaults", "accounts", "streams", "webhooks"}
     unknown = set(raw) - known
     if unknown:
         raise ConfigError(
@@ -386,6 +464,7 @@ def load_config(explicit: str | None = None, root: Path | None = None) -> Config
 
     accounts = [_parse_account(a, i, defaults) for i, a in enumerate(raw.get("accounts") or [])]
     streams = [_parse_stream(s, i, defaults) for i, s in enumerate(raw.get("streams") or [])]
+    webhooks = [_parse_webhook(w, i) for i, w in enumerate(raw.get("webhooks") or [])]
 
     if not accounts:
         raise ConfigError(
@@ -393,7 +472,8 @@ def load_config(explicit: str | None = None, root: Path | None = None) -> Config
             f"see config.toml.example."
         )
 
-    cfg = Config(root=root, defaults=defaults, accounts=accounts, streams=streams, source=path)
+    cfg = Config(root=root, defaults=defaults, accounts=accounts, streams=streams,
+                 source=path, webhooks=webhooks)
     for a in cfg.accounts:
         a.profile_path = cfg._resolve(a.profile_dir)
     _validate(cfg)

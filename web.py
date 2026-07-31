@@ -100,6 +100,61 @@ def _auth_configured() -> bool:
     return _auth_problem() == ""
 
 
+# --------------------------------------------------------------------------
+# API keys — how other systems authenticate
+# --------------------------------------------------------------------------
+#
+# A browser gets a session cookie. A machine gets a bearer token, because a
+# program cannot reasonably be asked to POST a login form and keep a cookie
+# jar. Keys live in .env as API_KEYS, comma-separated:
+#
+#     API_KEYS=k_live_abc...,k_live_def...
+#
+# Several so a consumer can be revoked on its own, by deleting its key, without
+# re-issuing to everyone else.
+#
+# WHAT A KEY MAY NOT DO. It reads collected data and may spend rate-limit
+# budget through /api/fetch, and that is the whole list. It cannot add an
+# account, open a sign-in browser, or hide a stream — those write secrets to
+# disk, launch a process, or change what a human sees, and none of them is
+# something a remote integration should reach. The rule is enforced by an
+# allowlist in _require_auth, not by the caller being polite.
+MIN_API_KEY_LEN = 24
+
+# Endpoints a key may call. Everything else is cookie-only, deliberately.
+API_KEY_PATHS = {
+    "/api/tweets", "/api/status", "/api/streams", "/api/export", "/api/guard",
+    "/api/fetch",
+}
+
+
+def _api_keys() -> set:
+    raw = os.getenv("API_KEYS", "")
+    return {k.strip() for k in raw.split(",")
+            if len(k.strip()) >= MIN_API_KEY_LEN}
+
+
+def _presented_key(headers) -> str:
+    """Bearer token, or the X-API-Key header some clients find easier."""
+    auth = headers.get("Authorization", "")
+    if auth.lower().startswith("bearer "):
+        return auth[7:].strip()
+    return (headers.get("X-API-Key") or "").strip()
+
+
+def _valid_api_key(presented: str) -> bool:
+    if not presented:
+        return False
+    # compare_digest against every key, and never break early: returning as
+    # soon as one matches leaks, through timing, roughly where in the list a
+    # guessed key would sit.
+    hit = False
+    for k in _api_keys():
+        if hmac.compare_digest(presented, k):
+            hit = True
+    return hit
+
+
 def _check_credentials(user: str, password: str) -> bool:
     """Constant-time compare, so response timing cannot leak the credentials."""
     want_u = os.getenv("DASH_USER", "")
@@ -252,8 +307,36 @@ def _query_tweets(p):
     if p.get("has_media"):
         where.append("t.media_urls NOT IN ('[]', '')")
 
+    # Cursors, for programs syncing rather than people browsing.
+    #
+    # Two, because they answer different questions and one of them has a trap:
+    #
+    #   since_id           everything POSTED after this tweet. What people
+    #                      expect, and fine for "show me what's new". But X
+    #                      indexes some tweets late, so a tweet collected now
+    #                      can carry an older id than one collected a minute
+    #                      ago — and this cursor steps straight over those.
+    #   since_collected_ms everything WE SAW after this point. Gapless, because
+    #                      collection order is the order rows actually appear.
+    #                      Use this one to mirror the database.
+    #
+    # Saying so here rather than only in the docs: the difference is invisible
+    # until a consumer notices it is quietly missing tweets.
+    cursoring = False
+    if p.get("since_id"):
+        where.append("t.tweet_id > ?")
+        params.append(int(p["since_id"]))
+        cursoring = True
+    if p.get("since_collected_ms"):
+        where.append("t.collected_ms > ?")
+        params.append(int(p["since_collected_ms"]))
+        cursoring = True
+
     sql = f"SELECT t.* FROM tweets t {joins} WHERE {' AND '.join(where)}"
-    order = "ASC" if p.get("order") == "asc" else "DESC"
+    # A cursor walk has to run oldest-first, or "the last row I got" is not a
+    # position you can resume from.
+    order = "ASC" if (p.get("order") == "asc" or cursoring) else "DESC"
+    order_by = "t.collected_ms, t.tweet_id" if p.get("since_collected_ms") else "t.tweet_id"
     limit = min(int(p.get("limit") or 50), 500)
     offset = int(p.get("offset") or 0)
 
@@ -262,10 +345,19 @@ def _query_tweets(p):
             f"SELECT COUNT(*) c FROM tweets t {joins} WHERE {' AND '.join(where)}", params
         ).fetchone()["c"]
         rows = con.execute(
-            f"{sql} ORDER BY t.tweet_id {order} LIMIT ? OFFSET ?", [*params, limit, offset]
+            f"{sql} ORDER BY {order_by} {order} LIMIT ? OFFSET ?",
+            [*params, limit, offset]
         ).fetchall()
 
-    return {"total": total, "rows": [_row_to_json(r) for r in rows]}
+    out = {"total": total, "rows": [_row_to_json(r) for r in rows]}
+    if rows:
+        # Hand back the position to resume from, so a consumer never has to
+        # work out which field to remember.
+        last = rows[-1]
+        out["cursor"] = {"since_id": str(last["tweet_id"]),
+                         "since_collected_ms": last["collected_ms"]}
+        out["has_more"] = len(rows) == limit and total > limit
+    return out
 
 
 def _row_to_json(r):
@@ -780,10 +872,34 @@ class Handler(BaseHTTPRequestHandler):
 
     def _require_auth(self) -> bool:
         """True if the request may proceed; otherwise responds and returns False."""
+        path = urllib.parse.urlparse(self.path).path
+
+        # A machine key gets an explicit allowlist of endpoints, never "whatever
+        # a signed-in human can do". Checked before the cookie so an API client
+        # that also happens to carry a stale cookie still gets key semantics.
+        presented = _presented_key(self.headers)
+        if presented:
+            if not _valid_api_key(presented):
+                self._send(401, {"error": "invalid API key"})
+                return False
+            if path not in API_KEY_PATHS:
+                self._send(403, {
+                    "error": f"an API key cannot use {path}",
+                    "allowed": sorted(API_KEY_PATHS),
+                    "detail": "Adding accounts, signing in and changing the view "
+                              "are dashboard-only. Sign in with a browser for those.",
+                })
+                return False
+            return True
+
         if self._authed():
             return True
-        if self.path.startswith("/api/"):
-            self._send(401, {"error": "not signed in", "login": "/login"})
+        if path.startswith("/api/"):
+            self._send(401, {
+                "error": "not signed in",
+                "detail": "Browsers sign in at /login. Programs send "
+                          "'Authorization: Bearer <key>' with a key from API_KEYS.",
+            })
         else:
             self._send(200, self._login_html(), "text/html; charset=utf-8")
         return False
@@ -886,6 +1002,23 @@ class Handler(BaseHTTPRequestHandler):
                 return self._send(200, PAGE, "text/html; charset=utf-8")
             if u.path == "/api/status":
                 return self._send(200, _status())
+            if u.path == "/api/streams":
+                # /api/status carries account health and rate-limit internals.
+                # An integration wants to know what exists and how much of it
+                # there is, so this is that and nothing else.
+                if not _CFG.db_results.exists():
+                    return self._send(200, {"streams": []})
+                with _connect() as con:
+                    rows = con.execute(
+                        "SELECT s.label, s.query, s.list_id, s.hidden, "
+                        "       COUNT(h.tweet_id) AS tweets "
+                        "FROM streams s LEFT JOIN tweet_hits h USING(stream_id) "
+                        "GROUP BY s.stream_id ORDER BY s.label").fetchall()
+                return self._send(200, {"streams": [
+                    {"label": r["label"],
+                     "source": ("list:" + r["list_id"]) if r["list_id"] else r["query"],
+                     "hidden": bool(r["hidden"]), "tweets": r["tweets"]}
+                    for r in rows]})
             if u.path == "/api/guard":
                 import guard
                 return self._send(200, guard.assess(

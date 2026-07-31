@@ -288,6 +288,21 @@ to X".
 cannot act on is the same as no message. The code and comments stay precise —
 this rule is about the screen.
 
+### R20 — A key is scoped by an allowlist, never by good manners
+
+An API key may read collected data and call `/api/fetch`. It may not add an
+account, open a sign-in browser, or change the view. The list lives in
+`API_KEY_PATHS` and is checked before anything else runs.
+
+*Why:* the alternative is "a key can do whatever a signed-in human can", which
+means a leaked key rewrites `config.toml`, writes secrets to disk and launches
+browser processes. Scoping by endpoint makes a leak cost data exposure instead
+of the account.
+
+Delivery to other systems follows the same shape: signed so the receiver can
+prove it was us, at-least-once so nothing is dropped, and on its own task so a
+receiver's outage never becomes our lag. See §6b.
+
 ---
 
 ## 3. Architecture
@@ -344,7 +359,8 @@ never pulls in a browser. A collector process has no Chrome in it at all.
 | `collector.py` | when to poll, and when to stop | `poll_once()`, `next_interval()`, `Collector` |
 | `store.py` | what is kept, and its shape | snowflake helpers, `normalize_tweet()`, `Store`, export writers |
 | `guard.py` | what not to do | `assess()`, `classify_account()` |
-| `web.py` | the dashboard | `serve()`, the single-page `PAGE` |
+| `web.py` | the dashboard and the read API | `serve()`, the single-page `PAGE` |
+| `webhook.py` | pushing tweets to other systems | `run()`, `pump()`, `sign()`, `verify()` |
 | `main.py` | the CLI | `login doctor guard serve search export watch` |
 
 ### Data flow, one poll
@@ -425,6 +441,10 @@ polls               -- the audit trail: one row per poll, why it stopped
 
 gaps                -- detected discontinuities. Recorded, never yet backfilled.
   gap_id stream_id lo_tweet_id hi_tweet_id lo_ms hi_ms resume_cursor status
+
+webhook_state       -- how far each endpoint has been delivered (see 6b)
+  label last_ms last_tweet_id      -- the cursor, in COLLECTION order
+  sent failures next_attempt_ms last_error last_ok_ms
 ```
 
 Three decisions worth defending:
@@ -765,6 +785,132 @@ nginx -T | grep -n 'scraper.vedictech.in'
 Re-running `bash deploy/setup.sh` is the fix for most of these and is always
 safe. It cannot remove a certificate (R17) or touch another site (R18).
 
+## 6b. Feeding other systems
+
+The dashboard is one consumer of `results.db`. Other systems get the same
+tweets two ways, and they compose: push for speed, pull to catch up or
+backfill.
+
+### Push — we POST to you
+
+Declare an endpoint in `config.toml`; the sender runs inside `watch`.
+
+```toml
+[[webhooks]]
+label      = "main"
+url        = "https://your-system.example.com/hooks/tweets"
+secret_env = "WEBHOOK_SECRET_MAIN"     # names a variable in .env
+streams    = []                        # e.g. ["politicians"]; empty = all
+batch_size = 50
+enabled    = true
+```
+
+```http
+POST /hooks/tweets
+Content-Type: application/json
+X-XS-Timestamp: 1785414135
+X-XS-Signature: sha256=<hmac>
+X-XS-Webhook: main
+
+{"version":1,"webhook":"main","sent_at":1785414135,"count":2,
+ "tweets":[{"tweet_id":"2082803616151437632","text":"…","author_username":"…",
+            "created_at":"…","lag_ms":15400,"streams":["politicians"], …}]}
+```
+
+**Verify the signature.** HMAC-SHA256 over `"<timestamp>.<raw body>"` with the
+shared secret. The timestamp is inside the signed material so a captured
+delivery cannot be replayed forever; reject anything older than a few minutes.
+`webhook.verify()` is a working reference implementation, and it is what the
+test suite exercises — port it rather than reinventing it.
+
+**De-duplicate on `tweet_id`.** Delivery is *at-least-once*: the cursor only
+advances after a 2xx, so a receiver that answers 200 and then dies before
+committing will see that batch again. `tweet_id` is stable forever.
+
+**`tweet_id` is a string, always.** Tweet ids passed 2⁵³ years ago, so any
+consumer parsing JSON numbers — every JavaScript one — would silently round it
+and corrupt the id.
+
+Three properties worth relying on:
+
+| property | why it holds |
+|---|---|
+| Nothing is lost | Delivery position is a cursor in the database, not a queue in memory. A receiver down for a day catches up by itself; a restart here changes nothing. |
+| Your outage is not our lag | The sender is its own task with its own HTTP client. A receiver that hangs for its full timeout costs one background task; polling X keeps its schedule. |
+| Failures back off | 5s doubling to a 15-minute cap, cursor untouched. Recovery needs no manual step. |
+
+The cursor is `(collected_ms, tweet_id)`, **not** `tweet_id`. Tweets do not
+arrive in posting order — X indexes some late, so a tweet collected now can
+carry an older snowflake than one collected a minute ago. A `tweet_id` cursor
+steps over those permanently and the gap is invisible.
+
+A new endpoint starts from **now**, not from the whole archive.
+
+```bash
+python3 main.py webhook --test      # one real tweet to every endpoint, consuming nothing
+python3 main.py webhook --status    # how far each has got, and what is stuck
+python3 main.py watch --all --no-webhooks   # collect without delivering
+```
+
+### Pull — you ask us
+
+Set `API_KEYS` in `.env` (comma-separated, so one consumer can be revoked
+alone). Programs send a bearer token; browsers keep using the session cookie.
+
+```bash
+curl -H "Authorization: Bearer $KEY" \
+     "https://scraper.vedictech.in/api/tweets?since_collected_ms=0&limit=200"
+```
+
+| endpoint | gives you |
+|---|---|
+| `GET /api/tweets` | the tweets, with all the dashboard's filters |
+| `GET /api/streams` | what exists and how much of it |
+| `GET /api/export` | the same as CSV |
+| `GET /api/status` | account health, rate-limit budget |
+| `POST /api/fetch` | go to X now. Spends budget — see below |
+
+Filters: `stream` `q` `author` `lang` `min_likes` `since` `has_media` `order`
+`limit` (max 500) `offset`.
+
+**Two cursors, and the difference matters:**
+
+- `since_collected_ms` — everything *we saw* after this point. Gapless. Use
+  this to mirror the database.
+- `since_id` — everything *posted* after this tweet. What people expect, and
+  fine for "show me what's new", but it silently skips late-indexed tweets for
+  the same reason the webhook cursor does not use it.
+
+Every response carries `cursor` with both, so a consumer never has to work out
+which field to remember:
+
+```json
+{"total": 384, "rows": [...],
+ "cursor": {"since_id": "2082803115678687574", "since_collected_ms": 1785414135000},
+ "has_more": true}
+```
+
+### What a key may not do
+
+An allowlist, enforced server-side — not a convention:
+
+```
+allowed   /api/tweets  /api/streams  /api/export  /api/status  /api/guard  /api/fetch
+refused   /api/account      writes secrets to disk
+          /api/login/*      launches a browser process
+          /api/stream/hide  changes what a human sees
+```
+
+A leaked key then costs you data exposure, not a banned X account or a
+rewritten `config.toml`.
+
+`POST /api/fetch` still goes through the guard (R7): it re-checks the budget
+independently of any client, and refuses unless warnings are acknowledged with
+`"ack": true`. **A client that loops on it will spend the same ~50 requests per
+15 minutes the collector needs** and can get the account restricted (R11). Push
+is the right shape for staying current; `/api/fetch` is for going and getting
+something specific.
+
 ## 7. Operating
 
 **Daily**
@@ -1064,7 +1210,8 @@ python3 main.py login   --account LABEL [--refresh-only] [--force] [--debug-dete
 python3 main.py doctor  [--accounts] [--streams] [--selftest] [--lag] [--since 24h]
 python3 main.py guard   [--action fetch --cost 5] [--json]
 python3 main.py serve   [--host H] [--port P] [--behind-proxy]
-python3 main.py watch   [--stream LABEL | --all] [--once]
+python3 main.py watch   [--stream LABEL | --all] [--once] [--no-webhooks]
+python3 main.py webhook [--status] [--test]
 python3 main.py search  --query '...' | --list URL  [--limit N]
 python3 main.py export  [--stream LABEL] [--since 6h] [--format csv|json|jsonl|raw]
 python3 tests/test_all.py
@@ -1072,4 +1219,5 @@ python3 tests/test_all.py
 
 **Files:** `config` what you declared · `auth` how you get a session · `engine`
 how we talk to X · `collector` when to poll · `store` what we keep · `guard`
-what not to do · `web` how you look at it · `main` how you drive it.
+what not to do · `web` how you look at it · `webhook` how other systems get it ·
+`main` how you drive it.

@@ -24,6 +24,7 @@ import shutil
 import subprocess
 import sys
 import threading
+import time
 from contextlib import aclosing
 from datetime import datetime, timezone
 
@@ -1240,6 +1241,110 @@ def test_web_event_loop(tmp):
 # runner
 # ==========================================================================
 
+async def run_webhook(tmp):
+    """
+    Delivery: signing, the cursor, and what happens when the receiver is down.
+
+    Offline — the receiver is a real HTTP server on localhost, so the signing
+    and the status handling are exercised for real rather than mocked.
+    """
+    import json as _json
+    import threading as _threading
+    from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+    import config as _C
+    import webhook as wh
+
+    print("== signing ==")
+    secret, body = "s3cret_shared_value", b'{"tweets":[]}'
+    ts = str(int(time.time()))
+    sig = wh.sign(secret, ts, body)
+    ok(wh.verify(secret, ts, body, sig), "a genuine delivery verifies")
+    ok(not wh.verify("other", ts, body, sig), "a different secret does not")
+    ok(not wh.verify(secret, ts, body + b"x", sig), "a tampered body does not")
+    old = str(int(time.time()) - 3600)
+    ok(not wh.verify(secret, old, body, wh.sign(secret, old, body)),
+       "an hour-old delivery is refused (replay)")
+    ok(not wh.verify(secret, ts, body, ""), "a missing signature is refused")
+
+    print()
+    print("== delivery ==")
+    got, fail = [], {"on": False}
+
+    class H(BaseHTTPRequestHandler):
+        def log_message(self, *a):
+            pass
+
+        def do_POST(self):
+            raw = self.rfile.read(int(self.headers.get("Content-Length") or 0))
+            if fail["on"]:
+                self.send_response(503)
+                self.send_header("Content-Length", "0")
+                self.end_headers()
+                return
+            got.append((wh.verify(secret, self.headers.get("X-XS-Timestamp"),
+                                  raw, self.headers.get("X-XS-Signature")),
+                        _json.loads(raw)))
+            self.send_response(200)
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+
+    srv = ThreadingHTTPServer(("127.0.0.1", 0), H)
+    _threading.Thread(target=srv.serve_forever, daemon=True).start()
+    os.environ["WH_SECRET"] = secret
+
+    st = Store(tmp / "results.db", False)
+    await st.open()
+    try:
+        # Populate through the real collector path, so what gets delivered is
+        # exactly what a real poll stores — not a hand-built row that might
+        # differ in some field the payload depends on.
+        stream = Stream()
+        sid = await st.ensure_stream(stream.label, stream.query, "Latest", True)
+        await poll_once(ReplayEngine([ids_at(10, 15, 20, 25, 30)]), st, stream, sid)
+
+        hook = _C.WebhookCfg(label="t", url=f"http://127.0.0.1:{srv.server_address[1]}/h",
+                             secret_env="WH_SECRET", batch_size=2)
+        import httpx
+        async with httpx.AsyncClient() as client:
+            sent = await wh.pump(hook, st, client, log=lambda m: None)
+            ok(sent == 5, f"every collected tweet is delivered ({sent})")
+            ok(all(sig for sig, _ in got), "every batch is signed")
+            ids = [x["tweet_id"] for _, p in got for x in p["tweets"]]
+            ok(len(ids) == len(set(ids)) == 5, "batching produces no duplicates")
+            ok(all(isinstance(i, str) for i in ids),
+               "tweet_id crosses the wire as a string (2^53 safety)")
+            ok(await wh.pump(hook, st, client, log=lambda m: None) == 0,
+               "nothing new means nothing sent")
+
+            # Receiver falls over. The cursor must NOT move.
+            fail["on"] = True
+            await poll_once(ReplayEngine([ids_at(1)]), st, stream, sid)
+            before = await st.webhook_cursor("t")
+            await wh.pump(hook, st, client, log=lambda m: None)
+            after = await st.webhook_cursor("t")
+            ok(after["last_tweet_id"] == before["last_tweet_id"],
+               "a failed delivery leaves the cursor alone, so nothing is skipped")
+            ok(after["failures"] == 1 and after["last_error"],
+               f"the failure is recorded with its reason: {(after['last_error'] or '')[:24]}")
+            ok(after["next_attempt_ms"] > int(time.time() * 1000),
+               "and backs off rather than hammering a receiver that is down")
+
+            # It comes back. Catching up must need no manual step.
+            fail["on"] = False
+            await st.webhook_advance("t", before["last_ms"], before["last_tweet_id"], 0)
+            sent = await wh.pump(hook, st, client, log=lambda m: None)
+            ok(sent == 1, "the receiver recovers and the missed tweet arrives")
+            ok((await st.webhook_cursor("t"))["failures"] == 0,
+               "and the failure count resets")
+
+        ok(wh.backoff_ms(1) < wh.backoff_ms(3) <= wh.BACKOFF_MAX_S * 1000,
+           "back-off grows but stays capped")
+    finally:
+        await st.close()
+        srv.shutdown()
+
+
 def main():
     root = HERE / ".tmp"
     cwd = os.getcwd()
@@ -1274,6 +1379,9 @@ def main():
         section("collector (watermark, dedup, gaps, intervals)")
         asyncio.run(run_collector(fresh("collector")))
         test_interval()
+
+        section("webhook (signing, cursor, receiver outage)")
+        asyncio.run(run_webhook(fresh("webhook")))
 
         section("web (shared event loop)")
         test_web_event_loop(fresh("web"))

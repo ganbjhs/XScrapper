@@ -350,6 +350,7 @@ def build_parser():
     _add_search(sub)
     _add_export(sub)
     _add_watch(sub)
+    _add_webhook(sub)
     return p
 
 
@@ -373,6 +374,15 @@ async def cmd_serve(args) -> int:
              f"empty until you run `{CLI} watch --once`.")
     return web.serve(cfg, host=args.host, port=args.port, log=_log,
                      behind_proxy=args.behind_proxy)
+
+
+def _add_webhook(sub):
+    wh = sub.add_parser("webhook", help="Deliver collected tweets to other systems.")
+    wh.add_argument("--status", action="store_true",
+                    help="How far each endpoint has got, and what is stuck.")
+    wh.add_argument("--test", action="store_true",
+                    help="Send one real tweet to every endpoint without consuming it.")
+    wh.set_defaults(func=cmd_webhook)
 
 
 def _add_search(sub):
@@ -421,6 +431,8 @@ def _add_watch(sub):
                     help="Stream label from config.toml (repeatable). Default: all enabled.")
     wp.add_argument("--all", action="store_true", help="All enabled streams.")
     wp.add_argument("--once", action="store_true", help="One poll per stream, then exit.")
+    wp.add_argument("--no-webhooks", action="store_true",
+                    help="Collect but do not deliver to [[webhooks]].")
     wp.add_argument("--duration", type=float, help="Stop after N seconds.")
     wp.add_argument("--max-concurrency", type=int, default=0,
                     help="Max concurrent polls (default: number of active accounts).")
@@ -652,6 +664,78 @@ def _apply_overrides(stream, args):
     return stream
 
 
+async def _flush_webhooks(cfg, st, log=None) -> int:
+    """Deliver whatever is outstanding, once, and return how many went out."""
+    hooks = cfg.enabled_webhooks()
+    if not hooks:
+        return 0
+    import httpx
+
+    import webhook
+    log = log or _log
+    sent = 0
+    async with httpx.AsyncClient(follow_redirects=False) as client:
+        for h in hooks:
+            cur = await st.webhook_cursor(h.label)
+            if not cur["last_ms"] and not cur["sent"]:
+                await st.webhook_start_here(h.label)
+                log(f"[webhook:{h.label}] new endpoint — starting from now")
+                continue
+            sent += await webhook.pump(h, st, client, log=log)
+    return sent
+
+
+async def cmd_webhook(args) -> int:
+    """Inspect and drive webhook delivery without running the collector."""
+    import webhook
+
+    cfg = load_config(args.config)
+    hooks = cfg.enabled_webhooks()
+    if not hooks:
+        _log("No [[webhooks]] in config.toml. See config.toml.example.")
+        return EXIT_CONFIG
+
+    st = store_mod.Store(cfg.db_results, cfg.defaults.keep_entry_json)
+    await st.open()
+    try:
+        if args.test:
+            # Prove the URL, the secret and the receiver all work, using one
+            # real tweet, WITHOUT moving the cursor — so a test never costs a
+            # delivery the far end would otherwise have received for real.
+            import httpx
+            rows = await st.tweets_after(0, 0, 1)
+            if not rows:
+                _log("Nothing collected yet, so there is nothing to send.")
+                return EXIT_OK
+            async with httpx.AsyncClient(follow_redirects=False) as client:
+                for h in hooks:
+                    ok, err = await webhook.deliver_batch(client, h, st, rows)
+                    _log(f"  {'OK  ' if ok else 'FAIL'} {h.label} -> {h.url}"
+                         + ("" if ok else f"\n       {err}"))
+            _log("")
+            _log("(a test delivery does not advance the cursor — nothing was consumed)")
+            return EXIT_OK
+
+        if args.status:
+            for h in hooks:
+                c = await st.webhook_cursor(h.label)
+                behind = len(await st.tweets_after(
+                    c["last_ms"], c["last_tweet_id"], 1000,
+                    labels=h.streams or None, include_hidden=h.include_hidden))
+                _log(f"  {h.label} -> {h.url}")
+                _log(f"      delivered {c['sent']} so far, {behind}{'+' if behind >= 1000 else ''} waiting")
+                if c["failures"]:
+                    _log(f"      {c['failures']} failure(s) in a row: {c['last_error']}")
+                    _log(f"      next attempt in {max(0, c['next_attempt_ms'] - int(time.time() * 1000)) // 1000}s")
+            return EXIT_OK
+
+        sent = await _flush_webhooks(cfg, st)
+        _log(f"[webhook] delivered {sent} tweet(s)")
+        return EXIT_OK
+    finally:
+        await st.close()
+
+
 async def cmd_watch(args) -> int:
     cfg = load_config(args.config)
 
@@ -728,6 +812,7 @@ async def cmd_watch(args) -> int:
     try:
         if args.once:
             results = await collector.run_once()
+            await _flush_webhooks(cfg, st)
             starved = [r for r in results if r.starved]
             if starved:
                 _log("")
@@ -738,9 +823,17 @@ async def cmd_watch(args) -> int:
 
         runner = asyncio.create_task(collector.run_forever(duration=args.duration))
         stopper = asyncio.create_task(stop.wait())
-        done, pending = await asyncio.wait(
-            {runner, stopper}, return_when=asyncio.FIRST_COMPLETED
-        )
+
+        # Delivery runs BESIDE collection, never inside it. A receiver that
+        # hangs for its full timeout on every batch would otherwise add that
+        # delay to every poll, turning someone else's outage into our lag.
+        tasks = {runner, stopper}
+        if cfg.enabled_webhooks() and not args.no_webhooks:
+            import webhook
+            tasks.add(asyncio.create_task(
+                webhook.run(cfg, st, log=_log, stop=stop)))
+
+        done, pending = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
         for task in pending:
             task.cancel()
         await asyncio.gather(*pending, return_exceptions=True)

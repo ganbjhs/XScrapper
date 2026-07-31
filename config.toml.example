@@ -92,3 +92,30 @@ enabled = true
 
 # To stop watching something, set enabled = false. Tweets already collected
 # stay in the database — nothing here ever deletes them.
+
+
+# ---------------------------------------------------------------------------
+# Sending tweets to another system
+#
+# Each block is one place we POST new tweets to, seconds after they are
+# collected. Delivery position is remembered in the database, so a receiver
+# that goes down catches up by itself when it comes back — nothing is lost and
+# there is nothing to restart.
+#
+# Every delivery is signed with a shared secret, so the receiver can prove the
+# request came from you. `secret_env` names a variable in .env; a webhook with
+# no secret is refused, because anyone who learned the URL could otherwise post
+# fake tweets into your system.
+#
+# A new endpoint starts from NOW, not from the whole archive.
+#
+#   python3 main.py webhook --test      send one real tweet, consuming nothing
+#   python3 main.py webhook --status    how far each endpoint has got
+#
+# [[webhooks]]
+# label      = "main"
+# url        = "https://your-system.example.com/hooks/tweets"
+# secret_env = "WEBHOOK_SECRET_MAIN"       # the NAME of a variable in .env
+# streams    = []                          # e.g. ["politicians"]; empty = all
+# batch_size = 50                          # tweets per POST
+# enabled    = true

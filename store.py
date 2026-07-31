@@ -384,6 +384,22 @@ CREATE TABLE IF NOT EXISTS gaps (
   created_at    TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS ix_gaps_open ON gaps(status, stream_id, hi_tweet_id DESC);
+
+-- How far each webhook has been delivered. One row per endpoint; see the
+-- webhook section below for why this is a cursor and not a queue.
+CREATE TABLE IF NOT EXISTS webhook_state (
+  label           TEXT PRIMARY KEY,
+  last_ms         INTEGER NOT NULL DEFAULT 0,   -- cursor: collected_ms
+  last_tweet_id   INTEGER NOT NULL DEFAULT 0,   -- cursor: tie-break within a ms
+  sent            INTEGER NOT NULL DEFAULT 0,   -- lifetime tweets delivered
+  failures        INTEGER NOT NULL DEFAULT 0,   -- consecutive, resets on success
+  next_attempt_ms INTEGER NOT NULL DEFAULT 0,   -- back-off gate
+  last_error      TEXT,
+  last_ok_ms      INTEGER
+);
+
+-- Delivery walks tweets in collection order, which is not the primary key.
+CREATE INDEX IF NOT EXISTS ix_tweets_delivery ON tweets(collected_ms, tweet_id);
 """
 
 
@@ -508,6 +524,109 @@ class Store:
              _iso_ms(int(time.time() * 1000))),
         )
         return cur.lastrowid
+
+    # ----------------------------------------------------------------------
+    # webhook delivery
+    # ----------------------------------------------------------------------
+    #
+    # Delivery is tracked as a CURSOR, not a queue of pending rows.
+    #
+    # A queue needs enqueueing on every insert, draining, retry counters per
+    # row, and a cleanup job — and if the sender is down when a tweet arrives,
+    # whether it is ever delivered depends on the enqueue having happened.
+    # A cursor has none of that: "everything collected after this point" is a
+    # query, so a receiver that was down for a day catches up by itself the
+    # moment it comes back, and there is nothing to leak or prune.
+    #
+    # The cursor is (collected_ms, tweet_id), NOT tweet_id alone. Tweets do not
+    # arrive in posting order — X indexes some late, so a tweet collected now
+    # can have an older snowflake than one collected a minute ago. A tweet_id
+    # cursor would step over those permanently, and the gap would be invisible.
+
+    async def webhook_cursor(self, label: str) -> dict:
+        row = self.db.execute(
+            "SELECT * FROM webhook_state WHERE label = ?", (label,)).fetchone()
+        if row:
+            return dict(row)
+        return {"label": label, "last_ms": 0, "last_tweet_id": 0, "sent": 0,
+                "failures": 0, "next_attempt_ms": 0, "last_error": None,
+                "last_ok_ms": None}
+
+    async def webhook_advance(self, label: str, last_ms: int, last_tweet_id: int,
+                              sent: int) -> None:
+        """Record a successful delivery. Only ever called after a 2xx."""
+        now = int(time.time() * 1000)
+        self.db.execute(
+            "INSERT INTO webhook_state(label, last_ms, last_tweet_id, sent, "
+            "                          failures, next_attempt_ms, last_error, last_ok_ms) "
+            "VALUES(?,?,?,?,0,0,NULL,?) "
+            "ON CONFLICT(label) DO UPDATE SET "
+            "  last_ms = excluded.last_ms, last_tweet_id = excluded.last_tweet_id, "
+            "  sent = webhook_state.sent + excluded.sent, failures = 0, "
+            "  next_attempt_ms = 0, last_error = NULL, last_ok_ms = excluded.last_ok_ms",
+            (label, last_ms, last_tweet_id, sent, now))
+
+    async def webhook_failed(self, label: str, error: str, next_attempt_ms: int) -> None:
+        """Record a failure WITHOUT moving the cursor, so nothing is skipped."""
+        self.db.execute(
+            "INSERT INTO webhook_state(label, last_ms, last_tweet_id, sent, "
+            "                          failures, next_attempt_ms, last_error) "
+            "VALUES(?,0,0,0,1,?,?) "
+            "ON CONFLICT(label) DO UPDATE SET "
+            "  failures = webhook_state.failures + 1, "
+            "  next_attempt_ms = excluded.next_attempt_ms, "
+            "  last_error = excluded.last_error",
+            (label, next_attempt_ms, error[:400]))
+
+    async def webhook_start_here(self, label: str) -> None:
+        """
+        Point a brand-new endpoint at 'from now on'.
+
+        Without this, adding a webhook to a database with months of history
+        would immediately fire every tweet in it at the receiver. New endpoints
+        want the future, not the archive; use --backfill to ask for the past
+        deliberately.
+        """
+        row = self.db.execute(
+            "SELECT MAX(collected_ms) m, MAX(tweet_id) t FROM tweets").fetchone()
+        await self.webhook_advance(label, row["m"] or 0, row["t"] or 0, 0)
+        self.db.execute("UPDATE webhook_state SET sent = 0 WHERE label = ?", (label,))
+
+    async def tweets_after(self, last_ms: int, last_tweet_id: int, limit: int,
+                           labels: list | None = None,
+                           include_hidden: bool = False) -> list:
+        """
+        The next batch to deliver, oldest first.
+
+        Strict ordering on the composite cursor: rows collected in the same
+        millisecond are broken by tweet_id, so no row is ever visited twice and
+        none is skipped.
+        """
+        where = ["t.source = 'result'",
+                 "(t.collected_ms > ? OR (t.collected_ms = ? AND t.tweet_id > ?))"]
+        params: list = [last_ms, last_ms, last_tweet_id]
+
+        if labels:
+            where.append(
+                "EXISTS (SELECT 1 FROM tweet_hits h JOIN streams s USING(stream_id) "
+                "        WHERE h.tweet_id = t.tweet_id AND s.label IN "
+                f"       ({','.join('?' * len(labels))}))")
+            params += list(labels)
+        elif not include_hidden:
+            where.append(
+                "EXISTS (SELECT 1 FROM tweet_hits h JOIN streams s USING(stream_id) "
+                "        WHERE h.tweet_id = t.tweet_id AND s.hidden = 0)")
+
+        rows = self.db.execute(
+            f"SELECT * FROM tweets t WHERE {' AND '.join(where)} "
+            "ORDER BY t.collected_ms, t.tweet_id LIMIT ?", [*params, limit]
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+    async def stream_labels_for(self, tweet_id: int) -> list:
+        return [r["label"] for r in self.db.execute(
+            "SELECT s.label FROM tweet_hits h JOIN streams s USING(stream_id) "
+            "WHERE h.tweet_id = ? ORDER BY s.label", (tweet_id,))]
 
     async def set_hidden(self, label: str, hidden: bool) -> bool:
         """
