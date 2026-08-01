@@ -149,6 +149,15 @@ say "browser"
 #
 # Shared, not per-user: the service runs as $APP_USER, this script as root, and
 # the default cache path would put the download somewhere $APP_USER cannot read.
+#
+# The path goes into .env, which is the ONE place every entry point already
+# reads — config.load_config() calls load_dotenv() before anything touches a
+# browser, so the CLI and the service both get it.
+#
+# It used to be set only on the systemd unit. The service was therefore fine
+# while `main.py doctor --browser` looked in the default cache, found nothing,
+# and reported the browser as missing when it was sitting in /opt/ms-playwright
+# all along.
 export PLAYWRIGHT_BROWSERS_PATH=/opt/ms-playwright
 if [ "$SKIP_BROWSER" = "1" ]; then
   warn "skipped (SKIP_BROWSER=1) — sign accounts in on a machine with a browser"
@@ -172,10 +181,15 @@ with sync_playwright() as p:
         copy accounts.db + profiles/ up instead."
   fi
 fi
-# systemd units get a clean environment, so the path must be stated there too.
-mkdir -p /etc/systemd/system/xscraper-web.service.d
-printf '[Service]\nEnvironment=PLAYWRIGHT_BROWSERS_PATH=%s\n' /opt/ms-playwright \
-  > /etc/systemd/system/xscraper-web.service.d/playwright.conf
+# Recorded in .env so every entry point finds it, not just the service.
+if ! grep -q '^PLAYWRIGHT_BROWSERS_PATH=' "$APP_DIR/.env" 2>/dev/null; then
+  printf 'PLAYWRIGHT_BROWSERS_PATH=%s\n' /opt/ms-playwright >> "$APP_DIR/.env"
+  ok "recorded the browser path in .env"
+fi
+# The old per-service override is now redundant and is a second place for the
+# two to disagree.
+rm -f /etc/systemd/system/xscraper-web.service.d/playwright.conf
+rmdir /etc/systemd/system/xscraper-web.service.d 2>/dev/null || true
 
 say "config"
 cd "$APP_DIR"

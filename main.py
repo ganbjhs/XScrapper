@@ -182,6 +182,11 @@ async def _verify_search(cfg, api) -> int:
 # doctor
 # --------------------------------------------------------------------------
 
+# The interpreter that owns the venv, so printed commands are runnable as-is
+# rather than assuming whatever python happens to be on PATH.
+APP_VENV = sys.executable
+
+
 async def check_browser(cfg) -> int:
     """
     Can this machine run the sign-in browser, and how slowly?
@@ -229,7 +234,25 @@ async def check_browser(cfg) -> int:
         _log("  Fix         : bash deploy/setup.sh")
         return EXIT_CONFIG
 
-    _log(f"  browsers at : {os.getenv('PLAYWRIGHT_BROWSERS_PATH') or '(default cache)'}")
+    # Where the binaries are, and whether anything is actually there. These
+    # are two different questions and only asking the first is how "the browser
+    # is missing" gets reported about a browser that is installed, just
+    # somewhere this process was never told about.
+    bp = os.getenv("PLAYWRIGHT_BROWSERS_PATH")
+    if bp:
+        d = pathlib.Path(bp)
+        have = sorted(x.name for x in d.glob("chromium*")) if d.is_dir() else []
+        _log(f"  browsers at : {bp}" + ("" if d.is_dir() else "   (DOES NOT EXIST)"))
+        _log(f"  found       : {', '.join(have) if have else 'nothing'}")
+    else:
+        home = pathlib.Path.home() / ".cache" / "ms-playwright"
+        have = sorted(x.name for x in home.glob("chromium*")) if home.is_dir() else []
+        _log(f"  browsers at : (default cache) {home}")
+        _log(f"  found       : {', '.join(have) if have else 'nothing'}")
+        _log("  NOTE        : PLAYWRIGHT_BROWSERS_PATH is not set for this process.")
+        _log("                deploy/setup.sh installs into /opt/ms-playwright and")
+        _log("                records that in .env. If .env has no such line, this")
+        _log("                install predates that — re-run deploy/setup.sh.")
 
     # Launch through the SAME path the sign-in window uses, so a pass here
     # means the real thing works rather than something adjacent to it.
@@ -265,11 +288,36 @@ async def check_browser(cfg) -> int:
     except Exception as e:
         for ln in lines:
             _log(f"  launch      : {ln.strip()}")
-        _log(f"  FAILED      : {type(e).__name__}: {e}")
+        msg = str(e)
+        _log(f"  FAILED      : {type(e).__name__}")
         _log("")
-        _log("  If that mentions a missing library, run:")
-        _log("      .venv/bin/python3 -m playwright install-deps chromium")
-        _log("  If it was killed with no message, it is memory — see above.")
+
+        # Name the cause rather than printing the traceback and hoping. These
+        # are the failures this actually hits; anything else falls through to
+        # the raw message.
+        if "Executable doesn't exist" in msg or "playwright install" in msg:
+            where = os.getenv("PLAYWRIGHT_BROWSERS_PATH", "/opt/ms-playwright")
+            _log("  The Playwright PACKAGE is installed but the browser BINARY is not")
+            _log("  where this process looked. Install it into the shared location, so")
+            _log("  the service and the command line both find it:")
+            _log("")
+            _log(f"      sudo PLAYWRIGHT_BROWSERS_PATH={where} \\")
+            _log(f"           {APP_VENV} -m playwright install chromium")
+            _log(f"      sudo PLAYWRIGHT_BROWSERS_PATH={where} \\")
+            _log(f"           {APP_VENV} -m playwright install-deps chromium")
+            _log(f"      sudo chmod -R a+rX {where}")
+            _log("")
+            _log("  Then make every entry point aware of it, once:")
+            _log(f"      echo 'PLAYWRIGHT_BROWSERS_PATH={where}' >> .env")
+            _log("")
+            _log("  Or simply re-run  bash deploy/setup.sh , which now does all of it.")
+        elif "libnss3" in msg or "error while loading shared libraries" in msg or "libgbm" in msg:
+            _log("  A system library the browser links against is missing:")
+            _log(f"      sudo {APP_VENV} -m playwright install-deps chromium")
+        elif "Target closed" in msg or "crashed" in msg:
+            _log("  The browser started and died. That is usually memory — see above.")
+        else:
+            _log(f"  {msg.splitlines()[0][:300]}")
         return EXIT_CONFIG
 
     _log("")
