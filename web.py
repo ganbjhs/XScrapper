@@ -1222,6 +1222,8 @@ class Handler(BaseHTTPRequestHandler):
                 return
             if u.path == "/":
                 return self._send(200, PAGE, "text/html; charset=utf-8")
+            if u.path in ("/accounts", "/accounts/"):
+                return self._send(200, ACCOUNTS_PAGE, "text/html; charset=utf-8")
             if u.path == "/api/status":
                 return self._send(200, _status())
             if u.path == "/api/streams":
@@ -1394,12 +1396,27 @@ def serve(cfg, host="127.0.0.1", port=8765, log=print, behind_proxy=False):
     return 0
 
 
-PAGE = r"""<!doctype html>
+# --------------------------------------------------------------------------
+# the pages
+# --------------------------------------------------------------------------
+#
+# Two pages now — the dashboard and the accounts panel — so the pieces both
+# need live in shared constants rather than being copied. The sign-in window in
+# particular is CSS, markup and about a hundred lines of coordinate-scaling
+# JavaScript; a second copy of that would drift from the first the moment
+# either was touched.
+#
+# Assembled with plain concatenation. A template engine would be a dependency,
+# and str.format would fight every { in the CSS and JS.
+
+_DOC_HEAD = r"""<!doctype html>
 <html lang="en"><head>
 <meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>X Collector</title>
+<title>__TITLE__</title>
 <style>
-  :root{
+"""
+
+_CSS_CORE = r"""  :root{
     --bg:#fff; --panel:#f7f8fa; --line:#e3e6ea; --fg:#14171a; --dim:#5b7083;
     --accent:#1d9bf0; --warn:#c0392b; --ok:#17a673; --radius:10px;
   }
@@ -1478,7 +1495,9 @@ PAGE = r"""<!doctype html>
   .banner.err{border-color:var(--warn);color:var(--warn)}
   .banner.ok{border-color:var(--ok);color:var(--ok)}
   a{color:var(--accent)}
-  /* The remote browser. The image IS the page: clicks and keys are forwarded
+"""
+
+_CSS_LOGIN = r"""  /* The remote browser. The image IS the page: clicks and keys are forwarded
      to a real Chrome running on the server, so this behaves like a window. */
   #loginwrap{position:fixed;inset:0;background:rgba(0,0,0,.6);z-index:50;
              display:none;place-items:center}
@@ -1552,7 +1571,212 @@ PAGE = r"""<!doctype html>
          text-align:left;padding:2px 0;text-decoration:underline;cursor:pointer}
   code{background:var(--bg);padding:1px 5px;border-radius:5px;font-size:12px;
        border:1px solid var(--line)}
-</style></head><body>
+"""
+
+_HTML_LOGIN = r"""<div id="loginwrap">
+  <div id="loginbox">
+    <div id="loginhead">
+      <b>Sign in to X</b>
+      <span id="loginmsg">Starting…</span>
+      <button id="logindone" hidden>Done</button>
+      <button id="loginx">Close</button>
+    </div>
+    <div id="loginstage">
+      <img id="loginimg" alt="The X sign-in page">
+    </div>
+    <div id="loginhint">This is a real browser. Click and type in it as you normally
+      would. Your password goes straight to x.com — this page never sees it.
+      Scrolling works too.</div>
+  </div>
+</div>
+
+"""
+
+_JS_HELPERS = r"""const $ = s => document.querySelector(s);
+let activeStream = "";
+let openCfg = null;      // which stream has its settings open
+
+const esc = s => (s||"").replace(/[&<>"']/g, c =>
+  ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+
+function ago(iso){
+  if(!iso) return "";
+  const s = (Date.now() - new Date(iso).getTime())/1000;
+  if (s < 60) return Math.max(0,Math.round(s))+"s ago";
+  if (s < 3600) return Math.round(s/60)+"m ago";
+  if (s < 86400) return Math.round(s/3600)+"h ago";
+  return Math.round(s/86400)+"d ago";
+}
+const num = n => n == null ? "0" : n >= 1000 ? (n/1000).toFixed(1)+"K" : ""+n;
+
+// A duration in seconds, said the way a person would say it.
+function secs(s){
+  if (s < 90)    return Math.round(s) + " seconds";
+  if (s < 5400)  return Math.round(s/60) + " minutes";
+  if (s < 86400) return Math.round(s/3600) + " hours";
+  return Math.round(s/86400) + " days";
+}
+
+// A video's length, as a player shows it. X reports duration in MILLISECONDS —
+// feeding it to secs() above turns a 5-minute clip into "3 days".
+function clock(ms){
+  const t = Math.round(ms/1000), m = Math.floor(t/60), s = t % 60;
+  if (m < 60) return `${m}:${String(s).padStart(2,"0")}`;
+  return `${Math.floor(m/60)}:${String(m%60).padStart(2,"0")}:${String(s).padStart(2,"0")}`;
+}
+
+/* Distinguishes "the server is not running" from "the server said no".
+   A bare "Failed to fetch" is useless — it is what the browser says when the
+   backend is simply gone, which is the single most likely cause. */
+async function api(url, opts){
+  let r;
+  try {
+    r = await fetch(url, opts);
+  } catch (e) {
+    throw new Error("Cannot reach the collector. It may have stopped — " +
+                    "reload the page in a moment.");
+  }
+  const d = await r.json().catch(() => ({error: `HTTP ${r.status}`}));
+  if (!r.ok) throw new Error(d.error || `HTTP ${r.status}`);
+  return d;
+}
+
+function banner(msg, kind){
+  $("#banner").innerHTML = msg ? `<div class="banner ${kind||''}">${msg}</div>` : "";
+}
+
+"""
+
+_JS_LOGIN = r"""/* ------------------------------------------------------------------
+   The sign-in window.
+
+   The <img> is a live picture of a real Chrome running on the server.
+   Clicks are scaled from the displayed size back to the real window size
+   and forwarded; keystrokes go straight through. The password is typed
+   into the genuine x.com form — this page never reads or stores it.
+
+   As soon as X reports the account as signed in, the session is copied
+   out and the browser is shut down. It exists only to get past the
+   captcha and device checks that a plain script cannot clear.
+   ------------------------------------------------------------------ */
+let loginTimer = null, loginW = 1100, loginH = 780, loginDone = false;
+
+function loginMsg(text, bad){
+  $("#loginmsg").textContent = text;
+  $("#loginmsg").style.color = bad ? "var(--warn)" : "var(--dim)";
+}
+
+function loginStopFrames(){
+  if (loginTimer) { clearInterval(loginTimer); loginTimer = null; }
+}
+
+async function loginOpen(label){
+  $("#loginwrap").classList.add("on");
+  loginMsg("Starting a browser…");
+  $("#logindone").hidden = true;
+  loginDone = false;
+  let d;
+  try {
+    d = await api("/api/login/start", {
+      method:"POST", headers:{"Content-Type":"application/json"},
+      body: JSON.stringify({label})
+    });
+  } catch (e) { return loginMsg(e.message, true); }
+  if (d.error){ loginMsg(d.error, true); return; }
+
+  loginW = d.width; loginH = d.height;
+  loginMsg("Type your X username and password in the window below.");
+  loginFrame();
+  loginTimer = setInterval(loginFrame, 900);
+
+  // The profile may already be signed in, in which case there is nothing for
+  // anyone to do — capture it and close.
+  if (d.state === "logged_in") loginAct({act:"none"});
+}
+
+function loginFrame(){
+  if (loginDone) return;   // the browser is gone; asking again just 409s
+  // Cache-buster: the URL is constant but the picture changes every frame.
+  $("#loginimg").src = "/api/login/frame?t=" + Date.now();
+}
+
+async function loginAct(payload){
+  if (loginDone) return;
+  let d;
+  try {
+    d = await api("/api/login/act", {
+      method:"POST", headers:{"Content-Type":"application/json"},
+      body: JSON.stringify(payload)
+    });
+  } catch (e) { return loginMsg(e.message, true); }
+
+  if (d.error)  return loginMsg(d.error, true);
+  if (d.closed) return loginClose();
+
+  if (d.state === "challenge")
+    loginMsg("X wants a code or a puzzle solved — do it in the window below.");
+  else if (d.state === "needs_login")
+    loginMsg("Type your X username and password in the window below.");
+
+  if (d.captured){
+    // The browser has already been shut down server-side at this point.
+    loginDone = true;
+    loginStopFrames();
+    $("#logindone").hidden = false;
+    if (d.active){
+      loginMsg(`Signed in as @${d.username}. This account is ready to collect.`);
+      banner(`@${esc(d.username)} is connected and collecting.`, "ok");
+      await status();
+    } else {
+      loginMsg(`Signed in as @${d.username}, but the session could not be saved: `
+               + d.detail, true);
+    }
+    return;
+  }
+  setTimeout(loginFrame, 250);
+}
+
+$("#loginimg").onclick = (e) => {
+  const r = e.target.getBoundingClientRect();
+  // The image is displayed scaled; clicks must land on the real pixels.
+  const x = Math.round((e.clientX - r.left) * (loginW / r.width));
+  const y = Math.round((e.clientY - r.top)  * (loginH / r.height));
+  loginAct({act:"click", x, y});
+};
+$("#loginimg").onwheel = (e) => { e.preventDefault(); loginAct({act:"scroll", dy: e.deltaY}); };
+
+document.addEventListener("keydown", (e) => {
+  if (!$("#loginwrap").classList.contains("on")) return;
+  if (e.key === "Escape") { e.preventDefault(); return loginClose(); }
+  e.preventDefault();
+  if (e.key.length === 1)        loginAct({act:"type", text:e.key});
+  else if (["Enter","Backspace","Tab","ArrowLeft","ArrowRight","ArrowUp","ArrowDown","Delete"].includes(e.key))
+    loginAct({act:"key", key:e.key});
+});
+// Pasting a password is normal and safer than typing it.
+document.addEventListener("paste", (e) => {
+  if (!$("#loginwrap").classList.contains("on")) return;
+  const text = (e.clipboardData || window.clipboardData).getData("text");
+  if (text) { e.preventDefault(); loginAct({act:"type", text}); }
+});
+
+async function loginClose(){
+  loginStopFrames();
+  $("#loginwrap").classList.remove("on");
+  // Always tell the server, even after a successful capture: the call is
+  // idempotent, and a browser left running holds the account's profile
+  // directory open, which blocks the next sign-in.
+  try { await api("/api/login/cancel", {method:"POST",
+        headers:{"Content-Type":"application/json"}, body:"{}"}); } catch {}
+  loginDone = false;
+  await status();
+}
+$("#loginx").onclick = loginClose;
+$("#logindone").onclick = loginClose;
+
+"""
+
+_DASH_BODY = r"""</style></head><body>
 
 <header>
   <h1>X Collector</h1>
@@ -1635,21 +1859,8 @@ Tick this to see only original posts."><input type="checkbox" id="noretweets"> h
     <div class="box">
       <h2>X accounts</h2>
       <div id="accounts"><span class="muted">—</span></div>
-      <button id="acctnew" style="width:100%;margin-top:8px;padding:5px;font-size:13px">
-        + Add an account</button>
-      <div id="acctform" hidden style="margin-top:8px;display:grid;gap:5px">
-        <p class="muted" style="margin:0 0 2px">
-          Give it a short name, then sign in. A window opens where you type your
-          X password directly into x.com.</p>
-        <input id="a_label" placeholder="short name, e.g. acct_b">
-        <input id="a_user"  placeholder="X username (optional)">
-        <input id="a_proxy" placeholder="proxy (leave blank)">
-        <div style="display:flex;gap:6px">
-          <button id="a_save" class="primary" style="flex:1;padding:5px;font-size:13px">
-            Save and sign in</button>
-          <button id="a_cancel" style="padding:5px 10px;font-size:13px">Cancel</button>
-        </div>
-      </div>
+      <a href="/accounts" class="linky" style="display:block;margin-top:6px">
+        Manage accounts →</a>
     </div>
     <div class="box">
       <h2>Saved so far</h2>
@@ -1667,62 +1878,9 @@ Tick this to see only original posts."><input type="checkbox" id="noretweets"> h
   </aside>
 </div>
 
-<div id="loginwrap">
-  <div id="loginbox">
-    <div id="loginhead">
-      <b>Sign in to X</b>
-      <span id="loginmsg">Starting…</span>
-      <button id="logindone" hidden>Done</button>
-      <button id="loginx">Close</button>
-    </div>
-    <div id="loginstage">
-      <img id="loginimg" alt="The X sign-in page">
-    </div>
-    <div id="loginhint">This is a real browser. Click and type in it as you normally
-      would. Your password goes straight to x.com — this page never sees it.
-      Scrolling works too.</div>
-  </div>
-</div>
+"""
 
-<script>
-const $ = s => document.querySelector(s);
-let activeStream = "";
-let openCfg = null;      // which stream has its settings open
-
-const esc = s => (s||"").replace(/[&<>"']/g, c =>
-  ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
-
-function ago(iso){
-  if(!iso) return "";
-  const s = (Date.now() - new Date(iso).getTime())/1000;
-  if (s < 60) return Math.max(0,Math.round(s))+"s ago";
-  if (s < 3600) return Math.round(s/60)+"m ago";
-  if (s < 86400) return Math.round(s/3600)+"h ago";
-  return Math.round(s/86400)+"d ago";
-}
-const num = n => n == null ? "0" : n >= 1000 ? (n/1000).toFixed(1)+"K" : ""+n;
-
-// A duration in seconds, said the way a person would say it.
-function secs(s){
-  if (s < 90)    return Math.round(s) + " seconds";
-  if (s < 5400)  return Math.round(s/60) + " minutes";
-  if (s < 86400) return Math.round(s/3600) + " hours";
-  return Math.round(s/86400) + " days";
-}
-
-// A video's length, as a player shows it. X reports duration in MILLISECONDS —
-// feeding it to secs() above turns a 5-minute clip into "3 days".
-function clock(ms){
-  const t = Math.round(ms/1000), m = Math.floor(t/60), s = t % 60;
-  if (m < 60) return `${m}:${String(s).padStart(2,"0")}`;
-  return `${Math.floor(m/60)}:${String(m%60).padStart(2,"0")}:${String(s).padStart(2,"0")}`;
-}
-
-function banner(msg, kind){
-  $("#banner").innerHTML = msg ? `<div class="banner ${kind||''}">${msg}</div>` : "";
-}
-
-const PAGE_SIZE = 100;
+_DASH_JS = r"""const PAGE_SIZE = 100;
 let offset = 0, loaded = 0, lastTotal = 0;
 
 function params(){
@@ -1738,22 +1896,6 @@ function params(){
   if ($("#media").checked) p.set("has_media","1");
   if ($("#noretweets").checked) p.set("no_retweets","1");
   return p;
-}
-
-/* Distinguishes "the server is not running" from "the server said no".
-   A bare "Failed to fetch" is useless — it is what the browser says when the
-   backend is simply gone, which is the single most likely cause. */
-async function api(url, opts){
-  let r;
-  try {
-    r = await fetch(url, opts);
-  } catch (e) {
-    throw new Error("Cannot reach the collector. It may have stopped — " +
-                    "reload the page in a moment.");
-  }
-  const d = await r.json().catch(() => ({error: `HTTP ${r.status}`}));
-  if (!r.ok) throw new Error(d.error || `HTTP ${r.status}`);
-  return d;
 }
 
 async function search(append){
@@ -1919,34 +2061,32 @@ async function status(){
   });
   drawCfg(all);
 
-  $("#accounts").innerHTML = (d.accounts||[]).length
-    ? d.accounts.map(a => {
-        const st = a.status || (a.active ? "live" : "dead");
-        // The word repeats what the colour says, for anyone who cannot rely on
-        // colour — and says it in words rather than status codes.
-        const label = {live:"Working", warning:"Check this", dead:"Signed out",
-                       unknown:"Not set up"}[st] || st;
-        const reasons = (a.reasons||[]).length
-          ? `<div class="muted" style="margin:1px 0 5px 2px">`
-            + a.reasons.map(r => `• ${esc(r)}`).join("<br>")
-            + (a.action ? `<br><span style="opacity:.85">→ ${esc(a.action)}</span>` : "")
-            + `</div>`
-          : "";
-        const needs = st === "dead" || st === "unknown";
-        return `<div class="row">
-            <span class="k">@${esc(a.username)}${a.proxy?' <span title="uses a proxy">⛓</span>':''}</span>
-            <span class="flag ${st}">${label}</span>
-          </div>${reasons}
-          ${needs ? `<button data-signin="${esc(a.label||a.username)}"
-             style="width:100%;margin:2px 0 8px;padding:4px;font-size:12px">
-             Sign in to X</button>` : ""}`;
-      }).join("")
-    : '<span class="muted">none yet — add one below</span>';
+  /* Only what you glance at.
+     The reasons, remedies and per-account facts moved to /accounts — in a
+     300px column every unhealthy account produced a paragraph of small grey
+     text, and none of it is something you act on mid-search. What matters here
+     is "is anything collecting", and if not, that something is wrong. */
+  /* "Collecting" is `active`, NOT status === "live".
+     Amber is not a weaker red (R12): an account with no proxy and no
+     known-device cookie is flagged amber and is collecting perfectly well.
+     Counting only green made this box announce "Nothing is collecting right
+     now" while the one account was, in fact, collecting. */
+  const accts  = d.accounts || [];
+  const good   = accts.filter(a => a.active);
+  const bad    = accts.length - good.length;
 
-  // Wire the sign-in buttons this pass just drew. status() replaces the whole
-  // panel every 15s, so anything bound before now is gone with the old nodes.
-  document.querySelectorAll("[data-signin]").forEach(b =>
-    b.onclick = () => loginOpen(b.dataset.signin));
+  $("#accounts").innerHTML = accts.length
+    ? good.map(a => `<div class="row">
+          <span class="k">@${esc(a.username)}${a.proxy?' <span title="uses a proxy">⛓</span>':''}</span>
+          <span class="flag ${a.status === "warning" ? "warning" : "live"}">${
+            a.status === "warning" ? "Working*" : "Working"}</span>
+        </div>`).join("")
+      // Never silently omit the unhealthy ones: an empty panel and a panel
+      // hiding three dead accounts must not look the same (R12).
+      + (bad ? `<div class="row"><span class="k">${bad} not collecting</span>
+                  <span class="flag ${good.length ? "warning" : "dead"}">see below</span></div>` : "")
+      + (good.length ? "" : '<div class="muted">Nothing is collecting right now.</div>')
+    : '<span class="muted">none yet</span>';
 
   // Both queues, named. They are separate allowances that do not share, so
   // showing one number invites spending the wrong budget.
@@ -2243,33 +2383,6 @@ $("#tg_test").onclick = async () => {
   finally { $("#tg_test").disabled = false; }
 };
 
-$("#acctnew").onclick = () => { $("#acctform").hidden = false; $("#a_label").focus(); };
-$("#a_cancel").onclick = () => { $("#acctform").hidden = true; };
-$("#a_save").onclick = async () => {
-  const body = {
-    label: $("#a_label").value.trim(), username: $("#a_user").value.trim(),
-    proxy: $("#a_proxy").value.trim(),
-  };
-  if (!body.label) return banner("Give the account a short name first.", "err");
-  $("#a_save").disabled = true;
-  try {
-    const d = await api("/api/account", {
-      method:"POST", headers:{"Content-Type":"application/json"},
-      body: JSON.stringify(body)
-    });
-    if (d.error) return banner(esc(d.error), "err");
-    ["#a_label","#a_user","#a_proxy"].forEach(s => $(s).value = "");
-    $("#acctform").hidden = true;
-    banner("");
-    await status();
-    // Straight into signing in. An account that is saved but not signed in
-    // collects nothing, so there is no reason to make that a second step —
-    // and no reason to send anyone to a terminal for it.
-    await loginOpen(d.label);
-  } catch (e) { banner(esc(e.message), "err"); }
-  finally { $("#a_save").disabled = false; }
-};
-
 /* ------------------------------------------------------------------
    Auto-update.
 
@@ -2342,135 +2455,229 @@ $("#newbtn").onclick    = () => { showPending(); window.scrollTo({top: 0, behavi
 // A hidden tab should not keep querying; catch up the moment it is visible.
 document.addEventListener("visibilitychange", () => { if (!document.hidden) tick(); });
 
-/* ------------------------------------------------------------------
-   The sign-in window.
-
-   The <img> is a live picture of a real Chrome running on the server.
-   Clicks are scaled from the displayed size back to the real window size
-   and forwarded; keystrokes go straight through. The password is typed
-   into the genuine x.com form — this page never reads or stores it.
-
-   As soon as X reports the account as signed in, the session is copied
-   out and the browser is shut down. It exists only to get past the
-   captcha and device checks that a plain script cannot clear.
-   ------------------------------------------------------------------ */
-let loginTimer = null, loginW = 1100, loginH = 780, loginDone = false;
-
-function loginMsg(text, bad){
-  $("#loginmsg").textContent = text;
-  $("#loginmsg").style.color = bad ? "var(--warn)" : "var(--dim)";
-}
-
-function loginStopFrames(){
-  if (loginTimer) { clearInterval(loginTimer); loginTimer = null; }
-}
-
-async function loginOpen(label){
-  $("#loginwrap").classList.add("on");
-  loginMsg("Starting a browser…");
-  $("#logindone").hidden = true;
-  loginDone = false;
-  let d;
-  try {
-    d = await api("/api/login/start", {
-      method:"POST", headers:{"Content-Type":"application/json"},
-      body: JSON.stringify({label})
-    });
-  } catch (e) { return loginMsg(e.message, true); }
-  if (d.error){ loginMsg(d.error, true); return; }
-
-  loginW = d.width; loginH = d.height;
-  loginMsg("Type your X username and password in the window below.");
-  loginFrame();
-  loginTimer = setInterval(loginFrame, 900);
-
-  // The profile may already be signed in, in which case there is nothing for
-  // anyone to do — capture it and close.
-  if (d.state === "logged_in") loginAct({act:"none"});
-}
-
-function loginFrame(){
-  if (loginDone) return;   // the browser is gone; asking again just 409s
-  // Cache-buster: the URL is constant but the picture changes every frame.
-  $("#loginimg").src = "/api/login/frame?t=" + Date.now();
-}
-
-async function loginAct(payload){
-  if (loginDone) return;
-  let d;
-  try {
-    d = await api("/api/login/act", {
-      method:"POST", headers:{"Content-Type":"application/json"},
-      body: JSON.stringify(payload)
-    });
-  } catch (e) { return loginMsg(e.message, true); }
-
-  if (d.error)  return loginMsg(d.error, true);
-  if (d.closed) return loginClose();
-
-  if (d.state === "challenge")
-    loginMsg("X wants a code or a puzzle solved — do it in the window below.");
-  else if (d.state === "needs_login")
-    loginMsg("Type your X username and password in the window below.");
-
-  if (d.captured){
-    // The browser has already been shut down server-side at this point.
-    loginDone = true;
-    loginStopFrames();
-    $("#logindone").hidden = false;
-    if (d.active){
-      loginMsg(`Signed in as @${d.username}. This account is ready to collect.`);
-      banner(`@${esc(d.username)} is connected and collecting.`, "ok");
-      await status();
-    } else {
-      loginMsg(`Signed in as @${d.username}, but the session could not be saved: `
-               + d.detail, true);
-    }
-    return;
-  }
-  setTimeout(loginFrame, 250);
-}
-
-$("#loginimg").onclick = (e) => {
-  const r = e.target.getBoundingClientRect();
-  // The image is displayed scaled; clicks must land on the real pixels.
-  const x = Math.round((e.clientX - r.left) * (loginW / r.width));
-  const y = Math.round((e.clientY - r.top)  * (loginH / r.height));
-  loginAct({act:"click", x, y});
-};
-$("#loginimg").onwheel = (e) => { e.preventDefault(); loginAct({act:"scroll", dy: e.deltaY}); };
-
-document.addEventListener("keydown", (e) => {
-  if (!$("#loginwrap").classList.contains("on")) return;
-  if (e.key === "Escape") { e.preventDefault(); return loginClose(); }
-  e.preventDefault();
-  if (e.key.length === 1)        loginAct({act:"type", text:e.key});
-  else if (["Enter","Backspace","Tab","ArrowLeft","ArrowRight","ArrowUp","ArrowDown","Delete"].includes(e.key))
-    loginAct({act:"key", key:e.key});
-});
-// Pasting a password is normal and safer than typing it.
-document.addEventListener("paste", (e) => {
-  if (!$("#loginwrap").classList.contains("on")) return;
-  const text = (e.clipboardData || window.clipboardData).getData("text");
-  if (text) { e.preventDefault(); loginAct({act:"type", text}); }
-});
-
-async function loginClose(){
-  loginStopFrames();
-  $("#loginwrap").classList.remove("on");
-  // Always tell the server, even after a successful capture: the call is
-  // idempotent, and a browser left running holds the account's profile
-  // directory open, which blocks the next sign-in.
-  try { await api("/api/login/cancel", {method:"POST",
-        headers:{"Content-Type":"application/json"}, body:"{}"}); } catch {}
-  loginDone = false;
-  await status();
-}
-$("#loginx").onclick = loginClose;
-$("#logindone").onclick = loginClose;
-
 status(); search().then(() => setLive(true)); risks();
 setInterval(() => { status(); risks(); }, 15000);
-</script>
-</body></html>
 """
+
+
+def _page(title: str, css: str, body: str, js: str) -> str:
+    """One page: shared shell, shared sign-in window, page-specific middle."""
+    return (_DOC_HEAD.replace("__TITLE__", title)
+            + _CSS_CORE + css + _CSS_LOGIN
+            + body + _HTML_LOGIN
+            + "<script>\n" + _JS_HELPERS + js + _JS_LOGIN
+            + "</script>\n</body></html>\n")
+
+
+PAGE = _page("X Collector", "", _DASH_BODY, _DASH_JS)
+
+
+# --------------------------------------------------------------------------
+# /accounts — the control panel
+# --------------------------------------------------------------------------
+#
+# Accounts outgrew the sidebar. Signing one in, reading why it is unhappy and
+# knowing what to do next are not glanceable things, and squeezing them into a
+# 300px column meant every account showed a wall of small grey text.
+#
+# So the dashboard keeps only what you glance at — which accounts are working —
+# and everything else lives here.
+#
+# Built around PLATFORMS rather than a flat list, because X will not be the
+# only one. Instagram and Facebook appear as real sections saying plainly that
+# they are not built yet. An empty list under a heading reads as "broken"; a
+# sentence saying "not supported yet" reads as "not built", which is the truth.
+
+_ACCT_CSS = r"""
+  /* The shared core styles .wrap as the dashboard's two-column grid. Without
+     resetting display, the platform cards flowed into those columns and
+     Instagram sat beside X instead of beneath it. */
+  .wrap{display:block;max-width:820px;margin:0 auto;padding:18px}
+  .plat{border:1px solid var(--line);border-radius:var(--radius);margin-bottom:16px;
+        background:var(--panel);overflow:hidden}
+  .plathead{display:flex;align-items:center;gap:10px;padding:12px 16px;
+            border-bottom:1px solid var(--line)}
+  .plathead h2{margin:0;font-size:15px;font-weight:650;letter-spacing:0}
+  .platmark{width:26px;height:26px;border-radius:7px;display:grid;place-items:center;
+            font-weight:700;font-size:14px;color:#fff;flex:0 0 auto}
+  .platnote{color:var(--dim);font-size:13px;margin-left:auto}
+  .platbody{padding:12px 16px}
+  .soon{color:var(--dim);font-size:13px;padding:14px 16px}
+  .acct{border:1px solid var(--line);border-radius:9px;padding:12px 14px;
+        margin-bottom:10px;background:var(--bg)}
+  .acct .top{display:flex;align-items:center;gap:10px;flex-wrap:wrap}
+  .acct .who{font-weight:650}
+  .facts{display:grid;grid-template-columns:repeat(auto-fit,minmax(140px,1fr));
+         gap:6px 16px;margin-top:10px;font-size:13px}
+  .fact .k{color:var(--dim);font-size:11px;text-transform:uppercase;letter-spacing:.05em;
+           display:block}
+  .why{margin-top:10px;padding:8px 10px;border-radius:7px;background:var(--panel);
+       font-size:13px;color:var(--dim)}
+  .why b{color:var(--fg);font-weight:600}
+  .acctacts{display:flex;gap:6px;margin-top:10px;flex-wrap:wrap}
+  .acctacts button{font-size:13px;padding:5px 12px}
+  /* `display:grid` beats the browser's own [hidden]{display:none}, so the
+     form showed even while marked hidden. Say so explicitly. */
+  .addform{display:grid;gap:6px;max-width:380px;margin-top:10px}
+  .addform[hidden]{display:none}
+"""
+
+_ACCT_BODY = r"""</style></head><body>
+
+<header>
+  <h1>Accounts</h1>
+  <a href="/" class="muted" style="font-size:13px">← Back to tweets</a>
+  <a href="/logout" class="muted" style="font-size:13px;margin-left:auto">Sign out</a>
+</header>
+
+<div id="banner"></div>
+
+<div class="wrap">
+  <div class="plat">
+    <div class="plathead">
+      <span class="platmark" style="background:#000">X</span>
+      <h2>X (Twitter)</h2>
+      <span class="platnote" id="xcount">—</span>
+    </div>
+    <div class="platbody">
+      <div id="accounts"><p class="muted">Loading…</p></div>
+      <button id="acctnew" style="margin-top:4px">+ Add an account</button>
+      <div id="acctform" hidden class="addform">
+        <p class="muted" style="margin:0">
+          Give it a short name, then sign in. A window opens where you type your
+          X password directly into x.com — this page never sees it.
+          Use a throwaway account, never a personal one.</p>
+        <input id="a_label" placeholder="short name, e.g. acct_b">
+        <input id="a_user"  placeholder="X username (optional)">
+        <input id="a_proxy" placeholder="proxy (leave blank)">
+        <div style="display:flex;gap:6px">
+          <button id="a_save" class="primary" style="flex:1">Save and sign in</button>
+          <button id="a_cancel">Cancel</button>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <div class="plat">
+    <div class="plathead">
+      <span class="platmark" style="background:linear-gradient(45deg,#f09433,#dc2743,#bc1888)">In</span>
+      <h2>Instagram</h2>
+      <span class="platnote">not built yet</span>
+    </div>
+    <div class="soon">
+      Nothing here collects from Instagram yet. It is listed so the shape of this
+      page does not change when it is added — not because it is switched off.
+    </div>
+  </div>
+
+  <div class="plat">
+    <div class="plathead">
+      <span class="platmark" style="background:#1877f2">f</span>
+      <h2>Facebook</h2>
+      <span class="platnote">not built yet</span>
+    </div>
+    <div class="soon">
+      Same as Instagram — a placeholder, not a setting.
+    </div>
+  </div>
+</div>
+
+"""
+
+_ACCT_JS = r"""
+/* What each state means, in words rather than a colour alone. */
+const STATE = {
+  live:    {label:"Working",    note:"Collecting normally."},
+  warning: {label:"Check this", note:"It works, but something below will bite later."},
+  dead:    {label:"Signed out", note:"X is refusing this session. It collects nothing."},
+  unknown: {label:"Not set up", note:"Added, but never signed in to X."},
+};
+
+function when(iso){
+  if (!iso) return "never";
+  return ago(iso);
+}
+
+async function load(){
+  let d;
+  try { d = await api("/api/status"); }
+  catch (e) { return banner(esc(e.message).replace(/\n/g,"<br>"), "err"); }
+
+  const accts = d.accounts || [];
+  // Same rule as the dashboard: collecting is `active`. An amber account is
+  // working; the amber says something will bite later, not that it is down.
+  const live = accts.filter(a => a.active).length;
+  $("#xcount").textContent = accts.length
+    ? `${live} of ${accts.length} collecting` : "none yet";
+
+  if (d.accounts_error)
+    banner("Could not read the account store: " + esc(d.accounts_error), "err");
+
+  $("#accounts").innerHTML = accts.length ? accts.map(a => {
+    const st = a.status || (a.active ? "live" : "dead");
+    const s  = STATE[st] || {label: st, note: ""};
+    const needs = st === "dead" || st === "unknown";
+    const reasons = (a.reasons || []).length
+      ? `<div class="why">${a.reasons.map(r => "• " + esc(r)).join("<br>")}
+           ${a.action ? `<br><b>What to do:</b> ${esc(a.action)}` : ""}</div>`
+      : "";
+    return `<div class="acct">
+      <div class="top">
+        <span class="who">@${esc(a.username)}</span>
+        <span class="flag ${st}">${s.label}</span>
+        <span class="muted">${esc(s.note)}</span>
+      </div>
+      <div class="facts">
+        <div class="fact"><span class="k">name in config</span>${esc(a.label || "—")}</div>
+        <div class="fact"><span class="k">requests made</span>${a.requests ?? 0}</div>
+        <div class="fact"><span class="k">last used</span>${esc(when(a.last_used))}</div>
+        <div class="fact"><span class="k">own proxy</span>${a.proxy ? "yes" : "no — shares this machine's address"}</div>
+        <div class="fact"><span class="k">busy queues</span>${(a.locked||[]).length ? esc((a.locked||[]).join(", ")) : "none"}</div>
+      </div>
+      ${a.error ? `<div class="why"><b>Last error from X:</b> ${esc(a.error)}</div>` : ""}
+      ${reasons}
+      <div class="acctacts">
+        <button data-signin="${esc(a.label || a.username)}" ${needs ? 'class="primary"' : ""}>
+          ${needs ? "Sign in to X" : "Sign in again"}</button>
+      </div>
+    </div>`;
+  }).join("") : '<p class="muted">No X accounts yet. Add one below.</p>';
+
+  // Bound in the same pass that draws them — this panel is redrawn on every
+  // refresh, so anything bound earlier belongs to nodes that are gone.
+  document.querySelectorAll("[data-signin]").forEach(b =>
+    b.onclick = () => loginOpen(b.dataset.signin));
+}
+
+$("#acctnew").onclick  = () => { $("#acctform").hidden = false; $("#a_label").focus(); };
+$("#a_cancel").onclick = () => { $("#acctform").hidden = true; };
+$("#a_save").onclick = async () => {
+  const body = {
+    label: $("#a_label").value.trim(), username: $("#a_user").value.trim(),
+    proxy: $("#a_proxy").value.trim(),
+  };
+  if (!body.label) return banner("Give the account a short name first.", "err");
+  $("#a_save").disabled = true;
+  try {
+    const d = await api("/api/account", {
+      method:"POST", headers:{"Content-Type":"application/json"},
+      body: JSON.stringify(body)
+    });
+    if (d.error) return banner(esc(d.error), "err");
+    ["#a_label","#a_user","#a_proxy"].forEach(s => $(s).value = "");
+    $("#acctform").hidden = true;
+    banner("");
+    await load();
+    await loginOpen(d.label);        // saved but not signed in collects nothing
+  } catch (e) { banner(esc(e.message), "err"); }
+  finally { $("#a_save").disabled = false; }
+};
+
+// status() is what the shared sign-in code calls when it finishes.
+const status = load;
+
+load();
+setInterval(load, 15000);
+"""
+
+ACCOUNTS_PAGE = _page("Accounts — X Collector", _ACCT_CSS, _ACCT_BODY, _ACCT_JS)
