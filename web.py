@@ -1008,6 +1008,7 @@ def _login_start(label):
         _LOGIN["platform"] = acct.platform
         return {"ok": True, "label": label, "platform": acct.platform,
                 "state": sess.state, "screen_name": sess.screen_name,
+                "url": sess.url(),
                 "width": mod.LOGIN_VIEWPORT["width"],
                 "height": mod.LOGIN_VIEWPORT["height"]}
 
@@ -1027,11 +1028,16 @@ def _login_act(body):
             _run(s.press(str(body.get("key") or "Enter")), timeout=30)
         elif act == "scroll":
             _run(s.scroll(int(body.get("dy") or 0)), timeout=30)
+        elif act == "reload":
+            # Instagram's login sometimes wedges on a half-rendered page. A
+            # reload is what a person would do, and it costs nothing.
+            _run(s.reload(), timeout=60)
         state = _run(s.refresh_state(), timeout=30)
     except Exception as e:
         return {"error": f"{type(e).__name__}: {e}"}
 
-    out = {"ok": True, "state": state, "screen_name": s.screen_name}
+    out = {"ok": True, "state": state, "screen_name": s.screen_name,
+           "url": s.url()}
     if state == "logged_in":
         out.update(_login_capture())
     return out
@@ -1296,6 +1302,8 @@ class Handler(BaseHTTPRequestHandler):
                 return self._send(200, PAGE, "text/html; charset=utf-8")
             if u.path in ("/accounts", "/accounts/"):
                 return self._send(200, ACCOUNTS_PAGE, "text/html; charset=utf-8")
+            if u.path == "/signin":
+                return self._send(200, _SIGNIN_PAGE, "text/html; charset=utf-8")
             if u.path == "/api/status":
                 return self._send(200, _status())
             if u.path == "/api/streams":
@@ -1576,138 +1584,21 @@ _CSS_CORE = r"""  :root{
   a{color:var(--accent)}
 """
 
-_CSS_LOGIN = r"""  /* The remote browser. The image IS the page: clicks and keys are forwarded
-     to a real Chrome running on the server, so this behaves like a window. */
-  #loginwrap{position:fixed;inset:0;background:rgba(0,0,0,.6);z-index:50;
-             display:none;place-items:center}
-  #loginwrap.on{display:grid}
-  /* A DEFINITE height, not max-height. A flex column sized by its content
-     gives its children an indefinite height, and `max-height:100%` on the
-     image inside then resolves to nothing at all — the image stayed 780px tall
-     in a 700px window and the fix silently did nothing. Pinning the height is
-     what makes the percentage below mean something.
-     The cap is the natural size (780px of page + 92px of chrome), so on a tall
-     screen the picture is 1:1 with no letterboxing, and on a short one the box
-     is the window and the picture scales down to fit it. */
-  #loginbox{background:var(--bg);border:1px solid var(--line);border-radius:12px;
-            overflow:hidden;width:min(96vw,1100px);height:min(96vh,872px);
-            display:flex;flex-direction:column}
-  #loginhead{display:flex;align-items:center;gap:12px;padding:10px 14px;
-             border-bottom:1px solid var(--line);flex:0 0 auto}
-  #loginhead b{font-size:14px}
-  #loginmsg{color:var(--dim);font-size:13px;flex:1}
-  /* The remote page must ALWAYS fit. It is a fixed 1100x780 screenshot, and it
-     used to be dropped in at full size inside a scrolling box — so on a laptop
-     the bottom of X's login card, Continue button included, was simply below
-     the fold. You cannot press a button you cannot see, and it is not obvious
-     the window scrolls.
-     flex:1 + min-height:0 lets the stage take the leftover height and shrink;
-     max-height:100% on the image scales it down to match. Both max-* on a
-     replaced element preserve the aspect ratio, so the element's box stays
-     exactly the drawn image — which is what keeps click mapping honest. */
-  /* flex, NOT grid. A grid row sized `auto` grows to fit its item, so the
-     image's `max-height:100%` resolved against the image's own height — a
-     circular constraint that clamps to nothing. A flex item's percentage
-     cross-size resolves against the container's definite height instead. */
-  #loginstage{flex:1;min-height:0;display:flex;align-items:center;
-              justify-content:center;overflow:hidden;background:#000}
-  #loginimg{display:block;max-width:100%;max-height:100%;cursor:crosshair}
-  #loginhint{padding:7px 14px;font-size:12px;color:var(--dim);flex:0 0 auto;
-             border-top:1px solid var(--line);background:var(--panel)}
-  .livetog{display:flex;align-items:center;gap:6px;font-size:13px;color:var(--dim);
-           border:1px solid var(--line);border-radius:8px;padding:4px 9px;cursor:pointer}
-  .livetog select{padding:2px 4px;font-size:12px;border:0;background:transparent}
-  #livedot{width:7px;height:7px;border-radius:50%;background:var(--dim);display:inline-block}
-  #livedot.on{background:var(--ok);animation:pulse 2s ease-in-out infinite}
-  @keyframes pulse{0%,100%{opacity:1}50%{opacity:.35}}
-  /* A brief tint on arrival, then it settles into the list. Permanent
-     highlighting would just accumulate into noise. */
-  @keyframes arrive{from{background:rgba(29,155,240,.16)}to{background:var(--panel)}}
-  .card.new{animation:arrive 2.5s ease-out}
-  #newbar{position:sticky;top:52px;z-index:8;display:none;margin-bottom:10px}
-  #newbar button{width:100%;padding:7px;background:var(--accent);color:#fff;
-                 border-color:var(--accent);font-weight:600}
-  .streamrow{display:flex;gap:4px;margin-bottom:5px}
-  /* "Everything" is a direct child with no row wrapper, so it carries its own
-     spacing; the ones inside a row get theirs from .streamrow. */
-  #streams > .streambtn{margin-bottom:5px}
-  .streambtn{display:block;width:100%;text-align:left;font-size:13px}
-  .streambtn.active{border-color:var(--accent);background:rgba(29,155,240,.1)}
-  .streambtn.off{opacity:.5}
-  .streamx{flex:0 0 auto;padding:4px 8px;font-size:12px;color:var(--dim)}
-  .streamx:hover{border-color:var(--accent);color:var(--accent)}
-  .streamcfg{border:1px solid var(--line);border-radius:8px;padding:8px 10px;
-             margin:-2px 0 8px;background:var(--bg);display:grid;gap:6px}
-  .cfgrow{display:flex;align-items:center;justify-content:space-between;gap:6px;
-          font-size:12px;color:var(--dim)}
-  .cfgrow select,.cfgrow input{font-size:12px;padding:3px 6px;max-width:58%}
-  .cfgchk{font-size:12px;color:var(--dim);display:flex;align-items:center;gap:6px}
-  .cfghead{font-size:11px;text-transform:uppercase;letter-spacing:.06em;
-           color:var(--dim);margin-top:4px;border-top:1px solid var(--line);padding-top:6px}
-  .cfgbtn{width:100%;padding:4px;font-size:12px}
-  .cfgbtn.danger{border-color:var(--warn);color:var(--warn)}
-  .linky{width:100%;border:0;background:none;color:var(--dim);font-size:12px;
-         text-align:left;padding:2px 0;text-decoration:underline;cursor:pointer}
-  code{background:var(--bg);padding:1px 5px;border-radius:5px;font-size:12px;
-       border:1px solid var(--line)}
-
-  /* ---- small screens -------------------------------------------------
-     Written against real widths rather than a guess: 390px is an iPhone,
-     768px a tablet in portrait. The two things that actually break at those
-     sizes are the header, which is a flex row of eight controls, and the
-     sign-in window, whose fixed 1000-1100px picture has to shrink to fit a
-     phone without breaking the click mapping — it already does, because both
-     max-* on the image preserve its aspect ratio. */
-  @media (max-width: 760px){
-    header{padding:10px 12px;gap:8px}
-    h1{width:100%;margin:0}
-    #q{min-width:0;flex:1 1 100%;order:-1}
-    #src,#pages{flex:1 1 auto;min-width:0;font-size:13px}
-    header button{flex:1 1 auto;font-size:13px}
-    .livetog{flex:1 1 100%;justify-content:center}
-    .filters{padding:0 12px 4px;gap:6px}
-    .filters input,.filters select,.filters label{font-size:12px}
-    .wrap{padding:12px;gap:12px}
-    .banner{margin:0 12px 10px}
-    .card{padding:10px 12px}
-    .media img,.media video,.playwrap img{max-height:200px}
-    /* The sign-in window becomes the whole screen. On a phone there is no
-       room for a modal that is politely inset, and the picture needs every
-       pixel it can get to stay readable. */
-    #loginbox{width:100vw;height:100vh;max-height:100vh;border:0;border-radius:0}
-    #loginhead{padding:8px 10px;gap:8px}
-    #loginhint{font-size:11px;padding:6px 10px}
-    /* The accounts page: one fact per line reads better than a squeezed grid. */
-    .facts{grid-template-columns:1fr 1fr}
-    .plathead{padding:10px 12px}
-    .platbody{padding:10px 12px}
-    .addform{max-width:none}
-  }
-  @media (max-width: 420px){
-    .facts{grid-template-columns:1fr}
-    .cfgrow{flex-direction:column;align-items:stretch;gap:2px}
-    .cfgrow select,.cfgrow input{max-width:none}
-  }
-"""
-
-_HTML_LOGIN = r"""<div id="loginwrap">
-  <div id="loginbox">
-    <div id="loginhead">
-      <b>Sign in to X</b>
-      <span id="loginmsg">Starting…</span>
-      <button id="logindone" hidden>Done</button>
-      <button id="loginx">Close</button>
-    </div>
-    <div id="loginstage">
-      <img id="loginimg" alt="The X sign-in page">
-    </div>
-    <div id="loginhint">This is a real browser. Click and type in it as you normally
-      would. Your password goes straight to x.com — this page never sees it.
-      Scrolling works too.</div>
-  </div>
-</div>
-
-"""
+# --------------------------------------------------------------------------
+# the sign-in tab
+# --------------------------------------------------------------------------
+#
+# This was a modal inside the dashboard, and it did not survive contact with
+# Instagram. The plumbing was fine — clicks and keys arrived, Instagram
+# answered — but a 1000x820 remote page scaled into a 300px-margin dialog gives
+# you small targets, unreadable labels, and no room for the page to grow. Then
+# Instagram shows an error banner, the whole form REFLOWS downward, and the
+# button you were aiming at is 50px from where you last saw it.
+#
+# So the sign-in gets its own tab and the whole window. It is a browser; it
+# should be the size of a browser. The page also shows the remote URL, because
+# a picture with no address bar is a black box, and "did my click do anything"
+# is the question this whole flow lives or dies on.
 
 _JS_HELPERS = r"""const $ = s => document.querySelector(s);
 let activeStream = "";
@@ -1764,134 +1655,187 @@ function banner(msg, kind){
 
 """
 
-_JS_LOGIN = r"""/* ------------------------------------------------------------------
-   The sign-in window.
+_SIGNIN_PAGE = r"""<!doctype html>
+<html lang="en"><head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Sign in — X Collector</title>
+<style>
+  :root{--bg:#fff;--panel:#f7f8fa;--line:#e3e6ea;--fg:#14171a;--dim:#5b7083;
+        --accent:#1d9bf0;--warn:#c0392b;--ok:#17a673}
+  @media (prefers-color-scheme:dark){
+    :root{--bg:#15181c;--panel:#1e2126;--line:#2f3336;--fg:#e7e9ea;--dim:#8b98a5}}
+  *{box-sizing:border-box}
+  html,body{height:100%}
+  body{margin:0;display:flex;flex-direction:column;background:#000;color:var(--fg);
+       font:14px/1.5 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif}
+  header{display:flex;align-items:center;gap:12px;padding:8px 14px;background:var(--bg);
+         border-bottom:1px solid var(--line);flex:0 0 auto;flex-wrap:wrap}
+  header b{font-size:14px}
+  #msg{color:var(--dim);flex:1;min-width:180px}
+  #msg.bad{color:var(--warn)} #msg.good{color:var(--ok)}
+  #addr{font:12px/1.4 ui-monospace,SFMono-Regular,Menlo,monospace;color:var(--dim);
+        background:var(--panel);border:1px solid var(--line);border-radius:6px;
+        padding:3px 8px;max-width:46vw;overflow:hidden;text-overflow:ellipsis;
+        white-space:nowrap}
+  button{font:inherit;color:var(--fg);background:var(--panel);border:1px solid var(--line);
+         border-radius:8px;padding:6px 12px;cursor:pointer}
+  button:hover{border-color:var(--accent)}
+  button.primary{background:var(--accent);color:#fff;border-color:var(--accent);font-weight:600}
+  /* The picture fills whatever is left. 1:1 when it fits, scaled down when it
+     does not — and never letterboxed INSIDE the image, because the click
+     mapping reads the element's own box. */
+  #stage{flex:1;min-height:0;display:flex;align-items:center;justify-content:center;
+         overflow:auto;background:#000}
+  #shot{display:block;max-width:100%;max-height:100%;cursor:crosshair}
+  #hint{flex:0 0 auto;padding:6px 14px;font-size:12px;color:var(--dim);
+        background:var(--bg);border-top:1px solid var(--line)}
+  #busy{position:fixed;top:8px;right:14px;background:var(--accent);color:#fff;
+        font-size:11px;padding:2px 9px;border-radius:999px;display:none}
+  #busy.on{display:block}
+</style></head><body>
 
-   The <img> is a live picture of a real Chrome running on the server.
-   Clicks are scaled from the displayed size back to the real window size
-   and forwarded; keystrokes go straight through. The password is typed
-   into the genuine x.com form — this page never reads or stores it.
+<header>
+  <b id="what">Signing in</b>
+  <span id="addr">—</span>
+  <span id="msg">Starting a browser…</span>
+  <button id="reload" title="Reload the remote page">Reload</button>
+  <button id="done" class="primary" hidden>Done</button>
+  <button id="close">Close</button>
+</header>
 
-   As soon as X reports the account as signed in, the session is copied
-   out and the browser is shut down. It exists only to get past the
-   captcha and device checks that a plain script cannot clear.
-   ------------------------------------------------------------------ */
-let loginTimer = null, loginW = 1100, loginH = 780, loginDone = false;
+<div id="stage"><img id="shot" alt="The sign-in page"></div>
+<div id="hint">This is a real browser running on the server. Click and type in it
+  as you would anywhere else — solve any captcha or code prompt here. Your
+  password goes straight to the site; this page never sees it.</div>
+<div id="busy">working…</div>
 
-function loginMsg(text, bad){
-  $("#loginmsg").textContent = text;
-  $("#loginmsg").style.color = bad ? "var(--warn)" : "var(--dim)";
-}
+<script>
+const $ = s => document.querySelector(s);
+const esc = s => (s||"").replace(/[&<>"']/g, c =>
+  ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+const LABEL = new URLSearchParams(location.search).get("label") || "";
 
-function loginStopFrames(){
-  if (loginTimer) { clearInterval(loginTimer); loginTimer = null; }
-}
+let W = 1000, H = 820, done = false, timer = null, busy = 0;
 
-async function loginOpen(label){
-  $("#loginwrap").classList.add("on");
-  loginMsg("Starting a browser…");
-  $("#logindone").hidden = true;
-  loginDone = false;
-  let d;
+function say(text, kind){ const m = $("#msg"); m.textContent = text; m.className = kind || ""; }
+function mark(n){ busy = Math.max(0, busy + n); $("#busy").classList.toggle("on", busy > 0); }
+
+async function api(url, opts){
+  mark(1);
   try {
-    d = await api("/api/login/start", {
-      method:"POST", headers:{"Content-Type":"application/json"},
-      body: JSON.stringify({label})
-    });
-  } catch (e) { return loginMsg(e.message, true); }
-  if (d.error){ loginMsg(d.error, true); return; }
-
-  loginW = d.width; loginH = d.height;
-  loginMsg("Type your X username and password in the window below.");
-  loginFrame();
-  loginTimer = setInterval(loginFrame, 900);
-
-  // The profile may already be signed in, in which case there is nothing for
-  // anyone to do — capture it and close.
-  if (d.state === "logged_in") loginAct({act:"none"});
+    const r = await fetch(url, opts);
+    const d = await r.json().catch(() => ({error: `HTTP ${r.status}`}));
+    if (!r.ok && !d.error) throw new Error(`HTTP ${r.status}`);
+    return d;
+  } catch (e) {
+    return {error: "Lost contact with the collector. Is it still running?"};
+  } finally { mark(-1); }
 }
 
-function loginFrame(){
-  if (loginDone) return;   // the browser is gone; asking again just 409s
-  // Cache-buster: the URL is constant but the picture changes every frame.
-  $("#loginimg").src = "/api/login/frame?t=" + Date.now();
+function shot(){
+  if (done) return;
+  $("#shot").src = "/api/login/frame?t=" + Date.now();
 }
 
-async function loginAct(payload){
-  if (loginDone) return;
-  let d;
-  try {
-    d = await api("/api/login/act", {
-      method:"POST", headers:{"Content-Type":"application/json"},
-      body: JSON.stringify(payload)
-    });
-  } catch (e) { return loginMsg(e.message, true); }
+function show(d){
+  if (d.url) $("#addr").textContent = d.url.replace(/^https?:\/\//, "");
+  const S = {
+    needs_login: "Type your username and password below.",
+    challenge:   "The site is asking for a code or a puzzle — answer it below.",
+    unknown:     "Signed in, but the account could not be identified yet.",
+  };
+  if (d.state && S[d.state]) say(S[d.state]);
+}
 
-  if (d.error)  return loginMsg(d.error, true);
-  if (d.closed) return loginClose();
+async function start(){
+  if (!LABEL){ return say("No account named in the link.", "bad"); }
+  $("#what").textContent = "Signing in — " + LABEL;
+  const d = await api("/api/login/start", {
+    method:"POST", headers:{"Content-Type":"application/json"},
+    body: JSON.stringify({label: LABEL})
+  });
+  if (d.error) return say(d.error, "bad");
+  W = d.width; H = d.height;
+  $("#what").textContent =
+    (d.platform === "instagram" ? "Sign in to Instagram — " : "Sign in to X — ") + LABEL;
+  show(d);
+  shot();
+  // Twice a second. The old modal polled at 900ms and every click felt like it
+  // had been ignored, which is the one thing this page cannot afford.
+  timer = setInterval(shot, 500);
+}
 
-  if (d.state === "challenge")
-    loginMsg("X wants a code or a puzzle solved — do it in the window below.");
-  else if (d.state === "needs_login")
-    loginMsg("Type your X username and password in the window below.");
-
+async function act(payload){
+  if (done) return;
+  const d = await api("/api/login/act", {
+    method:"POST", headers:{"Content-Type":"application/json"},
+    body: JSON.stringify(payload)
+  });
+  if (d.error) return say(d.error, "bad");
+  if (d.closed) return finish("The sign-in window was closed.", "bad");
+  show(d);
   if (d.captured){
-    // The browser has already been shut down server-side at this point.
-    loginDone = true;
-    loginStopFrames();
-    $("#logindone").hidden = false;
-    if (d.active){
-      loginMsg(`Signed in as @${d.username}. This account is ready to collect.`);
-      banner(`@${esc(d.username)} is connected and collecting.`, "ok");
-      await status();
-    } else {
-      loginMsg(`Signed in as @${d.username}, but the session could not be saved: `
-               + d.detail, true);
-    }
+    if (d.active) finish(`Signed in as @${d.username}. You can close this tab.`, "good");
+    else finish(`Signed in as @${d.username}, but saving failed: ${d.detail}`, "bad");
     return;
   }
-  setTimeout(loginFrame, 250);
+  shot();   // immediate feedback, rather than waiting for the next tick
 }
 
-$("#loginimg").onclick = (e) => {
+function finish(text, kind){
+  done = true;
+  if (timer) { clearInterval(timer); timer = null; }
+  say(text, kind);
+  $("#done").hidden = false;
+  try { if (window.opener) window.opener.postMessage("signed-in", location.origin); } catch {}
+}
+
+/* Clicks are scaled from the displayed picture back to the real one. Both
+   max-* on the image preserve its aspect ratio, so the element's box IS the
+   drawn picture and this stays exact at any window size. */
+$("#shot").onclick = (e) => {
   const r = e.target.getBoundingClientRect();
-  // The image is displayed scaled; clicks must land on the real pixels.
-  const x = Math.round((e.clientX - r.left) * (loginW / r.width));
-  const y = Math.round((e.clientY - r.top)  * (loginH / r.height));
-  loginAct({act:"click", x, y});
+  act({act:"click",
+       x: Math.round((e.clientX - r.left) * (W / r.width)),
+       y: Math.round((e.clientY - r.top)  * (H / r.height))});
 };
-$("#loginimg").onwheel = (e) => { e.preventDefault(); loginAct({act:"scroll", dy: e.deltaY}); };
+$("#shot").onwheel = (e) => { e.preventDefault(); act({act:"scroll", dy: e.deltaY}); };
 
 document.addEventListener("keydown", (e) => {
-  if (!$("#loginwrap").classList.contains("on")) return;
-  if (e.key === "Escape") { e.preventDefault(); return loginClose(); }
+  if (done) return;
+  if (e.key === "Escape") return;
+  if ((e.ctrlKey || e.metaKey) && !["v","V"].includes(e.key)) return;  // let copy/paste/devtools through
   e.preventDefault();
-  if (e.key.length === 1)        loginAct({act:"type", text:e.key});
+  if (e.key.length === 1) act({act:"type", text:e.key});
   else if (["Enter","Backspace","Tab","ArrowLeft","ArrowRight","ArrowUp","ArrowDown","Delete"].includes(e.key))
-    loginAct({act:"key", key:e.key});
+    act({act:"key", key:e.key});
 });
-// Pasting a password is normal and safer than typing it.
 document.addEventListener("paste", (e) => {
-  if (!$("#loginwrap").classList.contains("on")) return;
+  if (done) return;
   const text = (e.clipboardData || window.clipboardData).getData("text");
-  if (text) { e.preventDefault(); loginAct({act:"type", text}); }
+  if (text) { e.preventDefault(); act({act:"type", text}); }
 });
 
-async function loginClose(){
-  loginStopFrames();
-  $("#loginwrap").classList.remove("on");
-  // Always tell the server, even after a successful capture: the call is
-  // idempotent, and a browser left running holds the account's profile
-  // directory open, which blocks the next sign-in.
-  try { await api("/api/login/cancel", {method:"POST",
+$("#reload").onclick = () => { act({act:"reload"}); say("Reloading…"); };
+$("#close").onclick = $("#done").onclick = async () => {
+  if (timer) clearInterval(timer);
+  try { await fetch("/api/login/cancel", {method:"POST",
         headers:{"Content-Type":"application/json"}, body:"{}"}); } catch {}
-  loginDone = false;
-  await status();
-}
-$("#loginx").onclick = loginClose;
-$("#logindone").onclick = loginClose;
+  window.close();
+  // window.close() is refused for tabs the script did not open, so say what
+  // happened rather than leaving a dead-looking page.
+  say("Finished. You can close this tab.", "good");
+};
+// Closing the tab must not leave a browser running against the profile.
+window.addEventListener("pagehide", () => {
+  navigator.sendBeacon?.("/api/login/cancel", new Blob(["{}"], {type:"application/json"}));
+});
 
+start();
+</script>
+</body></html>
 """
+
 
 _DASH_BODY = r"""</style></head><body>
 
@@ -2577,12 +2521,37 @@ setInterval(() => { status(); risks(); }, 15000);
 """
 
 
+# Signing in opens its own tab, so neither page carries the remote browser any
+# more — no modal markup, no coordinate scaling, no keyboard capture fighting
+# the page underneath. Both just open a window.
+_JS_SIGNIN = r"""
+function loginOpen(label){
+  const w = window.open("/signin?label=" + encodeURIComponent(label),
+                        "xs_signin_" + label, "width=1180,height=980");
+  // NOTE the explicit +. JavaScript does not join adjacent string literals the
+  // way Python and C do — "a" "b" is a syntax error, not "ab". Writing it the
+  // Python way took the whole dashboard script down with "missing ) after
+  // argument list", which reads like a bracket problem and is not one.
+  if (!w) return banner(
+    "Your browser blocked the sign-in window. Allow pop-ups for this site, " +
+    "or open <a href=\"/signin?label=" + encodeURIComponent(label) + "\">this link</a>.",
+    "err");
+  banner("Sign in to the site in the new tab, then come back here.", "ok");
+  // The tab tells us when it is done, so this page refreshes without being
+  // asked and the account flips to Working while you are looking at it.
+  window.addEventListener("message", (e) => {
+    if (e.origin === location.origin && e.data === "signed-in") status();
+  }, {once: true});
+}
+"""
+
+
 def _page(title: str, css: str, body: str, js: str) -> str:
-    """One page: shared shell, shared sign-in window, page-specific middle."""
+    """One page: shared shell, page-specific middle."""
     return (_DOC_HEAD.replace("__TITLE__", title)
-            + _CSS_CORE + css + _CSS_LOGIN
-            + body + _HTML_LOGIN
-            + "<script>\n" + _JS_HELPERS + js + _JS_LOGIN
+            + _CSS_CORE + css
+            + body
+            + "<script>\n" + _JS_HELPERS + _JS_SIGNIN + js
             + "</script>\n</body></html>\n")
 
 

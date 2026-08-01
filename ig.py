@@ -338,6 +338,9 @@ class InteractiveLogin:
         self._alive()
         return await self.page.screenshot(type="jpeg", quality=68)
 
+    def url(self) -> str:
+        return (self.page.url or "") if self.page else ""
+
     async def click(self, x: int, y: int):
         self._alive()
         await self.page.mouse.click(x, y)
@@ -355,6 +358,10 @@ class InteractiveLogin:
     async def scroll(self, dy: int):
         self._alive()
         await self.page.mouse.wheel(0, dy)
+
+    async def reload(self):
+        self._alive()
+        await self.page.reload(wait_until="domcontentloaded", timeout=45000)
 
     async def harvest(self) -> Session:
         """Copy the session out. Only meaningful once state is LOGGED_IN."""
