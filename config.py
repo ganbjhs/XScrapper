@@ -56,9 +56,15 @@ class Defaults:
     keep_entry_json: bool = False
 
 
+# Which network an account belongs to. Accounts are per-platform: an X session
+# and an Instagram session share nothing but the shape of the config block.
+PLATFORMS = ("x", "instagram")
+
+
 @dataclass
 class AccountCfg:
     label: str
+    platform: str = "x"
     username: str = ""
     password_env: str = ""
     email: str = ""
@@ -150,8 +156,12 @@ class Config:
         path = Path(p).expanduser()
         return path if path.is_absolute() else (self.root / path)
 
-    def enabled_accounts(self) -> list[AccountCfg]:
-        return [a for a in self.accounts if a.enabled]
+    def enabled_accounts(self, platform: str | None = None) -> list[AccountCfg]:
+        return [a for a in self.accounts
+                if a.enabled and (platform is None or a.platform == platform)]
+
+    def accounts_for(self, platform: str) -> list[AccountCfg]:
+        return [a for a in self.accounts if a.platform == platform]
 
     def enabled_streams(self) -> list[StreamCfg]:
         return [s for s in self.streams if s.enabled]
@@ -183,8 +193,15 @@ def _parse_account(raw: dict, idx: int, defaults: Defaults) -> AccountCfg:
         raise ConfigError(f"[[accounts]] #{idx + 1} is missing a `label`.")
 
     profile_dir = str(_pick(raw, "profile_dir", f"{defaults.profiles_dir}/{label}"))
+    platform = str(_pick(raw, "platform", "x")).strip().lower()
+    if platform not in PLATFORMS:
+        raise ConfigError(
+            f"[[accounts]] {label!r}: platform={platform!r} is not one of "
+            f"{PLATFORMS}.")
+
     return AccountCfg(
         label=label,
+        platform=platform,
         username=str(raw.get("username") or "").strip(),
         password_env=str(raw.get("password_env") or "").strip(),
         email=str(raw.get("email") or "").strip(),

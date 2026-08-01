@@ -398,7 +398,7 @@ def _status():
         out["accounts_error"] = f"{type(e).__name__}: {e}"
 
     by_label = {a.get("label") for a in out["accounts"]}
-    for acct in _CFG.accounts:
+    for acct in _CFG.accounts_for("x"):
         if acct.label not in by_label:
             # Added but never signed in. Showing it is the point: otherwise
             # "I added an account" and "it is collecting" look the same.
@@ -409,6 +409,44 @@ def _status():
                 "action": "Use the Sign in to X button below.",
                 "requests": 0, "proxy": bool(acct.proxy), "never_logged_in": True,
             })
+
+    # Instagram, from its own store. Kept in a separate list rather than mixed
+    # into out["accounts"]: they authenticate differently, fail differently and
+    # are read by different code, so flattening them would only invite one to
+    # be treated as the other.
+    out["instagram"] = []
+    try:
+        import ig
+        declared = {a.label: a for a in _CFG.accounts_for("instagram")}
+        path = _CFG.root / "ig_accounts.db"
+        rows = []
+        if path.exists():
+            with ig.Store(path) as st:
+                rows = st.all()
+        for r in rows:
+            out["instagram"].append({
+                "username": r["username"], "label": r["label"],
+                "active": bool(r["active"]), "error": r["error_msg"],
+                "requests": r["total_req"], "last_used": r["last_used"],
+                "proxy": bool(r["proxy"]),
+                "status": "live" if r["active"] else "dead",
+                "reasons": [] if r["active"] else [r["error_msg"] or "not signed in"],
+                "action": "" if r["active"] else "Press Sign in to Instagram.",
+            })
+        # Declared but never signed in — shown for the same reason as on the X
+        # side: "I added it" and "it is collecting" must not look identical.
+        seen = {r["label"] for r in rows}
+        for label, acct in declared.items():
+            if label not in seen:
+                out["instagram"].append({
+                    "username": acct.username or label, "label": label,
+                    "active": False, "status": "unknown",
+                    "reasons": ["added, but not signed in to Instagram yet"],
+                    "action": "Press Sign in to Instagram.",
+                    "requests": 0, "proxy": bool(acct.proxy),
+                })
+    except Exception as e:
+        out["instagram_error"] = f"{type(e).__name__}: {e}"
 
     if not _CFG.db_results.exists():
         out["totals"] = {"tweets": 0, "note": "nothing collected yet"}
@@ -684,9 +722,14 @@ def _add_account(body):
     if label in existing:
         return {"error": f"There is already an account called {label!r}."}
 
+    platform = (body.get("platform") or "x").strip().lower()
+    if platform not in ("x", "instagram"):
+        return {"error": f"unknown platform {platform!r}"}
+
     block = (
         f'\n[[accounts]]\n'
         f'label              = "{label}"\n'
+        f'platform           = "{platform}"\n'
         f'username           = "{username}"\n'
         f'password_env       = "X_PASSWORD_{label.upper().replace("-", "_")}"\n'
         f'profile_dir        = "profiles/{label}"\n'
@@ -704,7 +747,7 @@ def _add_account(body):
         return {"error": f"Saved to config.toml, but the file no longer loads: "
                          f"{type(e).__name__}: {e}"}
 
-    return {"ok": True, "label": label}
+    return {"ok": True, "label": label, "platform": platform}
 
 
 # --------------------------------------------------------------------------
@@ -896,7 +939,7 @@ def _test_telegram(body):
 #
 # One at a time, deliberately. Each session holds a Chrome process open against
 # an account's profile directory, and two Chromes on one profile corrupt it.
-_LOGIN = {"session": None, "label": None}
+_LOGIN = {"session": None, "label": None, "platform": "x"}
 _LOGIN_LOCK = threading.RLock()
 
 
@@ -923,9 +966,23 @@ def _login_reap():
     _login_drop()
 
 
-def _login_start(label):
-    import auth
+def _login_module(platform: str):
+    """
+    The module that knows how to sign into this platform.
 
+    Both expose the same surface — InteractiveLogin with frame/click/type/
+    scroll, LOGIN_VIEWPORT, and the state constants — so everything below drives
+    either without caring which it got. That is the whole reason the sign-in
+    window did not have to be written twice.
+    """
+    if platform == "instagram":
+        import ig
+        return ig
+    import auth
+    return auth
+
+
+def _login_start(label):
     _login_reap()
     with _LOGIN_LOCK:
         if _LOGIN["session"] is not None:
@@ -936,8 +993,9 @@ def _login_start(label):
         except Exception as e:
             return {"error": str(e)}
 
+        mod = _login_module(acct.platform)
         try:
-            sess = _run(auth.InteractiveLogin(acct).start(), timeout=180)
+            sess = _run(mod.InteractiveLogin(acct).start(), timeout=180)
         except ImportError:
             return {"error": "The browser this needs is not installed on the "
                              "server. Ask whoever set it up to run: "
@@ -945,11 +1003,13 @@ def _login_start(label):
         except Exception as e:
             return {"error": f"Could not open a browser: {type(e).__name__}: {e}"}
 
-        _LOGIN["session"], _LOGIN["label"] = sess, label
-        return {"ok": True, "label": label, "state": sess.state,
-                "screen_name": sess.screen_name,
-                "width": auth.LOGIN_VIEWPORT["width"],
-                "height": auth.LOGIN_VIEWPORT["height"]}
+        _LOGIN["session"] = sess
+        _LOGIN["label"] = label
+        _LOGIN["platform"] = acct.platform
+        return {"ok": True, "label": label, "platform": acct.platform,
+                "state": sess.state, "screen_name": sess.screen_name,
+                "width": mod.LOGIN_VIEWPORT["width"],
+                "height": mod.LOGIN_VIEWPORT["height"]}
 
 
 def _login_act(body):
@@ -977,44 +1037,56 @@ def _login_act(body):
     return out
 
 
+def _ig_store_path():
+    """Instagram sessions live beside the X ones, not inside them."""
+    return _CFG.root / "ig_accounts.db"
+
+
 def _login_capture():
     """
     Signed in — copy the session out of the browser, then close the browser.
 
-    The browser is disposable; the session is the asset. Everything the HTTP
-    collector needs (cookies plus the real user-agent) is taken here, checked
-    against X with one real request, and written to accounts.db. Chrome is then
-    shut down cleanly, which is also what flushes the profile that keeps this
-    device trusted for next time.
+    The browser is disposable; the session is the asset. Everything a later
+    HTTP client needs (cookies plus the REAL user-agent) is taken here and
+    written down; the browser is then shut down cleanly, which is also what
+    flushes the profile that keeps this device trusted next time.
     """
-    import auth
-
     s, label = _LOGIN["session"], _LOGIN["label"]
+    platform = _LOGIN.get("platform", "x")
     if s is None:
         return {"error": "The sign-in window is closed."}
+
     try:
         harvest = _run(s.harvest(), timeout=60)
         if not harvest.has_required:
-            # Do NOT close the browser here: X sets these a moment after the
+            # Do NOT close the browser: both sites set these a moment after the
             # redirect, so the next poll usually succeeds. Tearing the window
-            # down would make the operator start over for a timing blip.
-            return {"error": "Signed in, but X has not finished setting up the "
-                             "session yet. Give it a moment."}
+            # down would make someone start over for a timing blip.
+            return {"error": "Signed in, but the session cookies are not set "
+                             "yet. Give it a moment and it will finish."}
 
-        async def save():
-            api = auth.open_api(_CFG.db_accounts)
-            return await auth.upsert_session(api, harvest, _CFG.account(label))
+        if platform == "instagram":
+            import ig
+            with ig.Store(_ig_store_path()) as st:
+                active, detail = ig.capture(st, harvest, _CFG.account(label))
+            username = harvest.username
+        else:
+            import auth
+            async def save():
+                api = auth.open_api(_CFG.db_accounts)
+                return await auth.upsert_session(api, harvest, _CFG.account(label))
 
-        username, res = _run(save(), timeout=120)
-        if res.ok:
-            auth.write_identity(_CFG.account(label), username)
+            username, res = _run(save(), timeout=120)
+            active, detail = res.ok, ("" if res.ok else res.error)
+            if res.ok:
+                auth.write_identity(_CFG.account(label), username)
     except Exception as e:
         _login_drop()
         return {"error": f"Could not save the session: {type(e).__name__}: {e}"}
 
     _login_drop()
-    return {"captured": True, "username": username, "active": res.ok,
-            "detail": "" if res.ok else res.error}
+    return {"captured": True, "username": username, "active": active,
+            "platform": platform, "detail": "" if active else detail}
 
 
 def _login_cancel():
@@ -1439,7 +1511,14 @@ _CSS_CORE = r"""  :root{
   button.danger{border-color:var(--warn);color:var(--warn)}
   button:disabled{opacity:.5;cursor:not-allowed}
   .wrap{display:grid;grid-template-columns:1fr 300px;gap:18px;padding:18px;align-items:start}
-  @media(max-width:900px){.wrap{grid-template-columns:1fr}}
+  /* Stack, and put the sidebar UNDER the results — on a phone the tweets are
+     what you came for, and a 300px column of status above them is a wall to
+     scroll past before reaching any. */
+  @media(max-width:900px){
+    .wrap{grid-template-columns:1fr}
+    .wrap main{order:1}
+    .wrap aside{order:2}
+  }
   .filters{display:flex;gap:8px;flex-wrap:wrap;padding:0 18px 4px;align-items:center}
   .filters input,.filters select{padding:5px 8px;font-size:13px}
   .card{border:1px solid var(--line);border-radius:var(--radius);padding:12px 14px;margin-bottom:10px;
@@ -1571,6 +1650,44 @@ _CSS_LOGIN = r"""  /* The remote browser. The image IS the page: clicks and keys
          text-align:left;padding:2px 0;text-decoration:underline;cursor:pointer}
   code{background:var(--bg);padding:1px 5px;border-radius:5px;font-size:12px;
        border:1px solid var(--line)}
+
+  /* ---- small screens -------------------------------------------------
+     Written against real widths rather than a guess: 390px is an iPhone,
+     768px a tablet in portrait. The two things that actually break at those
+     sizes are the header, which is a flex row of eight controls, and the
+     sign-in window, whose fixed 1000-1100px picture has to shrink to fit a
+     phone without breaking the click mapping — it already does, because both
+     max-* on the image preserve its aspect ratio. */
+  @media (max-width: 760px){
+    header{padding:10px 12px;gap:8px}
+    h1{width:100%;margin:0}
+    #q{min-width:0;flex:1 1 100%;order:-1}
+    #src,#pages{flex:1 1 auto;min-width:0;font-size:13px}
+    header button{flex:1 1 auto;font-size:13px}
+    .livetog{flex:1 1 100%;justify-content:center}
+    .filters{padding:0 12px 4px;gap:6px}
+    .filters input,.filters select,.filters label{font-size:12px}
+    .wrap{padding:12px;gap:12px}
+    .banner{margin:0 12px 10px}
+    .card{padding:10px 12px}
+    .media img,.media video,.playwrap img{max-height:200px}
+    /* The sign-in window becomes the whole screen. On a phone there is no
+       room for a modal that is politely inset, and the picture needs every
+       pixel it can get to stay readable. */
+    #loginbox{width:100vw;height:100vh;max-height:100vh;border:0;border-radius:0}
+    #loginhead{padding:8px 10px;gap:8px}
+    #loginhint{font-size:11px;padding:6px 10px}
+    /* The accounts page: one fact per line reads better than a squeezed grid. */
+    .facts{grid-template-columns:1fr 1fr}
+    .plathead{padding:10px 12px}
+    .platbody{padding:10px 12px}
+    .addform{max-width:none}
+  }
+  @media (max-width: 420px){
+    .facts{grid-template-columns:1fr}
+    .cfgrow{flex-direction:column;align-items:stretch;gap:2px}
+    .cfgrow select,.cfgrow input{max-width:none}
+  }
 """
 
 _HTML_LOGIN = r"""<div id="loginwrap">
@@ -2562,11 +2679,28 @@ _ACCT_BODY = r"""</style></head><body>
     <div class="plathead">
       <span class="platmark" style="background:linear-gradient(45deg,#f09433,#dc2743,#bc1888)">In</span>
       <h2>Instagram</h2>
-      <span class="platnote">not built yet</span>
+      <span class="platnote" id="igcount">—</span>
     </div>
-    <div class="soon">
-      Nothing here collects from Instagram yet. It is listed so the shape of this
-      page does not change when it is added — not because it is switched off.
+    <div class="platbody">
+      <p class="muted" style="margin:0 0 10px">
+        You can sign an account in here, and it is stored. <b>Nothing collects
+        from Instagram yet</b> — the collector is not written. This is the first
+        half, done first because signing in is the part that needs a human.</p>
+      <div id="igaccounts"><p class="muted">Loading…</p></div>
+      <button id="ignew" style="margin-top:4px">+ Add an Instagram account</button>
+      <div id="igform" hidden class="addform">
+        <p class="muted" style="margin:0">
+          Give it a short name, then sign in. A real Instagram opens in a window
+          — solve the captcha and any code prompt there, exactly as you would on
+          your phone. Your password goes straight to instagram.com.</p>
+        <input id="ig_label" placeholder="short name, e.g. ig_a">
+        <input id="ig_user"  placeholder="Instagram username (optional)">
+        <input id="ig_proxy" placeholder="proxy (leave blank)">
+        <div style="display:flex;gap:6px">
+          <button id="ig_save" class="primary" style="flex:1">Save and sign in</button>
+          <button id="ig_cancel">Cancel</button>
+        </div>
+      </div>
     </div>
   </div>
 
@@ -2643,11 +2777,67 @@ async function load(){
     </div>`;
   }).join("") : '<p class="muted">No X accounts yet. Add one below.</p>';
 
-  // Bound in the same pass that draws them — this panel is redrawn on every
+  renderIG(d.instagram || [], d.instagram_error);
+
+  // Bound in the same pass that draws them — both panels are redrawn on every
   // refresh, so anything bound earlier belongs to nodes that are gone.
   document.querySelectorAll("[data-signin]").forEach(b =>
     b.onclick = () => loginOpen(b.dataset.signin));
 }
+
+function renderIG(list, err){
+  $("#igcount").textContent = list.length
+    ? `${list.filter(a => a.active).length} of ${list.length} signed in` : "none yet";
+  if (err) banner("Could not read the Instagram accounts: " + esc(err), "err");
+
+  $("#igaccounts").innerHTML = list.length ? list.map(a => {
+    const st = a.status || (a.active ? "live" : "dead");
+    const s  = STATE[st] || {label: st, note: ""};
+    return `<div class="acct">
+      <div class="top">
+        <span class="who">@${esc(a.username)}</span>
+        <span class="flag ${st}">${st === "live" ? "Signed in" : s.label}</span>
+        <span class="muted">${esc(st === "live"
+          ? "Session stored. Nothing collects from it yet." : s.note)}</span>
+      </div>
+      <div class="facts">
+        <div class="fact"><span class="k">name in config</span>${esc(a.label || "—")}</div>
+        <div class="fact"><span class="k">last used</span>${esc(when(a.last_used))}</div>
+        <div class="fact"><span class="k">own proxy</span>${a.proxy ? "yes" : "no"}</div>
+      </div>
+      ${(a.reasons||[]).length ? `<div class="why">${a.reasons.map(r=>"• "+esc(r)).join("<br>")}
+         ${a.action ? `<br><b>What to do:</b> ${esc(a.action)}` : ""}</div>` : ""}
+      <div class="acctacts">
+        <button data-signin="${esc(a.label || a.username)}" ${a.active ? "" : 'class="primary"'}>
+          ${a.active ? "Sign in again" : "Sign in to Instagram"}</button>
+      </div>
+    </div>`;
+  }).join("") : '<p class="muted">No Instagram accounts yet.</p>';
+}
+
+$("#ignew").onclick    = () => { $("#igform").hidden = false; $("#ig_label").focus(); };
+$("#ig_cancel").onclick = () => { $("#igform").hidden = true; };
+$("#ig_save").onclick = async () => {
+  const body = {
+    label: $("#ig_label").value.trim(), username: $("#ig_user").value.trim(),
+    proxy: $("#ig_proxy").value.trim(), platform: "instagram",
+  };
+  if (!body.label) return banner("Give the account a short name first.", "err");
+  $("#ig_save").disabled = true;
+  try {
+    const d = await api("/api/account", {
+      method:"POST", headers:{"Content-Type":"application/json"},
+      body: JSON.stringify(body)
+    });
+    if (d.error) return banner(esc(d.error), "err");
+    ["#ig_label","#ig_user","#ig_proxy"].forEach(s => $(s).value = "");
+    $("#igform").hidden = true;
+    banner("");
+    await load();
+    await loginOpen(d.label);
+  } catch (e) { banner(esc(e.message), "err"); }
+  finally { $("#ig_save").disabled = false; }
+};
 
 $("#acctnew").onclick  = () => { $("#acctform").hidden = false; $("#a_label").focus(); };
 $("#a_cancel").onclick = () => { $("#acctform").hidden = true; };
