@@ -2041,11 +2041,17 @@ $("#src").onchange = () => {
   $("#q").placeholder = isList
     ? "Paste an X list link — https://x.com/i/lists/1234567890"
     : "Type words to find in the tweets you have saved…";
-  /* Lists get 500 requests per 15 min against search's 50, so the same number
-     of tweets is a far smaller share of the budget. Say so where it is chosen. */
+  /* Lists are a far better deal than searches on BOTH counts, and the numbers
+     are not close.
+       requests : 500 per 15 min against 50
+       per request : X returns exactly the 20 asked for on a search, and
+                     ignores the count on a list — measured 78 to 92, so ~90.
+     Quoting 20 per request for a list understated it by four and a half times:
+     "5 pages, about 100 tweets" actually fetched 460. */
+  const per = isList ? 90 : 20;
   [...$("#pages").options].forEach(o => {
     const n = parseInt(o.value, 10);
-    o.textContent = `about ${n*20} tweets · uses ${n} of your `
+    o.textContent = `about ${n*per} tweets · uses ${n} of your `
       + (isList ? "500" : "50") + " requests";
   });
 };
