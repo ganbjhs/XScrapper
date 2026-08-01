@@ -11,6 +11,7 @@ profiles/
 
 # Outputs
 results.*
+browser-check.jpg
 exports/
 logs/
 

@@ -281,9 +281,47 @@ async def check_browser(cfg) -> int:
                             wait_until="domcontentloaded", timeout=60000)
             _log(f"  loaded a page in {_t.time() - t1:.1f}s")
 
+            # domcontentloaded fires BEFORE the page paints. Screenshotting on
+            # that boundary produced an 8 KB near-blank image on a fast server
+            # and a 76 KB one on a slower laptop, purely because the laptop got
+            # there later — a measurement that says more about timing than
+            # about the browser. Let it settle first.
+            await page.wait_for_timeout(2500)
+
+            # What did it actually render? A page that loads but paints
+            # nothing looks identical to a healthy one in every number above,
+            # and is the difference between "the browser works" and "the
+            # sign-in window is usable".
+            title = await page.title()
+            text = (await page.inner_text("body"))[:400] if await page.query_selector("body") else ""
+            _log(f"  page title  : {title!r}")
+            _log(f"  visible text: {len(text)} chars"
+                 + (f"  {text.strip().splitlines()[0][:60]!r}" if text.strip() else ""))
+
             t2 = _t.time()
             shot = await page.screenshot(type="jpeg", quality=68)
-            _log(f"  screenshot  : {len(shot) // 1024} KB in {_t.time() - t2:.1f}s")
+            kb = len(shot) // 1024
+            _log(f"  screenshot  : {kb} KB in {_t.time() - t2:.1f}s")
+
+            out = pathlib.Path(cfg.root) / "browser-check.jpg"
+            out.write_bytes(shot)
+            _log(f"  saved to    : {out}")
+
+            # A real login page is tens of KB. Single digits means it painted
+            # almost nothing, and on a bare server that is nearly always fonts:
+            # Chromium with no fonts installed renders text as nothing at all.
+            if kb < 15:
+                _log("")
+                _log("  THAT IS TOO SMALL for a real page — it rendered close to blank.")
+                if len(text) > 50:
+                    _log("  The text IS there, so the page loaded and did not paint it.")
+                    _log("  On a bare server that is fonts. Install some:")
+                    _log("      sudo apt-get install -y fonts-liberation fonts-noto-core \\")
+                    _log("           fonts-noto-color-emoji fonts-dejavu-core")
+                else:
+                    _log("  There is no text either, so the page did not load properly.")
+                    _log("  Instagram may be serving a block page to this address.")
+                _log(f"  Look at {out.name} and see for yourself.")
             await ctx.close()
     except Exception as e:
         for ln in lines:
