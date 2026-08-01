@@ -118,4 +118,10 @@ enabled = true
 # secret_env = "WEBHOOK_SECRET_MAIN"       # the NAME of a variable in .env
 # streams    = []                          # e.g. ["politicians"]; empty = all
 # batch_size = 50                          # tweets per POST
+# min_likes  = 0                           # skip quieter tweets
+# skip_retweets = false
 # enabled    = true
+#
+# Telegram is NOT configured here. Switch it on per list with the gear in the
+# dashboard — those settings live in the database so the running watcher picks
+# them up without a restart.

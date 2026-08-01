@@ -217,17 +217,33 @@ The dashboard defaults to querying the local database. Getting new tweets from
 X is an explicit, confirmed, budgeted action that never fires on a keystroke.
 Auto-update re-reads the local database only.
 
-### R16 — Collected tweets are never deleted
+### R16 — Deleting data is possible, never convenient, and never the default
 
-There is no delete button, no delete endpoint, and no delete command. Streams
-can be disabled; their tweets stay.
+Removing a stream offers two separate actions, and they are not variations of
+one another:
 
-*Why:* X's Latest index only reaches back ~7 days, so anything deleted more than
-a week after collection is unrecoverable. Storage is cheap and the data is not.
+| | what happens | reversible |
+|---|---|---|
+| **Stop watching** | the stream stops being collected and leaves the sidebar; every tweet stays, still searchable, still served by the API | yes |
+| **Delete this and its tweets** | the tweets go too, permanently | **no** |
 
-The one-time cleanup in §9 was done by hand, against a backup, with the exact
-rows named. That is the only way this should ever happen: deliberately, once,
-with a copy kept.
+The first is one click. The second requires typing the stream's name, says how
+many tweets will go, and reports exactly what went.
+
+*Why:* X's Latest index only reaches back ~7 days, so anything destroyed more
+than a week after collection can never be collected again. Storage is cheap and
+the data is not.
+
+**A tweet matched by more than one stream survives.** Deleting a junk stream
+must not punch holes in a list you kept, so only tweets that no other stream
+also matched are removed — and the count reported is the number actually
+deleted, not the number the stream contained.
+
+*This rule replaced an earlier one that said deletion did not exist at all.*
+That version shipped "hide" instead, which turned out to be the wrong shape:
+hiding left a growing list of hidden things to manage, and the operator wanted
+the entry gone. The safety it was protecting is real, so it moved into the
+confirmation rather than into a refusal.
 
 ### R17 — HTTPS is not a manual step, and re-deploying can never turn it off
 
@@ -852,6 +868,52 @@ python3 main.py webhook --status    # how far each has got, and what is stuck
 python3 main.py watch --all --no-webhooks   # collect without delivering
 ```
 
+### Push — Telegram
+
+Same machinery as webhooks: same cursor, same back-off, same "never block
+collection". Only the formatting and the transport differ, which is why it
+lives beside them rather than as its own subsystem.
+
+Set it up in the dashboard under **What we are watching → ⚙ Telegram &
+settings**: make a bot by messaging `@BotFather`, paste the token and a chat
+id, press *Send a test*. Then switch it on per stream with the ⚙ beside that
+stream, where you can also set a minimum like count and skip retweets.
+
+Unlike webhooks, Telegram is **not** declared in `config.toml`. It is switched
+on per stream from the dashboard, so its settings live where the dashboard can
+write them and the running watcher can re-read them — the `streams` table. The
+bot token is the exception: it is a credential, so it goes in `.env` with the
+others.
+
+Two things Telegram forces:
+
+- **Messages are batched.** Their limit is about 20 messages a minute into one
+  group, so a busy list sending one message per tweet would start collecting
+  429s within a minute. Tweets are packed up to 3500 characters per message
+  with a pause between sends.
+- **HTML, not Markdown.** Tweet text is full of unbalanced underscores,
+  asterisks and brackets, and Telegram rejects a whole message whose Markdown
+  does not parse. Escaping three characters for HTML always works.
+
+A tweet too long for one message is trimmed, not dropped — and the *raw* text
+is trimmed before escaping, never after. Cutting an escaped string can slice
+through the middle of an entity (`&amp;` → `&am`), which Telegram rejects as
+malformed, taking the whole batch down with it.
+
+### Per-stream settings
+
+The ⚙ beside each stream sets how often it is checked, how many tweets per
+check, whether it is paused, and where it goes.
+
+**These live in the database, not `config.toml`.** `config.toml` declares WHAT
+to watch; the `streams` table says how it is tuned right now. The split is what
+lets a change in the dashboard reach the running watcher on its next cycle —
+editing `config.toml` would need a restart, and rewriting a file a human
+hand-edited would eat their comments.
+
+`NULL` means "no override, use config.toml", which is deliberately not the same
+as `0`: a `min_interval_s` of 0 would poll as fast as the loop can turn.
+
 ### Pull — you ask us
 
 Set `API_KEYS` in `.env` (comma-separated, so one consumer can be revoked
@@ -898,7 +960,8 @@ An allowlist, enforced server-side — not a convention:
 allowed   /api/tweets  /api/streams  /api/export  /api/status  /api/guard  /api/fetch
 refused   /api/account      writes secrets to disk
           /api/login/*      launches a browser process
-          /api/stream/hide  changes what a human sees
+          /api/stream/*     changes what is collected, or destroys data
+          /api/settings/*   writes credentials to disk
 ```
 
 A leaked key then costs you data exposure, not a banned X account or a
@@ -1175,7 +1238,8 @@ account ends up collecting under a label nobody chose.**
   resource cost and buys nothing once you hold the cookies.
 - **Do not add per-keystroke live search.** It would drain the budget the
   watcher needs.
-- **Do not add a delete button** (R16).
+- **Do not make deleting data easy** (R16). Stopping is one click; destroying
+  needs the name typed.
 - **Do not unpin twscrape** without running `doctor --selftest`.
 - **Do not set `TWS_PROXY`.** It silently overrides every per-account proxy,
   collapsing the pool onto one IP. Config rejects it.

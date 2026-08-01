@@ -1379,6 +1379,95 @@ async def run_webhook(tmp):
 
         ok(wh.backoff_ms(1) < wh.backoff_ms(3) <= wh.BACKOFF_MAX_S * 1000,
            "back-off grows but stays capped")
+
+        print()
+        print("== filters ==")
+
+        class _F:
+            skip_retweets = True
+            min_likes = 10
+
+        ok(not wh._wanted(_F(), {"is_retweet": 1, "like_count": 999}),
+           "skip_retweets drops a retweet")
+        ok(not wh._wanted(_F(), {"is_retweet": 0, "like_count": 9}),
+           "min_likes drops a quiet tweet")
+        ok(wh._wanted(_F(), {"is_retweet": 0, "like_count": 10}),
+           "and keeps one that clears the bar")
+
+        # The cursor MUST move past rows we chose not to send. If it did not, a
+        # stream whose every tweet is filtered out would re-read the same rows
+        # forever, deliver nothing, and never advance.
+        hook.min_likes = 10 ** 9
+        before = await st.webhook_cursor("t")
+        async with httpx.AsyncClient() as client:
+            await poll_once(ReplayEngine([ids_at(0)]), st, stream, sid)
+            await wh.pump(hook, st, client, log=lambda m: None)
+        after = await st.webhook_cursor("t")
+        ok(after["last_tweet_id"] > before["last_tweet_id"],
+           "the cursor advances past filtered-out tweets, so a fully filtered "
+           "stream cannot wedge delivery")
+        hook.min_likes = 0
+
+        print()
+        print("== telegram ==")
+        msgs = wh.tg_format(
+            [{"tweet_id": 1, "author_display_name": "A & B", "author_username": "ab",
+              "text": "<script>x</script>", "url": "https://x.com/1", "like_count": 3}],
+            {1: ["politicians"]})
+        ok(len(msgs) == 1 and "&amp;" in msgs[0] and "&lt;script&gt;" in msgs[0],
+           "telegram escapes the three characters its HTML mode cares about")
+        ok("open on X" in msgs[0], "and every tweet carries a link back")
+
+        big = [{"tweet_id": i, "author_display_name": "n", "author_username": "n",
+                "text": "y" * 900, "url": "https://x.com/", "like_count": 0}
+               for i in range(12)]
+        packed = wh.tg_format(big, {})
+        ok(len(packed) > 1 and all(len(m) <= wh.TG_MAX_CHARS for m in packed),
+           f"long runs are split into messages under Telegram's limit ({len(packed)} messages)")
+
+        huge = wh.tg_format(
+            [{"tweet_id": 1, "author_display_name": "n", "author_username": "n",
+              "text": "z" * 9000, "url": "https://x.com/1", "like_count": 0}], {})
+        ok(len(huge) == 1 and len(huge[0]) <= wh.TG_MAX_CHARS,
+           "one oversized tweet is trimmed rather than dropped or rejected")
+
+        print()
+        print("== stream settings and removal ==")
+        # A second stream matching some of the same tweets, so the "keep what
+        # another list also has" rule gets exercised rather than assumed.
+        s2 = await st.ensure_stream("other", "q2")
+        shared = await st.tweets_after(0, 0, 3)
+        for r in shared:
+            st.db.execute(
+                "INSERT OR IGNORE INTO tweet_hits(stream_id, tweet_id, first_seen_ms) "
+                "VALUES(?,?,?)", (s2, r["tweet_id"], r["collected_ms"]))
+        total_before = await st.count_tweets()
+
+        ok(await st.set_stream_settings("s", {"paused": 1, "min_interval_s": 300}),
+           "settings save against a real stream")
+        cfg_row = await st.stream_settings("s")
+        ok(cfg_row["paused"] == 1 and cfg_row["min_interval_s"] == 300,
+           "and read back")
+        await st.set_stream_settings("s", {"min_interval_s": None})
+        ok((await st.stream_settings("s"))["min_interval_s"] is None,
+           "clearing an override stores NULL, not 0 (0 would poll flat out)")
+        ok(not await st.set_stream_settings("nope", {"paused": 1}),
+           "settings for a stream that does not exist are refused, not invented")
+
+        r = await st.forget_stream("s", delete_tweets=False)
+        ok(r["found"] and r["tweets_deleted"] == 0, "stop watching removes no tweets")
+        ok(await st.count_tweets() == total_before,
+           "and every tweet is still there afterwards")
+        ok(not (await st.stream_settings("s")), "while the stream itself is gone")
+
+        # 's' is gone, so these three are now 'other' alone and go with it.
+        r = await st.forget_stream("other", delete_tweets=True)
+        ok(r["tweets_deleted"] == len(shared),
+           f"deleting data removes that stream's tweets ({r['tweets_deleted']})")
+        ok(await st.count_tweets() == total_before - len(shared),
+           "and only those")
+        ok(not (await st.forget_stream("other"))["found"],
+           "and removing it twice is not an error, just found=False")
     finally:
         await st.close()
         srv.shutdown()
@@ -1421,6 +1510,7 @@ def main():
 
         section("webhook (signing, cursor, receiver outage)")
         asyncio.run(run_webhook(fresh("webhook")))
+
 
         section("web (shared event loop)")
         test_web_event_loop(fresh("web"))

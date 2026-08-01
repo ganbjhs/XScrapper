@@ -29,6 +29,7 @@ import hashlib
 import hmac
 import json
 import os
+import re
 import secrets
 import sqlite3
 import threading
@@ -267,19 +268,6 @@ def _query_tweets(p):
         joins = "JOIN tweet_hits h USING(tweet_id) JOIN streams s USING(stream_id)"
         where.append("s.label = ?")
         params.append(p["stream"])
-    elif not p.get("show_hidden"):
-        # Show a tweet if ANY stream still showing it matched it.
-        #
-        # Deliberately not "hide anything a hidden stream matched": a tweet can
-        # belong to several streams, so that phrasing would make hiding a junk
-        # stream also hide the good stream's tweets wherever the two overlap —
-        # silently losing rows from a view the operator did not touch.
-        #
-        # EXISTS rather than a JOIN because a tweet with three matching streams
-        # would otherwise come back three times.
-        where.append(
-            "EXISTS (SELECT 1 FROM tweet_hits h2 JOIN streams s2 USING(stream_id) "
-            "        WHERE h2.tweet_id = t.tweet_id AND s2.hidden = 0)")
 
     if p.get("q"):
         # Free text across the tweet and its author.
@@ -454,8 +442,27 @@ def _status():
                     (s["stream_id"], s["first_poll_ms"]),
                 ).fetchall() if watched else []
                 lags = sorted(x["lag_ms"] for x in lag)
+                cols = s.keys()
+
+                def _col(name, default=None):
+                    return s[name] if name in cols and s[name] is not None else default
+
+                # Map the stored interval back to the named speed the panel
+                # offers, so re-opening it shows what is actually set rather
+                # than defaulting to blank and inviting an accidental change.
+                speed = ""
+                mi = _col("min_interval_s")
+                if mi is not None:
+                    speed = next((k for k, v in SPEEDS.items() if abs(v - mi) < 0.5), "")
+
                 out["streams"].append({
-                    "hidden": bool(s["hidden"]) if "hidden" in s.keys() else False,
+                    "paused": bool(_col("paused", 0)),
+                    "speed": speed,
+                    "pages": _col("max_pages_per_poll"),
+                    "tg_enabled": bool(_col("tg_enabled", 0)),
+                    "tg_chat_id": _col("tg_chat_id", ""),
+                    "tg_min_likes": _col("tg_min_likes", 0),
+                    "tg_skip_retweets": bool(_col("tg_skip_retweets", 0)),
                     "label": s["label"], "query": s["query"], "tab": s["tab"],
                     "count": hits,
                     "lag_p50": lags[len(lags) // 2] / 1000 if lags else None,
@@ -673,6 +680,189 @@ def _add_account(body):
                          f"{type(e).__name__}: {e}"}
 
     return {"ok": True, "label": label}
+
+
+# --------------------------------------------------------------------------
+# stream settings, removal, and Telegram
+# --------------------------------------------------------------------------
+
+def _with_store(fn):
+    """Run one coroutine against a writable Store. The read path stays read-only."""
+    async def go():
+        st = store_mod.Store(_CFG.db_results, _CFG.defaults.keep_entry_json)
+        await st.open()
+        try:
+            return await fn(st)
+        finally:
+            await st.close()
+    return _run(go())
+
+
+# Update speeds, named rather than numeric. "Every 30 seconds" is a promise the
+# system cannot keep — the interval is adaptive and X's budget is the real
+# ceiling — so these set the FLOOR and let the controller settle above it.
+SPEEDS = {"fastest": 5, "fast": 15, "normal": 60, "slow": 300, "hourly": 1800}
+
+
+def _stream_settings(body):
+    label = (body.get("label") or "").strip()
+    if not label:
+        return {"error": "which stream?"}
+
+    vals = {}
+    if "paused" in body:
+        vals["paused"] = int(bool(body["paused"]))
+    if "speed" in body:
+        speed = str(body.get("speed") or "")
+        if speed and speed not in SPEEDS:
+            return {"error": f"speed must be one of: {', '.join(SPEEDS)}"}
+        # "" clears the override and goes back to whatever config.toml says.
+        vals["min_interval_s"] = SPEEDS.get(speed) if speed else None
+    if "pages" in body:
+        pages = body.get("pages")
+        if pages in (None, "", 0):
+            vals["max_pages_per_poll"] = None
+        else:
+            try:
+                n = int(pages)
+            except (TypeError, ValueError):
+                return {"error": "pages must be a whole number"}
+            if not 1 <= n <= 25:
+                return {"error": "pages must be between 1 and 25"}
+            vals["max_pages_per_poll"] = n
+    if "tg_enabled" in body:
+        vals["tg_enabled"] = int(bool(body["tg_enabled"]))
+    if "tg_chat_id" in body:
+        chat = str(body.get("tg_chat_id") or "").strip()
+        if chat and not re.fullmatch(r"-?\d{1,20}|@[A-Za-z0-9_]{4,32}", chat):
+            return {"error": "a chat id is a number like -1001234567890, "
+                             "or a public channel like @mychannel"}
+        vals["tg_chat_id"] = chat or None
+    if "tg_min_likes" in body:
+        try:
+            vals["tg_min_likes"] = max(0, int(body.get("tg_min_likes") or 0))
+        except (TypeError, ValueError):
+            return {"error": "minimum likes must be a whole number"}
+    if "tg_skip_retweets" in body:
+        vals["tg_skip_retweets"] = int(bool(body["tg_skip_retweets"]))
+
+    if not vals:
+        return {"error": "nothing to change"}
+    if not _with_store(lambda st: st.set_stream_settings(label, vals)):
+        return {"error": f"no stream called {label!r}"}
+    return {"ok": True, "label": label, "applied": vals}
+
+
+def _stream_remove(body):
+    """
+    Two very different actions, and the caller must say which.
+
+    `delete_tweets` is not a flag with a safe default — it is the difference
+    between "stop watching this" and "destroy what it collected", so it is
+    required to be explicit and the reply says exactly what went.
+    """
+    label = (body.get("label") or "").strip()
+    if not label:
+        return {"error": "which stream?"}
+    hard = bool(body.get("delete_tweets"))
+
+    # Destroying data needs the operator to have typed the name. A misclick
+    # cannot produce this, and X's ~7-day window means it cannot be undone.
+    if hard and (body.get("confirm") or "").strip() != label:
+        return {"error": f"To delete the data, type the name exactly: {label}"}
+
+    res = _with_store(lambda st: st.forget_stream(label, delete_tweets=hard))
+    if not res.get("found"):
+        return {"error": f"no stream called {label!r}"}
+
+    # A stream declared in config.toml would simply be recreated on the next
+    # poll, so removing it there too is the only way "stop watching" sticks.
+    removed_from_config = _drop_stream_from_config(label)
+    res["removed_from_config"] = removed_from_config
+    if removed_from_config:
+        try:
+            _reload_config()
+        except Exception as e:
+            res["warning"] = f"config.toml no longer loads: {e}"
+    return res
+
+
+def _drop_stream_from_config(label: str) -> bool:
+    """Remove a [[streams]] block by label, leaving the rest of the file alone."""
+    path = _CFG.root / "config.toml"
+    if not path.exists():
+        return False
+    text = path.read_text()
+    # Match the block from its [[streams]] header to the next top-level table
+    # or end of file, and only when THIS block's label is the one asked for.
+    pattern = re.compile(
+        r'\n\[\[streams\]\]\s*\n(?:(?!\n\[\[|\n\[).)*?'
+        r'label\s*=\s*["\']' + re.escape(label) + r'["\'](?:(?!\n\[\[|\n\[).)*',
+        re.S)
+    new, n = pattern.subn("\n", text)
+    if not n:
+        return False
+    path.write_text(new)
+    return True
+
+
+def _save_telegram(body):
+    """Store the bot token and default chat in .env, where secrets live."""
+    token = (body.get("token") or "").strip()
+    chat = (body.get("chat_id") or "").strip()
+
+    if token and not re.fullmatch(r"\d{6,12}:[A-Za-z0-9_-]{30,50}", token):
+        return {"error": "That does not look like a bot token. BotFather gives "
+                         "you something like 123456789:AAH... — paste the whole line."}
+    if chat and not re.fullmatch(r"-?\d{1,20}|@[A-Za-z0-9_]{4,32}", chat):
+        return {"error": "a chat id is a number like -1001234567890, "
+                         "or a public channel like @mychannel"}
+
+    env_path = _CFG.root / ".env"
+    cur = env_path.read_text() if env_path.exists() else ""
+    for key, val in (("TELEGRAM_BOT_TOKEN", token), ("TELEGRAM_CHAT_ID", chat)):
+        if not val:
+            continue
+        lines, done = [], False
+        for ln in cur.splitlines():
+            if ln.strip().startswith(f"{key}="):
+                lines.append(f"{key}={val}")
+                done = True
+            else:
+                lines.append(ln)
+        if not done:
+            lines.append(f"{key}={val}")
+        cur = "\n".join(lines) + "\n"
+        os.environ[key] = val          # live now, without a restart
+    env_path.write_text(cur)
+    try:
+        env_path.chmod(0o600)
+    except OSError:
+        pass
+    return {"ok": True, "has_token": bool(os.getenv("TELEGRAM_BOT_TOKEN")),
+            "chat_id": os.getenv("TELEGRAM_CHAT_ID", "")}
+
+
+def _test_telegram(body):
+    """Send one real message, so 'saved' and 'working' are not confused."""
+    import webhook as wh
+
+    token = wh.telegram_token()
+    chat = (body.get("chat_id") or os.getenv("TELEGRAM_CHAT_ID", "")).strip()
+    if not token:
+        return {"error": "No bot token saved yet."}
+    if not chat:
+        return {"error": "No chat id — tell me where to send it."}
+
+    async def go():
+        import httpx
+        async with httpx.AsyncClient() as client:
+            return await wh.tg_send(
+                client, token, chat,
+                "<b>X Collector</b>\nConnected. Tweets will arrive here.")
+
+    ok, err = _run(go(), timeout=40)
+    return {"ok": ok} if ok else {"error": err}
 
 
 # --------------------------------------------------------------------------
@@ -1017,14 +1207,14 @@ class Handler(BaseHTTPRequestHandler):
                     return self._send(200, {"streams": []})
                 with _connect() as con:
                     rows = con.execute(
-                        "SELECT s.label, s.query, s.list_id, s.hidden, "
+                        "SELECT s.label, s.query, s.list_id, s.paused, "
                         "       COUNT(h.tweet_id) AS tweets "
                         "FROM streams s LEFT JOIN tweet_hits h USING(stream_id) "
                         "GROUP BY s.stream_id ORDER BY s.label").fetchall()
                 return self._send(200, {"streams": [
                     {"label": r["label"],
                      "source": ("list:" + r["list_id"]) if r["list_id"] else r["query"],
-                     "hidden": bool(r["hidden"]), "tweets": r["tweets"]}
+                     "paused": bool(r["paused"]), "tweets": r["tweets"]}
                     for r in rows]})
             if u.path == "/api/guard":
                 import guard
@@ -1069,23 +1259,18 @@ class Handler(BaseHTTPRequestHandler):
                 return self._send(200, _login_act(body))
             if u.path == "/api/login/cancel":
                 return self._send(200, _login_cancel())
-            if u.path == "/api/stream/hide":
-                label = (body.get("label") or "").strip()
-                hide = bool(body.get("hidden"))
-                if not label:
-                    return self._send(400, {"error": "which stream?"})
-
-                async def _hide():
-                    st = store_mod.Store(_CFG.db_results, _CFG.defaults.keep_entry_json)
-                    await st.open()
-                    try:
-                        return await st.set_hidden(label, hide)
-                    finally:
-                        await st.close()
-
-                if not _run(_hide()):
-                    return self._send(404, {"error": f"no stream called {label!r}"})
-                return self._send(200, {"ok": True, "label": label, "hidden": hide})
+            if u.path == "/api/stream/settings":
+                return self._send(200, _stream_settings(body))
+            if u.path == "/api/stream/remove":
+                return self._send(200, _stream_remove(body))
+            if u.path == "/api/settings/telegram":
+                if not _auth_configured():
+                    return self._send(403, {"error":
+                        "Saving the Telegram token needs DASH_USER/DASH_PASSWORD "
+                        "set in .env, so the endpoint is behind a login."})
+                return self._send(200, _save_telegram(body))
+            if u.path == "/api/settings/telegram/test":
+                return self._send(200, _test_telegram(body))
             if u.path == "/api/account":
                 # Writes an X password into .env, so it needs a real gate.
                 # The old check was "is the socket on 127.0.0.1", which is
@@ -1327,7 +1512,17 @@ PAGE = r"""<!doctype html>
   .streambtn.active{border-color:var(--accent);background:rgba(29,155,240,.1)}
   .streambtn.off{opacity:.5}
   .streamx{flex:0 0 auto;padding:4px 8px;font-size:12px;color:var(--dim)}
-  .streamx:hover{border-color:var(--warn);color:var(--warn)}
+  .streamx:hover{border-color:var(--accent);color:var(--accent)}
+  .streamcfg{border:1px solid var(--line);border-radius:8px;padding:8px 10px;
+             margin:-2px 0 8px;background:var(--bg);display:grid;gap:6px}
+  .cfgrow{display:flex;align-items:center;justify-content:space-between;gap:6px;
+          font-size:12px;color:var(--dim)}
+  .cfgrow select,.cfgrow input{font-size:12px;padding:3px 6px;max-width:58%}
+  .cfgchk{font-size:12px;color:var(--dim);display:flex;align-items:center;gap:6px}
+  .cfghead{font-size:11px;text-transform:uppercase;letter-spacing:.06em;
+           color:var(--dim);margin-top:4px;border-top:1px solid var(--line);padding-top:6px}
+  .cfgbtn{width:100%;padding:4px;font-size:12px}
+  .cfgbtn.danger{border-color:var(--warn);color:var(--warn)}
   .linky{width:100%;border:0;background:none;color:var(--dim);font-size:12px;
          text-align:left;padding:2px 0;text-decoration:underline;cursor:pointer}
   code{background:var(--bg);padding:1px 5px;border-radius:5px;font-size:12px;
@@ -1395,6 +1590,22 @@ Tick this to see only original posts."><input type="checkbox" id="noretweets"> h
     <div class="box">
       <h2>What we are watching</h2>
       <div id="streams"><span class="muted">—</span></div>
+      <button id="tgtoggle" class="linky" style="margin-top:6px">⚙ Telegram &amp; settings</button>
+      <div id="tgbox" hidden style="margin-top:6px;display:grid;gap:5px">
+        <p class="muted" style="margin:0">
+          Send new tweets straight to Telegram. Make a bot by messaging
+          <b>@BotFather</b> on Telegram, then paste what it gives you here.
+          Switch it on per list with the ⚙ next to that list.</p>
+        <input id="tg_token" placeholder="bot token from @BotFather" autocomplete="off">
+        <input id="tg_chat" placeholder="chat id, e.g. -1001234567890">
+        <p class="muted" style="margin:0;font-size:11px">
+          Not sure of the chat id? Add the bot to your group, send it a message,
+          then open api.telegram.org/bot&lt;token&gt;/getUpdates — the id is in there.</p>
+        <div style="display:flex;gap:6px">
+          <button id="tg_save" class="primary" style="flex:1;padding:5px;font-size:13px">Save</button>
+          <button id="tg_test" style="padding:5px 10px;font-size:13px">Send a test</button>
+        </div>
+      </div>
     </div>
     <div class="box">
       <h2>X accounts</h2>
@@ -1451,7 +1662,7 @@ Tick this to see only original posts."><input type="checkbox" id="noretweets"> h
 <script>
 const $ = s => document.querySelector(s);
 let activeStream = "";
-let showHidden = false;
+let openCfg = null;      // which stream has its settings open
 
 const esc = s => (s||"").replace(/[&<>"']/g, c =>
   ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
@@ -1654,30 +1865,21 @@ async function status(){
     return banner(esc(e.message).replace(/\n/g,"<br>"), "err");
   }
 
-  const all    = d.streams || [];
-  const hidden = all.filter(s => s.hidden);
-  const shown  = all.filter(s => !s.hidden);
-  const list   = showHidden ? all : shown;
+  const all = d.streams || [];
 
   $("#streams").innerHTML = all.length
     ? `<button class="streambtn ${activeStream?'':'active'}" data-s="">Everything</button>` +
-      list.map(s => `<div class="streamrow">
-        <button class="streambtn ${activeStream===s.label?'active':''} ${s.hidden?'off':''}"
+      all.map(s => `<div class="streamrow">
+        <button class="streambtn ${activeStream===s.label?'active':''} ${s.paused?'off':''}"
           data-s="${esc(s.label)}" title="${esc(s.query || s.label)}">
           ${esc(s.label)} <span class="muted">· ${s.count} tweets</span>
+          ${s.paused ? '<span class="muted">· paused</span>' : ''}
+          ${s.tg_enabled ? '<span class="muted">· → Telegram</span>' : ''}
           ${s.lag_p50!=null ? `<span class="muted">· usually saved ${secs(s.lag_p50)} after posting</span>`:''}
         </button>
-        <button class="streamx" data-hide="${esc(s.label)}" data-to="${s.hidden?0:1}"
-          title="${s.hidden ? 'Show this again' : 'Hide this. The tweets are kept — nothing is deleted.'}"
-        >${s.hidden ? '↩' : '✕'}</button>
-      </div>`).join("") +
-      // Only offer the toggle while there is actually something hidden —
-      // otherwise unhiding the last stream leaves a "hide them again" link
-      // that refers to nothing.
-      (hidden.length
-        ? `<button id="showhidden" class="linky">${showHidden
-             ? "stop showing hidden ones" : `show ${hidden.length} hidden`}</button>`
-        : "")
+        <button class="streamx" data-gear="${esc(s.label)}" title="Settings">⚙</button>
+      </div>
+      <div class="streamcfg" data-cfg="${esc(s.label)}" hidden></div>`).join("")
     : '<span class="muted">nothing yet</span>';
 
   document.querySelectorAll(".streambtn").forEach(b =>
@@ -1685,23 +1887,12 @@ async function status(){
 
   // Bind in the same pass that draws them: status() replaces this whole panel
   // every 15s, so anything bound earlier belongs to nodes that no longer exist.
-  document.querySelectorAll(".streamx").forEach(b => b.onclick = async () => {
-    const label = b.dataset.hide, to = b.dataset.to === "1";
-    try {
-      await api("/api/stream/hide", {
-        method:"POST", headers:{"Content-Type":"application/json"},
-        body: JSON.stringify({label, hidden: to})
-      });
-    } catch (e) { return banner(esc(e.message), "err"); }
-    // Hiding the stream you are filtered to would leave you staring at an
-    // empty list with no obvious way back.
-    if (to && activeStream === label) activeStream = "";
-    banner(to ? `Hid <b>${esc(label)}</b>. Its ${'tweets are still saved'} — use
-                 <b>show hidden</b> to bring it back.` : `<b>${esc(label)}</b> is back.`, "ok");
-    await status(); await search();
+  document.querySelectorAll("[data-gear]").forEach(b => b.onclick = () => {
+    const label = b.dataset.gear;
+    openCfg = (openCfg === label) ? null : label;
+    drawCfg(all);
   });
-  const sh = $("#showhidden");
-  if (sh) sh.onclick = () => { showHidden = !showHidden; status(); };
+  drawCfg(all);
 
   $("#accounts").innerHTML = (d.accounts||[]).length
     ? d.accounts.map(a => {
@@ -1738,6 +1929,111 @@ async function status(){
     (s0 ? `<div class="row"><span class="k">requests left this 15 min</span>
            <span>${s0.rl_remaining} of ${s0.rl_limit}</span></div>` : "") +
     (d.totals.note ? `<div class="muted">${esc(d.totals.note)}</div>` : "");
+}
+
+/* ------------------------------------------------------------------
+   Per-stream settings, behind the gear.
+
+   Kept collapsed and rendered on demand: the sidebar redraws every 15s, and
+   an always-open form would fight whatever you were typing into it. Only the
+   one you opened is built, and it survives the redraw because openCfg is
+   module state rather than DOM state.
+   ------------------------------------------------------------------ */
+const SPEED_LABELS = {"":"leave as configured", fastest:"as fast as allowed (~5s)",
+  fast:"every 15s or so", normal:"every minute or so", slow:"every 5 minutes or so",
+  hourly:"every half hour or so"};
+
+function drawCfg(streams){
+  document.querySelectorAll("[data-cfg]").forEach(box => {
+    const label = box.dataset.cfg;
+    if (label !== openCfg){ box.hidden = true; box.innerHTML = ""; return; }
+    const s = streams.find(x => x.label === label) || {};
+    box.hidden = false;
+    box.innerHTML = `
+      <label class="cfgrow">How often to check
+        <select data-k="speed">${Object.entries(SPEED_LABELS).map(([v,t]) =>
+          `<option value="${v}" ${s.speed===v?"selected":""}>${t}</option>`).join("")}</select>
+      </label>
+      <label class="cfgrow">Tweets per check
+        <select data-k="pages">
+          <option value="">leave as configured</option>
+          <option value="1"  ${s.pages===1?"selected":""}>about 20</option>
+          <option value="5"  ${s.pages===5?"selected":""}>about 100</option>
+          <option value="10" ${s.pages===10?"selected":""}>about 200</option>
+        </select>
+      </label>
+      <label class="cfgchk"><input type="checkbox" data-k="paused" ${s.paused?"checked":""}>
+        Pause — stop checking this for now</label>
+
+      <div class="cfghead">Send to Telegram</div>
+      <label class="cfgchk"><input type="checkbox" data-k="tg_enabled" ${s.tg_enabled?"checked":""}>
+        Send these tweets to Telegram</label>
+      <label class="cfgrow">Send where
+        <input data-k="tg_chat_id" placeholder="default chat" value="${esc(s.tg_chat_id||"")}"></label>
+      <label class="cfgrow">Only if it has at least
+        <input data-k="tg_min_likes" type="number" min="0" style="width:70px"
+               value="${s.tg_min_likes||0}"> likes</label>
+      <label class="cfgchk"><input type="checkbox" data-k="tg_skip_retweets"
+        ${s.tg_skip_retweets?"checked":""}> Skip retweets</label>
+
+      <div class="cfghead">Remove</div>
+      <button class="cfgbtn" data-act="stop">Stop watching — keep the tweets</button>
+      <button class="cfgbtn danger" data-act="wipe">Delete this and its tweets</button>
+      <div class="muted" style="margin-top:4px;font-size:11px">
+        Stopping is reversible. Deleting is not — X only lets you look back
+        about 7 days.</div>`;
+
+    // Every control saves itself. A Save button here would be one more thing
+    // to forget to press.
+    box.querySelectorAll("[data-k]").forEach(el => el.onchange = async () => {
+      const k = el.dataset.k;
+      const v = el.type === "checkbox" ? el.checked : el.value;
+      try {
+        const r = await api("/api/stream/settings", {
+          method:"POST", headers:{"Content-Type":"application/json"},
+          body: JSON.stringify({label, [k]: v})
+        });
+        if (r.error) return banner(esc(r.error), "err");
+        banner(`Saved for <b>${esc(label)}</b>.`, "ok");
+      } catch (e) { return banner(esc(e.message), "err"); }
+      await status();
+    });
+
+    box.querySelectorAll("[data-act]").forEach(b => b.onclick = () =>
+      removeStream(label, b.dataset.act === "wipe", s.count || 0));
+  });
+}
+
+async function removeStream(label, wipe, count){
+  let body = {label};
+  if (wipe){
+    const typed = prompt(
+      `Delete "${label}" AND its ${count} tweets?\n\n` +
+      `This cannot be undone. X only lets you look back about 7 days, so ` +
+      `anything older than that can never be collected again.\n\n` +
+      `Tweets also matched by another list are kept.\n\n` +
+      `Type the name to confirm:`);
+    if (typed === null) return;
+    body = {label, delete_tweets: true, confirm: typed.trim()};
+  } else if (!confirm(`Stop watching "${label}"?\n\n` +
+                      `Its ${count} tweets stay and are still searchable.`)) {
+    return;
+  }
+  let d;
+  try {
+    d = await api("/api/stream/remove", {
+      method:"POST", headers:{"Content-Type":"application/json"},
+      body: JSON.stringify(body)
+    });
+  } catch (e) { return banner(esc(e.message), "err"); }
+  if (d.error) return banner(esc(d.error), "err");
+
+  if (activeStream === label) activeStream = "";
+  openCfg = null;
+  banner(wipe
+    ? `Deleted <b>${esc(label)}</b> and ${d.tweets_deleted} tweet(s).`
+    : `Stopped watching <b>${esc(label)}</b>. Its tweets are still here.`, "ok");
+  await status(); await search();
 }
 
 $("#src").onchange = () => {
@@ -1868,6 +2164,43 @@ async function risks(){
       ${f.remedy?`<div class="muted" style="margin-top:2px">→ ${esc(f.remedy)}</div>`:''}
     </div>`).join("");
 }
+
+$("#tgtoggle").onclick = () => {
+  const box = $("#tgbox");
+  box.hidden = !box.hidden;
+  if (!box.hidden) $("#tg_token").focus();
+};
+$("#tg_save").onclick = async () => {
+  $("#tg_save").disabled = true;
+  try {
+    const d = await api("/api/settings/telegram", {
+      method:"POST", headers:{"Content-Type":"application/json"},
+      body: JSON.stringify({token: $("#tg_token").value.trim(),
+                            chat_id: $("#tg_chat").value.trim()})
+    });
+    if (d.error) return banner(esc(d.error), "err");
+    // Never echo the token back into the page once it is stored.
+    $("#tg_token").value = "";
+    $("#tg_token").placeholder = d.has_token ? "saved — paste again to replace"
+                                             : "bot token from @BotFather";
+    banner("Telegram saved. Switch it on for a list with the ⚙ beside it.", "ok");
+  } catch (e) { banner(esc(e.message), "err"); }
+  finally { $("#tg_save").disabled = false; }
+};
+$("#tg_test").onclick = async () => {
+  $("#tg_test").disabled = true;
+  banner("Sending a test message…");
+  try {
+    const d = await api("/api/settings/telegram/test", {
+      method:"POST", headers:{"Content-Type":"application/json"},
+      body: JSON.stringify({chat_id: $("#tg_chat").value.trim()})
+    });
+    banner(d.error ? "Telegram said: " + esc(d.error)
+                   : "Sent. Check Telegram — if nothing arrived, the chat id is wrong.",
+           d.error ? "err" : "ok");
+  } catch (e) { banner(esc(e.message), "err"); }
+  finally { $("#tg_test").disabled = false; }
+};
 
 $("#acctnew").onclick = () => { $("#acctform").hidden = false; $("#a_label").focus(); };
 $("#a_cancel").onclick = () => { $("#acctform").hidden = true; };

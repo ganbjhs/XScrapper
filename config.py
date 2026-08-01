@@ -109,11 +109,13 @@ class WebhookCfg:
     label: str
     url: str
     secret_env: str = ""
-    streams: list = field(default_factory=list)   # empty = every visible stream
+    streams: list = field(default_factory=list)   # empty = every stream
     batch_size: int = 50
     timeout_s: float = 10.0
-    include_hidden: bool = False
     enabled: bool = True
+    kind: str = "webhook"
+    min_likes: int = 0
+    skip_retweets: bool = False
 
     @property
     def secret(self) -> str:
@@ -335,8 +337,9 @@ def _parse_webhook(raw: dict, idx: int) -> WebhookCfg:
         streams=[str(s) for s in streams],
         batch_size=batch,
         timeout_s=float(_pick(raw, "timeout_s", 10.0)),
-        include_hidden=bool(_pick(raw, "include_hidden", False)),
         enabled=bool(_pick(raw, "enabled", True)),
+        min_likes=int(_pick(raw, "min_likes", 0)),
+        skip_retweets=bool(_pick(raw, "skip_retweets", False)),
     )
 
 

@@ -552,10 +552,25 @@ class Store:
         so new columns need an explicit ALTER or older databases keep working
         but quietly lack the field.
         """
+        # Per-stream tuning lives in the DATABASE, not config.toml.
+        #
+        # config.toml declares WHAT to watch; these say how it is tuned right
+        # now. Splitting them that way is what lets the dashboard change a
+        # setting and have the running watcher pick it up on its next cycle —
+        # editing config.toml would need a restart, and rewriting a file a
+        # human hand-edited would eat their comments. NULL means "inherit
+        # whatever config.toml says", so nothing here has to duplicate a
+        # default in order to leave it alone.
         wanted = {"polls": {"rl_reset": "INTEGER"},
                   "tweets": {"media_json": "TEXT"},
                   "streams": {"list_id": "TEXT",
-                              "hidden": "INTEGER NOT NULL DEFAULT 0"}}
+                              "paused": "INTEGER NOT NULL DEFAULT 0",
+                              "min_interval_s": "REAL",
+                              "max_pages_per_poll": "INTEGER",
+                              "tg_enabled": "INTEGER NOT NULL DEFAULT 0",
+                              "tg_chat_id": "TEXT",
+                              "tg_min_likes": "INTEGER NOT NULL DEFAULT 0",
+                              "tg_skip_retweets": "INTEGER NOT NULL DEFAULT 0"}}
         added = []
         for table, cols in wanted.items():
             have = {r["name"] for r in self.db.execute(f"PRAGMA table_info({table})")}
@@ -699,8 +714,7 @@ class Store:
         self.db.execute("UPDATE webhook_state SET sent = 0 WHERE label = ?", (label,))
 
     async def tweets_after(self, last_ms: int, last_tweet_id: int, limit: int,
-                           labels: list | None = None,
-                           include_hidden: bool = False) -> list:
+                           labels: list | None = None) -> list:
         """
         The next batch to deliver, oldest first.
 
@@ -718,10 +732,6 @@ class Store:
                 "        WHERE h.tweet_id = t.tweet_id AND s.label IN "
                 f"       ({','.join('?' * len(labels))}))")
             params += list(labels)
-        elif not include_hidden:
-            where.append(
-                "EXISTS (SELECT 1 FROM tweet_hits h JOIN streams s USING(stream_id) "
-                "        WHERE h.tweet_id = t.tweet_id AND s.hidden = 0)")
 
         rows = self.db.execute(
             f"SELECT * FROM tweets t WHERE {' AND '.join(where)} "
@@ -734,24 +744,77 @@ class Store:
             "SELECT s.label FROM tweet_hits h JOIN streams s USING(stream_id) "
             "WHERE h.tweet_id = ? ORDER BY s.label", (tweet_id,))]
 
-    async def set_hidden(self, label: str, hidden: bool) -> bool:
-        """
-        Take a stream out of the dashboard, or put it back.
+    # ----------------------------------------------------------------------
+    # per-stream settings and removal
+    # ----------------------------------------------------------------------
 
-        HIDING IS NOT DELETING, and the difference is the whole point. Every
-        tweet stays in the database, every watermark stays intact, and unhiding
-        restores the view exactly. Nothing in this project deletes a collected
-        tweet (R16): X's index only reaches back about 7 days, so a delete a
-        week later is unrecoverable in a way a hide never is.
+    SETTINGS = ("paused", "min_interval_s", "max_pages_per_poll",
+                "tg_enabled", "tg_chat_id", "tg_min_likes", "tg_skip_retweets")
 
-        What this is for: every ad-hoc "get new tweets" in the dashboard leaves
-        a permanent `ui:<whatever you typed>` stream behind. Try a few searches
-        and the sidebar fills with them. This is how you clear them away without
-        touching what they collected.
+    async def stream_settings(self, label: str) -> dict:
+        row = self.db.execute(
+            "SELECT * FROM streams WHERE label = ?", (label,)).fetchone()
+        return dict(row) if row else {}
+
+    async def set_stream_settings(self, label: str, values: dict) -> bool:
         """
+        Update tuning for one stream. Only known keys, only if it exists.
+
+        NULL is meaningful here and is not the same as 0: it means "no override,
+        use whatever config.toml says". Clearing a box in the dashboard has to
+        put the setting back to inheriting, not pin it to zero — a
+        min_interval_s of 0 would poll as fast as the loop can turn.
+        """
+        cols = [k for k in values if k in self.SETTINGS]
+        if not cols:
+            return False
+        sets = ", ".join(f"{c} = ?" for c in cols)
         cur = self.db.execute(
-            "UPDATE streams SET hidden = ? WHERE label = ?", (int(hidden), label))
+            f"UPDATE streams SET {sets} WHERE label = ?",
+            [*(values[c] for c in cols), label])
         return bool(cur.rowcount)
+
+    async def forget_stream(self, label: str, delete_tweets: bool = False) -> dict:
+        """
+        Remove a stream. Two very different operations behind one door.
+
+        delete_tweets=False — stop watching. The stream row and its links go;
+        every tweet stays and is still searchable and still served by the API.
+        Reversible: re-adding the same query reattaches to the same history.
+
+        delete_tweets=True — destroy the data too. Only tweets that NO other
+        stream also matched are removed, because a tweet shared with a stream
+        you are keeping is that stream's data as well; deleting it would punch
+        a hole in a list you never touched.
+
+        X's index only reaches back about a week, so anything removed here that
+        is older than that cannot be collected again. Ever. That is why this
+        needs a typed confirmation in the UI and why it reports exactly what it
+        removed rather than saying "done".
+        """
+        row = self.db.execute(
+            "SELECT stream_id FROM streams WHERE label = ?", (label,)).fetchone()
+        if not row:
+            return {"found": False}
+        sid = row["stream_id"]
+
+        removed = 0
+        if delete_tweets:
+            removed = self.db.execute(
+                "SELECT COUNT(*) c FROM tweets WHERE source = 'result' AND tweet_id IN ("
+                "  SELECT tweet_id FROM tweet_hits WHERE stream_id = ?"
+                "  EXCEPT SELECT tweet_id FROM tweet_hits WHERE stream_id != ?)",
+                (sid, sid)).fetchone()["c"]
+            self.db.execute(
+                "DELETE FROM tweets WHERE tweet_id IN ("
+                "  SELECT tweet_id FROM tweet_hits WHERE stream_id = ?"
+                "  EXCEPT SELECT tweet_id FROM tweet_hits WHERE stream_id != ?)",
+                (sid, sid))
+
+        for table in ("tweet_hits", "polls", "watermarks", "gaps"):
+            self.db.execute(f"DELETE FROM {table} WHERE stream_id = ?", (sid,))
+        self.db.execute("DELETE FROM streams WHERE stream_id = ?", (sid,))
+        return {"found": True, "label": label, "tweets_deleted": removed}
 
     async def mark_first_poll(self, stream_id: int, ms: int) -> None:
         self.db.execute(

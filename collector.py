@@ -301,9 +301,43 @@ class Collector:
                 "last_poll_ts": 0.0,
             }
 
+    def apply_settings(self, stream) -> bool:
+        """
+        Re-read this stream's dashboard settings. Returns False if it is paused.
+
+        Read every poll rather than once at startup, so pausing a stream or
+        changing how often it runs takes effect on the next cycle instead of at
+        the next restart. It is one indexed row from a database this process
+        already holds open.
+
+        NULL means "no override" — the value from config.toml stands. That is
+        why it is not stored as 0: an interval of 0 would poll as fast as the
+        loop can turn, which is exactly the accident this distinction avoids.
+        """
+        try:
+            row = self.store.db.execute(
+                "SELECT paused, min_interval_s, max_pages_per_poll FROM streams "
+                "WHERE label = ?", (stream.label,)).fetchone()
+        except Exception:
+            return True     # settings unreadable is not a reason to stop collecting
+        if row is None:
+            return True
+
+        if row["min_interval_s"] is not None:
+            stream.min_interval_s = float(row["min_interval_s"])
+        if row["max_pages_per_poll"] is not None:
+            stream.max_pages_per_poll = int(row["max_pages_per_poll"])
+        return not row["paused"]
+
     async def poll_stream(self, stream) -> PollResult:
         sid = self.stream_ids[stream.label]
         st = self.state[stream.label]
+
+        if not self.apply_settings(stream):
+            # Paused. Check back on the normal cadence rather than spinning,
+            # so un-pausing is picked up without a restart.
+            st["next_ms"] = int((time.time() + max(stream.min_interval_s, 10)) * 1000)
+            return PollResult(stream_label=stream.label, stop_reason="paused")
 
         async with self.sem:
             res = await poll_once(self.engine, self.store, stream, sid, log=self.log)
