@@ -1036,6 +1036,145 @@ streams, fourteen of them junk. Watch deliberately; search ad-hoc sparingly.
 
 ---
 
+## 8b. Instagram — planned, not built
+
+**Nothing in this section exists yet.** It is the design agreed before writing
+any of it, recorded here so the decisions are visible and can be argued with.
+Rules are numbered `IG*` so they cannot be mistaken for the `R*` rules, which
+describe code that actually runs.
+
+### The target is completeness, not speed
+
+Decided 2026-08-01, and it inverts the priority the X side was built around.
+Apify was tried first and **missed posts** — returned an incomplete set. So for
+Instagram the metric is not lag, it is: *did we get everything?*
+
+That single choice drives most of what follows. On X, freshness justified
+stopping a poll early at the watermark. Here, stopping early is the thing most
+likely to reproduce the failure being fixed.
+
+### Why the scraping route, knowing the official one is free
+
+§6b's arithmetic stands: Meta charges nothing, and `business_discovery` sits on
+a flat 200-calls-per-hour limit. It was rejected because it only reaches public
+Business/Creator accounts and because its freshness is measured in tens of
+minutes.
+
+**Run `tools/ig_probe.py` anyway**, and not to reconsider. For every target that
+*is* a Business/Creator account, the official API becomes a **correctness
+oracle**: the same handle fetched two ways, and any post the official API knows
+about that the scraper missed is a proven gap, with a name and a timestamp.
+That is the difference between believing the collector is complete and being
+able to show it. Nothing else available gives a ground truth to check against.
+
+### Three paths, doing different jobs
+
+A merged feed is fast and cheap but is a *merge* — Instagram decides what
+enters it and how far back it goes. Trusting it alone is how you end up with
+Apify's problem.
+
+| path | cost | job |
+|---|---|---|
+| **Following / Favourites feed** | 1 request, many accounts | the fast path. Notices new posts. |
+| **Per-profile sweep** | 1 request per handle | the authoritative path. Slow cycle, proves what a handle actually posted. |
+| **Official API** | free, where reachable | the oracle. Independent confirmation. |
+
+Reconcile them: anything a sweep or the oracle finds that the feed never
+delivered is recorded in `gaps` exactly as X's missed ranges are. **A gap that
+is detected is a bug report; a gap that is not detected is data loss.**
+
+The ranked home feed is never used, for the same reason as R4 — it silently
+omits, so an early stop on it means nothing.
+
+### The rules
+
+**IG1 — One identity per account, invented once, never changed.**
+Device id, user agent, app and OS version, locale, timezone. The X equivalent
+is the persistent Chrome profile (§7). Changing any of these mid-life is a
+stronger signal than the request volume ever is: it reads as a stolen session.
+
+**IG2 — One residential IP per account, for that account's whole life.**
+Datacenter ranges are penalised heavily, and an account that moves address
+looks compromised. This is not optional the way it is on X.
+
+**IG3 — The budget is ours to impose, because Instagram publishes none.**
+X returns `x-rate-limit-*` on every response and `guard.assess` is built on it.
+Instagram returns nothing equivalent, so the ceiling is a number *we choose and
+enforce*, using the self-count already in `guard._budget`. Treat every figure
+as a guess until §8b's ramp has measured it.
+
+**IG4 — Stop at the first challenge. Never retry through one.**
+A checkpoint means Instagram wants a human. Retrying turns a recoverable
+challenge into a dead account. Mark it, stop that account, and say so.
+
+**IG5 — The collector never writes. Follows are done by hand.**
+The approach needs the collector account to follow its targets — do that
+manually, once, from a phone. Automated following, liking or posting is what
+Instagram's spam systems are actually built to catch, and it would put the
+account's own writes in the same session as its reads.
+
+**IG6 — No account collects until it is warmed.**
+Age plus real human use first. A day-old account making structured requests is
+the most obvious pattern there is.
+
+**IG7 — Accounts sleep.**
+Quiet hours, per account, in its own configured timezone. Continuous
+round-the-clock polling is not a rate problem, it is a *shape* problem — no
+person is awake at 04:00 every night.
+
+**IG8 — One request at a time per account, always jittered.**
+No concurrency within an account, and no fixed interval. §7's jitter reasoning,
+applied harder.
+
+**IG9 — A chronological source, or none.**
+Following or Favourites. Never the ranked feed (R4).
+
+**IG10 — The first anomaly stops that account and is recorded.**
+Not just hard blocks — a truncated feed, a latency jump, or an empty response
+where posts were expected. These are the *leading* indicators, and they are the
+only warning Instagram gives before it acts.
+
+### Finding the safe rate
+
+**You cannot find Instagram's limit the way you find X's.** On X a 429 is
+harmless, recoverable, and the headers tell you where you stand — the stress
+test in §7 can safely walk right up to the line. On Instagram the first hard
+signal *is* the punishment: an action-block, or a checkpoint on the account.
+
+So the ramp never targets the wall. It finds the highest rate at which nothing
+looks wrong, and stops one step below.
+
+```
+day 1    1 poll / 30 min     record: latency, posts returned, error shapes
+day 2    1 poll / 20 min     compare against day 1
+day 3    1 poll / 15 min     ...
+day 4    1 poll / 10 min
+```
+
+Advance a step only after a clean 24 hours. Watch the three leading indicators
+from IG10 rather than waiting for a block. **At the first anomaly: drop back
+two steps, hold for 48 hours, and treat the step below as the ceiling.**
+
+Run it on one account against one target. The number found is that account's
+number — limits appear to vary with account age and history, so it is a
+starting point for others, not a constant.
+
+### Build order
+
+1. **Recon, collecting nothing.** One warmed account, by hand, recording the
+   real shapes: what the feed returns, what a challenge looks like, what a
+   truncated response looks like. Every number in this section is a guess until
+   this is done.
+2. **`engine_ig.py`** behind the same interface as `engine.py`, so `collector`,
+   `store`, `guard`, `web`, the API and delivery all carry over untouched. This
+   is the payoff from the engine seam (§3).
+3. **One account, one target, slow, for a week.** Stability before scale.
+4. **The ramp above.**
+5. **Reconciliation** — profile sweeps and the official oracle, writing `gaps`.
+6. **More accounts,** each with its own identity and IP (IG1, IG2).
+
+Do not start at 2. Step 1 is what makes the rest not fiction.
+
 ## 9. Problems and solutions
 
 Everything that has actually gone wrong, with the fix. This is the
