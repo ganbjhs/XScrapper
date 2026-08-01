@@ -994,21 +994,41 @@ def _login_start(label):
             return {"error": str(e)}
 
         mod = _login_module(acct.platform)
+
+        # CAPTURE the launch diagnostics. _launch reports which browser it
+        # tried, which failed and why, and every one of those lines used to go
+        # into a default `lambda m: None` — so "it works on my laptop but the
+        # server shows nothing" arrived with the one explanation discarded.
+        trace = []
+
+        def log(m):
+            trace.append(str(m).strip())
+            print(f"[signin:{label}] {m}", flush=True)   # and into journalctl
+
+        started = time.time()
         try:
-            sess = _run(mod.InteractiveLogin(acct).start(), timeout=180)
+            sess = _run(mod.InteractiveLogin(acct).start(log=log), timeout=180)
         except ImportError:
-            return {"error": "The browser this needs is not installed on the "
-                             "server. Ask whoever set it up to run: "
-                             "deploy/setup.sh"}
+            return {"error": "The browser this needs is not installed on this "
+                             "server. Run:  bash deploy/setup.sh",
+                    "trace": trace}
+        except TimeoutError:
+            return {"error": "The browser did not start within 3 minutes. On a "
+                             "small server this is almost always memory — "
+                             "headless Chrome needs roughly 1 GB free. Check "
+                             "with:  python3 main.py doctor --browser",
+                    "trace": trace}
         except Exception as e:
-            return {"error": f"Could not open a browser: {type(e).__name__}: {e}"}
+            return {"error": f"Could not open a browser: {type(e).__name__}: {e}",
+                    "trace": trace}
+        took = time.time() - started
 
         _LOGIN["session"] = sess
         _LOGIN["label"] = label
         _LOGIN["platform"] = acct.platform
         return {"ok": True, "label": label, "platform": acct.platform,
                 "state": sess.state, "screen_name": sess.screen_name,
-                "url": sess.url(),
+                "url": sess.url(), "took_s": round(took, 1), "trace": trace,
                 "width": mod.LOGIN_VIEWPORT["width"],
                 "height": mod.LOGIN_VIEWPORT["height"]}
 
@@ -1750,11 +1770,41 @@ function show(d){
 async function start(){
   if (!LABEL){ return say("No account named in the link.", "bad"); }
   $("#what").textContent = "Signing in — " + LABEL;
+
+  /* Starting a browser is slow on a small server — tens of seconds, sometimes
+     more on the first run while the binary is paged in. A bare spinner for
+     that long is indistinguishable from a hang, which is exactly what it was
+     mistaken for. Count up, and say what is happening. */
+  const t0 = Date.now();
+  const tick = setInterval(() => {
+    const s = Math.round((Date.now() - t0) / 1000);
+    say(s < 20 ? `Starting a browser on the server… ${s}s`
+      : s < 60 ? `Still starting… ${s}s. The first run is the slow one.`
+      : `Still starting… ${s}s. If this passes about 90s the server is probably `
+        + `short of memory — check with:  python3 main.py doctor --browser`);
+  }, 1000);
+
   const d = await api("/api/login/start", {
     method:"POST", headers:{"Content-Type":"application/json"},
     body: JSON.stringify({label: LABEL})
   });
-  if (d.error) return say(d.error, "bad");
+  clearInterval(tick);
+
+  if (d.error){
+    say(d.error, "bad");
+    // The launch trace is the whole explanation for "works on my laptop, not
+    // on the server". Show it rather than making someone read journalctl.
+    if ((d.trace || []).length){
+      const pre = document.createElement("pre");
+      pre.style.cssText = "margin:10px 14px;padding:10px;background:var(--panel);"
+        + "border:1px solid var(--line);border-radius:8px;color:var(--dim);"
+        + "font-size:12px;white-space:pre-wrap";
+      pre.textContent = d.trace.join("\n");
+      $("#stage").replaceChildren(pre);
+    }
+    return;
+  }
+  if (d.took_s > 20) console.log("browser took " + d.took_s + "s to start");
   W = d.width; H = d.height;
   $("#what").textContent =
     (d.platform === "instagram" ? "Sign in to Instagram — " : "Sign in to X — ") + LABEL;

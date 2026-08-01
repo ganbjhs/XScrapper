@@ -24,6 +24,7 @@ import argparse
 import asyncio
 import json
 import os
+import pathlib
 import signal
 import sys
 import time
@@ -181,8 +182,105 @@ async def _verify_search(cfg, api) -> int:
 # doctor
 # --------------------------------------------------------------------------
 
+async def check_browser(cfg) -> int:
+    """
+    Can this machine run the sign-in browser, and how slowly?
+
+    Exists because "it works on my laptop but the server just spins" is a
+    question with about six possible answers — Playwright missing, the browser
+    binary missing, system libraries missing, the sandbox refused, /dev/shm too
+    small, or simply not enough memory — and from a spinner they all look
+    identical. Every one of them shows up here with its own message.
+    """
+    import shutil
+    import time as _t
+
+    _log("== browser ==")
+
+    # Memory first: on a small VPS this is the answer far more often than
+    # anything else, and it is the one thing a stack trace never mentions.
+    try:
+        info = {}
+        for line in pathlib.Path("/proc/meminfo").read_text().splitlines():
+            k, _, v = line.partition(":")
+            info[k] = int(v.strip().split()[0]) // 1024      # MB
+        avail, total = info.get("MemAvailable", 0), info.get("MemTotal", 0)
+        swap = info.get("SwapTotal", 0)
+        _log(f"  memory      : {avail} MB available of {total} MB, swap {swap} MB")
+        if avail < 700:
+            _log("  WARNING     : headless Chrome needs roughly 1 GB free. This is")
+            _log("                the usual reason a sign-in window never appears —")
+            _log("                the kernel kills Chrome and nothing says so.")
+            _log("                Fix: add swap, or sign in on a laptop and copy")
+            _log("                accounts.db + profiles/ up.")
+    except Exception:
+        _log("  memory      : (not readable here; /proc/meminfo is Linux-only)")
+
+    shm = shutil.disk_usage("/dev/shm").total // (1024 * 1024) if pathlib.Path("/dev/shm").exists() else 0
+    if shm:
+        _log(f"  /dev/shm    : {shm} MB" + ("  (small, but --disable-dev-shm-usage covers it)"
+                                            if shm < 128 else ""))
+
+    try:
+        import playwright
+        _log(f"  playwright  : {pathlib.Path(playwright.__file__).parent}")
+    except ImportError:
+        _log("  playwright  : NOT INSTALLED")
+        _log("  Fix         : bash deploy/setup.sh")
+        return EXIT_CONFIG
+
+    _log(f"  browsers at : {os.getenv('PLAYWRIGHT_BROWSERS_PATH') or '(default cache)'}")
+
+    # Launch through the SAME path the sign-in window uses, so a pass here
+    # means the real thing works rather than something adjacent to it.
+    import auth
+    from playwright.async_api import async_playwright
+
+    acct = (cfg.accounts or [None])[0]
+    if acct is None:
+        _log("  no accounts declared, so there is no profile to test with")
+        return EXIT_CONFIG
+
+    lines = []
+    t0 = _t.time()
+    try:
+        async with async_playwright() as pw:
+            ctx = await auth._launch(pw, acct, True, lines.append)
+            launch_s = _t.time() - t0
+            page = ctx.pages[0] if ctx.pages else await ctx.new_page()
+            for ln in lines:
+                _log(f"  launch      : {ln.strip()}")
+            _log(f"  launched in : {launch_s:.1f}s"
+                 + ("   (slow — a first launch pages the binary in)" if launch_s > 15 else ""))
+
+            t1 = _t.time()
+            await page.goto("https://www.instagram.com/accounts/login/",
+                            wait_until="domcontentloaded", timeout=60000)
+            _log(f"  loaded a page in {_t.time() - t1:.1f}s")
+
+            t2 = _t.time()
+            shot = await page.screenshot(type="jpeg", quality=68)
+            _log(f"  screenshot  : {len(shot) // 1024} KB in {_t.time() - t2:.1f}s")
+            await ctx.close()
+    except Exception as e:
+        for ln in lines:
+            _log(f"  launch      : {ln.strip()}")
+        _log(f"  FAILED      : {type(e).__name__}: {e}")
+        _log("")
+        _log("  If that mentions a missing library, run:")
+        _log("      .venv/bin/python3 -m playwright install-deps chromium")
+        _log("  If it was killed with no message, it is memory — see above.")
+        return EXIT_CONFIG
+
+    _log("")
+    _log("  This machine can run the sign-in window.")
+    return EXIT_OK
+
+
 async def cmd_doctor(args) -> int:
     cfg = load_config(args.config)
+    if args.browser:
+        return await check_browser(cfg)
     show_all = not any([args.accounts, args.selftest, args.lag, args.streams])
 
     rc = EXIT_OK
@@ -319,6 +417,8 @@ def build_parser():
                     help="Assert the twscrape internals this project depends on.")
     dr.add_argument("--probe", action="store_true",
                     help="Hit each validation endpoint and report what it returns today.")
+    dr.add_argument("--browser", action="store_true",
+                    help="Can this machine actually run the sign-in browser?")
     dr.add_argument("--lag", action="store_true", help="Lag percentiles from the results store.")
     dr.add_argument("--since", default="24h", help="Window for --lag (e.g. 6h, 24h, 7d).")
     dr.set_defaults(func=cmd_doctor)
