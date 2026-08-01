@@ -475,6 +475,31 @@ def _status():
     except Exception as e:
         out["totals"]["error"] = f"{type(e).__name__}: {e}"
 
+    # Budget per QUEUE, not per stream.
+    #
+    # This used to take whichever stream happened to sort first and show its
+    # last recorded header — so with both kinds configured you saw a search's
+    # "35/50" while about to spend from a list's 500, or the reverse. Worse, it
+    # was a frozen snapshot: X resets the window every 15 minutes, and a value
+    # recorded before a reset reads as spent budget that has already come back.
+    #
+    # guard._budget already answers both properly, including the reset, so ask
+    # it rather than keeping a second, worse copy of the same logic here.
+    try:
+        import guard as _g
+        out["budget"] = {}
+        for queue in ("search", "list"):
+            b = _g._budget(_CFG, queue)
+            if b.get("known"):
+                out["budget"][queue] = {
+                    "remaining": b["remaining"], "limit": b["limit"],
+                    "resets_in": max(0, int(b["reset"] - time.time())) if b.get("reset") else None,
+                    "rolled": b.get("window_rolled", False),
+                    "stale_s": b.get("age_s"),
+                }
+    except Exception as e:
+        out["budget_error"] = f"{type(e).__name__}: {e}"
+
     return out
 
 
@@ -1923,11 +1948,21 @@ async function status(){
   document.querySelectorAll("[data-signin]").forEach(b =>
     b.onclick = () => loginOpen(b.dataset.signin));
 
-  const s0 = (d.streams||[]).find(s => s.rl_limit);
+  // Both queues, named. They are separate allowances that do not share, so
+  // showing one number invites spending the wrong budget.
+  const QNAME = {search: "word searches", list: "lists"};
+  const budget = Object.entries(d.budget || {}).map(([q, b]) =>
+    `<div class="row"><span class="k">${QNAME[q] || q}</span>
+       <span>${b.remaining} of ${b.limit}</span></div>` +
+    (b.resets_in != null
+      ? `<div class="muted" style="margin:-2px 0 4px 2px;font-size:11px">
+           ${b.rolled ? "window reset — full again"
+                      : `resets in ${secs(b.resets_in)}`}</div>` : "")
+  ).join("");
+
   $("#totals").innerHTML =
     `<div class="row"><span class="k">tweets</span><span>${d.totals.tweets ?? 0}</span></div>` +
-    (s0 ? `<div class="row"><span class="k">requests left this 15 min</span>
-           <span>${s0.rl_remaining} of ${s0.rl_limit}</span></div>` : "") +
+    (budget ? `<div class="cfghead" style="margin-top:6px">Requests left</div>` + budget : "") +
     (d.totals.note ? `<div class="muted">${esc(d.totals.note)}</div>` : "");
 }
 
