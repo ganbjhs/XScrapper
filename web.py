@@ -1029,6 +1029,7 @@ def _login_start(label):
         return {"ok": True, "label": label, "platform": acct.platform,
                 "state": sess.state, "screen_name": sess.screen_name,
                 "url": sess.url(), "took_s": round(took, 1), "trace": trace,
+                "warning": getattr(sess, "error", "") or "",
                 "width": mod.LOGIN_VIEWPORT["width"],
                 "height": mod.LOGIN_VIEWPORT["height"]}
 
@@ -1805,6 +1806,10 @@ async function start(){
     return;
   }
   if (d.took_s > 20) console.log("browser took " + d.took_s + "s to start");
+  // The browser started but the page never showed what it should. Say it —
+  // a blank white rectangle with a cheerful "type your password below" is the
+  // worst possible combination.
+  if (d.warning){ say(d.warning, "bad"); }
   W = d.width; H = d.height;
   $("#what").textContent =
     (d.platform === "instagram" ? "Sign in to Instagram — " : "Sign in to X — ") + LABEL;

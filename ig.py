@@ -311,9 +311,21 @@ class InteractiveLogin:
             try:
                 await self.page.goto(LOGIN_URL, wait_until="domcontentloaded",
                                      timeout=45000)
-                await self.page.wait_for_timeout(1500)
-            except Exception:
-                pass
+                # Wait for the FORM, not for a number of milliseconds.
+                # Instagram is a React app: domcontentloaded fires long before
+                # anything is painted, and a fixed sleep that is generous on a
+                # laptop is a guess on a server. If it never appears, say so —
+                # a blank window with no explanation is the worst outcome here.
+                try:
+                    await self.page.wait_for_selector(
+                        'input[name="username"], input[name="password"]',
+                        timeout=20000, state="visible")
+                except Exception:
+                    self.error = ("Instagram loaded but never showed a login "
+                                  "form. It may be blocking this server's "
+                                  "address, or the page did not render.")
+            except Exception as e:
+                self.error = f"{type(e).__name__}: {e}"
         return self
 
     def _alive(self):

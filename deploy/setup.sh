@@ -110,6 +110,13 @@ apt-get update -qq
 # sqlite3 is for backups; the app itself uses Python's bundled driver.
 apt-get install -y -qq python3 python3-venv python3-pip git sqlite3 >/dev/null
 ok "python3, venv, git, sqlite3"
+# Fonts. A minimal server image ships none, and Chromium then renders text as
+# nothing at all — the page loads, the DOM is correct, and the screenshot comes
+# back blank. playwright install-deps covers some of this; these are the ones
+# that actually matter for a Latin + emoji web page.
+apt-get install -y -qq fonts-liberation fonts-dejavu-core fonts-noto-core \
+                      fonts-noto-color-emoji >/dev/null 2>&1 || true
+ok "fonts (without these, pages render blank)"
 for p in nginx certbot python3-certbot-nginx; do
   dpkg -s "$p" >/dev/null 2>&1 || apt-get install -y -qq "$p" >/dev/null
 done

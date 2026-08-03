@@ -411,23 +411,37 @@ async def _launch(pw, acct, headless: bool, log):
     if acct.proxy_or_none:
         kwargs["proxy"] = {"server": acct.proxy_or_none}
 
-    # Tried in order, most faithful first:
+    # Tried in order, most faithful first.
     #
-    #   1. real Chrome — ships the proprietary codecs and branding that
-    #      fingerprinters look for;
-    #   2. Playwright's bundled Chromium — what a server actually has;
-    #   3. the same, sandbox off.
+    # channel="chromium" MATTERS AND IS NOT COSMETIC. With headless=True and no
+    # channel, Playwright runs `chrome-headless-shell` — a stripped-down binary
+    # meant for scraping static pages. It loads Instagram's login perfectly
+    # happily and then paints NOTHING: the tab showed a plain white rectangle,
+    # the URL was right, the title was right, and the screenshot came back at
+    # 8 KB instead of the ~70 KB a real render produces. Nothing errors, so
+    # every check upstream passes.
     #
-    # (3) exists because Chromium's sandbox needs unprivileged user namespaces,
-    # and a hardened systemd unit (NoNewPrivileges) or Ubuntu's AppArmor policy
-    # denies them. The failure is a launch error with no hint of the cause, and
-    # the whole browser is there to visit one site, so falling back beats
-    # reporting "could not open a browser" and stopping. It is announced, never
-    # silent, and only ever reached after the sandboxed attempt has failed.
+    # channel="chromium" asks for the FULL browser in new-headless mode, which
+    # renders like the real thing. `playwright install chromium` puts both on
+    # disk, so this costs nothing extra.
+    #
+    # The no-sandbox variants exist because Chromium's sandbox needs
+    # unprivileged user namespaces, and a hardened systemd unit
+    # (NoNewPrivileges) or Ubuntu's AppArmor policy denies them. The failure is
+    # a launch error with no hint of the cause, and the whole browser is there
+    # to visit one site, so falling back beats stopping. Announced, never
+    # silent, and only ever reached after the sandboxed attempt failed.
+    nosandbox = [*args, "--no-sandbox"]
     attempts = (
         ("Google Chrome", dict(kwargs, channel="chrome")),
-        ("bundled Chromium", kwargs),
-        ("bundled Chromium without its sandbox", dict(kwargs, args=[*args, "--no-sandbox"])),
+        ("bundled Chromium", dict(kwargs, channel="chromium")),
+        ("bundled Chromium without its sandbox",
+         dict(kwargs, channel="chromium", args=nosandbox)),
+        # Last resorts. These render badly on app-heavy sites; reaching them at
+        # all is worth saying out loud.
+        ("the headless shell (renders poorly)", kwargs),
+        ("the headless shell without its sandbox (renders poorly)",
+         dict(kwargs, args=nosandbox)),
     )
     last = None
     for i, (what, kw) in enumerate(attempts):
