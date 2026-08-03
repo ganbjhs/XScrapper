@@ -273,13 +273,65 @@ async def check_browser(cfg) -> int:
             page = ctx.pages[0] if ctx.pages else await ctx.new_page()
             for ln in lines:
                 _log(f"  launch      : {ln.strip()}")
+            lines.clear()      # already reported; the failure path prints it too
             _log(f"  launched in : {launch_s:.1f}s"
                  + ("   (slow — a first launch pages the binary in)" if launch_s > 15 else ""))
 
+            # A neutral site first. If THIS fails the box has no working
+            # network or DNS, and nothing about Instagram is the story.
             t1 = _t.time()
-            await page.goto("https://www.instagram.com/accounts/login/",
-                            wait_until="domcontentloaded", timeout=60000)
-            _log(f"  loaded a page in {_t.time() - t1:.1f}s")
+            try:
+                await page.goto("https://example.com/", wait_until="domcontentloaded",
+                                timeout=30000)
+                _log(f"  neutral site: loaded in {_t.time() - t1:.1f}s")
+            except Exception as e:
+                _log(f"  neutral site: FAILED — {str(e).splitlines()[0][:120]}")
+                _log("  This machine cannot browse at all. Check DNS and outbound 443.")
+                await ctx.close()
+                return EXIT_CONFIG
+
+            t1 = _t.time()
+            try:
+                await page.goto("https://www.instagram.com/accounts/login/",
+                                wait_until="domcontentloaded", timeout=60000)
+                _log(f"  loaded a page in {_t.time() - t1:.1f}s")
+            except Exception as e:
+                _log(f"  instagram   : REFUSED — {str(e).splitlines()[0][:130]}")
+                # Ask again over plain HTTP. A browser blocked where curl is not
+                # means fingerprinting; both blocked means the ADDRESS.
+                try:
+                    import httpx
+                    r = httpx.get("https://www.instagram.com/accounts/login/",
+                                  timeout=20, follow_redirects=True,
+                                  headers={"User-Agent": "Mozilla/5.0 (X11; Linux x86_64) "
+                                           "AppleWebKit/537.36 (KHTML, like Gecko) "
+                                           "Chrome/131.0.0.0 Safari/537.36"})
+                    _log(f"  plain HTTP  : {r.status_code}, {len(r.content) // 1024} KB")
+                    plain_ok = r.status_code == 200 and len(r.content) > 20000
+                except Exception as e2:
+                    _log(f"  plain HTTP  : failed too ({type(e2).__name__})")
+                    plain_ok = False
+                _log("")
+                _log("  The browser works — it loaded example.com. Instagram is what")
+                _log("  refused, and it refused THIS SERVER'S ADDRESS.")
+                if plain_ok:
+                    _log("  A plain request got through, so it is the automated browser")
+                    _log("  being fingerprinted rather than the address alone.")
+                else:
+                    _log("  A plain request was refused as well, so it is the address:")
+                    _log("  Instagram blocks datacenter ranges, and this is a VPS.")
+                _log("")
+                _log("  This is RULEBOOK IG2, arriving exactly where it said it would.")
+                _log("  Options, best first:")
+                _log("    1. Give the Instagram account a residential proxy, and keep")
+                _log("       that same address for its whole life. Set `proxy` on its")
+                _log("       block in config.toml.")
+                _log("    2. Sign in on a home machine and copy ig_accounts.db and")
+                _log("       profiles/<label>/ up, as with X.")
+                _log("  No amount of fixing on this box changes a decision made at the")
+                _log("  other end.")
+                await ctx.close()
+                return EXIT_CONFIG
 
             # domcontentloaded fires BEFORE the page paints. Screenshotting on
             # that boundary produced an 8 KB near-blank image on a fast server

@@ -1097,6 +1097,17 @@ stronger signal than the request volume ever is: it reads as a stolen session.
 Datacenter ranges are penalised heavily, and an account that moves address
 looks compromised. This is not optional the way it is on X.
 
+*Confirmed 2026-08-03, before a single line of collector was written.* The
+sign-in browser on the VPS reached Instagram and got
+`net::ERR_HTTP_RESPONSE_CODE_FAILURE` — an HTTP error with no body — while
+`example.com` loaded fine from the same browser a second earlier. The tab
+therefore showed a plain white rectangle: the page had nothing in it to paint,
+and every check upstream passed because a browser had genuinely started. There
+is no local fix for a decision made at the other end. `doctor --browser` now
+loads a neutral site first and then retries over plain HTTP, so "the box cannot
+browse", "the address is blocked" and "the automated browser is fingerprinted"
+are three different messages instead of one blank screen.
+
 **IG3 — The budget is ours to impose, because Instagram publishes none.**
 X returns `x-rate-limit-*` on every response and `guard.assess` is built on it.
 Instagram returns nothing equivalent, so the ceiling is a number *we choose and
