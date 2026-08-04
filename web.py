@@ -1785,6 +1785,40 @@ _CSS_MODERN = r"""
        background:var(--panel);padding:11px 15px;box-shadow:var(--shadow-sm)}
   .kpi .tile .l{font-size:11px;text-transform:uppercase;letter-spacing:.05em;color:var(--dim)}
   .kpi .tile .v{font-size:23px;font-weight:750;margin-top:2px}
+
+  /* Saving stream settings. The button is the only thing that sends them, so
+     it reads as the primary action, and "not sent yet" sits beside it — an
+     unsent change must never look the same as a saved one. */
+  .cfgsave{display:flex;align-items:center;gap:8px;margin-top:10px}
+  .cfgbtn.primary{border-color:var(--accent);color:var(--accent);font-weight:600}
+  .cfgbtn.primary:disabled{opacity:.5;cursor:default}
+  .cfgdirty{font-size:12px;color:var(--warn)}
+  .cfgbtn.danger{border-color:var(--warn);color:var(--warn)}
+  .cfgnote{font-size:11px;color:var(--dim);margin:2px 0 8px 22px;line-height:1.45}
+
+  /* Filters panel. These rules MUST live in _CSS_MODERN — the dashboard page is
+     built as _CSS_CORE + _CSS_MODERN, so a rule dropped into any other <style>
+     block in this file (the sign-in page has one) is parsed by the browser for
+     a different document and silently does nothing. That is exactly how this
+     panel first shipped: the markup was right, the grid never applied, and
+     every label sat inline beside its input. */
+  #filters{background:var(--bg);border-bottom:1px solid var(--line);
+           padding:14px 20px;max-width:1240px;margin:0 auto}
+  .filtgrid{display:grid;gap:12px 16px;
+            grid-template-columns:repeat(auto-fit,minmax(180px,1fr))}
+  .filtgrid label{display:flex;flex-direction:column;gap:5px;
+                  font-size:12px;color:var(--dim)}
+  .filtgrid input,.filtgrid select{font:inherit;color:var(--fg);background:var(--panel);
+      border:1px solid var(--line);border-radius:8px;padding:7px 10px;width:100%}
+  .filtgrid input:focus,.filtgrid select:focus{outline:none;border-color:var(--accent)}
+  .filtrow{display:flex;align-items:center;gap:16px;flex-wrap:wrap;margin-top:14px}
+  .filtchk{display:flex;align-items:center;gap:6px;font-size:13px;color:var(--fg)}
+  .filtcount{background:var(--accent);color:#fff;border-radius:999px;
+             padding:0 6px;font-size:11px;margin-left:4px}
+
+  /* A stream that is only a saved search must not look like a live one. */
+  .warnbit{color:var(--warn);font-size:11px}
+  .tgon{color:var(--ok);font-size:11px}
 """
 
 # --------------------------------------------------------------------------
@@ -1896,32 +1930,6 @@ _SIGNIN_PAGE = r"""<!doctype html>
   #busy{position:fixed;top:8px;right:14px;background:var(--accent);color:#fff;
         font-size:11px;padding:2px 9px;border-radius:999px;display:none}
   #busy.on{display:block}
-  /* Saving stream settings. The button is the only thing that sends them, so
-     it reads as the primary action, and "not sent yet" sits beside it — an
-     unsent change must never look the same as a saved one. */
-  .cfgsave{display:flex;align-items:center;gap:8px;margin-top:10px}
-  .cfgbtn.primary{border-color:var(--accent);color:var(--accent);font-weight:600}
-  .cfgbtn.primary:disabled{opacity:.5;cursor:default}
-  .cfgdirty{font-size:12px;color:var(--warn)}
-  .cfgbtn.danger{border-color:var(--warn);color:var(--warn)}
-  .cfgnote{font-size:11px;color:var(--dim);margin:2px 0 8px 22px;line-height:1.45}
-  /* Filters panel */
-  #filters{background:var(--bg);border-bottom:1px solid var(--line);
-           padding:14px 16px;flex:0 0 auto}
-  .filtgrid{display:grid;gap:12px 16px;
-            grid-template-columns:repeat(auto-fit,minmax(180px,1fr));max-width:1100px}
-  .filtgrid label{display:flex;flex-direction:column;gap:5px;
-                  font-size:12px;color:var(--dim)}
-  .filtgrid input,.filtgrid select{font:inherit;color:var(--fg);background:var(--panel);
-      border:1px solid var(--line);border-radius:8px;padding:7px 10px;width:100%}
-  .filtgrid input:focus,.filtgrid select:focus{outline:none;border-color:var(--accent)}
-  .filtrow{display:flex;align-items:center;gap:16px;flex-wrap:wrap;margin-top:14px}
-  .filtchk{display:flex;align-items:center;gap:6px;font-size:13px}
-  .filtcount{background:var(--accent);color:#fff;border-radius:999px;
-             padding:0 6px;font-size:11px;margin-left:4px}
-  /* A stream that is only a saved search must not look like a live one. */
-  .warnbit{color:var(--warn);font-size:11px}
-  .tgon{color:var(--ok);font-size:11px}
 </style></head><body>
 
 <header>
