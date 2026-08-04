@@ -72,14 +72,15 @@ def main() -> int:
 
     password, password_env = _resolve_password(args)
 
-    from instagrapi import Client
     from instagrapi.exceptions import (
         TwoFactorRequired, ChallengeRequired, ClientError,
     )
 
-    cl = Client()
-    if args.proxy:
-        cl.set_proxy(args.proxy)
+    # Same device every time. Instagram's checkpoint message asks in so many
+    # words for "the same saved client settings, device identifiers, and
+    # proxy/IP" — new_client is where all three are held steady.
+    cl = ig_session.new_client(args.label, proxy=args.proxy,
+                               username=args.username, log=print)
     cl.challenge_code_handler = ig_session._make_challenge_handler(print)
 
     verification_code = ""

@@ -10,11 +10,23 @@ the same numeric "have I reached known ground" test works — no snowflake math.
 
 CLI (the working model — simple on purpose):
 
-  python3 collect_ig.py add-source --label natgeo --type user --value natgeo
+  python3 collect_ig.py add-source --label natgeo --type user --value 787132
   python3 collect_ig.py add-source --label home   --type following
   python3 collect_ig.py list-sources
   python3 collect_ig.py run                 # one pass over every enabled source
-  python3 collect_ig.py run --loop --every 120
+  python3 collect_ig.py run --loop --every 300
+
+PREFER THE NUMERIC USER ID over the username in a `user` source. Instagram
+grants name lookup and media reads as separate permissions, and a restricted
+session (anything with an open checkpoint) routinely serves media by id while
+refusing to resolve the name — so a source keyed by name can be uncollectable
+while the identical source keyed by id works. A username still works when the
+account is unrestricted; the id simply never stops working. To find it, open
+https://www.instagram.com/<name>/ and search the page source for "profile_id".
+
+A `following` source needs the HOME feed, which is account-scoped and is the
+first thing Instagram withdraws under a checkpoint. user/hashtag sources are
+unaffected, which is why one failing source no longer stops the others.
 
 Sources are stored in ig_results.db (store_ig), so the API and a future
 dashboard read the same list. The account that collects is the active Instagram
@@ -29,6 +41,7 @@ import ig
 import ig_session
 import store_ig
 from engine_ig import IGEngine
+from instagrapi.exceptions import LoginRequired
 
 
 def _active_account() -> str:
@@ -41,8 +54,17 @@ def _active_account() -> str:
     return rows[0]["username"]
 
 
-async def collect_source(engine, store, source, *, page_size=12, max_pages=5, log=print) -> int:
-    """One pass over a source: collect posts newer than the watermark, save them."""
+async def collect_source(engine, store, source, *, page_size=12, max_pages=2, log=print) -> int:
+    """One pass over a source: collect posts newer than the watermark, save them.
+
+    max_pages defaults to 2, not 5. A routine poll reads ONE page and stops at
+    the watermark, so the only run that ever spends the full budget is the cold
+    start — and a cold start that opens with five back-to-back requests is
+    exactly how you earn a PleaseWaitFewMinutes on a fresh session (it is how we
+    earned ours). Two pages is enough backlog to be useful; raise it with
+    --max-pages once the account is warm, and note the watermark means you only
+    pay it once.
+    """
     wm = store.watermark(source.label)
     collected, newest, stop = [], None, False
 
@@ -67,7 +89,8 @@ async def collect_source(engine, store, source, *, page_size=12, max_pages=5, lo
     return new
 
 
-async def run_once(store_path="ig_results.db", account_override="", log=print) -> int:
+async def run_once(store_path="ig_results.db", account_override="", *,
+                   page_size=12, max_pages=2, log=print) -> int:
     with store_ig.Store(store_path) as store:
         sources = store.sources(only_enabled=True)
         if not sources:
@@ -89,12 +112,41 @@ async def run_once(store_path="ig_results.db", account_override="", log=print) -
             except Exception as e:
                 log(f"  could not load @{acct}: {e}")
                 continue
+
             engine = IGEngine(cl, account=acct)
+            refreshed = False       # relogin is attempted at most ONCE per pass
             for s in group:
                 try:
-                    total += await collect_source(engine, store, s, log=log)
+                    total += await collect_source(engine, store, s, page_size=page_size,
+                                              max_pages=max_pages, log=log)
+                    continue
+                except LoginRequired as e:
+                    log(f"  [{s.label}] session rejected: {type(e).__name__}")
                 except Exception as e:
                     log(f"  [{s.label}] error: {type(e).__name__}: {e}")
+                    continue
+
+                # THE SESSION IS THE TEST, not a probe run beforehand. Only a
+                # source that actually came back login_required triggers a
+                # relogin, and only the first one does — a checkpointed account
+                # must not be knocked on once per source. Sources that still
+                # work keep working either way: a partly-restricted session
+                # (common while a checkpoint is open) collects what it can.
+                if refreshed:
+                    continue
+                refreshed = True
+                try:
+                    cl = ig_session.refresh(acct, log=log)
+                except Exception as e:
+                    log(f"  cannot refresh @{acct}: {e}")
+                    continue
+                engine = IGEngine(cl, account=acct)
+                try:
+                    total += await collect_source(engine, store, s, page_size=page_size,
+                                              max_pages=max_pages, log=log)
+                except Exception as e:
+                    log(f"  [{s.label}] still failing after refresh: "
+                        f"{type(e).__name__}: {e}")
         log(f"done: {total} new post(s) stored")
         return total
 
@@ -118,6 +170,10 @@ def main() -> int:
     r.add_argument("--account", default="", help="override which IG login collects")
     r.add_argument("--loop", action="store_true")
     r.add_argument("--every", type=int, default=120, help="seconds between passes with --loop")
+    r.add_argument("--max-pages", type=int, default=2,
+                   help="pages per source per pass (default 2; a warm poll uses 1)")
+    r.add_argument("--page-size", type=int, default=12,
+                   help="posts per page (default 12)")
 
     args = ap.parse_args()
     store_path = "ig_results.db"
@@ -150,15 +206,16 @@ def main() -> int:
         return 0
 
     if args.cmd == "run":
+        paging = {"page_size": args.page_size, "max_pages": args.max_pages}
         if not args.loop:
-            asyncio.run(run_once(store_path, args.account))
+            asyncio.run(run_once(store_path, args.account, **paging))
             return 0
 
         async def loop():
             while True:
                 started = time.time()
                 try:
-                    await run_once(store_path, args.account)
+                    await run_once(store_path, args.account, **paging)
                 except Exception as e:
                     print(f"pass error: {type(e).__name__}: {e}")
                 await asyncio.sleep(max(5, args.every - (time.time() - started)))

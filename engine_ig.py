@@ -241,51 +241,43 @@ def _page_from_media(media_list, page_no, cursor, account, raw=None) -> IGPage:
 # session -> authenticated client
 # ==========================================================================
 
-def build_client(cookies: dict, user_agent: str, proxy: str = "", log=lambda m: None):
+def build_client(cookies: dict, user_agent: str, proxy: str = "", log=lambda m: None,
+                 *, label: str = "ig_a", root="."):
     """
     Turn a harvested Instagram session (ig.Session.cookies + the real browser
     user-agent) into an authenticated instagrapi Client.
 
-    The user-agent and proxy are pinned to what the login browser used, for the
-    same reason auth.validate_http reuses acc.make_client: the HTTP client that
-    collects must look like the browser that logged in, or Instagram reads the
-    change of device as a stolen session (IG1).
+    The DEVICE, user-agent and proxy are pinned to what the account has always
+    used, for the same reason auth.validate_http reuses acc.make_client: the
+    HTTP client that collects must look like the one that logged in, or
+    Instagram reads the change of device as a stolen session (IG1).
+
+    The pinning is not done here — ig_session.new_client owns it, so there is a
+    single place where a device is chosen. See "THE DEVICE SEED" in that module
+    for why a fresh Client() per login was invalidating these sessions.
     """
-    from instagrapi import Client
-
-    cl = Client()
-    if proxy:
-        cl.set_proxy(proxy)          # HTTP or SOCKS5; residential per IG1
-    if user_agent and not user_agent.startswith("@"):
-        cl.set_user_agent(user_agent)
-
-    # Seed the cookie jar with everything ig.py harvested, then authenticate
-    # from sessionid. login_by_sessionid pulls ds_user_id and settles device
-    # state; the extra cookies keep the fingerprint identical to the browser.
-    csrftoken = cookies.get("csrftoken", "")
-    settings = {
-        "cookies": dict(cookies),
-        "authorization_data": {
-            "ds_user_id": cookies.get("ds_user_id", ""),
-            "sessionid": cookies.get("sessionid", ""),
-        },
-    }
-    if user_agent and not user_agent.startswith("@"):
-        settings["user_agent"] = user_agent
-    try:
-        cl.set_settings(settings)
-    except Exception as e:
-        log(f"[ig] set_settings warned: {type(e).__name__}: {e}")
+    import ig_session
 
     sessionid = cookies.get("sessionid", "")
     if not sessionid:
-        raise RuntimeError("no sessionid in the harvested session")
+        raise RuntimeError("no sessionid in the stored session")
+
+    cl = ig_session.new_client(label, proxy=proxy, root=root, log=log)
+
+    # Only fall back to the stored user-agent when no seed has supplied one. A
+    # seeded client's user-agent is DERIVED from its device_settings, and
+    # overriding one without the other is precisely the mismatch (a Pixel 8 Pro
+    # claiming to be some other handset) that gets a session flagged.
+    if user_agent and not user_agent.startswith("@") and not cl.settings.get("user_agent"):
+        cl.set_user_agent(user_agent)
+
+    # Canonical, minimal login. login_by_sessionid replaces settings["cookies"]
+    # and re-runs init(), which re-reads settings["uuids"] — so the seeded
+    # device SURVIVES this call. (An earlier version pre-loaded a partial
+    # settings dict of cookies + authorization_data with no uuids, which made
+    # instagrapi redirect-loop into the login page; a full device seed with no
+    # cookies is the opposite case and is what login_by_sessionid expects.)
     cl.login_by_sessionid(sessionid)
-    if csrftoken:
-        try:
-            cl.private.headers["X-CSRFToken"] = csrftoken
-        except Exception:
-            pass
     return cl
 
 
@@ -311,7 +303,8 @@ def client_from_store(store, username: str, proxy: str = "", log=lambda m: None)
             "detects at sign-in, which may differ from the label you typed).")
     import json
     cookies = json.loads(row["cookies"] or "{}")
-    return build_client(cookies, row["user_agent"], proxy or (row.get("proxy") or ""), log)
+    return build_client(cookies, row["user_agent"], proxy or (row.get("proxy") or ""), log,
+                        label=row["label"] or "ig_a")
 
 
 # ==========================================================================
@@ -333,6 +326,44 @@ class IGEngine:
     def __init__(self, client, account: str | None = None):
         self.cl = client
         self.account = account
+        self._pk_cache: dict = {}
+
+    def resolve_user(self, who) -> str:
+        """
+        Turn 'natgeo' into '787132'. Numeric input is returned untouched.
+
+        WHY THIS IS ITS OWN STEP, AND WHY IT CAN FAIL WHERE FETCHING DOES NOT.
+        The media endpoint takes a numeric pk; only lookup takes a name. Those
+        are different permissions, and measured on a live restricted session
+        they came apart completely: user_medias_paginated_v1('787132') returned
+        posts while user_id_from_username('natgeo'), user_info_by_username_v1
+        and search_users ALL returned login_required or 400. So a source
+        configured by name can be unfetchable while the very same source
+        configured by id collects perfectly.
+
+        Hence: resolve once, cache it, and if resolution fails say exactly that
+        — the fix is a numeric id in the source, not a new login.
+        """
+        s = str(who)
+        if s.isdigit():
+            return s
+        if s in self._pk_cache:
+            return self._pk_cache[s]
+        name = s.lstrip("@")
+        try:
+            pk = str(self.cl.user_id_from_username(name))
+        except Exception as e:
+            raise RuntimeError(
+                f"could not resolve the username '{name}' to a numeric id: "
+                f"{type(e).__name__}. Instagram gates name lookup separately from "
+                f"media reads, so this can fail on a session that fetches fine.\n"
+                f"  Fix: give the source the NUMERIC id instead of the name — "
+                f"open https://www.instagram.com/{name}/ , view source and search "
+                f"for \"profile_id\", then re-add:\n"
+                f"    python3 collect_ig.py add-source --label <label> --type user "
+                f"--value <numeric_id>") from e
+        self._pk_cache[s] = pk
+        return pk
 
     # -- one target account -------------------------------------------------
     async def user_pages(self, user_id, *, page_size: int = 12,
@@ -341,7 +372,11 @@ class IGEngine:
         Yield IGPages for ONE user's feed, newest first — the natural fit for
         the watermark poll. Uses the paginated v1 endpoint, which hands back a
         real end_cursor so a walk can resume mid-stream.
+
+        Accepts a numeric pk or a username; see resolve_user for why the two are
+        not interchangeable as far as Instagram is concerned.
         """
+        user_id = await asyncio.to_thread(self.resolve_user, user_id)
         page_no = 0
         end_cursor = cursor or ""
         while True:
@@ -486,35 +521,74 @@ def _smoke():
             print(f"  @{a.get('username') or '(no handle)':20} "
                   f"active={a.get('active')}  label={a.get('label')}")
 
-    # Prefer the shared session module: it reuses the saved sidecar and, if the
-    # session has died, relogins automatically from the password in .env. Fall
-    # back to the raw DB cookies for a session imported before ig_session
-    # existed.
+    # What is actually on disk, before any network call — the first question to
+    # answer when a session misbehaves is "which device and which session am I
+    # even using?", and guessing at it wastes more time than printing it.
+    import ig_session
+    label = next((a.get("label") for a in rows
+                  if a.get("username") == username), None) or "ig_a"
+    dev_path = ig_session.device_path(label)
+    device = ig_session.load_device(label)
+    side = ig_session.sidecar_path(username)
+    print(f"\ndevice seed  {dev_path}: "
+          + (f"pinned, uuid={(device.get('uuids') or {}).get('uuid')}, "
+             f"{(device.get('device_settings') or {}).get('model')}"
+             if device else "NONE YET (one will be minted on first use)"))
+    print(f"sidecar      {side}: {'present' if side.exists() else 'none'}")
+
+    # The shared session module reuses that sidecar and, if the session has
+    # died, relogins automatically from the password in .env. A failure here is
+    # the answer, not something to paper over with a second attempt: the
+    # fallback path would only re-run the same dead cookie and bury the real
+    # message under a redirect-loop traceback.
     try:
-        import ig_session
         cl = ig_session.load_client(username, store_path=store_path, log=print)
     except Exception as e:
-        print(f"  (shared session load failed: {e}\n   falling back to stored cookies)")
-        with ig.Store(store_path) as st:
-            cl = client_from_store(st, username, log=print)
+        print(f"\ncould not get a working session for @{username}:\n  {e}")
+        return 2
     eng = IGEngine(cl, account=username)
 
     async def run():
+        # Each source is tried SEPARATELY and a failure in one does not end the
+        # run. Instagram grants these endpoints independently — a session can be
+        # barred from the home feed (an account-scoped read) while serving user
+        # feeds perfectly — so "the home feed failed" is a fact about one source,
+        # not a verdict on the session. Reporting it as the latter is what had
+        # this project throwing away a session that could collect.
+        ok_any = False
+
         print(f"\n-- home feed for @{username} --")
-        async for page in eng.timeline_pages(max_pages=1):
-            for pk in page.result_ids[:10]:
-                rec = page.entries_by_id[pk]
-                lag = page.lag_ms(pk)
-                lag_s = f"{lag/1000:.0f}s" if lag is not None else "?"
-                print(f"  @{rec['username']:20} {rec['url']}  lag={lag_s}")
-            print(f"  ({len(page.result_ids)} posts, next_cursor={bool(page.cursor)})")
-        if len(sys.argv) >= 3:
-            uid = sys.argv[2]
-            print(f"\n-- user feed for id {uid} --")
+        try:
+            async for page in eng.timeline_pages(max_pages=1):
+                for pk in page.result_ids[:10]:
+                    rec = page.entries_by_id[pk]
+                    lag = page.lag_ms(pk)
+                    lag_s = f"{lag/1000:.0f}s" if lag is not None else "?"
+                    print(f"  @{rec['username']:20} {rec['url']}  lag={lag_s}")
+                print(f"  ({len(page.result_ids)} posts, next_cursor={bool(page.cursor)})")
+            ok_any = True
+        except Exception as e:
+            print(f"  unavailable: {type(e).__name__}: {str(e)[:160]}")
+            print("  (account-scoped; commonly barred while a checkpoint is open. "
+                  "'following' sources need this endpoint — user/hashtag sources do not.)")
+
+        uid = sys.argv[2] if len(sys.argv) >= 3 else "787132"   # natgeo
+        print(f"\n-- user feed for id {uid} --")
+        try:
             async for page in eng.user_pages(uid, max_pages=1):
                 for pk in page.result_ids[:10]:
-                    print("  ", page.entries_by_id[pk]["url"])
-        return 0
+                    rec = page.entries_by_id[pk]
+                    print(f"  @{rec['username']:20} {rec['url']}")
+                print(f"  ({len(page.result_ids)} posts)")
+            ok_any = True
+        except Exception as e:
+            print(f"  unavailable: {type(e).__name__}: {str(e)[:160]}")
+
+        print()
+        print("session can collect: YES — at least one source works"
+              if ok_any else
+              "session can collect: NO — every source was refused")
+        return 0 if ok_any else 2
 
     return asyncio.run(run())
 

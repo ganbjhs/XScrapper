@@ -23,10 +23,20 @@ Optional:  python3 ig_import.py "<sessionid>" --label ig_a --proxy http://...
 The proxy, if given, is stored and used for collection exactly like the browser
 path would — one steady address per account (IG1).
 
-WHAT IT DOES. Builds an instagrapi client from the cookie, proves it works with
-a real authenticated call, reads back the TRUE handle (so the store key is
-right), harvests the cookie jar, and saves an active row into ig_accounts.db —
-the same shape ig.capture() would have written. Then engine_ig.py can load it.
+WHAT IT DOES. Builds an instagrapi client ON THIS ACCOUNT'S PINNED DEVICE (see
+"THE DEVICE SEED" in ig_session.py — this is the part that stops the cookie
+being invalidated a few minutes later), proves the cookie works with a real
+authenticated call, reads back the TRUE handle (so the store key is right),
+harvests the cookie jar, and saves an active row into ig_accounts.db — the same
+shape ig.capture() would have written. Then engine_ig.py can load it.
+
+A --proxy given here is stored with the session, and collection reads it back
+from the same place — so the device AND the address stay matched without anyone
+having to remember to pass the flag twice.
+
+IF INSTAGRAM HAS CHECKPOINTED THE ACCOUNT, this script cannot help until a human
+clears it: log in as the account in a real browser or the Instagram app, finish
+the "confirm it's you" prompt, and only then copy a fresh sessionid here.
 """
 
 import argparse
@@ -55,12 +65,12 @@ def main() -> int:
               "then ':' or '%3A'. Copy the whole Value of the `sessionid` cookie.")
         return 1
 
-    from instagrapi import Client
     from instagrapi.exceptions import ClientError
 
-    cl = Client()
-    if args.proxy:
-        cl.set_proxy(args.proxy)
+    # Built through ig_session so the cookie is adopted BY THE ACCOUNT'S PINNED
+    # DEVICE, not by a freshly-minted random one. Importing on device A and then
+    # collecting on device B is what was getting these sessions invalidated.
+    cl = ig_session.new_client(args.label, proxy=args.proxy, log=print)
 
     print("Validating the session with Instagram…")
     try:
@@ -68,7 +78,6 @@ def main() -> int:
             print("Instagram rejected the sessionid. It may be expired — grab a "
                   "fresh one from your browser and try again.")
             return 2
-        info = cl.account_info()             # a real authenticated call = proof
     except ClientError as e:
         print(f"Instagram rejected the session: {type(e).__name__}: {e}")
         print("Most often the sessionid is stale. Re-copy it from a browser where "
@@ -78,8 +87,15 @@ def main() -> int:
         print(f"Could not validate: {type(e).__name__}: {e}")
         return 2
 
-    username = info.username or ""
+    # login_by_sessionid sets cl.username; fall back to account_info, then to the
+    # user id, so a flaky info endpoint never blocks a good login.
+    username = getattr(cl, "username", "") or ""
     user_id = str(getattr(cl, "user_id", "") or _parse_ds_user_id(sessionid))
+    if not username:
+        try:
+            username = (cl.account_info().username or "")
+        except Exception:
+            username = "user_" + user_id
 
     # Persist through the shared module: it writes the reusable device+cookie
     # sidecar (so an imported cookie is reused exactly like a password login)
