@@ -25,6 +25,7 @@ until DASH_USER and DASH_PASSWORD are set.
 
 import asyncio
 import base64
+import datetime
 import hashlib
 import hmac
 import json
@@ -259,6 +260,19 @@ def _connect():
     return con
 
 
+def _day_ms(value: str):
+    """Midnight UTC for a yyyy-mm-dd date input, or None if it is not one.
+
+    Returns None rather than raising: a half-typed date in a live-filtering box
+    should narrow nothing, not blank the page with an error.
+    """
+    try:
+        d = datetime.datetime.strptime(str(value).strip()[:10], "%Y-%m-%d")
+    except (ValueError, TypeError):
+        return None
+    return int(d.replace(tzinfo=datetime.timezone.utc).timestamp() * 1000)
+
+
 def _query_tweets(p):
     """Filter the collected tweets. All of this is local; nothing touches X."""
     where, params = ["t.source = 'result'"], []
@@ -285,6 +299,40 @@ def _query_tweets(p):
     if p.get("min_likes"):
         where.append("t.like_count >= ?")
         params.append(int(p["min_likes"]))
+
+    if p.get("min_views"):
+        where.append("t.view_count >= ?")
+        params.append(int(p["min_views"]))
+
+    if p.get("min_followers"):
+        where.append("t.author_followers >= ?")
+        params.append(int(p["min_followers"]))
+
+    # Explicit date bounds, as dd/mm/yyyy-free ISO from the date inputs.
+    # `to` is inclusive of the whole day, which is what someone picking a date
+    # means — a bare midnight bound silently drops everything posted that day.
+    if p.get("from_date"):
+        ms = _day_ms(p["from_date"])
+        if ms is not None:
+            where.append("t.created_ms >= ?")
+            params.append(ms)
+    if p.get("to_date"):
+        ms = _day_ms(p["to_date"])
+        if ms is not None:
+            where.append("t.created_ms < ?")
+            params.append(ms + 86_400_000)
+
+    # Verification and account category come out of the stored raw tweet, not
+    # a column: twscrape carries user.blue / user.blueType and we keep the full
+    # JSON, so these are REAL values rather than a guess. `verified` is the old
+    # legacy flag and is False on essentially every modern account — `blue` is
+    # the checkmark people actually mean, so that is what this filters on.
+    if p.get("verified"):
+        where.append("json_extract(t.raw_json, '$.user.blue') = 1")
+
+    if p.get("category"):
+        where.append("json_extract(t.raw_json, '$.user.blueType') = ?")
+        params.append(p["category"])
 
     if p.get("since"):
         ms = store_mod.parse_window(p["since"])
@@ -1857,6 +1905,20 @@ _SIGNIN_PAGE = r"""<!doctype html>
   .cfgdirty{font-size:12px;color:var(--warn)}
   .cfgbtn.danger{border-color:var(--warn);color:var(--warn)}
   .cfgnote{font-size:11px;color:var(--dim);margin:2px 0 8px 22px;line-height:1.45}
+  /* Filters panel */
+  #filters{background:var(--bg);border-bottom:1px solid var(--line);
+           padding:14px 16px;flex:0 0 auto}
+  .filtgrid{display:grid;gap:12px 16px;
+            grid-template-columns:repeat(auto-fit,minmax(180px,1fr));max-width:1100px}
+  .filtgrid label{display:flex;flex-direction:column;gap:5px;
+                  font-size:12px;color:var(--dim)}
+  .filtgrid input,.filtgrid select{font:inherit;color:var(--fg);background:var(--panel);
+      border:1px solid var(--line);border-radius:8px;padding:7px 10px;width:100%}
+  .filtgrid input:focus,.filtgrid select:focus{outline:none;border-color:var(--accent)}
+  .filtrow{display:flex;align-items:center;gap:16px;flex-wrap:wrap;margin-top:14px}
+  .filtchk{display:flex;align-items:center;gap:6px;font-size:13px}
+  .filtcount{background:var(--accent);color:#fff;border-radius:999px;
+             padding:0 6px;font-size:11px;margin-left:4px}
   /* A stream that is only a saved search must not look like a live one. */
   .warnbit{color:var(--warn);font-size:11px}
   .tgon{color:var(--ok);font-size:11px}
@@ -2056,6 +2118,8 @@ _DASH_BODY = r"""</style></head><body>
     </select>
     <input id="q" placeholder="Type words to find in the tweets you have saved…" autofocus>
     <button class="primary" id="go">Search</button>
+    <button id="filtbtn" title="Narrow what is shown, without asking X for anything">
+      &#9776; Filters <span id="filtcount" class="filtcount" hidden></span></button>
     <select id="pages" title="How many tweets to ask X for">
       <option value="1">about 20 tweets</option>
       <option value="3">about 60 tweets</option>
@@ -2084,6 +2148,50 @@ _DASH_BODY = r"""</style></head><body>
   <a href="/logout" class="muted" style="font-size:13px;margin-left:auto">Sign out</a>
 </header>
 
+<!-- Filters. Every one of these runs against the database we already have, so
+     opening this panel and applying it costs NOTHING at X and cannot be rate
+     limited — unlike "Get new tweets" beside it. Category and Verified read
+     user.blueType / user.blue out of the stored raw tweet, so they are real
+     values rather than a heuristic on the text. -->
+<div id="filters" hidden>
+  <div class="filtgrid">
+    <label>Category
+      <select id="f_category">
+        <option value="">Any</option>
+        <option value="Government">Government</option>
+        <option value="Business">Business</option>
+      </select></label>
+    <label>Language
+      <input id="lang" placeholder="Any" title="Two-letter code, e.g. en or hi"></label>
+    <label>Min views
+      <input id="f_min_views" type="number" min="0" placeholder="e.g. 1000"></label>
+    <label>Min followers
+      <input id="f_min_followers" type="number" min="0" placeholder="e.g. 10000"></label>
+    <label>Min likes
+      <input id="minlikes" type="number" min="0" placeholder="e.g. 50"></label>
+    <label>From account
+      <input id="author" placeholder="from @someone"></label>
+    <label>From date <input id="f_from" type="date"></label>
+    <label>To date <input id="f_to" type="date"></label>
+    <label>Posted within
+      <select id="since">
+        <option value="">Any time</option><option value="1h">Past hour</option>
+        <option value="6h">Past 6 hours</option><option value="24h">Past day</option>
+        <option value="7d">Past week</option>
+      </select></label>
+  </div>
+  <div class="filtrow">
+    <label class="filtchk"><input type="checkbox" id="f_verified"> Verified only</label>
+    <label class="filtchk"><input type="checkbox" id="media"> Has photo or video</label>
+    <label class="filtchk"><input type="checkbox" id="noretweets"> Hide retweets</label>
+  </div>
+  <div class="filtrow">
+    <button class="primary" id="f_apply">Apply</button>
+    <button id="f_clear">Clear all</button>
+    <span id="f_summary" class="muted"></span>
+  </div>
+</div>
+
 <div id="banner"></div>
 
 <!-- ================= X (TWITTER) VIEW ================= -->
@@ -2094,19 +2202,13 @@ _DASH_BODY = r"""</style></head><body>
     <div class="tile"><div class="l">Accounts</div><div class="v" id="kpi-acct">—</div></div>
   </div>
 
+  <!-- Sorting and the result count stay out here. They are not filters — they
+       do not change WHICH tweets match, so hiding them behind the panel would
+       cost a click for something you read constantly. -->
   <div class="filters">
-    <input id="author" placeholder="from @someone" size="14">
-    <select id="since">
-      <option value="">any time</option><option value="1h">past hour</option>
-      <option value="6h">past 6 hours</option><option value="24h">past day</option>
-      <option value="7d">past week</option>
-    </select>
-    <input id="minlikes" type="number" placeholder="at least ? likes" style="width:140px">
-    <input id="lang" placeholder="language" style="width:90px" title="Two-letter code, e.g. en or hi">
-    <label class="muted"><input type="checkbox" id="media"> only with pictures or video</label>
-    <label class="muted" title="Tick to see only original posts."><input type="checkbox" id="noretweets"> hide retweets</label>
     <select id="order"><option value="desc">newest first</option><option value="asc">oldest first</option></select>
     <span class="muted" id="count"></span>
+    <span class="muted" id="activefilters"></span>
   </div>
 
   <div class="wrap">
@@ -2258,6 +2360,9 @@ document.getElementById('ig_q').addEventListener('keydown', function(e){ if(e.ke
 _DASH_JS = r"""const PAGE_SIZE = 100;
 let offset = 0, loaded = 0, lastTotal = 0;
 
+/* Built in ONE place so search, the auto-update tick and Download can never
+   disagree about what is being shown. A filter added here is applied by all
+   three; a filter added at a call site would silently apply to one of them. */
 function params(){
   const p = new URLSearchParams();
   const add = (k,v) => { if(v) p.set(k,v); };
@@ -2265,12 +2370,49 @@ function params(){
   add("author", $("#author").value.trim());
   add("since", $("#since").value);
   add("min_likes", $("#minlikes").value);
+  add("min_views", $("#f_min_views").value);
+  add("min_followers", $("#f_min_followers").value);
+  add("from_date", $("#f_from").value);
+  add("to_date", $("#f_to").value);
+  add("category", $("#f_category").value);
   add("lang", $("#lang").value.trim());
   add("order", $("#order").value);
   add("stream", activeStream);
+  if ($("#f_verified").checked) p.set("verified","1");
   if ($("#media").checked) p.set("has_media","1");
   if ($("#noretweets").checked) p.set("no_retweets","1");
   return p;
+}
+
+/* What is narrowing the results, in words, always on screen. A filter you
+   forgot you set reads as "the collector stopped finding things" — which is
+   the single most expensive misreading this dashboard can produce. */
+const FILTER_LABELS = {
+  author: "from", since: "within", min_likes: "min likes", min_views: "min views",
+  min_followers: "min followers", from_date: "from", to_date: "to",
+  category: "category", lang: "language", verified: "verified only",
+  has_media: "has media", no_retweets: "no retweets",
+};
+
+function describeFilters(){
+  const p = params();
+  const bits = [];
+  for (const [k, name] of Object.entries(FILTER_LABELS)) {
+    const v = p.get(k);
+    if (!v) continue;
+    bits.push(v === "1" ? name : `${name} ${v}`);
+  }
+  return bits;
+}
+
+function refreshFilterChrome(){
+  const bits = describeFilters();
+  const n = $("#filtcount"), a = $("#activefilters"), s = $("#f_summary");
+  if (n){ n.textContent = bits.length; n.hidden = bits.length === 0; }
+  if (a) a.textContent = bits.length ? "· filtered: " + bits.join(", ") : "";
+  if (s) s.textContent = bits.length
+    ? `${bits.length} filter${bits.length>1?"s":""} — applies to what you see and to Download`
+    : "No filters. Everything collected is shown.";
 }
 
 async function search(append){
@@ -2670,8 +2812,37 @@ $("#src").onchange();
 
 $("#go").onclick = search;
 $("#q").addEventListener("keydown", e => { if (e.key === "Enter") search(); });
-["author","since","minlikes","lang","order","media","noretweets"].forEach(id =>
-  $("#"+id).addEventListener("change", search));
+
+// Sorting re-runs on its own; the filters wait for Apply. Re-querying on every
+// keystroke of "min followers" would fire a query per digit and make 10000
+// pass through 1, 10, 100 and 1000 on the way.
+$("#order").addEventListener("change", search);
+
+const FILTER_IDS = ["author","since","minlikes","lang","media","noretweets",
+                    "f_min_views","f_min_followers","f_from","f_to",
+                    "f_category","f_verified"];
+FILTER_IDS.forEach(id => {
+  const el = $("#"+id);
+  if (el){ el.addEventListener("input", refreshFilterChrome);
+           el.addEventListener("change", refreshFilterChrome); }
+});
+
+$("#filtbtn").onclick = () => {
+  const box = $("#filters");
+  box.hidden = !box.hidden;
+  if (!box.hidden) refreshFilterChrome();
+};
+$("#f_apply").onclick = () => { refreshFilterChrome(); search(); };
+$("#f_clear").onclick = () => {
+  FILTER_IDS.forEach(id => {
+    const el = $("#"+id);
+    if (!el) return;
+    if (el.type === "checkbox") el.checked = false; else el.value = "";
+  });
+  refreshFilterChrome();
+  search();
+};
+refreshFilterChrome();
 
 $("#csv").onclick = () => { location = "/api/export?" + params(); };
 

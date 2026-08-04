@@ -1361,6 +1361,94 @@ def test_ig_device(tmp):
 
 
 # ==========================================================================
+# dashboard filters
+# ==========================================================================
+
+def test_filters(tmp):
+    """
+    The Filters panel must narrow on REAL stored values, not guesses.
+
+    Verified and Category have no column: they are read out of the raw tweet
+    JSON (user.blue / user.blueType), which twscrape carries and we keep. If a
+    schema change ever drops raw_json, these filters would silently match
+    nothing — which looks exactly like "the collector found nothing". This
+    pins them to actual rows so that failure is loud instead.
+    """
+    import json as _json
+    import sqlite3
+
+    import web
+
+    db = pathlib.Path(tmp) / "results.db"
+
+    async def build():
+        st = Store(db, True)
+        await st.open()
+        await st.close()
+    asyncio.run(build())
+
+    def raw(blue, kind):
+        return _json.dumps({"user": {"blue": blue, "blueType": kind,
+                                     "verified": False}})
+
+    con = sqlite3.connect(db)
+
+    # Fill every NOT NULL column from the schema rather than naming them by
+    # hand: this test is about the WHERE clause, and a row that fails to insert
+    # because the table grew a column tells us nothing about filtering.
+    info = list(con.execute("PRAGMA table_info(tweets)"))
+    required = [r[1] for r in info if r[3] and r[4] is None and not r[5]]
+    text_cols = {r[1] for r in info if "CHAR" in (r[2] or "").upper()
+                 or "TEXT" in (r[2] or "").upper()}
+
+    # created_ms: 2026-08-01, 2026-08-03, 2026-08-03
+    rows = [
+        (1, 1785542400000, 5000,  900000,  "en", raw(True,  "Government")),
+        (2, 1785715200000, 100,   50,      "hi", raw(False, None)),
+        (3, 1785715200000, 90000, 2000000, "en", raw(True,  "Business")),
+    ]
+    for tid, cms, views, followers, lang, rj in rows:
+        row = {c: ("" if c in text_cols else 0) for c in required}
+        row.update(tweet_id=tid, created_ms=cms, collected_ms=cms, source="result",
+                   text="t", url="u", lang=lang, author_username="a",
+                   author_followers=followers, view_count=views, like_count=0,
+                   is_retweet=0, media_urls="[]", raw_json=rj)
+        cols = ",".join(row)
+        con.execute(f"INSERT INTO tweets({cols}) "
+                    f"VALUES({','.join('?' * len(row))})", list(row.values()))
+    con.commit()
+    con.close()
+
+    class Cfg:
+        db_results = db
+    web._CFG = Cfg()
+
+    def n(**p):
+        return web._query_tweets(p)["total"]
+
+    print("== dates ==")
+    ok(web._day_ms("2026-08-01") == 1785542400000, "a yyyy-mm-dd date becomes midnight UTC")
+    ok(web._day_ms("nonsense") is None, "an unparseable date is ignored, not an error")
+    ok(n() == 3, "no filters shows everything")
+    ok(n(from_date="2026-08-03") == 2, "From date keeps that day and after")
+    ok(n(to_date="2026-08-01") == 1, "To date INCLUDES the whole day chosen")
+
+    print()
+    print("== values that live in the raw tweet ==")
+    ok(n(verified="1") == 2, "Verified only matches user.blue, not the legacy flag")
+    ok(n(category="Government") == 1, "Category reads user.blueType")
+    ok(n(category="Business") == 1, "and distinguishes between types")
+    ok(n(category="Government", verified="1") == 1, "filters combine as AND")
+
+    print()
+    print("== numeric thresholds ==")
+    ok(n(min_views="1000") == 2, "Min views is a floor, not an exact match")
+    ok(n(min_followers="1000000") == 1, "Min followers likewise")
+    ok(n(lang="hi") == 1, "Language still narrows")
+    ok(n(min_views="99999999") == 0, "a threshold nothing meets returns nothing, cleanly")
+
+
+# ==========================================================================
 # telegram: switching it on is what makes a stream watched
 # ==========================================================================
 
@@ -1650,6 +1738,9 @@ def main():
 
         section("instagram (one stable device per account)")
         test_ig_device(fresh("ig"))
+
+        section("dashboard filters (category, verified, views, followers, dates)")
+        test_filters(fresh("filters"))
 
         section("telegram (switching it on is what makes a stream watched)")
         test_telegram_watch_rule(fresh("tgwatch"))
