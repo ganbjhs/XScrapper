@@ -1066,7 +1066,21 @@ async def cmd_watch(args) -> int:
         # hangs for its full timeout on every batch would otherwise add that
         # delay to every poll, turning someone else's outage into our lag.
         tasks = {runner, stopper}
-        if cfg.enabled_webhooks() and not args.no_webhooks:
+        # Started whenever delivery is not explicitly disabled — NOT only when
+        # config.toml declares a webhook.
+        #
+        # That older condition was a silent trap. Telegram targets are read from
+        # the STREAMS TABLE, not from config.toml (see webhook.TelegramTarget:
+        # the dashboard has to be able to write them), and they are rebuilt
+        # inside webhook.run() every 2s. So a setup with Telegram switched on
+        # for a stream but no [[webhooks]] block — which is the normal setup,
+        # and ours — passed every check the user could see (token saved, "Send
+        # a test" delivering) while the delivery loop was never started at all.
+        # Nothing logged, because nothing ran.
+        #
+        # The loop costs nothing when there is nothing to send: it builds an
+        # empty target list and sleeps.
+        if not args.no_webhooks:
             import webhook
             tasks.add(asyncio.create_task(
                 webhook.run(cfg, st, log=_log, stop=stop)))
