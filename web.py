@@ -494,6 +494,14 @@ def _status():
                     speed = next((k for k, v in SPEEDS.items() if abs(v - mi) < 0.5), "")
 
                 out["streams"].append({
+                    # Has the COLLECTOR ever polled this, as opposed to it being
+                    # a one-off search the dashboard recorded? The sidebar is
+                    # titled "what we are watching" and used to show both kinds
+                    # identically, so an ad-hoc search looked like a live
+                    # subscription — you could switch Telegram on for it and
+                    # wait forever for a tweet that was never going to be
+                    # collected. Surfacing the difference is the fix.
+                    "watched": watched,
                     "paused": bool(_col("paused", 0)),
                     "speed": speed,
                     "pages": _col("max_pages_per_poll"),
@@ -1750,6 +1758,7 @@ _CSS_MODERN = r"""
 _JS_HELPERS = r"""const $ = s => document.querySelector(s);
 let activeStream = "";
 let openCfg = null;      // which stream has its settings open
+let cfgDirty = false;    // settings typed but not yet sent to the backend
 
 const esc = s => (s||"").replace(/[&<>"']/g, c =>
   ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
@@ -1839,6 +1848,18 @@ _SIGNIN_PAGE = r"""<!doctype html>
   #busy{position:fixed;top:8px;right:14px;background:var(--accent);color:#fff;
         font-size:11px;padding:2px 9px;border-radius:999px;display:none}
   #busy.on{display:block}
+  /* Saving stream settings. The button is the only thing that sends them, so
+     it reads as the primary action, and "not sent yet" sits beside it — an
+     unsent change must never look the same as a saved one. */
+  .cfgsave{display:flex;align-items:center;gap:8px;margin-top:10px}
+  .cfgbtn.primary{border-color:var(--accent);color:var(--accent);font-weight:600}
+  .cfgbtn.primary:disabled{opacity:.5;cursor:default}
+  .cfgdirty{font-size:12px;color:var(--warn)}
+  .cfgbtn.danger{border-color:var(--warn);color:var(--warn)}
+  .cfgnote{font-size:11px;color:var(--dim);margin:2px 0 8px 22px;line-height:1.45}
+  /* A stream that is only a saved search must not look like a live one. */
+  .warnbit{color:var(--warn);font-size:11px}
+  .tgon{color:var(--ok);font-size:11px}
 </style></head><body>
 
 <header>
@@ -2395,7 +2416,11 @@ async function status(){
           data-s="${esc(s.label)}" title="${esc(s.query || s.label)}">
           ${esc(s.label)} <span class="muted">· ${s.count} tweets</span>
           ${s.paused ? '<span class="muted">· paused</span>' : ''}
-          ${s.tg_enabled ? '<span class="muted">· → Telegram</span>' : ''}
+          ${s.tg_enabled ? '<span class="tgon">· → Telegram</span>' : ''}
+          ${!s.watched && s.tg_enabled
+              ? '<span class="warnbit">· starting — restart the watcher if this stays</span>'
+              : (!s.watched
+                  ? '<span class="warnbit">· one-off search, not being watched</span>' : '')}
           ${s.lag_p50!=null ? `<span class="muted">· usually saved ${secs(s.lag_p50)} after posting</span>`:''}
         </button>
         <button class="streamx" data-gear="${esc(s.label)}" title="Settings">⚙</button>
@@ -2410,6 +2435,11 @@ async function status(){
   // every 15s, so anything bound earlier belongs to nodes that no longer exist.
   document.querySelectorAll("[data-gear]").forEach(b => b.onclick = () => {
     const label = b.dataset.gear;
+    // Closing a panel with unsent edits is how a configuration silently fails
+    // to exist. Ask rather than discard.
+    if (cfgDirty && openCfg === label &&
+        !confirm("You have unsaved settings.\n\nClose without sending them?")) return;
+    cfgDirty = false;
     openCfg = (openCfg === label) ? null : label;
     drawCfg(all);
   });
@@ -2481,6 +2511,14 @@ function drawCfg(streams){
   document.querySelectorAll("[data-cfg]").forEach(box => {
     const label = box.dataset.cfg;
     if (label !== openCfg){ box.hidden = true; box.innerHTML = ""; return; }
+
+    // NEVER rebuild a panel that has unsent edits in it. status() redraws this
+    // sidebar every 15s and after every save, and a rebuild replaces innerHTML
+    // — so a chat id typed but not yet sent was being destroyed on a timer,
+    // with no error and no sign it had happened. Leaving the DOM alone while
+    // it is dirty is what makes "type it, then press Save" reliable.
+    if (cfgDirty && box.innerHTML){ box.hidden = false; return; }
+
     const s = streams.find(x => x.label === label) || {};
     box.hidden = false;
     box.innerHTML = `
@@ -2501,14 +2539,24 @@ function drawCfg(streams){
 
       <div class="cfghead">Send to Telegram</div>
       <label class="cfgchk"><input type="checkbox" data-k="tg_enabled" ${s.tg_enabled?"checked":""}>
-        Send these tweets to Telegram</label>
+        Watch this continuously and send every new tweet to Telegram</label>
+      <div class="cfgnote">Switching this on also makes the collector keep
+        checking ${esc(s.query || s.label)} on its own — it is not just a
+        forwarding switch. Only tweets found <b>after</b> you save are sent;
+        what is already collected is not resent.</div>
       <label class="cfgrow">Send where
-        <input data-k="tg_chat_id" placeholder="default chat" value="${esc(s.tg_chat_id||"")}"></label>
+        <input data-k="tg_chat_id" placeholder="e.g. -1003964750953 or @mychannel"
+               value="${esc(s.tg_chat_id||"")}"></label>
       <label class="cfgrow">Only if it has at least
         <input data-k="tg_min_likes" type="number" min="0" style="width:70px"
                value="${s.tg_min_likes||0}"> likes</label>
       <label class="cfgchk"><input type="checkbox" data-k="tg_skip_retweets"
         ${s.tg_skip_retweets?"checked":""}> Skip retweets</label>
+
+      <div class="cfgsave">
+        <button class="cfgbtn primary" data-save>Save settings</button>
+        <span class="cfgdirty" data-dirty hidden>not sent yet</span>
+      </div>
 
       <div class="cfghead">Remove</div>
       <button class="cfgbtn" data-act="stop">Stop watching — keep the tweets</button>
@@ -2517,21 +2565,50 @@ function drawCfg(streams){
         Stopping is reversible. Deleting is not — X only lets you look back
         about 7 days.</div>`;
 
-    // Every control saves itself. A Save button here would be one more thing
-    // to forget to press.
-    box.querySelectorAll("[data-k]").forEach(el => el.onchange = async () => {
-      const k = el.dataset.k;
-      const v = el.type === "checkbox" ? el.checked : el.value;
+    // ONE EXPLICIT SEND, carrying every field.
+    //
+    // This replaced a per-control autosave bound to `onchange`. That looked
+    // tidier and was quietly broken for the fields that mattered most: on a
+    // text input `onchange` fires only on BLUR, so typing a Telegram chat id
+    // and then clicking the enable checkbox sent the checkbox and never the
+    // chat id. The stream ended up enabled with nowhere to send, which the
+    // backend logs as "enabled but no chat id — skipping" and the operator
+    // sees as silence. Marking dirty on `input` and sending the whole form on
+    // one press removes the entire class of bug.
+    const markDirty = () => {
+      cfgDirty = true;
+      const tag = box.querySelector("[data-dirty]");
+      if (tag) tag.hidden = false;
+    };
+    box.querySelectorAll("[data-k]").forEach(el => {
+      el.oninput = markDirty;
+      el.onchange = markDirty;
+    });
+
+    box.querySelector("[data-save]").onclick = async (ev) => {
+      const btn = ev.currentTarget;
+      const body = {label};
+      box.querySelectorAll("[data-k]").forEach(el => {
+        body[el.dataset.k] = el.type === "checkbox" ? el.checked : el.value;
+      });
+      btn.disabled = true;
       try {
         const r = await api("/api/stream/settings", {
           method:"POST", headers:{"Content-Type":"application/json"},
-          body: JSON.stringify({label, [k]: v})
+          body: JSON.stringify(body)
         });
         if (r.error) return banner(esc(r.error), "err");
-        banner(`Saved for <b>${esc(label)}</b>.`, "ok");
-      } catch (e) { return banner(esc(e.message), "err"); }
-      await status();
-    });
+        // Only now is it safe to let the redraw rebuild this panel.
+        cfgDirty = false;
+        const tag = box.querySelector("[data-dirty]");
+        if (tag) tag.hidden = true;
+        banner(body.tg_enabled
+          ? `Saved. Sending <b>${esc(label)}</b> to Telegram ${esc(body.tg_chat_id || "(default chat)")}.`
+          : `Saved settings for <b>${esc(label)}</b>.`, "ok");
+        await status();
+      } catch (e) { banner(esc(e.message), "err"); }
+      finally { btn.disabled = false; }
+    };
 
     box.querySelectorAll("[data-act]").forEach(b => b.onclick = () =>
       removeStream(label, b.dataset.act === "wipe", s.count || 0));

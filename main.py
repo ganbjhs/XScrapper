@@ -589,6 +589,7 @@ def build_parser():
     _add_export(sub)
     _add_watch(sub)
     _add_webhook(sub)
+    _add_telegram(sub)
     return p
 
 
@@ -621,6 +622,20 @@ def _add_webhook(sub):
     wh.add_argument("--test", action="store_true",
                     help="Send one real tweet to every endpoint without consuming it.")
     wh.set_defaults(func=cmd_webhook)
+
+
+def _add_telegram(sub):
+    tg = sub.add_parser("telegram",
+                        help="Check and test Telegram delivery for a stream.")
+    tg.add_argument("--label", default="",
+                    help="Which stream to send from. Omit to list what is configured.")
+    tg.add_argument("--test", action="store_true",
+                    help="Actually send. Without it, this only shows what would go.")
+    tg.add_argument("--limit", type=int, default=3,
+                    help="How many recent tweets to send (default 3).")
+    tg.add_argument("--list", action="store_true",
+                    help="List every stream that sends to Telegram.")
+    tg.set_defaults(func=cmd_telegram)
 
 
 def _add_search(sub):
@@ -974,6 +989,152 @@ async def cmd_webhook(args) -> int:
         await st.close()
 
 
+async def cmd_telegram(args) -> int:
+    """
+    Prove Telegram delivery end to end, without waiting for someone to tweet.
+
+    WHY THIS EXISTS. The dashboard's "Send a test" button posts a fixed message
+    straight to the Telegram API, so it proves the bot token and the chat id and
+    nothing else — it never touches a stream, a cursor, or the formatter. Every
+    real failure this project has had lived in the part that button skips. This
+    sends REAL collected tweets through the REAL delivery path, so a pass here
+    means the pipeline works.
+
+    The cursor is deliberately NOT advanced. A test that consumes tweets would
+    make normal delivery skip them, so proving the thing works would quietly
+    cost you the messages you were proving it with.
+    """
+    import httpx
+
+    import webhook
+
+    cfg = load_config(args.config)
+    st = store_mod.Store(cfg.db_results, cfg.defaults.keep_entry_json)
+    await st.open()
+    try:
+        if not webhook.telegram_token():
+            _log("No TELEGRAM_BOT_TOKEN in .env. Save the bot token in the "
+                 "dashboard (Telegram settings), or add it to .env by hand.")
+            return EXIT_CONFIG
+
+        targets = await webhook.telegram_targets(st, log=_log)
+        if not targets:
+            _log("No stream has Telegram switched on. Open the dashboard, press "
+                 "the gear beside a stream, tick 'Send these tweets to Telegram', "
+                 "fill in the chat id and press Save settings.")
+            return EXIT_CONFIG
+
+        if args.list or not args.label:
+            _log(f"{len(targets)} stream(s) configured to send to Telegram:")
+            for t in targets:
+                _log(f"  {t.stream_label}   -> chat {t.chat_id}"
+                     + (f"  (min_likes={t.min_likes})" if t.min_likes else "")
+                     + ("  (skipping retweets)" if t.skip_retweets else ""))
+            if not args.label:
+                _log("\nPick one:  main.py telegram --test --label '<label>'")
+            return EXIT_OK
+
+        hook = next((t for t in targets if t.stream_label == args.label), None)
+        if hook is None:
+            _log(f"No Telegram-enabled stream called {args.label!r}. "
+                 f"Configured: {', '.join(repr(t.stream_label) for t in targets)}")
+            return EXIT_CONFIG
+
+        # Newest first for the pick, then reversed so the channel reads oldest
+        # to newest like a normal delivery would.
+        rows = [dict(r) for r in st.db.execute(
+            "SELECT t.* FROM tweets t WHERE t.source = 'result' AND EXISTS ("
+            "  SELECT 1 FROM tweet_hits h JOIN streams s USING(stream_id) "
+            "  WHERE h.tweet_id = t.tweet_id AND s.label = ?) "
+            "ORDER BY t.created_ms DESC LIMIT ?", (args.label, max(1, args.limit)))]
+        if not rows:
+            _log(f"{args.label!r} has no collected tweets yet, so there is "
+                 f"nothing to send. Let it poll once first.")
+            return EXIT_OK
+        rows.reverse()
+
+        if not args.test:
+            _log(f"Would send {len(rows)} tweet(s) from {args.label!r} to chat "
+                 f"{hook.chat_id}. Add --test to actually send them.")
+            for r in rows:
+                _log(f"  @{r['author_username']}  {r['url']}")
+            return EXIT_OK
+
+        _log(f"Sending {len(rows)} tweet(s) from {args.label!r} to chat "
+             f"{hook.chat_id} …")
+        async with httpx.AsyncClient(follow_redirects=False) as client:
+            ok, err = await webhook.deliver_telegram(client, hook, st, rows)
+        if not ok:
+            _log(f"Telegram refused it: {err}")
+            _log("A wrong chat id, or the bot was never added to the channel as "
+                 "an admin, are the two usual causes.")
+            return EXIT_CONFIG
+        _log(f"Sent. {len(rows)} tweet(s) are in chat {hook.chat_id}.")
+        _log("The delivery cursor was NOT moved — normal delivery still starts "
+             "from whenever you switched Telegram on.")
+        return EXIT_OK
+    finally:
+        await st.close()
+
+
+def _telegram_streams(cfg, existing_labels, log=None) -> list:
+    """
+    Streams the DATABASE says to watch: anything with Telegram switched on.
+
+    SWITCHING TELEGRAM ON MEANS "KEEP CHECKING THIS AND SEND IT TO ME". Those
+    are one intention, and splitting them across two places is what made this
+    subsystem so confusing to operate: the dashboard writes a search into the
+    streams table, the sidebar lists it under "what we are watching", you switch
+    Telegram on for it — and nothing ever polls it, because the watcher built
+    its list from config.toml alone. Everything looked configured and no tweet
+    could ever arrive.
+
+    So a stream with tg_enabled = 1 is watched, full stop. config.toml streams
+    are unaffected and still watched whether or not they send anywhere; this
+    only ADDS the ones the dashboard was already claiming to watch.
+    """
+    from config import StreamCfg
+
+    path = cfg.db_results
+    if not path.exists():
+        return []
+    import sqlite3
+    out = []
+    try:
+        con = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
+        con.row_factory = sqlite3.Row
+        rows = con.execute(
+            "SELECT label, query, list_id, tab, paused, min_interval_s, "
+            "       max_pages_per_poll "
+            "FROM streams WHERE tg_enabled = 1").fetchall()
+        con.close()
+    except sqlite3.Error as e:
+        if log:
+            log(f"[watch] could not read Telegram streams: {type(e).__name__}: {e}")
+        return []
+
+    for r in rows:
+        if r["label"] in existing_labels:
+            continue          # config.toml already declares it; that wins
+        if r["paused"]:
+            continue
+        if not (r["query"] or r["list_id"]):
+            # A row with neither is not pollable. Say so rather than adding a
+            # stream that would fail on every cycle.
+            if log:
+                log(f"[watch] {r['label']!r} has Telegram on but no query or list "
+                    f"— nothing to poll")
+            continue
+        s = StreamCfg(label=r["label"], query=r["query"] or "",
+                      list_id=r["list_id"] or "", tab=r["tab"] or "Latest")
+        if r["min_interval_s"]:
+            s.min_interval_s = float(r["min_interval_s"])
+        if r["max_pages_per_poll"]:
+            s.max_pages_per_poll = int(r["max_pages_per_poll"])
+        out.append(s)
+    return out
+
+
 async def cmd_watch(args) -> int:
     cfg = load_config(args.config)
 
@@ -982,10 +1143,17 @@ async def cmd_watch(args) -> int:
         if (args.all or not args.stream)
         else [cfg.stream(x) for x in args.stream]
     )
+    if args.all or not args.stream:
+        extra = _telegram_streams(cfg, {s.label for s in streams}, log=_log)
+        for s in extra:
+            _log(f"[watch] + {s.label}  (watched because Telegram is on for it)")
+        streams = streams + extra
+
     if not streams:
         raise ConfigError(
             "No streams to watch. Declare [[streams]] in config.toml "
-            "(see config.toml.example)."
+            "(see config.toml.example), or switch Telegram on for a search in "
+            "the dashboard."
         )
     streams = [_apply_overrides(s, args) for s in streams]
 

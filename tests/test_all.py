@@ -1277,6 +1277,146 @@ def test_web_event_loop(tmp):
 
 
 # ==========================================================================
+# instagram device pinning
+# ==========================================================================
+
+def test_ig_device(tmp):
+    """
+    The Instagram device fingerprint must be minted ONCE and reused forever.
+
+    This is a regression guard on a bug that cost real sessions: instagrapi's
+    Client() mints fresh random uuids when handed no settings, so every login
+    looked like a NEW handset to Instagram — which reads a session hopping
+    devices as a stolen cookie, invalidates it, and raises a checkpoint. If
+    anyone reintroduces a bare Client() on a login path, these checks fail.
+
+    Entirely offline: no call here touches Instagram.
+    """
+    import ig_session
+
+    print("== one device, minted once ==")
+    a = ig_session.new_client("ig_t", root=tmp)
+    b = ig_session.new_client("ig_t", root=tmp)
+    seed = ig_session.load_device("ig_t", root=tmp)
+    ua, ub = a.get_settings()["uuids"], b.get_settings()["uuids"]
+    ok(ua == ub, "two separately-built clients are the SAME device")
+    ok(ua == seed["uuids"], "and both match the seed file on disk")
+    ok(a.user_agent == b.user_agent, "the user-agent is stable across clients")
+    ok(all(ua.values()), "every uuid is populated (not silently blank)")
+
+    print()
+    print("== the seed survives what used to reroll it ==")
+    before = dict(a.get_settings()["uuids"])
+    a.settings["cookies"] = {"sessionid": "1%3Anot_a_real_session"}
+    a.init()      # precisely what login_by_sessionid() does internally
+    ok(a.get_settings()["uuids"] == before,
+       "login_by_sessionid's re-init does not mint a new device")
+
+    ig_session.save_device({"uuids": {"phone_id": "second-thoughts"}}, "ig_t",
+                           root=tmp)
+    ok(ig_session.load_device("ig_t", root=tmp)["uuids"] == before,
+       "save_device REFUSES to overwrite an existing seed")
+
+    print()
+    print("== a stale sidecar cannot drag an old device back ==")
+    stale = {"uuids": {k: "stale" for k in before},
+             "user_agent": "Instagram 1.0 Android (a different phone)",
+             "cookies": {"sessionid": "carried_through"}}
+    c = ig_session.new_client("ig_t", settings=stale, root=tmp)
+    ok(c.get_settings()["uuids"] == before, "the seed wins over the sidecar")
+    ok(c.user_agent == a.user_agent, "including the user-agent")
+    ok(c.get_settings()["cookies"].get("sessionid") == "carried_through",
+       "while the session itself is still carried through")
+
+    print()
+    print("== gentleness (IG4) ==")
+    ok(list(a.delay_range or []) == list(ig_session.DELAY_RANGE),
+       f"clients are built with a delay_range of {ig_session.DELAY_RANGE}")
+
+    print()
+    print("== username -> pk resolution ==")
+    # Instagram grants name LOOKUP and media READS separately: a live session
+    # was measured fetching user_medias_paginated_v1('787132') while every
+    # username resolver returned login_required. So a numeric id must never be
+    # sent through a lookup it does not need, and a failed lookup must say so.
+    from engine_ig import IGEngine
+
+    class Blocked:
+        calls = 0
+
+        def user_id_from_username(self, name):
+            Blocked.calls += 1
+            raise RuntimeError("login_required")
+
+    eng = IGEngine(Blocked())
+    ok(eng.resolve_user("787132") == "787132", "a numeric id passes straight through")
+    ok(eng.resolve_user(787132) == "787132", "including when it arrives as an int")
+    ok(Blocked.calls == 0, "and costs ZERO lookup requests")
+    try:
+        eng.resolve_user("natgeo")
+        ok(False, "a blocked lookup raises")
+    except RuntimeError as e:
+        ok("numeric id" in str(e) and "add-source" in str(e),
+           "a blocked lookup names the fix (use the numeric id) rather than the trace")
+
+
+# ==========================================================================
+# telegram: switching it on is what makes a stream watched
+# ==========================================================================
+
+def test_telegram_watch_rule(tmp):
+    """
+    A stream with Telegram switched on must be POLLED, not just forwarded.
+
+    The bug this guards: the dashboard writes a search into the streams table,
+    the sidebar lists it under "what we are watching", you switch Telegram on —
+    and nothing polls it, because the watcher built its list from config.toml
+    alone. Everything looked configured and no tweet could ever arrive.
+    """
+    import sqlite3
+
+    import main
+    import store as store_mod
+
+    db = pathlib.Path(tmp) / "results.db"
+
+    async def schema():
+        st = store_mod.Store(db, False)
+        await st.open()
+        await st.close()
+    asyncio.run(schema())
+
+    con = sqlite3.connect(db)
+    con.executemany(
+        "INSERT INTO streams(label,query,list_id,tab,tg_enabled,paused,created_at) "
+        "VALUES(?,?,?,?,?,?,'x')",
+        [("wanted",     "from:someone", None,      "Latest", 1, 0),
+         ("no_telegram","from:other",   None,      "Latest", 0, 0),
+         ("paused",     "from:third",   None,      "Latest", 1, 1),
+         ("nothing",    "",             None,      "Latest", 1, 0),
+         ("by_list",    "",             "12345",   "Latest", 1, 0),
+         ("politicians","",             "999",     "Latest", 1, 0)])
+    con.commit()
+    con.close()
+
+    class Cfg:
+        db_results = db
+
+    # 'politicians' stands in for a stream config.toml already declares.
+    got = main._telegram_streams(Cfg(), {"politicians"}, log=lambda m: None)
+    labels = sorted(s.label for s in got)
+
+    ok(labels == ["by_list", "wanted"], f"only pollable Telegram streams are added ({labels})")
+    ok("no_telegram" not in labels, "Telegram off means not watched by this rule")
+    ok("paused" not in labels, "a paused stream is not woken up by Telegram being on")
+    ok("nothing" not in labels, "a row with no query and no list is skipped, not polled")
+    ok("politicians" not in labels,
+       "a stream config.toml already declares is not added twice")
+    by_list = next(s for s in got if s.label == "by_list")
+    ok(by_list.list_id == "12345", "a list-backed stream keeps its list_id")
+
+
+# ==========================================================================
 # runner
 # ==========================================================================
 
@@ -1507,6 +1647,12 @@ def main():
         section("collector (watermark, dedup, gaps, intervals)")
         asyncio.run(run_collector(fresh("collector")))
         test_interval()
+
+        section("instagram (one stable device per account)")
+        test_ig_device(fresh("ig"))
+
+        section("telegram (switching it on is what makes a stream watched)")
+        test_telegram_watch_rule(fresh("tgwatch"))
 
         section("webhook (signing, cursor, receiver outage)")
         asyncio.run(run_webhook(fresh("webhook")))
