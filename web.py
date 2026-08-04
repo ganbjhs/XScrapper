@@ -1163,6 +1163,51 @@ LOGIN_PAGE = """<!doctype html>
 </form></body></html>"""
 
 
+def _ig_status():
+    """Instagram accounts + sources + totals for the dashboard's Instagram view."""
+    import sqlite3
+    root = _CFG.root
+    out = {"accounts": [], "sources": [], "totals": {"posts": 0}}
+    ap = root / "ig_accounts.db"
+    if ap.exists():
+        try:
+            con = sqlite3.connect(f"file:{ap}?mode=ro", uri=True, timeout=5)
+            con.row_factory = sqlite3.Row
+            for r in con.execute("SELECT username, active, proxy, error_msg FROM accounts"):
+                out["accounts"].append({"username": r["username"], "active": bool(r["active"]),
+                                        "proxy": bool(r["proxy"]), "error": r["error_msg"]})
+            con.close()
+        except Exception as e:
+            out["accounts_error"] = f"{type(e).__name__}: {e}"
+    rp = root / "ig_results.db"
+    if rp.exists():
+        try:
+            import store_ig
+            with store_ig.Store(rp) as st:
+                out["sources"] = [{"label": x.label, "type": x.type, "value": x.value}
+                                  for x in st.sources(only_enabled=False)]
+                out["totals"] = st.stats()
+        except Exception as e:
+            out["sources_error"] = f"{type(e).__name__}: {e}"
+    return out
+
+
+def _ig_posts(q):
+    """Collected Instagram posts, newest first, in the shared API shape."""
+    rp = _CFG.root / "ig_results.db"
+    if not rp.exists():
+        return {"count": 0, "posts": [], "next_cursor": None}
+    import store_ig
+    with store_ig.Store(rp) as st:
+        rows = st.query(limit=int(q.get("limit") or 30),
+                        source=q.get("source") or None,
+                        username=q.get("username") or None,
+                        before_pk=int(q["cursor"]) if q.get("cursor") else None)
+        posts = [store_ig.to_api(r) for r in rows]
+    return {"count": len(posts), "posts": posts,
+            "next_cursor": posts[-1]["id"] if posts else None}
+
+
 class Handler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
 
@@ -1366,6 +1411,10 @@ class Handler(BaseHTTPRequestHandler):
                 return self._send(200, png, "image/jpeg")
             if u.path == "/api/export":
                 return self._export(q)
+            if u.path == "/api/ig/status":
+                return self._send(200, _ig_status())
+            if u.path == "/api/ig/posts":
+                return self._send(200, _ig_posts(q))
             return self._send(404, {"error": "not found"})
         except Exception as e:
             import traceback
@@ -1603,6 +1652,83 @@ _CSS_CORE = r"""  :root{
   .banner.err{border-color:var(--warn);color:var(--warn)}
   .banner.ok{border-color:var(--ok);color:var(--ok)}
   a{color:var(--accent)}
+"""
+
+# Modern visual + structural layer, appended AFTER _CSS_CORE so later rules win.
+# Adds the brand, source switcher, KPI strip and the per-source view scoping.
+# Removes no existing id/class, so every JS hook keeps working.
+_CSS_MODERN = r"""
+  :root{
+    --radius:12px;
+    --shadow-sm:0 1px 2px rgba(16,24,40,.05),0 1px 3px rgba(16,24,40,.08);
+    --shadow-md:0 6px 20px rgba(16,24,40,.10);
+    --ring:rgba(29,155,240,.28);
+    --brand1:#1d9bf0; --brand2:#0a6ebd;
+  }
+  @media (prefers-color-scheme:dark){
+    :root{ --shadow-sm:0 1px 2px rgba(0,0,0,.45); --shadow-md:0 8px 24px rgba(0,0,0,.55);
+           --panel:#1b1e23; --line:#2b2f36; }
+  }
+  body{-webkit-font-smoothing:antialiased;letter-spacing:.1px}
+  [hidden]{display:none!important}
+
+  header{padding:11px 20px;gap:12px}
+  .brand{display:flex;align-items:center;gap:9px;font-weight:800;font-size:16px;
+         margin-right:4px;white-space:nowrap;letter-spacing:.2px}
+  .brand .logo{width:27px;height:27px;border-radius:8px;display:grid;place-items:center;
+       color:#fff;font-size:15px;font-weight:800;
+       background:linear-gradient(135deg,var(--brand1),var(--brand2));
+       box-shadow:0 2px 6px rgba(29,155,240,.4)}
+  .hdrctl{display:inline-flex;gap:10px;align-items:center;flex-wrap:wrap}
+
+  .seg{display:inline-flex;background:var(--panel);border:1px solid var(--line);
+       border-radius:999px;padding:3px;gap:2px}
+  .seg .segbtn{border:0;background:transparent;border-radius:999px;padding:6px 13px;
+       font-weight:650;color:var(--dim);display:inline-flex;align-items:center;gap:7px}
+  .seg .segbtn:hover{border:0;box-shadow:none;color:var(--fg)}
+  .seg .segbtn[aria-selected="true"]{background:var(--bg);color:var(--fg);
+       box-shadow:var(--shadow-sm);border:1px solid var(--line)}
+  .seg .segbtn:disabled{opacity:.5;cursor:not-allowed}
+  .seg .mk{width:17px;height:17px;border-radius:5px;display:grid;place-items:center;
+       font-size:10px;color:#fff;font-weight:800}
+  .mk.x{background:#000}
+  .mk.ig{background:linear-gradient(45deg,#f09433,#dc2743,#bc1888)}
+  .mk.fb{background:#1877f2}
+  .soon{font-size:9px;font-weight:800;background:var(--line);color:var(--dim);
+        border-radius:999px;padding:1px 6px;text-transform:uppercase;letter-spacing:.04em}
+
+  input,select,button{border-radius:10px;padding:8px 12px;
+        transition:border-color .12s,box-shadow .12s,background .12s,filter .12s}
+  input:focus,select:focus{outline:none;border-color:var(--accent);box-shadow:0 0 0 3px var(--ring)}
+  button{font-weight:600}
+  button:hover{border-color:var(--accent);box-shadow:var(--shadow-sm)}
+  button.primary{box-shadow:0 1px 2px rgba(29,155,240,.35)}
+  button.primary:hover{filter:brightness(1.06);box-shadow:0 3px 10px rgba(29,155,240,.35)}
+
+  .wrap{max-width:1240px;margin:0 auto;gap:20px;padding:20px}
+  .filters{max-width:1240px;margin:0 auto;padding:14px 20px 2px;gap:8px}
+  .filters input,.filters select{background:var(--panel);border-radius:8px}
+
+  .card{border-radius:var(--radius);background:var(--bg);box-shadow:var(--shadow-sm);
+        padding:14px 16px;transition:box-shadow .15s,transform .12s}
+  .card:hover{box-shadow:var(--shadow-md)}
+  .metrics{gap:16px}
+  .metrics a{margin-left:auto;font-weight:650;text-decoration:none}
+
+  aside .box{border-radius:var(--radius);box-shadow:var(--shadow-sm);padding:14px 16px}
+  aside h2{font-size:11px;letter-spacing:.07em;margin-bottom:10px}
+  .streambtn{border-radius:9px;padding:8px 10px;transition:border-color .12s,box-shadow .12s}
+  .streambtn:hover{box-shadow:var(--shadow-sm)}
+  .streambtn.active{border-color:var(--accent);box-shadow:0 0 0 2px var(--ring)}
+  .banner{border-radius:10px;box-shadow:var(--shadow-sm)}
+  .flag.dead{background:rgba(192,57,43,.18);color:#e0483a}
+  .empty{padding:44px 20px;text-align:center;color:var(--dim)}
+
+  .kpi{display:flex;gap:12px;flex-wrap:wrap;max-width:1240px;margin:14px auto 0;padding:0 20px}
+  .kpi .tile{flex:1;min-width:150px;border:1px solid var(--line);border-radius:var(--radius);
+       background:var(--panel);padding:11px 15px;box-shadow:var(--shadow-sm)}
+  .kpi .tile .l{font-size:11px;text-transform:uppercase;letter-spacing:.05em;color:var(--dim)}
+  .kpi .tile .v{font-size:23px;font-weight:750;margin-top:2px}
 """
 
 # --------------------------------------------------------------------------
@@ -1895,106 +2021,218 @@ start();
 _DASH_BODY = r"""</style></head><body>
 
 <header>
-  <h1>X Collector</h1>
-  <select id="src" title="What the Get new tweets button should fetch">
-    <option value="search">words</option>
-    <option value="list">a list</option>
-  </select>
-  <input id="q" placeholder="Type words to find in the tweets you have saved…" autofocus>
-  <button class="primary" id="go">Search</button>
-  <select id="pages" title="How many tweets to ask X for">
-    <option value="1">about 20 tweets</option>
-    <option value="3">about 60 tweets</option>
-    <option value="5" selected>about 100 tweets</option>
-    <option value="10">about 200 tweets</option>
-    <option value="25">about 500 tweets</option>
-  </select>
-  <button id="getnew" title="Asks X for tweets you do not have yet">Get new tweets</button>
-  <button id="csv">Download</button>
-  <label class="livetog" title="Checks for tweets the collector has saved since you loaded this page.
-It does not contact X, so it is free.">
-    <input type="checkbox" id="autorefresh" checked>
-    <span id="livedot"></span>Auto-update
-    <select id="everysec">
-      <option value="15" selected>every 15s</option>
-      <option value="30">every 30s</option>
-      <option value="60">every 60s</option>
+  <div class="brand"><span class="logo">◎</span>Collector</div>
+  <div class="seg" role="tablist" aria-label="Source">
+    <button type="button" class="segbtn" aria-selected="true" onclick="switchPlatform('x',this)"><span class="mk x">&#120143;</span>X</button>
+    <button type="button" class="segbtn" aria-selected="false" onclick="switchPlatform('ig',this)"><span class="mk ig">&#9678;</span>Instagram</button>
+    <button type="button" class="segbtn" disabled><span class="mk fb">f</span>Facebook <span class="soon">soon</span></button>
+  </div>
+
+  <span id="xctl" class="hdrctl">
+    <select id="src" title="What the Get new tweets button should fetch">
+      <option value="search">words</option>
+      <option value="list">a list</option>
     </select>
-  </label>
+    <input id="q" placeholder="Type words to find in the tweets you have saved…" autofocus>
+    <button class="primary" id="go">Search</button>
+    <select id="pages" title="How many tweets to ask X for">
+      <option value="1">about 20 tweets</option>
+      <option value="3">about 60 tweets</option>
+      <option value="5" selected>about 100 tweets</option>
+      <option value="10">about 200 tweets</option>
+      <option value="25">about 500 tweets</option>
+    </select>
+    <button id="getnew" title="Asks X for tweets you do not have yet">Get new tweets</button>
+    <button id="csv">Download</button>
+    <label class="livetog" title="Checks for tweets saved since you loaded this page. It does not contact X, so it is free.">
+      <input type="checkbox" id="autorefresh" checked>
+      <span id="livedot"></span>Auto-update
+      <select id="everysec">
+        <option value="15" selected>every 15s</option>
+        <option value="30">every 30s</option>
+        <option value="60">every 60s</option>
+      </select>
+    </label>
+  </span>
+
+  <span id="igctl" class="hdrctl" hidden>
+    <input id="ig_q" placeholder="Filter Instagram posts by @username…">
+    <button id="ig_refresh">Refresh</button>
+  </span>
+
   <a href="/logout" class="muted" style="font-size:13px;margin-left:auto">Sign out</a>
 </header>
 
-<div class="filters">
-  <input id="author" placeholder="from @someone" size="14">
-  <select id="since">
-    <option value="">any time</option><option value="1h">past hour</option>
-    <option value="6h">past 6 hours</option><option value="24h">past day</option>
-    <option value="7d">past week</option>
-  </select>
-  <input id="minlikes" type="number" placeholder="at least ? likes" style="width:140px">
-  <input id="lang" placeholder="language" style="width:90px" title="Two-letter code, e.g. en or hi">
-  <label class="muted"><input type="checkbox" id="media"> only with pictures or video</label>
-  <label class="muted" title="A retweet is someone resharing another account's post.
-Tick this to see only original posts."><input type="checkbox" id="noretweets"> hide retweets</label>
-  <select id="order"><option value="desc">newest first</option><option value="asc">oldest first</option></select>
-  <span class="muted" id="count"></span>
-</div>
-
 <div id="banner"></div>
 
-<div class="wrap">
-  <main>
-    <div id="newbar"><button id="newbtn"></button></div>
-    <div id="results"><p class="muted">Loading…</p></div>
-  </main>
-  <aside>
-    <div class="box" id="riskbox" hidden>
-      <h2>Needs your attention</h2>
-      <div id="risks"></div>
-    </div>
-    <div class="box">
-      <h2>What we are watching</h2>
-      <div id="streams"><span class="muted">—</span></div>
-      <button id="tgtoggle" class="linky" style="margin-top:6px">⚙ Telegram &amp; settings</button>
-      <div id="tgbox" hidden style="margin-top:6px;display:grid;gap:5px">
-        <p class="muted" style="margin:0">
-          Send new tweets straight to Telegram. Make a bot by messaging
-          <b>@BotFather</b> on Telegram, then paste what it gives you here.
-          Switch it on per list with the ⚙ next to that list.</p>
-        <input id="tg_token" placeholder="bot token from @BotFather" autocomplete="off">
-        <input id="tg_chat" placeholder="chat id, e.g. -1001234567890">
-        <p class="muted" style="margin:0;font-size:11px">
-          Not sure of the chat id? Add the bot to your group, send it a message,
-          then open api.telegram.org/bot&lt;token&gt;/getUpdates — the id is in there.</p>
-        <div style="display:flex;gap:6px">
-          <button id="tg_save" class="primary" style="flex:1;padding:5px;font-size:13px">Save</button>
-          <button id="tg_test" style="padding:5px 10px;font-size:13px">Send a test</button>
+<!-- ================= X (TWITTER) VIEW ================= -->
+<div id="view-x">
+  <div class="kpi">
+    <div class="tile"><div class="l">Saved so far</div><div class="v" id="kpi-saved">—</div></div>
+    <div class="tile"><div class="l">Watching</div><div class="v" id="kpi-watch">—</div></div>
+    <div class="tile"><div class="l">Accounts</div><div class="v" id="kpi-acct">—</div></div>
+  </div>
+
+  <div class="filters">
+    <input id="author" placeholder="from @someone" size="14">
+    <select id="since">
+      <option value="">any time</option><option value="1h">past hour</option>
+      <option value="6h">past 6 hours</option><option value="24h">past day</option>
+      <option value="7d">past week</option>
+    </select>
+    <input id="minlikes" type="number" placeholder="at least ? likes" style="width:140px">
+    <input id="lang" placeholder="language" style="width:90px" title="Two-letter code, e.g. en or hi">
+    <label class="muted"><input type="checkbox" id="media"> only with pictures or video</label>
+    <label class="muted" title="Tick to see only original posts."><input type="checkbox" id="noretweets"> hide retweets</label>
+    <select id="order"><option value="desc">newest first</option><option value="asc">oldest first</option></select>
+    <span class="muted" id="count"></span>
+  </div>
+
+  <div class="wrap">
+    <main>
+      <div id="newbar"><button id="newbtn"></button></div>
+      <div id="results"><p class="muted">Loading…</p></div>
+    </main>
+    <aside>
+      <div class="box" id="riskbox" hidden>
+        <h2>Needs your attention</h2>
+        <div id="risks"></div>
+      </div>
+      <div class="box">
+        <h2>What we are watching</h2>
+        <div id="streams"><span class="muted">—</span></div>
+        <button id="tgtoggle" class="linky" style="margin-top:6px">⚙ Telegram &amp; settings</button>
+        <div id="tgbox" hidden style="margin-top:6px;display:grid;gap:5px">
+          <p class="muted" style="margin:0">Send new tweets straight to Telegram. Make a bot by messaging <b>@BotFather</b>, then paste what it gives you here. Switch it on per list with the ⚙ next to that list.</p>
+          <input id="tg_token" placeholder="bot token from @BotFather" autocomplete="off">
+          <input id="tg_chat" placeholder="chat id, e.g. -1001234567890">
+          <p class="muted" style="margin:0;font-size:11px">Not sure of the chat id? Add the bot to your group, send it a message, then open api.telegram.org/bot&lt;token&gt;/getUpdates — the id is in there.</p>
+          <div style="display:flex;gap:6px">
+            <button id="tg_save" class="primary" style="flex:1;padding:5px;font-size:13px">Save</button>
+            <button id="tg_test" style="padding:5px 10px;font-size:13px">Send a test</button>
+          </div>
         </div>
       </div>
-    </div>
-    <div class="box">
-      <h2>X accounts</h2>
-      <div id="accounts"><span class="muted">—</span></div>
-      <a href="/accounts" class="linky" style="display:block;margin-top:6px">
-        Manage accounts →</a>
-    </div>
-    <div class="box">
-      <h2>Saved so far</h2>
-      <div id="totals"><span class="muted">—</span></div>
-    </div>
-    <div class="box">
-      <h2>Search tips</h2>
-      <p class="muted" style="margin:0 0 6px">Searching what you have saved takes plain
-      words. When you press <b>Get new tweets</b>, X also understands:</p>
-      <p class="muted" style="margin:0"><code>from:someone</code> — only their posts<br>
-      <code>-filter:replies</code> — skip replies<br>
-      <code>lang:en</code> — English only<br>
-      <code>min_faves:50</code> — at least 50 likes</p>
-    </div>
-  </aside>
+      <div class="box">
+        <h2>X accounts</h2>
+        <div id="accounts"><span class="muted">—</span></div>
+        <a href="/accounts" class="linky" style="display:block;margin-top:6px">Manage accounts →</a>
+      </div>
+      <div class="box">
+        <h2>Saved so far</h2>
+        <div id="totals"><span class="muted">—</span></div>
+      </div>
+      <div class="box">
+        <h2>Search tips</h2>
+        <p class="muted" style="margin:0"><code>from:someone</code> — only their posts<br>
+        <code>-filter:replies</code> — skip replies<br>
+        <code>lang:en</code> — English only<br>
+        <code>min_faves:50</code> — at least 50 likes</p>
+      </div>
+    </aside>
+  </div>
 </div>
 
+<!-- ================= INSTAGRAM VIEW ================= -->
+<div id="view-ig" hidden>
+  <div class="kpi">
+    <div class="tile"><div class="l">Posts collected</div><div class="v" id="ig-kpi-posts">—</div></div>
+    <div class="tile"><div class="l">Sources</div><div class="v" id="ig-kpi-sources">—</div></div>
+    <div class="tile"><div class="l">Accounts</div><div class="v" id="ig-kpi-acct">—</div></div>
+  </div>
+  <div class="wrap">
+    <main>
+      <div id="ig-results"><p class="muted">Loading Instagram posts…</p></div>
+    </main>
+    <aside>
+      <div class="box">
+        <h2>Instagram sources</h2>
+        <div id="ig-sources"><span class="muted">—</span></div>
+        <p class="muted" style="margin:8px 0 0;font-size:12px">Add with <code>collect_ig.py add-source</code>.</p>
+      </div>
+      <div class="box">
+        <h2>Instagram accounts</h2>
+        <div id="ig-accounts"><span class="muted">—</span></div>
+        <a href="/accounts" class="linky" style="display:block;margin-top:6px">Manage accounts →</a>
+      </div>
+      <div class="box">
+        <h2>How Instagram is collected</h2>
+        <p class="muted" style="margin:0">Collected headlessly by <code>collect_ig.py</code> into <code>ig_results.db</code>, and served to Watch-Tower through the API (<code>api.py</code>). This view reads that same store.</p>
+      </div>
+    </aside>
+  </div>
+</div>
+
+<script>
+// ---- source switching: swaps the whole view, not just styling ----
+function igset(id, v){ var e = document.getElementById(id); if(e) e.textContent = v; }
+
+function switchPlatform(p, el){
+  document.querySelectorAll('.seg .segbtn').forEach(function(b){
+    b.setAttribute('aria-selected', b === el ? 'true' : 'false');
+  });
+  document.getElementById('view-x').hidden  = (p !== 'x');
+  document.getElementById('view-ig').hidden = (p !== 'ig');
+  document.getElementById('xctl').hidden  = (p !== 'x');
+  document.getElementById('igctl').hidden = (p !== 'ig');
+  if(p === 'ig') loadIG();
+}
+
+function igCard(pst){
+  var a = (pst.author && pst.author.username) || '';
+  var m = pst.metrics || {};
+  var when = pst.created_at ? ago(pst.created_at) : '';
+  return '<article class="card"><div class="top">'
+    + '<span class="name">@' + esc(a) + '</span>'
+    + '<span class="when">· ' + esc(when) + '</span>'
+    + '<span class="handle">· ' + esc(pst.source || '') + '</span></div>'
+    + '<div class="text">' + esc(pst.text || '') + '</div>'
+    + '<div class="metrics"><span>♥ ' + (m.likes ?? 0) + '</span>'
+    + '<span>💬 ' + (m.comments ?? 0) + '</span>'
+    + (m.views ? '<span>▶ ' + m.views + '</span>' : '')
+    + '<a href="' + esc(pst.url || '#') + '" target="_blank" rel="noopener" style="margin-left:auto">open ↗</a></div></article>';
+}
+
+async function loadIG(){
+  try{
+    var st = await api('/api/ig/status');
+    igset('ig-kpi-posts', ((st.totals && st.totals.posts) || 0).toLocaleString());
+    igset('ig-kpi-sources', (st.sources || []).length + ' sources');
+    var live = (st.accounts || []).filter(function(a){return a.active;}).length;
+    igset('ig-kpi-acct', live + ' active');
+    var srcs = st.sources || [];
+    document.getElementById('ig-sources').innerHTML = srcs.length
+      ? srcs.map(function(s){ return '<div class="row"><span>' + esc(s.type)
+          + (s.value ? ' · ' + esc(s.value) : '') + '</span><span class="muted">'
+          + esc(s.label) + '</span></div>'; }).join('')
+      : '<span class="muted">no sources yet</span>';
+    var accs = st.accounts || [];
+    document.getElementById('ig-accounts').innerHTML = accs.length
+      ? accs.map(function(a){ return '<div class="row"><span class="name">@' + esc(a.username||'')
+          + '</span><span class="flag ' + (a.active?'live':'dead') + '">' + (a.active?'live':'off')
+          + '</span></div>'; }).join('')
+      : '<span class="muted">no Instagram account signed in</span>';
+  }catch(e){ /* keep going to posts */ }
+  await loadIGPosts();
+}
+
+async function loadIGPosts(){
+  var el = document.getElementById('ig-results');
+  try{
+    var qv = (document.getElementById('ig_q').value || '').trim().replace(/^@/, '');
+    var d = await api('/api/ig/posts?limit=50' + (qv ? '&username=' + encodeURIComponent(qv) : ''));
+    el.innerHTML = (d.posts && d.posts.length)
+      ? d.posts.map(igCard).join('')
+      : '<div class="empty">No Instagram posts collected yet.<br><span class="muted">Run <code>python3 collect_ig.py run</code> once a source is added.</span></div>';
+  }catch(e){ el.innerHTML = '<span class="muted">could not load Instagram posts</span>'; }
+}
+
+document.getElementById('ig_refresh').onclick = loadIG;
+document.getElementById('ig_q').addEventListener('keydown', function(e){ if(e.key === 'Enter') loadIGPosts(); });
+</script>
+
 """
+
 
 _DASH_JS = r"""const PAGE_SIZE = 100;
 let offset = 0, loaded = 0, lastTotal = 0;
@@ -2220,6 +2458,11 @@ async function status(){
     `<div class="row"><span class="k">tweets</span><span>${d.totals.tweets ?? 0}</span></div>` +
     (budget ? `<div class="cfghead" style="margin-top:6px">Requests left</div>` + budget : "") +
     (d.totals.note ? `<div class="muted">${esc(d.totals.note)}</div>` : "");
+
+  const kset = (id, v) => { const e = $("#" + id); if (e) e.textContent = v; };
+  kset("kpi-saved", (d.totals.tweets ?? 0).toLocaleString());
+  kset("kpi-watch", all.length + (all.length === 1 ? " source" : " sources"));
+  kset("kpi-acct", (d.accounts || []).filter(a => a.active).length + " active");
 }
 
 /* ------------------------------------------------------------------
@@ -2610,7 +2853,7 @@ def _page(title: str, css: str, body: str, js: str) -> str:
             + "</script>\n</body></html>\n")
 
 
-PAGE = _page("X Collector", "", _DASH_BODY, _DASH_JS)
+PAGE = _page("Collector", _CSS_MODERN, _DASH_BODY, _DASH_JS)
 
 
 # --------------------------------------------------------------------------

@@ -6,5 +6,14 @@
 # it reports.
 twscrape==0.19.2
 
+# Instagram's counterpart to twscrape: the free (MIT) private-API library that
+# engine_ig.py wraps. Pinned for the same reason — engine_ig.check() asserts the
+# exact Client methods we call, so an upgrade that renames one fails loudly.
+# To upgrade: bump this pin, run `python3 engine_ig.py <username>`, fix what it
+# reports. NOTE: it is a private-API client, not an official API — it can break
+# when Instagram shifts, exactly as snscrape did, and cannot make an account
+# ban-proof. Proxy + stable device + gentle interval is mitigation, not immunity.
+instagrapi==2.18.12
+
 python-dotenv>=1.0
 playwright>=1.49
