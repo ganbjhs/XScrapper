@@ -1666,6 +1666,26 @@ async def run_webhook(tmp):
         ok(len(packed) == 12 and all(len(m) <= wh.TG_MAX_CHARS for m in packed),
            "long tweets stay one-per-message and each is under Telegram's limit")
 
+        # X appends a t.co link to its own media. Printed above our permalink it
+        # showed the same destination twice.
+        selflink = wh.tg_format([{
+            "tweet_id": 9, "author_display_name": "R", "author_username": "r",
+            "text": "look at this https://t.co/selfLink1",
+            "urls": "[]", "media_urls": '["https://pbs.twimg.com/media/x.jpg"]',
+            "url": "https://x.com/r/status/9", "like_count": 1}])[0]
+        ok("t.co/selfLink1" not in selflink,
+           "X's self-link to its own media is stripped — one link per message")
+        ok("https://x.com/r/status/9" in selflink, "the permalink stays")
+
+        shared = wh.tg_format([{
+            "tweet_id": 10, "author_display_name": "N", "author_username": "n",
+            "text": "read the report https://t.co/article22",
+            "urls": '["https://example.com/report"]', "media_urls": "[]",
+            "url": "https://x.com/n/status/10", "like_count": 1}])[0]
+        ok("t.co/article22" in shared,
+           "a link the AUTHOR shared is kept — there the t.co is the point of "
+           "the post, not duplication")
+
         ok(wh.TG_GAP_S >= 3.0,
            f"the gap between sends respects ~20 messages/minute per group "
            f"({wh.TG_GAP_S}s) — required now that every tweet is its own message")

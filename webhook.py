@@ -31,6 +31,7 @@ import asyncio
 import hashlib
 import hmac
 import json
+import re
 import os
 import time
 
@@ -143,6 +144,34 @@ def _tg_escape(s: str) -> str:
     return (s or "").replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
 
 
+_TRAILING_TCO = re.compile(r"(?:\s+https?://t\.co/\w+)+\s*$")
+
+
+def _strip_self_link(text: str, row: dict) -> str:
+    """
+    Drop the t.co link X appends to its OWN media, so the message carries one
+    link instead of two.
+
+    A tweet with a photo or video ends with a shortened link that resolves back
+    to the tweet itself — it is not something the author typed. Printing it
+    above our permalink showed the same destination twice.
+
+    The rule is conservative and reads the data rather than guessing: `urls`
+    holds the links the AUTHOR actually shared, so a trailing t.co is only
+    removed when that list is empty. A tweet linking to a news article keeps its
+    link, because there the t.co is the point of the post.
+    """
+    if not text:
+        return text
+    try:
+        shared = json.loads(row.get("urls") or "[]")
+    except (TypeError, ValueError):
+        shared = []
+    if shared:
+        return text
+    return _TRAILING_TCO.sub("", text)
+
+
 def tg_format(rows: list, labels_for: dict | None = None) -> list:
     """
     Render tweets into Telegram messages — EXACTLY ONE MESSAGE PER TWEET.
@@ -187,7 +216,7 @@ def tg_format(rows: list, labels_for: dict | None = None) -> list:
         # round. Cutting an already-escaped string can slice through the middle
         # of an entity — "&amp;" becoming "&am" — and Telegram rejects the whole
         # message as malformed HTML.
-        raw = (r.get("text") or "").strip()
+        raw = _strip_self_link((r.get("text") or "").strip(), r).strip()
         block = build(raw)
         while len(block) > TG_MAX_CHARS and raw:
             raw = raw[:max(0, len(raw) - (len(block) - TG_MAX_CHARS) - 16)]
