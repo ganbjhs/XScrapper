@@ -558,6 +558,7 @@ def _status():
                     "tg_min_likes": _col("tg_min_likes", 0),
                     "tg_skip_retweets": bool(_col("tg_skip_retweets", 0)),
                     "tg_skip_replies": bool(_col("tg_skip_replies", 0)),
+                    "tg_max_age_h": _col("tg_max_age_h", 0),
                     "label": s["label"], "query": s["query"], "tab": s["tab"],
                     "count": hits,
                     "lag_p50": lags[len(lags) // 2] / 1000 if lags else None,
@@ -826,7 +827,8 @@ def _with_store(fn):
 # Update speeds, named rather than numeric. "Every 30 seconds" is a promise the
 # system cannot keep — the interval is adaptive and X's budget is the real
 # ceiling — so these set the FLOOR and let the controller settle above it.
-SPEEDS = {"fastest": 5, "fast": 15, "normal": 60, "slow": 300, "hourly": 1800}
+SPEEDS = {"fastest": 5, "fast": 15, "normal": 60, "slow": 300,
+          "quarter": 900, "hourly": 1800}
 
 
 def _stream_settings(body):
@@ -872,6 +874,11 @@ def _stream_settings(body):
         vals["tg_skip_retweets"] = int(bool(body["tg_skip_retweets"]))
     if "tg_skip_replies" in body:
         vals["tg_skip_replies"] = int(bool(body["tg_skip_replies"]))
+    if "tg_max_age_h" in body:
+        try:
+            vals["tg_max_age_h"] = max(0, int(body.get("tg_max_age_h") or 0))
+        except (TypeError, ValueError):
+            return {"error": "hours must be a whole number (0 = no limit)"}
 
     if not vals:
         return {"error": "nothing to change"}
@@ -2786,7 +2793,7 @@ async function status(){
    ------------------------------------------------------------------ */
 const SPEED_LABELS = {"":"leave as configured", fastest:"as fast as allowed (~5s)",
   fast:"every 15s or so", normal:"every minute or so", slow:"every 5 minutes or so",
-  hourly:"every half hour or so"};
+  quarter:"every 15 minutes or so", hourly:"every half hour or so"};
 
 function drawCfg(streams){
   document.querySelectorAll("[data-cfg]").forEach(box => {
@@ -2835,6 +2842,13 @@ function drawCfg(streams){
         ${s.tg_skip_retweets?"checked":""}> Skip retweets</label>
       <label class="cfgchk"><input type="checkbox" data-k="tg_skip_replies"
         ${s.tg_skip_replies?"checked":""}> Skip replies</label>
+      <label class="cfgrow">Only if POSTED within this many hours (0 = no limit)
+        <input data-k="tg_max_age_h" type="number" min="0"
+               value="${s.tg_max_age_h||0}"></label>
+      <div class="cfgnote">Delivery normally keys on when a tweet was
+        <b>collected</b>, so a stream that has just started sends its whole
+        backlog — posts weeks old arriving as if new. This bounds it by when the
+        tweet was actually <b>published</b>.</div>
 
       <div class="cfgsave">
         <button class="cfgbtn primary" data-save>Save settings</button>

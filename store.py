@@ -578,7 +578,13 @@ class Store:
                               # query written without it). Filtering on our own
                               # is_reply column at delivery time is the only
                               # check that cannot be talked round.
-                              "tg_skip_replies": "INTEGER NOT NULL DEFAULT 0"}}
+                              "tg_skip_replies": "INTEGER NOT NULL DEFAULT 0",
+                              # Bound delivery by when a tweet was PUBLISHED,
+                              # not when we happened to collect it. A stream
+                              # that starts on an account with a week of
+                              # history otherwise pushes all of it into the
+                              # channel as if it were new. 0 = no limit.
+                              "tg_max_age_h": "INTEGER NOT NULL DEFAULT 0"}}
         added = []
         for table, cols in wanted.items():
             have = {r["name"] for r in self.db.execute(f"PRAGMA table_info({table})")}

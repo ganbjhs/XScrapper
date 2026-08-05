@@ -1709,6 +1709,23 @@ async def run_webhook(tmp):
         ok([r["tweet_id"] for r in rr if wh._wanted(_H(), r)] == [1, 2],
            "and leaves them alone when it is off")
 
+        # Delivery keys on when a tweet was COLLECTED, so a stream that has just
+        # started pushes its whole backlog. max_age_h bounds it by when the
+        # tweet was actually POSTED.
+        now_ms = int(time.time() * 1000)
+        class _A:
+            skip_retweets = False
+            skip_replies = False
+            min_likes = 0
+            max_age_h = 24
+        aged = [{"tweet_id": 1, "created_ms": now_ms - 2 * 3600_000, "like_count": 0},
+                {"tweet_id": 2, "created_ms": now_ms - 6 * 86_400_000, "like_count": 0}]
+        ok([r["tweet_id"] for r in aged if wh._wanted(_A(), r)] == [1],
+           "max_age_h drops a six-day-old post collected today, keeps a fresh one")
+        _A.max_age_h = 0
+        ok([r["tweet_id"] for r in aged if wh._wanted(_A(), r)] == [1, 2],
+           "and 0 means no age limit at all")
+
         ok(wh.TG_GAP_S >= 3.0,
            f"the gap between sends respects ~20 messages/minute per group "
            f"({wh.TG_GAP_S}s) — required now that every tweet is its own message")

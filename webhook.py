@@ -289,6 +289,15 @@ def _wanted(hook, row) -> bool:
     # actually holds.
     if getattr(hook, "skip_replies", False) and row.get("is_reply"):
         return False
+    # Age is measured on created_ms (when it was POSTED), never collected_ms.
+    # The cursor already keys on collection, so without this a stream that has
+    # just started delivers its entire backlog — six-day-old posts landing as
+    # though they had just appeared.
+    max_age_h = getattr(hook, "max_age_h", 0) or 0
+    if max_age_h:
+        created = row.get("created_ms") or 0
+        if created and (time.time() * 1000 - created) > max_age_h * 3600_000:
+            return False
     if (row.get("like_count") or 0) < getattr(hook, "min_likes", 0):
         return False
     return True
@@ -374,7 +383,7 @@ class TelegramTarget:
     url = TELEGRAM_API      # for logging only
 
     def __init__(self, stream_label, token, chat_id, *, min_likes=0,
-                 skip_retweets=False, skip_replies=False,
+                 skip_retweets=False, skip_replies=False, max_age_h=0,
                  batch_size=20, timeout_s=15.0):
         # The cursor is keyed on this label, so it must be stable and must not
         # collide with a webhook's.
@@ -386,6 +395,7 @@ class TelegramTarget:
         self.min_likes = int(min_likes or 0)
         self.skip_retweets = bool(skip_retweets)
         self.skip_replies = bool(skip_replies)
+        self.max_age_h = int(max_age_h or 0)
         self.batch_size = batch_size
         self.timeout_s = timeout_s
 
@@ -411,7 +421,8 @@ async def telegram_targets(store, log=print) -> list:
         out.append(TelegramTarget(
             row["label"], token, chat,
             min_likes=row["tg_min_likes"], skip_retweets=row["tg_skip_retweets"],
-            skip_replies=(row["tg_skip_replies"] if "tg_skip_replies" in row.keys() else 0)))
+            skip_replies=(row["tg_skip_replies"] if "tg_skip_replies" in row.keys() else 0),
+            max_age_h=(row["tg_max_age_h"] if "tg_max_age_h" in row.keys() else 0)))
     return out
 
 
