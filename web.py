@@ -37,6 +37,8 @@ import threading
 import time
 import urllib.parse
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
+from urllib.parse import unquote
 
 import store as store_mod
 
@@ -1438,6 +1440,23 @@ class Handler(BaseHTTPRequestHandler):
 
     _head_only = False
 
+    def _serve_static(self, path: str):
+        """
+        Serve one file from static/, and nothing outside it.
+
+        The traversal check is not decoration: "/static/../.env" and
+        "/static/..%2f.env" both arrive here as ordinary paths, and this
+        directory sits beside .env, config.toml and every .db file. resolve()
+        collapses the traversal and is_relative_to rejects anything that
+        escaped, so the only reachable files are the ones actually in static/.
+        """
+        rel = unquote(path[len("/static/"):])
+        target = (STATIC_DIR / rel).resolve()
+        if not target.is_relative_to(STATIC_DIR.resolve()) or not target.is_file():
+            return self._send(404, {"error": "not found"})
+        ctype = _STATIC_TYPES.get(target.suffix.lower(), "application/octet-stream")
+        return self._send(200, target.read_bytes(), ctype)
+
     def _send(self, code, body, ctype="application/json; charset=utf-8", extra=None):
         if isinstance(body, (dict, list)):
             body = json.dumps(body, ensure_ascii=False)
@@ -1484,7 +1503,10 @@ class Handler(BaseHTTPRequestHandler):
             if not self._require_auth():
                 return
             if u.path == "/":
-                return self._send(200, PAGE, "text/html; charset=utf-8")
+                return self._send(200, _static_text("index.html"),
+                                  "text/html; charset=utf-8")
+            if u.path.startswith("/static/"):
+                return self._serve_static(u.path)
             if u.path in ("/accounts", "/accounts/"):
                 return self._send(200, ACCOUNTS_PAGE, "text/html; charset=utf-8")
             if u.path == "/signin":
@@ -1678,235 +1700,17 @@ def serve(cfg, host="127.0.0.1", port=8765, log=print, behind_proxy=False):
 # Assembled with plain concatenation. A template engine would be a dependency,
 # and str.format would fight every { in the CSS and JS.
 
-_DOC_HEAD = r"""<!doctype html>
-<html lang="en"><head>
-<meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>__TITLE__</title>
-<style>
-"""
+# _DOC_HEAD now lives in static/index.html
 
-_CSS_CORE = r"""  :root{
-    --bg:#fff; --panel:#f7f8fa; --line:#e3e6ea; --fg:#14171a; --dim:#5b7083;
-    --accent:#1d9bf0; --warn:#c0392b; --ok:#17a673; --radius:10px;
-  }
-  @media (prefers-color-scheme:dark){
-    :root{ --bg:#15181c; --panel:#1e2126; --line:#2f3336; --fg:#e7e9ea; --dim:#8b98a5; }
-  }
-  *{box-sizing:border-box}
-  body{margin:0;font:15px/1.5 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;
-       background:var(--bg);color:var(--fg)}
-  header{position:sticky;top:0;z-index:9;background:var(--bg);border-bottom:1px solid var(--line);
-         padding:12px 18px;display:flex;gap:10px;align-items:center;flex-wrap:wrap}
-  h1{font-size:15px;margin:0 12px 0 0;font-weight:650;white-space:nowrap}
-  input,select,button{font:inherit;color:var(--fg);background:var(--panel);
-        border:1px solid var(--line);border-radius:8px;padding:7px 10px}
-  input:focus,select:focus{outline:2px solid var(--accent);outline-offset:-1px}
-  #q{flex:1;min-width:240px}
-  button{cursor:pointer;background:var(--panel)}
-  button:hover{border-color:var(--accent)}
-  button.primary{background:var(--accent);color:#fff;border-color:var(--accent);font-weight:600}
-  button.danger{border-color:var(--warn);color:var(--warn)}
-  button:disabled{opacity:.5;cursor:not-allowed}
-  .wrap{display:grid;grid-template-columns:1fr 300px;gap:18px;padding:18px;align-items:start}
-  /* Stack, and put the sidebar UNDER the results — on a phone the tweets are
-     what you came for, and a 300px column of status above them is a wall to
-     scroll past before reaching any. */
-  @media(max-width:900px){
-    .wrap{grid-template-columns:1fr}
-    .wrap main{order:1}
-    .wrap aside{order:2}
-  }
-  .filters{display:flex;gap:8px;flex-wrap:wrap;padding:0 18px 4px;align-items:center}
-  .filters input,.filters select{padding:5px 8px;font-size:13px}
-  .card{border:1px solid var(--line);border-radius:var(--radius);padding:12px 14px;margin-bottom:10px;
-        background:var(--panel)}
-  .card .top{display:flex;gap:8px;align-items:baseline;flex-wrap:wrap;margin-bottom:5px}
-  .name{font-weight:650}
-  .handle,.when{color:var(--dim);font-size:13px}
-  .text{white-space:pre-wrap;word-wrap:break-word;margin:2px 0 8px}
-  .metrics{display:flex;gap:14px;color:var(--dim);font-size:13px;flex-wrap:wrap;align-items:center}
-  .media{display:flex;gap:6px;flex-wrap:wrap;margin:8px 0 4px}
-  .media img,.media video{max-height:220px;max-width:100%;border-radius:8px;
-       border:1px solid var(--line);background:#000}
-  .media video{width:min(100%,380px)}
-  /* A video shows as its still until clicked. The button IS the thumbnail. */
-  .playwrap{position:relative;padding:0;border:0;background:none;cursor:pointer;
-            line-height:0;border-radius:8px}
-  .playwrap img{display:block;max-height:220px}
-  .playbtn{position:absolute;inset:0;margin:auto;width:52px;height:52px;
-           border-radius:50%;background:rgba(0,0,0,.62);color:#fff;font-size:20px;
-           display:grid;place-items:center;pointer-events:none;line-height:1;
-           padding-left:4px}
-  .playwrap:hover .playbtn{background:rgba(0,0,0,.82)}
-  .dur{position:absolute;right:6px;bottom:6px;background:rgba(0,0,0,.72);color:#fff;
-       font-size:11px;padding:1px 6px;border-radius:4px;pointer-events:none;line-height:1.6}
-  .media .yt{width:min(100%,380px);height:214px;border:1px solid var(--line);
-       border-radius:8px;background:#000}
-  .medialink{display:flex;flex-direction:column;gap:2px;padding:9px 12px;
-       border:1px solid var(--line);border-radius:8px;text-decoration:none;
-       background:var(--bg);min-width:220px}
-  .medialink b{color:var(--fg);font-size:13px}
-  .medialink span{color:var(--dim);font-size:12px}
-  .medialink.live b{color:var(--warn)}
-  aside .box{border:1px solid var(--line);border-radius:var(--radius);padding:12px 14px;
-             margin-bottom:12px;background:var(--panel)}
-  aside h2{font-size:12px;text-transform:uppercase;letter-spacing:.06em;color:var(--dim);
-           margin:0 0 8px;font-weight:650}
-  .row{display:flex;justify-content:space-between;gap:8px;font-size:13px;padding:3px 0}
-  .row .k{color:var(--dim)}
-  .pill{display:inline-block;padding:1px 7px;border-radius:999px;font-size:11px;font-weight:650}
-  .pill.ok{background:rgba(23,166,115,.15);color:var(--ok)}
-  /* Status flags. Colour carries the meaning, the word carries it again for
-     anyone who cannot rely on colour alone. */
-  .flag{display:inline-block;padding:1px 7px;border-radius:999px;font-size:11px;
-        font-weight:700;letter-spacing:.03em}
-  .flag.live   {background:rgba(23,166,115,.16); color:#17a673}
-  .flag.warning{background:rgba(224,168,0,.20);  color:#b8860b}
-  .flag.dead   {background:rgba(192,57,43,.18);  color:#e0483a}
-  .flag.unknown{background:rgba(120,130,140,.20);color:var(--dim)}
-  .pill.bad{background:rgba(192,57,43,.15);color:var(--warn)}
-  .muted{color:var(--dim);font-size:13px}
-  .banner{margin:0 18px 10px;padding:9px 12px;border-radius:8px;font-size:13px;
-          border:1px solid var(--line);background:var(--panel)}
-  .banner.err{border-color:var(--warn);color:var(--warn)}
-  .banner.ok{border-color:var(--ok);color:var(--ok)}
-  a{color:var(--accent)}
-"""
+
+# _CSS_CORE now lives in static/base.css
+
 
 # Modern visual + structural layer, appended AFTER _CSS_CORE so later rules win.
 # Adds the brand, source switcher, KPI strip and the per-source view scoping.
 # Removes no existing id/class, so every JS hook keeps working.
-_CSS_MODERN = r"""
-  :root{
-    --radius:12px;
-    --shadow-sm:0 1px 2px rgba(16,24,40,.05),0 1px 3px rgba(16,24,40,.08);
-    --shadow-md:0 6px 20px rgba(16,24,40,.10);
-    --ring:rgba(29,155,240,.28);
-    --brand1:#1d9bf0; --brand2:#0a6ebd;
-  }
-  @media (prefers-color-scheme:dark){
-    :root{ --shadow-sm:0 1px 2px rgba(0,0,0,.45); --shadow-md:0 8px 24px rgba(0,0,0,.55);
-           --panel:#1b1e23; --line:#2b2f36; }
-  }
-  body{-webkit-font-smoothing:antialiased;letter-spacing:.1px}
-  [hidden]{display:none!important}
+# _CSS_MODERN now lives in static/app.css
 
-  header{padding:11px 20px;gap:12px}
-  .brand{display:flex;align-items:center;gap:9px;font-weight:800;font-size:16px;
-         margin-right:4px;white-space:nowrap;letter-spacing:.2px}
-  .brand .logo{width:27px;height:27px;border-radius:8px;display:grid;place-items:center;
-       color:#fff;font-size:15px;font-weight:800;
-       background:linear-gradient(135deg,var(--brand1),var(--brand2));
-       box-shadow:0 2px 6px rgba(29,155,240,.4)}
-  .hdrctl{display:inline-flex;gap:10px;align-items:center;flex-wrap:wrap}
-
-  .seg{display:inline-flex;background:var(--panel);border:1px solid var(--line);
-       border-radius:999px;padding:3px;gap:2px}
-  .seg .segbtn{border:0;background:transparent;border-radius:999px;padding:6px 13px;
-       font-weight:650;color:var(--dim);display:inline-flex;align-items:center;gap:7px}
-  .seg .segbtn:hover{border:0;box-shadow:none;color:var(--fg)}
-  .seg .segbtn[aria-selected="true"]{background:var(--bg);color:var(--fg);
-       box-shadow:var(--shadow-sm);border:1px solid var(--line)}
-  .seg .segbtn:disabled{opacity:.5;cursor:not-allowed}
-  .seg .mk{width:17px;height:17px;border-radius:5px;display:grid;place-items:center;
-       font-size:10px;color:#fff;font-weight:800}
-  .mk.x{background:#000}
-  .mk.ig{background:linear-gradient(45deg,#f09433,#dc2743,#bc1888)}
-  .mk.fb{background:#1877f2}
-  .soon{font-size:9px;font-weight:800;background:var(--line);color:var(--dim);
-        border-radius:999px;padding:1px 6px;text-transform:uppercase;letter-spacing:.04em}
-
-  input,select,button{border-radius:10px;padding:8px 12px;
-        transition:border-color .12s,box-shadow .12s,background .12s,filter .12s}
-  input:focus,select:focus{outline:none;border-color:var(--accent);box-shadow:0 0 0 3px var(--ring)}
-  button{font-weight:600}
-  button:hover{border-color:var(--accent);box-shadow:var(--shadow-sm)}
-  button.primary{box-shadow:0 1px 2px rgba(29,155,240,.35)}
-  button.primary:hover{filter:brightness(1.06);box-shadow:0 3px 10px rgba(29,155,240,.35)}
-
-  .wrap{max-width:1240px;margin:0 auto;gap:20px;padding:20px}
-  .filters{max-width:1240px;margin:0 auto;padding:14px 20px 2px;gap:8px}
-  .filters input,.filters select{background:var(--panel);border-radius:8px}
-
-  .card{border-radius:var(--radius);background:var(--bg);box-shadow:var(--shadow-sm);
-        padding:14px 16px;transition:box-shadow .15s,transform .12s}
-  .card:hover{box-shadow:var(--shadow-md)}
-  .metrics{gap:16px}
-  .metrics a{margin-left:auto;font-weight:650;text-decoration:none}
-
-  aside .box{border-radius:var(--radius);box-shadow:var(--shadow-sm);padding:14px 16px}
-  aside h2{font-size:11px;letter-spacing:.07em;margin-bottom:10px}
-  .streambtn{border-radius:9px;padding:8px 10px;transition:border-color .12s,box-shadow .12s}
-  .streambtn:hover{box-shadow:var(--shadow-sm)}
-  .streambtn.active{border-color:var(--accent);box-shadow:0 0 0 2px var(--ring)}
-  .banner{border-radius:10px;box-shadow:var(--shadow-sm)}
-  .flag.dead{background:rgba(192,57,43,.18);color:#e0483a}
-  .empty{padding:44px 20px;text-align:center;color:var(--dim)}
-
-  .kpi{display:flex;gap:12px;flex-wrap:wrap;max-width:1240px;margin:14px auto 0;padding:0 20px}
-  .kpi .tile{flex:1;min-width:150px;border:1px solid var(--line);border-radius:var(--radius);
-       background:var(--panel);padding:11px 15px;box-shadow:var(--shadow-sm)}
-  .kpi .tile .l{font-size:11px;text-transform:uppercase;letter-spacing:.05em;color:var(--dim)}
-  .kpi .tile .v{font-size:23px;font-weight:750;margin-top:2px}
-
-  /* Saving stream settings. The button is the only thing that sends them, so
-     it reads as the primary action, and "not sent yet" sits beside it — an
-     unsent change must never look the same as a saved one. */
-  /* The per-stream settings panel. It had NO styles at all — every rule below
-     was missing, so in a ~280px sidebar the labels wrapped around their own
-     inputs ("Only if it has at least [0] likes Skip retweets") and the whole
-     thing read as debris. Controls stack; nothing shares a line with a control
-     it does not belong to. */
-  .streamcfg{background:var(--bg);border:1px solid var(--line);
-             border-radius:var(--radius);padding:12px;margin:6px 0 10px}
-  .cfghead{font-size:11px;text-transform:uppercase;letter-spacing:.05em;
-           color:var(--dim);margin:14px 0 6px;font-weight:600}
-  .cfghead:first-child{margin-top:0}
-  .cfgrow{display:flex;flex-direction:column;gap:4px;
-          font-size:12px;color:var(--dim);margin-bottom:8px}
-  .cfgrow input,.cfgrow select{font:inherit;color:var(--fg);background:var(--panel);
-      border:1px solid var(--line);border-radius:8px;padding:6px 9px;width:100%}
-  .cfgrow input:focus,.cfgrow select:focus{outline:none;border-color:var(--accent)}
-  .cfgchk{display:flex;align-items:flex-start;gap:7px;font-size:12.5px;
-          color:var(--fg);margin-bottom:7px;line-height:1.4}
-  .cfgchk input{margin-top:2px;flex:0 0 auto}
-  .cfgbtn{width:100%;margin-bottom:6px;font-size:12.5px;padding:7px 10px;
-          text-align:center}
-
-  .cfgsave{display:flex;flex-direction:column;gap:0;margin-top:12px}
-  /* NOT a colour override. button.primary is already white-on-blue; setting
-     color here made the label blue on blue and the button read as an empty
-     box. */
-  .cfgbtn.primary{font-weight:600}
-  .cfgbtn.primary:disabled{opacity:.5;cursor:default}
-  .cfgdirty{font-size:12px;color:var(--warn);text-align:center;margin-top:2px}
-  .cfgbtn.danger{border-color:var(--warn);color:var(--warn)}
-  .cfgnote{font-size:11px;color:var(--dim);margin:0 0 10px 22px;line-height:1.45}
-
-  /* Filters panel. These rules MUST live in _CSS_MODERN — the dashboard page is
-     built as _CSS_CORE + _CSS_MODERN, so a rule dropped into any other <style>
-     block in this file (the sign-in page has one) is parsed by the browser for
-     a different document and silently does nothing. That is exactly how this
-     panel first shipped: the markup was right, the grid never applied, and
-     every label sat inline beside its input. */
-  #filters{background:var(--bg);border-bottom:1px solid var(--line);
-           padding:14px 20px;max-width:1240px;margin:0 auto}
-  .filtgrid{display:grid;gap:12px 16px;
-            grid-template-columns:repeat(auto-fit,minmax(180px,1fr))}
-  .filtgrid label{display:flex;flex-direction:column;gap:5px;
-                  font-size:12px;color:var(--dim)}
-  .filtgrid input,.filtgrid select{font:inherit;color:var(--fg);background:var(--panel);
-      border:1px solid var(--line);border-radius:8px;padding:7px 10px;width:100%}
-  .filtgrid input:focus,.filtgrid select:focus{outline:none;border-color:var(--accent)}
-  .filtrow{display:flex;align-items:center;gap:16px;flex-wrap:wrap;margin-top:14px}
-  .filtchk{display:flex;align-items:center;gap:6px;font-size:13px;color:var(--fg)}
-  .filtcount{background:var(--accent);color:#fff;border-radius:999px;
-             padding:0 6px;font-size:11px;margin-left:4px}
-
-  /* A stream that is only a saved search must not look like a live one. */
-  .warnbit{color:var(--warn);font-size:11px}
-  .tgon{color:var(--ok);font-size:11px}
-"""
 
 # --------------------------------------------------------------------------
 # the sign-in tab
@@ -1924,61 +1728,8 @@ _CSS_MODERN = r"""
 # a picture with no address bar is a black box, and "did my click do anything"
 # is the question this whole flow lives or dies on.
 
-_JS_HELPERS = r"""const $ = s => document.querySelector(s);
-let activeStream = "";
-let openCfg = null;      // which stream has its settings open
-let cfgDirty = false;    // settings typed but not yet sent to the backend
+# _JS_HELPERS now lives in static/helpers.js
 
-const esc = s => (s||"").replace(/[&<>"']/g, c =>
-  ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
-
-function ago(iso){
-  if(!iso) return "";
-  const s = (Date.now() - new Date(iso).getTime())/1000;
-  if (s < 60) return Math.max(0,Math.round(s))+"s ago";
-  if (s < 3600) return Math.round(s/60)+"m ago";
-  if (s < 86400) return Math.round(s/3600)+"h ago";
-  return Math.round(s/86400)+"d ago";
-}
-const num = n => n == null ? "0" : n >= 1000 ? (n/1000).toFixed(1)+"K" : ""+n;
-
-// A duration in seconds, said the way a person would say it.
-function secs(s){
-  if (s < 90)    return Math.round(s) + " seconds";
-  if (s < 5400)  return Math.round(s/60) + " minutes";
-  if (s < 86400) return Math.round(s/3600) + " hours";
-  return Math.round(s/86400) + " days";
-}
-
-// A video's length, as a player shows it. X reports duration in MILLISECONDS —
-// feeding it to secs() above turns a 5-minute clip into "3 days".
-function clock(ms){
-  const t = Math.round(ms/1000), m = Math.floor(t/60), s = t % 60;
-  if (m < 60) return `${m}:${String(s).padStart(2,"0")}`;
-  return `${Math.floor(m/60)}:${String(m%60).padStart(2,"0")}:${String(s).padStart(2,"0")}`;
-}
-
-/* Distinguishes "the server is not running" from "the server said no".
-   A bare "Failed to fetch" is useless — it is what the browser says when the
-   backend is simply gone, which is the single most likely cause. */
-async function api(url, opts){
-  let r;
-  try {
-    r = await fetch(url, opts);
-  } catch (e) {
-    throw new Error("Cannot reach the collector. It may have stopped — " +
-                    "reload the page in a moment.");
-  }
-  const d = await r.json().catch(() => ({error: `HTTP ${r.status}`}));
-  if (!r.ok) throw new Error(d.error || `HTTP ${r.status}`);
-  return d;
-}
-
-function banner(msg, kind){
-  $("#banner").innerHTML = msg ? `<div class="banner ${kind||''}">${msg}</div>` : "";
-}
-
-"""
 
 _SIGNIN_PAGE = r"""<!doctype html>
 <html lang="en"><head>
@@ -2196,1113 +1947,85 @@ start();
 """
 
 
-_DASH_BODY = r"""</style></head><body>
+# _DASH_BODY now lives in static/index.html
 
-<header>
-  <div class="brand"><span class="logo">◎</span>Collector</div>
-  <div class="seg" role="tablist" aria-label="Source">
-    <button type="button" class="segbtn" aria-selected="true" onclick="switchPlatform('x',this)"><span class="mk x">&#120143;</span>X</button>
-    <button type="button" class="segbtn" aria-selected="false" onclick="switchPlatform('ig',this)"><span class="mk ig">&#9678;</span>Instagram</button>
-    <button type="button" class="segbtn" disabled><span class="mk fb">f</span>Facebook <span class="soon">soon</span></button>
-  </div>
 
-  <span id="xctl" class="hdrctl">
-    <select id="src" title="What the Get new tweets button should fetch">
-      <option value="search">words</option>
-      <option value="list">a list</option>
-    </select>
-    <input id="q" placeholder="Type words to find in the tweets you have saved…" autofocus>
-    <button class="primary" id="go">Search</button>
-    <!-- Duration is top-level, not inside Filters. It is the control you change
-         most and the one that most changes what "no results" means, so hiding
-         it behind a panel made an empty feed look like a broken collector. -->
-    <select id="since" title="Only tweets POSTED inside this window">
-      <option value="1h">1 hour</option>
-      <option value="6h">6 hours</option>
-      <option value="12h">12 hours</option>
-      <option value="24h" selected>Last 24 hours</option>
-      <option value="48h">Last 48 hours</option>
-      <option value="7d">Last 7 days</option>
-      <option value="30d">Last 30 days</option>
-      <option value="">Any time</option>
-    </select>
-    <button id="filtbtn" title="Narrow what is shown, without asking X for anything">
-      &#9776; Filters <span id="filtcount" class="filtcount" hidden></span></button>
-    <select id="pages" title="How many tweets to ask X for">
-      <option value="1">about 20 tweets</option>
-      <option value="3">about 60 tweets</option>
-      <option value="5" selected>about 100 tweets</option>
-      <option value="10">about 200 tweets</option>
-      <option value="25">about 500 tweets</option>
-    </select>
-    <button id="getnew" title="Asks X for tweets you do not have yet">Get new tweets</button>
-    <button id="csv">Download</button>
-    <label class="livetog" title="Checks for tweets saved since you loaded this page. It does not contact X, so it is free.">
-      <input type="checkbox" id="autorefresh" checked>
-      <span id="livedot"></span>Auto-update
-      <select id="everysec">
-        <option value="15" selected>every 15s</option>
-        <option value="30">every 30s</option>
-        <option value="60">every 60s</option>
-      </select>
-    </label>
-  </span>
 
-  <span id="igctl" class="hdrctl" hidden>
-    <input id="ig_q" placeholder="Filter Instagram posts by @username…">
-    <select id="ig_since" title="Only posts published inside this window">
-      <option value="24h" selected>past 24 hours</option>
-      <option value="1h">past hour</option>
-      <option value="7d">past week</option>
-      <option value="">any time</option>
-    </select>
-    <button id="ig_refresh">Refresh</button>
-    <label class="livetog" title="Re-reads the local database. It never contacts Instagram, so it is free and cannot be rate limited.">
-      <input type="checkbox" id="ig_autorefresh" checked>
-      <span id="ig_livedot"></span>Live
-      <select id="ig_everysec">
-        <option value="30" selected>every 30s</option>
-        <option value="60">every 60s</option>
-        <option value="300">every 5m</option>
-      </select>
-    </label>
-  </span>
+# _DASH_JS now lives in static/app.js
 
-  <a href="/logout" class="muted" style="font-size:13px;margin-left:auto">Sign out</a>
-</header>
-
-<!-- Filters. Every one of these runs against the database we already have, so
-     opening this panel and applying it costs NOTHING at X and cannot be rate
-     limited — unlike "Get new tweets" beside it. Category and Verified read
-     user.blueType / user.blue out of the stored raw tweet, so they are real
-     values rather than a heuristic on the text. -->
-<div id="filters" hidden>
-  <div class="filtgrid">
-    <label>Category
-      <select id="f_category">
-        <option value="">Any</option>
-        <option value="Government">Government</option>
-        <option value="Business">Business</option>
-      </select></label>
-    <label>Language
-      <input id="lang" placeholder="Any" title="Two-letter code, e.g. en or hi"></label>
-    <label>Min views
-      <input id="f_min_views" type="number" min="0" placeholder="e.g. 1000"></label>
-    <label>Min followers
-      <input id="f_min_followers" type="number" min="0" placeholder="e.g. 10000"></label>
-    <label>Min likes
-      <input id="minlikes" type="number" min="0" placeholder="e.g. 50"></label>
-    <label>From account
-      <input id="author" placeholder="from @someone"></label>
-    <label>From date <input id="f_from" type="date"></label>
-    <label>To date <input id="f_to" type="date"></label>
-  </div>
-  <div class="filtrow">
-    <label class="filtchk"><input type="checkbox" id="f_verified"> Verified only</label>
-    <label class="filtchk"><input type="checkbox" id="media"> Has photo or video</label>
-    <label class="filtchk"><input type="checkbox" id="noretweets"> Hide retweets</label>
-  </div>
-  <div class="filtrow">
-    <button class="primary" id="f_apply">Apply</button>
-    <button id="f_clear">Clear all</button>
-    <span id="f_summary" class="muted"></span>
-  </div>
-</div>
-
-<div id="banner"></div>
-
-<!-- ================= X (TWITTER) VIEW ================= -->
-<div id="view-x">
-  <div class="kpi">
-    <div class="tile"><div class="l">Saved so far</div><div class="v" id="kpi-saved">—</div></div>
-    <div class="tile"><div class="l">Watching</div><div class="v" id="kpi-watch">—</div></div>
-    <div class="tile"><div class="l">Accounts</div><div class="v" id="kpi-acct">—</div></div>
-  </div>
-
-  <!-- Sorting and the result count stay out here. They are not filters — they
-       do not change WHICH tweets match, so hiding them behind the panel would
-       cost a click for something you read constantly. -->
-  <div class="filters">
-    <select id="order"><option value="desc">newest first</option><option value="asc">oldest first</option></select>
-    <span class="muted" id="count"></span>
-    <span class="muted" id="activefilters"></span>
-  </div>
-
-  <div class="wrap">
-    <main>
-      <div id="newbar"><button id="newbtn"></button></div>
-      <div id="results"><p class="muted">Loading…</p></div>
-    </main>
-    <aside>
-      <div class="box" id="riskbox" hidden>
-        <h2>Needs your attention</h2>
-        <div id="risks"></div>
-      </div>
-      <div class="box">
-        <h2>What we are watching</h2>
-        <div id="streams"><span class="muted">—</span></div>
-        <button id="tgtoggle" class="linky" style="margin-top:6px">⚙ Telegram &amp; settings</button>
-        <div id="tgbox" hidden style="margin-top:6px;display:grid;gap:5px">
-          <p class="muted" style="margin:0">Send new tweets straight to Telegram. Make a bot by messaging <b>@BotFather</b>, then paste what it gives you here. Switch it on per list with the ⚙ next to that list.</p>
-          <input id="tg_token" placeholder="bot token from @BotFather" autocomplete="off">
-          <input id="tg_chat" placeholder="chat id, e.g. -1001234567890">
-          <p class="muted" style="margin:0;font-size:11px">Not sure of the chat id? Add the bot to your group, send it a message, then open api.telegram.org/bot&lt;token&gt;/getUpdates — the id is in there.</p>
-          <div style="display:flex;gap:6px">
-            <button id="tg_save" class="primary" style="flex:1;padding:5px;font-size:13px">Save</button>
-            <button id="tg_test" style="padding:5px 10px;font-size:13px">Send a test</button>
-          </div>
-        </div>
-      </div>
-      <div class="box">
-        <h2>X accounts</h2>
-        <div id="accounts"><span class="muted">—</span></div>
-        <a href="/accounts" class="linky" style="display:block;margin-top:6px">Manage accounts →</a>
-      </div>
-      <div class="box">
-        <h2>Saved so far</h2>
-        <div id="totals"><span class="muted">—</span></div>
-      </div>
-      <div class="box">
-        <h2>Search tips</h2>
-        <p class="muted" style="margin:0"><code>from:someone</code> — only their posts<br>
-        <code>-filter:replies</code> — skip replies<br>
-        <code>lang:en</code> — English only<br>
-        <code>min_faves:50</code> — at least 50 likes</p>
-      </div>
-    </aside>
-  </div>
-</div>
-
-<!-- ================= INSTAGRAM VIEW ================= -->
-<div id="view-ig" hidden>
-  <div class="kpi">
-    <div class="tile"><div class="l">Posts collected</div><div class="v" id="ig-kpi-posts">—</div></div>
-    <div class="tile"><div class="l">Sources</div><div class="v" id="ig-kpi-sources">—</div></div>
-    <div class="tile"><div class="l">Accounts</div><div class="v" id="ig-kpi-acct">—</div></div>
-  </div>
-  <div class="wrap">
-    <main>
-      <div id="ig-results"><p class="muted">Loading Instagram posts…</p></div>
-    </main>
-    <aside>
-      <div class="box">
-        <h2>Instagram sources</h2>
-        <div id="ig-sources"><span class="muted">—</span></div>
-        <p class="muted" style="margin:8px 0 0;font-size:12px">Add with <code>collect_ig.py add-source</code>.</p>
-      </div>
-      <div class="box">
-        <h2>Instagram accounts</h2>
-        <div id="ig-accounts"><span class="muted">—</span></div>
-        <a href="/accounts" class="linky" style="display:block;margin-top:6px">Manage accounts →</a>
-      </div>
-      <div class="box">
-        <h2>How Instagram is collected</h2>
-        <p class="muted" style="margin:0">Collected headlessly by <code>collect_ig.py</code> into <code>ig_results.db</code>, and served to Watch-Tower through the API (<code>api.py</code>). This view reads that same store.</p>
-      </div>
-    </aside>
-  </div>
-</div>
-
-<script>
-// ---- source switching: swaps the whole view, not just styling ----
-function igset(id, v){ var e = document.getElementById(id); if(e) e.textContent = v; }
-
-function switchPlatform(p, el){
-  document.querySelectorAll('.seg .segbtn').forEach(function(b){
-    b.setAttribute('aria-selected', b === el ? 'true' : 'false');
-  });
-  document.getElementById('view-x').hidden  = (p !== 'x');
-  document.getElementById('view-ig').hidden = (p !== 'ig');
-  document.getElementById('xctl').hidden  = (p !== 'x');
-  document.getElementById('igctl').hidden = (p !== 'ig');
-  // Only the visible tab polls. Leaving both timers running would re-query the
-  // database for a view nobody is looking at.
-  if(p === 'ig'){ loadIG(); setIGLive(document.getElementById('ig_autorefresh').checked); }
-  else { setIGLive(false); }
-}
-
-function igCard(pst){
-  var a = (pst.author && pst.author.username) || '';
-  var m = pst.metrics || {};
-  var when = pst.created_at ? ago(pst.created_at) : '';
-  return '<article class="card"><div class="top">'
-    + '<span class="name">@' + esc(a) + '</span>'
-    + '<span class="when">· ' + esc(when) + '</span>'
-    + '<span class="handle">· ' + esc(pst.source || '') + '</span></div>'
-    + '<div class="text">' + esc(pst.text || '') + '</div>'
-    + '<div class="metrics"><span>♥ ' + (m.likes ?? 0) + '</span>'
-    + '<span>💬 ' + (m.comments ?? 0) + '</span>'
-    + (m.views ? '<span>▶ ' + m.views + '</span>' : '')
-    + '<a href="' + esc(pst.url || '#') + '" target="_blank" rel="noopener" style="margin-left:auto">open ↗</a></div></article>';
-}
-
-async function loadIG(){
-  try{
-    var st = await api('/api/ig/status');
-    igset('ig-kpi-posts', ((st.totals && st.totals.posts) || 0).toLocaleString());
-    igset('ig-kpi-sources', (st.sources || []).length + ' sources');
-    var live = (st.accounts || []).filter(function(a){return a.active;}).length;
-    igset('ig-kpi-acct', live + ' active');
-    var srcs = st.sources || [];
-    document.getElementById('ig-sources').innerHTML = srcs.length
-      ? srcs.map(function(s){ return '<div class="row"><span>' + esc(s.type)
-          + (s.value ? ' · ' + esc(s.value) : '') + '</span><span class="muted">'
-          + esc(s.label) + '</span></div>'; }).join('')
-      : '<span class="muted">no sources yet</span>';
-    var accs = st.accounts || [];
-    document.getElementById('ig-accounts').innerHTML = accs.length
-      ? accs.map(function(a){ return '<div class="row"><span class="name">@' + esc(a.username||'')
-          + '</span><span class="flag ' + (a.active?'live':'dead') + '">' + (a.active?'live':'off')
-          + '</span></div>'; }).join('')
-      : '<span class="muted">no Instagram account signed in</span>';
-  }catch(e){ /* keep going to posts */ }
-  await loadIGPosts();
-}
-
-async function loadIGPosts(){
-  var el = document.getElementById('ig-results');
-  try{
-    var qv = (document.getElementById('ig_q').value || '').trim().replace(/^@/, '');
-    var sn = document.getElementById('ig_since').value;
-    var d = await api('/api/ig/posts?limit=50'
-      + (qv ? '&username=' + encodeURIComponent(qv) : '')
-      + (sn ? '&since=' + encodeURIComponent(sn) : ''));
-
-    // An empty result inside a WINDOW means something different from an empty
-    // database, and saying "nothing collected yet" when 200 posts exist just
-    // older than a day sends you hunting a bug that is not there.
-    var windowName = document.getElementById('ig_since');
-    var label = windowName.options[windowName.selectedIndex].text;
-    el.innerHTML = (d.posts && d.posts.length)
-      ? d.posts.map(igCard).join('')
-      : (sn
-          ? '<div class="empty">Nothing posted in the ' + esc(label) + '.'
-            + '<br><span class="muted">The collector is watching; this is what '
-            + '"no new posts" looks like. Widen the window to see older ones.</span></div>'
-          : '<div class="empty">No Instagram posts collected yet.'
-            + '<br><span class="muted">Run <code>python3 collect_ig.py run</code> '
-            + 'once a source is added.</span></div>');
-  }catch(e){ el.innerHTML = '<span class="muted">could not load Instagram posts</span>'; }
-}
-
-/* Live re-read of the LOCAL database — it never calls Instagram, so unlike the
-   collector it costs nothing and can run as often as you like. Kept separate
-   from the X timer so switching tabs does not leave the other one polling. */
-var igTimer = null;
-function setIGLive(on){
-  var dot = document.getElementById('ig_livedot');
-  if (dot) dot.classList.toggle('on', on);
-  if (igTimer) clearInterval(igTimer);
-  igTimer = on
-    ? setInterval(function(){ if (!document.hidden) loadIG(); },
-                  parseInt(document.getElementById('ig_everysec').value, 10) * 1000)
-    : null;
-}
-
-document.getElementById('ig_refresh').onclick = loadIG;
-document.getElementById('ig_q').addEventListener('keydown', function(e){ if(e.key === 'Enter') loadIGPosts(); });
-document.getElementById('ig_since').onchange = loadIGPosts;
-document.getElementById('ig_autorefresh').onchange = function(){ setIGLive(this.checked); };
-document.getElementById('ig_everysec').onchange = function(){
-  setIGLive(document.getElementById('ig_autorefresh').checked); };
-</script>
-
-"""
-
-
-_DASH_JS = r"""const PAGE_SIZE = 100;
-let offset = 0, loaded = 0, lastTotal = 0;
-
-/* Built in ONE place so search, the auto-update tick and Download can never
-   disagree about what is being shown. A filter added here is applied by all
-   three; a filter added at a call site would silently apply to one of them. */
-function params(){
-  const p = new URLSearchParams();
-  const add = (k,v) => { if(v) p.set(k,v); };
-  add("q", $("#q").value.trim());
-  add("author", $("#author").value.trim());
-  add("since", $("#since").value);
-  add("min_likes", $("#minlikes").value);
-  add("min_views", $("#f_min_views").value);
-  add("min_followers", $("#f_min_followers").value);
-  add("from_date", $("#f_from").value);
-  add("to_date", $("#f_to").value);
-  add("category", $("#f_category").value);
-  add("lang", $("#lang").value.trim());
-  add("order", $("#order").value);
-  add("stream", activeStream);
-  if ($("#f_verified").checked) p.set("verified","1");
-  if ($("#media").checked) p.set("has_media","1");
-  if ($("#noretweets").checked) p.set("no_retweets","1");
-  return p;
-}
-
-/* What is narrowing the results, in words, always on screen. A filter you
-   forgot you set reads as "the collector stopped finding things" — which is
-   the single most expensive misreading this dashboard can produce. */
-const FILTER_LABELS = {
-  author: "from", since: "within", min_likes: "min likes", min_views: "min views",
-  min_followers: "min followers", from_date: "from", to_date: "to",
-  category: "category", lang: "language", verified: "verified only",
-  has_media: "has media", no_retweets: "no retweets",
-};
-
-function durationLabel(){
-  const el = $("#since");
-  return el && el.value ? el.options[el.selectedIndex].text.toLowerCase() : "";
-}
-
-function describeFilters(){
-  const p = params();
-  const bits = [];
-  for (const [k, name] of Object.entries(FILTER_LABELS)) {
-    const v = p.get(k);
-    if (!v) continue;
-    if (k === "since") { bits.push(durationLabel()); continue; }
-    bits.push(v === "1" ? name : `${name} ${v}`);
-  }
-  return bits;
-}
-
-function refreshFilterChrome(){
-  const bits = describeFilters();
-  const n = $("#filtcount"), a = $("#activefilters"), s = $("#f_summary");
-  if (n){ n.textContent = bits.length; n.hidden = bits.length === 0; }
-  if (a) a.textContent = bits.length ? "· filtered: " + bits.join(", ") : "";
-  if (s) s.textContent = bits.length
-    ? `${bits.length} filter${bits.length>1?"s":""} — applies to what you see and to Download`
-    : "No filters. Everything collected is shown.";
-}
-
-async function search(append){
-  if (!append){ offset = 0; loaded = 0; }
-  const p = params();
-  p.set("limit", PAGE_SIZE);
-  p.set("offset", offset);
-
-  let d;
-  try { d = await api("/api/tweets?" + p); }
-  catch (e) { return banner(esc(e.message).replace(/\n/g,"<br>"), "err"); }
-  banner("");
-
-  lastTotal = d.total || 0;
-  loaded += (d.rows || []).length;
-  $("#count").textContent = lastTotal
-    ? `showing ${loaded} of ${lastTotal}` : "nothing found";
-
-  if (!d.rows || !d.rows.length){
-    if (!append) {
-      const win = durationLabel();
-      $("#results").innerHTML = `<div class="empty">`
-        + (win ? `Nothing posted in the ${esc(win)}.`
-               : `No saved tweets match that.`)
-        + `<br><span class="muted">`
-        + (win ? `Widen <b>Duration</b> above to see older tweets. `
-               : ``)
-        + ($("#q").value.trim()
-            ? 'Or press <b>Get new tweets</b> to ask X for them.' : '')
-        + `</span></div>`;
-    }
-    return;
-  }
-  const html = d.rows.map(card).join("");
-  if (append) $("#more")?.remove(), $("#results").insertAdjacentHTML("beforeend", html);
-  else {
-    // A fresh search resets the high-water mark, otherwise changing filters
-    // would suppress everything older than whatever the previous filter showed.
-    $("#results").innerHTML = html;
-    topId = null; pending = []; $("#newbar").style.display = "none";
-  }
-  noteTop(d.rows);
-
-  if (loaded < lastTotal){
-    $("#results").insertAdjacentHTML("beforeend",
-      `<button id="more" style="width:100%;padding:10px">Show ${
-        Math.min(PAGE_SIZE, lastTotal - loaded)} more (${lastTotal - loaded} left)</button>`);
-    $("#more").onclick = () => { offset += PAGE_SIZE; search(true); };
-  }
-}
-
-/* Media rendering.
-   mp4s from video.twimg.com play inline — the URL in media_urls is the direct
-   file (verified: 200 video/mp4, byte-range capable), so a plain <video> works.
-   X BROADCASTS CANNOT BE PREVIEWED: x.com sends
-   `frame-ancestors 'self' https://x.com`, so any iframe from this page is
-   refused by the browser. They get an honest labelled link instead of an
-   embed that would render as a blank box. */
-const YT = /(?:youtube\.com\/watch\?v=|youtu\.be\/)([A-Za-z0-9_-]{11})/;
-
-function mediaHtml(t){
-  const bits = [];
-
-  /* Videos show their THUMBNAIL until you click.
-
-     Every card used to mount a real <video> pointing at video.twimg.com.
-     Even with preload="metadata" that is a request per clip, so scrolling a
-     page of 100 tweets pulled dozens of videos nobody watched — and X's media
-     URLs are signed and expire, so most of them came back 403 and rendered as
-     black boxes. A still is a few tens of KB against several MB, and it cannot
-     expire into a broken player.
-
-     media[] carries {type,url,thumb}. Older rows have only the flat
-     media_urls, so fall back to the previous behaviour for those rather than
-     showing them nothing. */
-  const media = (t.media && t.media.length)
-    ? t.media
-    : (t.media_urls || []).map(u => ({
-        type: /\.(jpg|jpeg|png|webp)(\?|$)/i.test(u) ? "photo"
-            : /\.mp4(\?|$)/i.test(u) ? "video" : "other",
-        url: u, thumb: null }));
-
-  for (const m of media){
-    if (m.type === "photo"){
-      bits.push(`<img src="${esc(m.thumb || m.url)}" loading="lazy" alt="">`);
-    } else if (m.type === "video" || m.type === "gif"){
-      const dur = m.duration ? `<span class="dur">${clock(m.duration)}</span>` : "";
-      bits.push(m.thumb
-        ? `<button class="playwrap" data-play="${esc(m.url)}" data-kind="${esc(m.type)}"
-                   title="Play">
-             <img src="${esc(m.thumb)}" loading="lazy" alt="">
-             <span class="playbtn">▶</span>${dur}
-           </button>`
-        : `<video src="${esc(m.url)}" controls preload="none"
-                  playsinline muted loop></video>`);
-    } else if (/\.m3u8(\?|$)/i.test(m.url)){
-      bits.push(`<a class="medialink" href="${esc(m.url)}" target="_blank" rel="noopener">
-                   <b>Video stream</b><span>cannot play here — opens in a new tab</span></a>`);
-    }
-  }
-
-  for (const u of (t.urls || [])){
-    const yt = u.match(YT);
-    if (yt){
-      bits.push(`<iframe class="yt" src="https://www.youtube-nocookie.com/embed/${esc(yt[1])}"
-                  loading="lazy" allowfullscreen
-                  referrerpolicy="strict-origin-when-cross-origin"></iframe>`);
-    } else if (/x\.com\/i\/broadcasts\//.test(u) || /pscp\.tv/.test(u)){
-      bits.push(`<a class="medialink live" href="${esc(u)}" target="_blank" rel="noopener">
-                   <b>● Live broadcast</b>
-                   <span>X does not allow these to play here — opens on x.com</span></a>`);
-    }
-  }
-  return bits.length ? `<div class="media">${bits.join("")}</div>` : "";
-}
-
-function card(t){
-  const media = mediaHtml(t);
-  return `<article class="card">
-    <div class="top">
-      <span class="name">${esc(t.author_display_name || t.author_username)}</span>
-      <span class="handle">@${esc(t.author_username)}</span>
-      <span class="when">· ${ago(t.created_at)}</span>
-      ${t.lang ? `<span class="handle">· ${esc(t.lang)}</span>` : ""}
-    </div>
-    <div class="text">${esc(t.text)}</div>
-    ${media}
-    <div class="metrics">
-      <span>♥ ${num(t.like_count)}</span>
-      <span>⟳ ${num(t.retweet_count)}</span>
-      <span>↩ ${num(t.reply_count)}</span>
-      ${t.view_count ? `<span>👁 ${num(t.view_count)}</span>` : ""}
-      ${t.lag_ms != null ? `<span title="how long after it was posted we saved it">⏱ ${(t.lag_ms/1000).toFixed(1)}s</span>` : ""}
-      <a href="${esc(t.url)}" target="_blank" rel="noopener">see on X ↗</a>
-    </div>
-  </article>`;
-}
-
-async function status(){
-  let d;
-  try { d = await api("/api/status"); }
-  catch (e) {
-    $("#accounts").innerHTML = '<span class="muted">server unreachable</span>';
-    return banner(esc(e.message).replace(/\n/g,"<br>"), "err");
-  }
-
-  const all = d.streams || [];
-
-  $("#streams").innerHTML = all.length
-    ? `<button class="streambtn ${activeStream?'':'active'}" data-s="">Everything</button>` +
-      all.map(s => `<div class="streamrow">
-        <button class="streambtn ${activeStream===s.label?'active':''} ${s.paused?'off':''}"
-          data-s="${esc(s.label)}" title="${esc(s.query || s.label)}">
-          ${esc(s.label)} <span class="muted">· ${s.count} tweets</span>
-          ${s.paused ? '<span class="muted">· paused</span>' : ''}
-          ${s.tg_enabled ? '<span class="tgon">· → Telegram</span>' : ''}
-          ${!s.watched && s.tg_enabled
-              ? '<span class="warnbit">· starting — restart the watcher if this stays</span>'
-              : (!s.watched
-                  ? '<span class="warnbit">· one-off search, not being watched</span>' : '')}
-          ${s.lag_p50!=null ? `<span class="muted">· usually saved ${secs(s.lag_p50)} after posting</span>`:''}
-        </button>
-        <button class="streamx" data-gear="${esc(s.label)}" title="Settings">⚙</button>
-      </div>
-      <div class="streamcfg" data-cfg="${esc(s.label)}" hidden></div>`).join("")
-    : '<span class="muted">nothing yet</span>';
-
-  document.querySelectorAll(".streambtn").forEach(b =>
-    b.onclick = () => { activeStream = b.dataset.s; status(); search(); });
-
-  // Bind in the same pass that draws them: status() replaces this whole panel
-  // every 15s, so anything bound earlier belongs to nodes that no longer exist.
-  document.querySelectorAll("[data-gear]").forEach(b => b.onclick = () => {
-    const label = b.dataset.gear;
-    // Closing a panel with unsent edits is how a configuration silently fails
-    // to exist. Ask rather than discard.
-    if (cfgDirty && openCfg === label &&
-        !confirm("You have unsaved settings.\n\nClose without sending them?")) return;
-    cfgDirty = false;
-    openCfg = (openCfg === label) ? null : label;
-    drawCfg(all);
-  });
-  drawCfg(all);
-
-  /* Only what you glance at.
-     The reasons, remedies and per-account facts moved to /accounts — in a
-     300px column every unhealthy account produced a paragraph of small grey
-     text, and none of it is something you act on mid-search. What matters here
-     is "is anything collecting", and if not, that something is wrong. */
-  /* "Collecting" is `active`, NOT status === "live".
-     Amber is not a weaker red (R12): an account with no proxy and no
-     known-device cookie is flagged amber and is collecting perfectly well.
-     Counting only green made this box announce "Nothing is collecting right
-     now" while the one account was, in fact, collecting. */
-  const accts  = d.accounts || [];
-  const good   = accts.filter(a => a.active);
-  const bad    = accts.length - good.length;
-
-  $("#accounts").innerHTML = accts.length
-    ? good.map(a => `<div class="row">
-          <span class="k">@${esc(a.username)}${a.proxy?' <span title="uses a proxy">⛓</span>':''}</span>
-          <span class="flag ${a.status === "warning" ? "warning" : "live"}">${
-            a.status === "warning" ? "Working*" : "Working"}</span>
-        </div>`).join("")
-      // Never silently omit the unhealthy ones: an empty panel and a panel
-      // hiding three dead accounts must not look the same (R12).
-      + (bad ? `<div class="row"><span class="k">${bad} not collecting</span>
-                  <span class="flag ${good.length ? "warning" : "dead"}">see below</span></div>` : "")
-      + (good.length ? "" : '<div class="muted">Nothing is collecting right now.</div>')
-    : '<span class="muted">none yet</span>';
-
-  // Both queues, named. They are separate allowances that do not share, so
-  // showing one number invites spending the wrong budget.
-  const QNAME = {search: "word searches", list: "lists"};
-  const budget = Object.entries(d.budget || {}).map(([q, b]) =>
-    `<div class="row"><span class="k">${QNAME[q] || q}</span>
-       <span>${b.remaining} of ${b.limit}</span></div>` +
-    (b.resets_in != null
-      ? `<div class="muted" style="margin:-2px 0 4px 2px;font-size:11px">
-           ${b.rolled ? "window reset — full again"
-                      : `resets in ${secs(b.resets_in)}`}</div>` : "")
-  ).join("");
-
-  $("#totals").innerHTML =
-    `<div class="row"><span class="k">tweets</span><span>${d.totals.tweets ?? 0}</span></div>` +
-    (budget ? `<div class="cfghead" style="margin-top:6px">Requests left</div>` + budget : "") +
-    (d.totals.note ? `<div class="muted">${esc(d.totals.note)}</div>` : "");
-
-  const kset = (id, v) => { const e = $("#" + id); if (e) e.textContent = v; };
-  kset("kpi-saved", (d.totals.tweets ?? 0).toLocaleString());
-  kset("kpi-watch", all.length + (all.length === 1 ? " source" : " sources"));
-  kset("kpi-acct", (d.accounts || []).filter(a => a.active).length + " active");
-}
-
-/* ------------------------------------------------------------------
-   Per-stream settings, behind the gear.
-
-   Kept collapsed and rendered on demand: the sidebar redraws every 15s, and
-   an always-open form would fight whatever you were typing into it. Only the
-   one you opened is built, and it survives the redraw because openCfg is
-   module state rather than DOM state.
-   ------------------------------------------------------------------ */
-const SPEED_LABELS = {"":"leave as configured", fastest:"as fast as allowed (~5s)",
-  fast:"every 15s or so", normal:"every minute or so", slow:"every 5 minutes or so",
-  quarter:"every 15 minutes or so", hourly:"every half hour or so"};
-
-function drawCfg(streams){
-  document.querySelectorAll("[data-cfg]").forEach(box => {
-    const label = box.dataset.cfg;
-    if (label !== openCfg){ box.hidden = true; box.innerHTML = ""; return; }
-
-    // NEVER rebuild a panel that has unsent edits in it. status() redraws this
-    // sidebar every 15s and after every save, and a rebuild replaces innerHTML
-    // — so a chat id typed but not yet sent was being destroyed on a timer,
-    // with no error and no sign it had happened. Leaving the DOM alone while
-    // it is dirty is what makes "type it, then press Save" reliable.
-    if (cfgDirty && box.innerHTML){ box.hidden = false; return; }
-
-    const s = streams.find(x => x.label === label) || {};
-    box.hidden = false;
-    box.innerHTML = `
-      <label class="cfgrow">How often to check
-        <select data-k="speed">${Object.entries(SPEED_LABELS).map(([v,t]) =>
-          `<option value="${v}" ${s.speed===v?"selected":""}>${t}</option>`).join("")}</select>
-      </label>
-      <label class="cfgrow">Tweets per check
-        <select data-k="pages">
-          <option value="">leave as configured</option>
-          <option value="1"  ${s.pages===1?"selected":""}>about 20</option>
-          <option value="5"  ${s.pages===5?"selected":""}>about 100</option>
-          <option value="10" ${s.pages===10?"selected":""}>about 200</option>
-        </select>
-      </label>
-      <label class="cfgchk"><input type="checkbox" data-k="paused" ${s.paused?"checked":""}>
-        Pause — stop checking this for now</label>
-
-      <div class="cfghead">Send to Telegram</div>
-      <label class="cfgchk"><input type="checkbox" data-k="tg_enabled" ${s.tg_enabled?"checked":""}>
-        Watch this continuously and send every new tweet to Telegram</label>
-      <div class="cfgnote">Switching this on also makes the collector keep
-        checking ${esc(s.query || s.label)} on its own — it is not just a
-        forwarding switch. Only tweets found <b>after</b> you save are sent;
-        what is already collected is not resent.</div>
-      <label class="cfgrow">Send where
-        <input data-k="tg_chat_id" placeholder="e.g. -1003964750953 or @mychannel"
-               value="${esc(s.tg_chat_id||"")}"></label>
-      <label class="cfgrow">Only if it has at least this many likes
-        <input data-k="tg_min_likes" type="number" min="0"
-               value="${s.tg_min_likes||0}"></label>
-      <label class="cfgchk"><input type="checkbox" data-k="tg_skip_retweets"
-        ${s.tg_skip_retweets?"checked":""}> Skip retweets</label>
-      <label class="cfgchk"><input type="checkbox" data-k="tg_skip_replies"
-        ${s.tg_skip_replies?"checked":""}> Skip replies</label>
-      <label class="cfgrow">Only if POSTED within this many hours (0 = no limit)
-        <input data-k="tg_max_age_h" type="number" min="0"
-               value="${s.tg_max_age_h||0}"></label>
-      <div class="cfgnote">Delivery normally keys on when a tweet was
-        <b>collected</b>, so a stream that has just started sends its whole
-        backlog — posts weeks old arriving as if new. This bounds it by when the
-        tweet was actually <b>published</b>.</div>
-
-      <div class="cfgsave">
-        <button class="cfgbtn primary" data-save>Save settings</button>
-        <button class="cfgbtn" data-tgtest>Send 3 test tweets</button>
-        <span class="cfgdirty" data-dirty hidden>not sent yet</span>
-      </div>
-
-      <div class="cfghead">Remove</div>
-      <button class="cfgbtn" data-act="stop">Stop watching — keep the tweets</button>
-      <button class="cfgbtn danger" data-act="wipe">Delete this and its tweets</button>
-      <div class="muted" style="margin-top:4px;font-size:11px">
-        Stopping is reversible. Deleting is not — X only lets you look back
-        about 7 days.</div>`;
-
-    // ONE EXPLICIT SEND, carrying every field.
-    //
-    // This replaced a per-control autosave bound to `onchange`. That looked
-    // tidier and was quietly broken for the fields that mattered most: on a
-    // text input `onchange` fires only on BLUR, so typing a Telegram chat id
-    // and then clicking the enable checkbox sent the checkbox and never the
-    // chat id. The stream ended up enabled with nowhere to send, which the
-    // backend logs as "enabled but no chat id — skipping" and the operator
-    // sees as silence. Marking dirty on `input` and sending the whole form on
-    // one press removes the entire class of bug.
-    const markDirty = () => {
-      cfgDirty = true;
-      const tag = box.querySelector("[data-dirty]");
-      if (tag) tag.hidden = false;
-    };
-    box.querySelectorAll("[data-k]").forEach(el => {
-      el.oninput = markDirty;
-      el.onchange = markDirty;
-    });
-
-    box.querySelector("[data-save]").onclick = async (ev) => {
-      const btn = ev.currentTarget;
-      const body = {label};
-      box.querySelectorAll("[data-k]").forEach(el => {
-        body[el.dataset.k] = el.type === "checkbox" ? el.checked : el.value;
-      });
-      btn.disabled = true;
-      try {
-        const r = await api("/api/stream/settings", {
-          method:"POST", headers:{"Content-Type":"application/json"},
-          body: JSON.stringify(body)
-        });
-        if (r.error) return banner(esc(r.error), "err");
-        // Only now is it safe to let the redraw rebuild this panel.
-        cfgDirty = false;
-        const tag = box.querySelector("[data-dirty]");
-        if (tag) tag.hidden = true;
-        banner(body.tg_enabled
-          ? `Saved. Sending <b>${esc(label)}</b> to Telegram ${esc(body.tg_chat_id || "(default chat)")}.`
-          : `Saved settings for <b>${esc(label)}</b>.`, "ok");
-        await status();
-      } catch (e) { banner(esc(e.message), "err"); }
-      finally { btn.disabled = false; }
-    };
-
-    // Tests THIS stream with THIS panel's chat id, including one you have
-    // typed but not yet saved — otherwise "test" would check the old value and
-    // tell you the new one works.
-    box.querySelector("[data-tgtest]").onclick = async (ev) => {
-      const btn = ev.currentTarget;
-      const chat = (box.querySelector('[data-k="tg_chat_id"]').value || "").trim();
-      btn.disabled = true;
-      banner("Sending 3 real tweets to Telegram…");
-      try {
-        const d = await api("/api/settings/telegram/test", {
-          method:"POST", headers:{"Content-Type":"application/json"},
-          body: JSON.stringify({chat_id: chat, stream: label})
-        });
-        banner(d.error ? "Telegram said: " + esc(d.error)
-             : (d.real ? `Sent ${d.sent} real tweet(s) from <b>${esc(label)}</b>, one per message.`
-                       : "Bot and chat id work, but this stream has no tweets yet."),
-               d.error ? "err" : "ok");
-      } catch (e) { banner(esc(e.message), "err"); }
-      finally { btn.disabled = false; }
-    };
-
-    box.querySelectorAll("[data-act]").forEach(b => b.onclick = () =>
-      removeStream(label, b.dataset.act === "wipe", s.count || 0));
-  });
-}
-
-async function removeStream(label, wipe, count){
-  let body = {label};
-  if (wipe){
-    const typed = prompt(
-      `Delete "${label}" AND its ${count} tweets?\n\n` +
-      `This cannot be undone. X only lets you look back about 7 days, so ` +
-      `anything older than that can never be collected again.\n\n` +
-      `Tweets also matched by another list are kept.\n\n` +
-      `Type the name to confirm:`);
-    if (typed === null) return;
-    body = {label, delete_tweets: true, confirm: typed.trim()};
-  } else if (!confirm(`Stop watching "${label}"?\n\n` +
-                      `Its ${count} tweets stay and are still searchable.`)) {
-    return;
-  }
-  let d;
-  try {
-    d = await api("/api/stream/remove", {
-      method:"POST", headers:{"Content-Type":"application/json"},
-      body: JSON.stringify(body)
-    });
-  } catch (e) { return banner(esc(e.message), "err"); }
-  if (d.error) return banner(esc(d.error), "err");
-
-  if (activeStream === label) activeStream = "";
-  openCfg = null;
-  banner(wipe
-    ? `Deleted <b>${esc(label)}</b> and ${d.tweets_deleted} tweet(s).`
-    : `Stopped watching <b>${esc(label)}</b>. Its tweets are still here.`, "ok");
-  await status(); await search();
-}
-
-$("#src").onchange = () => {
-  const isList = $("#src").value === "list";
-  $("#q").placeholder = isList
-    ? "Paste an X list link — https://x.com/i/lists/1234567890"
-    : "Type words to find in the tweets you have saved…";
-  /* Lists are a far better deal than searches on BOTH counts, and the numbers
-     are not close.
-       requests : 500 per 15 min against 50
-       per request : X returns exactly the 20 asked for on a search, and
-                     ignores the count on a list — measured 78 to 92, so ~90.
-     Quoting 20 per request for a list understated it by four and a half times:
-     "5 pages, about 100 tweets" actually fetched 460. */
-  const per = isList ? 90 : 20;
-  [...$("#pages").options].forEach(o => {
-    const n = parseInt(o.value, 10);
-    o.textContent = `about ${n*per} tweets · uses ${n} of your `
-      + (isList ? "500" : "50") + " requests";
-  });
-};
-$("#src").onchange();
-
-$("#go").onclick = search;
-$("#q").addEventListener("keydown", e => { if (e.key === "Enter") search(); });
-
-// Sorting re-runs on its own; the filters wait for Apply. Re-querying on every
-// keystroke of "min followers" would fire a query per digit and make 10000
-// pass through 1, 10, 100 and 1000 on the way.
-$("#order").addEventListener("change", search);
-$("#since").addEventListener("change", () => { refreshFilterChrome(); search(); });
-
-const FILTER_IDS = ["author","minlikes","lang","media","noretweets",
-                    "f_min_views","f_min_followers","f_from","f_to",
-                    "f_category","f_verified"];
-FILTER_IDS.forEach(id => {
-  const el = $("#"+id);
-  if (el){ el.addEventListener("input", refreshFilterChrome);
-           el.addEventListener("change", refreshFilterChrome); }
-});
-
-$("#filtbtn").onclick = () => {
-  const box = $("#filters");
-  box.hidden = !box.hidden;
-  if (!box.hidden) refreshFilterChrome();
-};
-$("#f_apply").onclick = () => { refreshFilterChrome(); search(); };
-$("#f_clear").onclick = () => {
-  FILTER_IDS.forEach(id => {
-    const el = $("#"+id);
-    if (!el) return;
-    if (el.type === "checkbox") el.checked = false; else el.value = "";
-  });
-  refreshFilterChrome();
-  search();
-};
-refreshFilterChrome();
-
-$("#csv").onclick = () => { location = "/api/export?" + params(); };
-
-$("#getnew").onclick = async () => {
-  const raw = $("#q").value.trim();
-  const isList = $("#src").value === "list";
-  if (!raw) return banner(isList
-      ? "Paste an X list link first."
-      : "Type what to look for first.", "err");
-  const query = isList ? "" : raw, listId = isList ? raw : "";
-  const pages = parseInt($("#pages").value, 10);
-
-  /* Ask the guard BEFORE spending anything. This is the whole point: the
-     dangerous click is the one you make without knowing the cost. */
-  let g;
-  try { g = await api(`/api/guard?action=fetch&cost=${pages}&queue=${isList?"list":"search"}`); }
-  catch (e) { return banner(esc(e.message).replace(/\n/g,"<br>"), "err"); }
-
-  const blocks = g.findings.filter(f => f.level === "block");
-  const warns  = g.findings.filter(f => f.level === "warn");
-
-  if (blocks.length){
-    return banner(
-      `<b>Cannot do that right now — ${esc(blocks[0].title)}</b><br>${esc(blocks[0].detail)}` +
-      (blocks[0].remedy ? `<br><b>What to do:</b> ${esc(blocks[0].remedy)}` : ""), "err");
-  }
-
-  let msg = `Ask X for about ${pages*20} tweets matching:\n\n${raw}\n\n` +
-            `This uses ${pages} of your ${isList ? 500 : 50} requests ` +
-            `for the next 15 minutes.\n`;
-  if (warns.length){
-    msg += "\nWorth knowing first:\n  • "
-         + warns.map(w => w.title + (w.remedy ? `\n    ${w.remedy}` : "")).join("\n  • ") + "\n";
-  }
-  msg += "\nAnything found is saved. Go ahead?";
-  if (!confirm(msg)) return;
-
-  $("#getnew").disabled = true;
-  banner("Asking X…");
-  try {
-    const d = await api("/api/fetch", {
-      method:"POST", headers:{"Content-Type":"application/json"},
-      body: JSON.stringify({query, list_id:listId, tab:"Latest", pages, ack:true})
-    });
-
-    if (d.error) banner("X said: " + esc(d.error), "err");
-    else if (d.hint) banner(esc(d.hint), "err");
-    else if (d.stop === "no_account_or_abort")
-      banner("No X account was free to do this. Check the accounts panel, or " +
-             "wait a few minutes for the request allowance to reset.", "err");
-    else {
-      let msg = `Found ${d.results} tweets — ${d.new} new, ${d.dup} you already had. ` +
-                `${d.rl_remaining} of ${d.rl_limit} requests left for the next 15 minutes.`;
-      if (d.stop === "exhausted" && d.pages < pages)
-        msg += ` That is everything X has for this.`;
-      banner(msg, "ok");
-      activeStream = d.stream;
-      $("#q").value = "";        // the search now lives as a filter on the left
-    }
-    await status(); await search();
-  } catch (e) {
-    banner(esc(e.message).replace(/\n/g,"<br>"), "err");
-  } finally { $("#getnew").disabled = false; }
-};
-
-/* Click a thumbnail to fetch and play that one video.
-
-   Delegated from #results rather than bound per card: the list is re-rendered
-   on every search, every auto-update tick and every "show more", so handlers
-   attached to individual cards would belong to nodes that no longer exist. */
-$("#results").addEventListener("click", (e) => {
-  const btn = e.target.closest("[data-play]");
-  if (!btn) return;
-  const gif = btn.dataset.kind === "gif";
-  const v = document.createElement("video");
-  v.src = btn.dataset.play;
-  v.controls = !gif; v.autoplay = true; v.playsInline = true;
-  v.muted = gif; v.loop = gif;
-  // If the URL has expired — X signs them and they do expire — say so instead
-  // of leaving a black rectangle where the video was.
-  v.onerror = () => {
-    const a = document.createElement("a");
-    a.className = "medialink"; a.target = "_blank"; a.rel = "noopener";
-    a.href = btn.dataset.play;
-    a.innerHTML = "<b>Video unavailable</b><span>X's link has expired — opens on x.com</span>";
-    v.replaceWith(a);
-  };
-  btn.replaceWith(v);
-});
-
-/* Standing risk panel. The costly mistakes here are the silent ones, so the
-   state that makes an action dangerous is always on screen — not only at the
-   moment you click. */
-async function risks(){
-  let g;
-  try { g = await api("/api/guard"); } catch { return; }
-  const items = g.findings.filter(f => f.level !== "info");
-  const box = $("#riskbox");
-  if (!items.length){ box.hidden = true; return; }
-  box.hidden = false;
-  $("#risks").innerHTML = items.map(f => `
-    <div style="margin-bottom:9px">
-      <span class="pill ${f.level==='block'?'bad':''}"
-            style="${f.level==='warn'?'background:rgba(224,168,0,.18);color:#b8860b':''}">
-        ${f.level==='block'?'Stops work':'Worth fixing'}</span>
-      <div style="margin-top:3px">${esc(f.title)}</div>
-      ${f.remedy?`<div class="muted" style="margin-top:2px">→ ${esc(f.remedy)}</div>`:''}
-    </div>`).join("");
-}
-
-$("#tgtoggle").onclick = () => {
-  const box = $("#tgbox");
-  box.hidden = !box.hidden;
-  if (!box.hidden) $("#tg_token").focus();
-};
-$("#tg_save").onclick = async () => {
-  $("#tg_save").disabled = true;
-  try {
-    const d = await api("/api/settings/telegram", {
-      method:"POST", headers:{"Content-Type":"application/json"},
-      body: JSON.stringify({token: $("#tg_token").value.trim(),
-                            chat_id: $("#tg_chat").value.trim()})
-    });
-    if (d.error) return banner(esc(d.error), "err");
-    // Never echo the token back into the page once it is stored.
-    $("#tg_token").value = "";
-    $("#tg_token").placeholder = d.has_token ? "saved — paste again to replace"
-                                             : "bot token from @BotFather";
-    banner("Telegram saved. Switch it on for a list with the ⚙ beside it.", "ok");
-  } catch (e) { banner(esc(e.message), "err"); }
-  finally { $("#tg_save").disabled = false; }
-};
-$("#tg_test").onclick = async () => {
-  $("#tg_test").disabled = true;
-  banner("Sending a test message…");
-  try {
-    const d = await api("/api/settings/telegram/test", {
-      method:"POST", headers:{"Content-Type":"application/json"},
-      body: JSON.stringify({chat_id: $("#tg_chat").value.trim()})
-    });
-    banner(d.error ? "Telegram said: " + esc(d.error)
-                   : "Sent. Check Telegram — if nothing arrived, the chat id is wrong.",
-           d.error ? "err" : "ok");
-  } catch (e) { banner(esc(e.message), "err"); }
-  finally { $("#tg_test").disabled = false; }
-};
-
-/* ------------------------------------------------------------------
-   Auto-update.
-
-   This re-reads the LOCAL DATABASE on a timer. It never calls X — the
-   watcher service already polls X continuously on its own adaptive
-   interval, and new tweets land in results.db as it goes. Auto-fetching
-   from the browser every 15s would be 240 requests/hour against a ceiling
-   of ~200, so it would rate-limit the watcher out of existence within the
-   hour. Reading the database is free and shows the same tweets.
-
-   New rows are PREPENDED rather than replacing the list, so scroll
-   position, "Show more" pages and reading position all survive a refresh.
-
-   The checkbox is #autorefresh, NOT #live. It used to share the id "live"
-   with the fetch button, so $("#live") returned the button, .checked was
-   undefined, and tick() bailed on its first line every single time — the
-   dot pulsed and nothing ever refreshed.
-   ------------------------------------------------------------------ */
-let liveTimer = null, pending = [], topId = null;
-
-const bigger = (a, b) => {           // tweet ids exceed 2^53; compare as BigInt
-  try { return BigInt(a) > BigInt(b); } catch { return false; }
-};
-
-function noteTop(rows){
-  for (const r of rows) if (!topId || bigger(r.tweet_id, topId)) topId = r.tweet_id;
-}
-
-function showPending(){
-  if (!pending.length) return;
-  const html = pending.map(t => card(t).replace('class="card"', 'class="card new"')).join("");
-  $("#results").insertAdjacentHTML("afterbegin", html);
-  noteTop(pending);
-  loaded += pending.length; lastTotal += pending.length; offset += pending.length;
-  $("#count").textContent = `showing ${loaded} of ${lastTotal}`;
-  pending = [];
-  $("#newbar").style.display = "none";
-}
-
-async function tick(){
-  if (!$("#autorefresh").checked || document.hidden) return;
-  let d;
-  try {
-    const p = params(); p.set("limit", PAGE_SIZE); p.set("offset", 0);
-    d = await api("/api/tweets?" + p);
-  } catch { return; }            // a blip should not spam the banner
-
-  const fresh = (d.rows || []).filter(r => !topId || bigger(r.tweet_id, topId));
-  if (!fresh.length) return;
-
-  // At the top of the page, drop them straight in; otherwise offer a button so
-  // the page never jumps under someone who is reading.
-  pending = fresh.concat(pending);
-  if (window.scrollY < 80) {
-    showPending();
-  } else {
-    $("#newbtn").textContent = `${pending.length} new tweet${pending.length>1?'s':''} — show them`;
-    $("#newbar").style.display = "block";
-  }
-}
-
-function setLive(on){
-  $("#livedot").classList.toggle("on", on);
-  if (liveTimer) clearInterval(liveTimer);
-  liveTimer = on ? setInterval(tick, parseInt($("#everysec").value, 10) * 1000) : null;
-}
-$("#autorefresh").onchange = () => setLive($("#autorefresh").checked);
-$("#everysec").onchange    = () => setLive($("#autorefresh").checked);
-$("#newbtn").onclick    = () => { showPending(); window.scrollTo({top: 0, behavior: "smooth"}); };
-// A hidden tab should not keep querying; catch up the moment it is visible.
-document.addEventListener("visibilitychange", () => { if (!document.hidden) tick(); });
-
-status(); search().then(() => setLive(true)); risks();
-setInterval(() => { status(); risks(); }, 15000);
-"""
 
 
 # Signing in opens its own tab, so neither page carries the remote browser any
 # more — no modal markup, no coordinate scaling, no keyboard capture fighting
 # the page underneath. Both just open a window.
-_JS_SIGNIN = r"""
-function loginOpen(label){
-  const w = window.open("/signin?label=" + encodeURIComponent(label),
-                        "xs_signin_" + label, "width=1180,height=980");
-  // NOTE the explicit +. JavaScript does not join adjacent string literals the
-  // way Python and C do — "a" "b" is a syntax error, not "ab". Writing it the
-  // Python way took the whole dashboard script down with "missing ) after
-  // argument list", which reads like a bracket problem and is not one.
-  if (!w) return banner(
-    "Your browser blocked the sign-in window. Allow pop-ups for this site, " +
-    "or open <a href=\"/signin?label=" + encodeURIComponent(label) + "\">this link</a>.",
-    "err");
-  banner("Sign in to the site in the new tab, then come back here.", "ok");
-  // The tab tells us when it is done, so this page refreshes without being
-  // asked and the account flips to Working while you are looking at it.
-  window.addEventListener("message", (e) => {
-    if (e.origin === location.origin && e.data === "signed-in") status();
-  }, {once: true});
-}
-"""
+# _JS_SIGNIN now lives in static/helpers.js
+
+
+
+# --------------------------------------------------------------------------
+# static assets
+# --------------------------------------------------------------------------
+#
+# THE DASHBOARD IS AN ORDINARY index.html NOW.
+#
+# It used to be assembled from Python string constants — _DOC_HEAD + _CSS_CORE
+# + _CSS_MODERN + _DASH_BODY + _DASH_JS — which meant no editor knew it was
+# HTML, no linter saw the CSS, and there were several unrelated <style> blocks
+# in one file that all looked alike. A rule appended to the wrong one is parsed
+# by the browser for a different document and silently does nothing, which is
+# exactly how the Filters panel shipped broken.
+#
+# Files, not strings, so a stylesheet is a stylesheet:
+#
+#   static/index.html   the page
+#   static/base.css     shared shell (tokens, buttons, cards)
+#   static/app.css      dashboard layer, loaded after base
+#   static/app.js       all dashboard behaviour
+#
+# Served by this process, not nginx: the app is already behind cookie auth here
+# and adding a second server to configure would trade one file for two moving
+# parts. There is no build step and no Node — you edit the file and reload.
+
+STATIC_DIR = Path(__file__).resolve().parent / "static"
+
+_STATIC_TYPES = {".html": "text/html; charset=utf-8",
+                 ".css": "text/css; charset=utf-8",
+                 ".js": "text/javascript; charset=utf-8",
+                 ".svg": "image/svg+xml",
+                 ".png": "image/png",
+                 ".ico": "image/x-icon"}
+
+
+def _static_text(name: str) -> str:
+    """Read a static file fresh on every request.
+
+    Deliberately not cached in memory: editing app.css and reloading the page
+    should show the change, and these files are a few tens of KB read from the
+    page cache. Caching them would buy nothing and cost the edit-reload loop.
+    """
+    return (STATIC_DIR / name).read_text(encoding="utf-8")
 
 
 def _page(title: str, css: str, body: str, js: str) -> str:
-    """One page: shared shell, page-specific middle."""
-    return (_DOC_HEAD.replace("__TITLE__", title)
-            + _CSS_CORE + css
-            + body
-            + "<script>\n" + _JS_HELPERS + _JS_SIGNIN + js
-            + "</script>\n</body></html>\n")
+    """
+    One small page: shared shell from static/, page-specific middle inline.
 
-
-PAGE = _page("Collector", _CSS_MODERN, _DASH_BODY, _DASH_JS)
+    The shell is LINKED, not pasted. base.css and helpers.js are the same files
+    the dashboard loads, so a change to a button or to the API client reaches
+    every page instead of only the one whose copy was edited. Only this page's
+    own css/js stays inline, because at a few KB a separate request would cost
+    more than it saves.
+    """
+    return (f'<!doctype html>\n<html lang="en"><head>\n'
+            f'<meta charset="utf-8">\n'
+            f'<meta name="viewport" content="width=device-width,initial-scale=1">\n'
+            f'<title>{title}</title>\n'
+            f'<link rel="stylesheet" href="/static/base.css">\n'
+            f'<style>\n{css}</style>\n'
+            f'</head><body>\n'
+            + body.replace("</style></head><body>", "", 1)
+            + '<script src="/static/helpers.js"></script>\n'
+            + "<script>\n" + js + "</script>\n</body></html>\n")
 
 
 # --------------------------------------------------------------------------
