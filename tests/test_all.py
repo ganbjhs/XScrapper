@@ -1694,6 +1694,21 @@ async def run_webhook(tmp):
         ok("x.com/r/status/9" not in onelink,
            "and no permalink of ours is appended")
 
+        # "-filter:replies" is a hint to X's SEARCH. It is honoured imperfectly
+        # and does nothing at all for a stream collected another way, so replies
+        # still reached the channel. is_reply is our own parsed field.
+        class _H:
+            skip_retweets = False
+            skip_replies = True
+            min_likes = 0
+        rr = [{"tweet_id": 1, "is_reply": 1, "like_count": 0},
+              {"tweet_id": 2, "is_reply": 0, "like_count": 0}]
+        ok([r["tweet_id"] for r in rr if wh._wanted(_H(), r)] == [2],
+           "skip_replies drops replies at delivery, whatever the search query said")
+        _H.skip_replies = False
+        ok([r["tweet_id"] for r in rr if wh._wanted(_H(), r)] == [1, 2],
+           "and leaves them alone when it is off")
+
         ok(wh.TG_GAP_S >= 3.0,
            f"the gap between sends respects ~20 messages/minute per group "
            f"({wh.TG_GAP_S}s) — required now that every tweet is its own message")

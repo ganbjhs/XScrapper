@@ -283,6 +283,12 @@ def _wanted(hook, row) -> bool:
     """Per-target filters, so a noisy stream can be narrowed on its way out."""
     if getattr(hook, "skip_retweets", False) and row.get("is_retweet"):
         return False
+    # Checked HERE and not left to the search query. "-filter:replies" is a hint
+    # to X's search, honoured imperfectly and not at all for a stream collected
+    # another way; is_reply is our own parsed field, so this is the check that
+    # actually holds.
+    if getattr(hook, "skip_replies", False) and row.get("is_reply"):
+        return False
     if (row.get("like_count") or 0) < getattr(hook, "min_likes", 0):
         return False
     return True
@@ -368,7 +374,8 @@ class TelegramTarget:
     url = TELEGRAM_API      # for logging only
 
     def __init__(self, stream_label, token, chat_id, *, min_likes=0,
-                 skip_retweets=False, batch_size=20, timeout_s=15.0):
+                 skip_retweets=False, skip_replies=False,
+                 batch_size=20, timeout_s=15.0):
         # The cursor is keyed on this label, so it must be stable and must not
         # collide with a webhook's.
         self.label = f"tg:{stream_label}"
@@ -378,6 +385,7 @@ class TelegramTarget:
         self.chat_id = str(chat_id)
         self.min_likes = int(min_likes or 0)
         self.skip_retweets = bool(skip_retweets)
+        self.skip_replies = bool(skip_replies)
         self.batch_size = batch_size
         self.timeout_s = timeout_s
 
@@ -402,7 +410,8 @@ async def telegram_targets(store, log=print) -> list:
             continue
         out.append(TelegramTarget(
             row["label"], token, chat,
-            min_likes=row["tg_min_likes"], skip_retweets=row["tg_skip_retweets"]))
+            min_likes=row["tg_min_likes"], skip_retweets=row["tg_skip_retweets"],
+            skip_replies=(row["tg_skip_replies"] if "tg_skip_replies" in row.keys() else 0)))
     return out
 
 

@@ -557,6 +557,7 @@ def _status():
                     "tg_chat_id": _col("tg_chat_id", ""),
                     "tg_min_likes": _col("tg_min_likes", 0),
                     "tg_skip_retweets": bool(_col("tg_skip_retweets", 0)),
+                    "tg_skip_replies": bool(_col("tg_skip_replies", 0)),
                     "label": s["label"], "query": s["query"], "tab": s["tab"],
                     "count": hits,
                     "lag_p50": lags[len(lags) // 2] / 1000 if lags else None,
@@ -869,6 +870,8 @@ def _stream_settings(body):
             return {"error": "minimum likes must be a whole number"}
     if "tg_skip_retweets" in body:
         vals["tg_skip_retweets"] = int(bool(body["tg_skip_retweets"]))
+    if "tg_skip_replies" in body:
+        vals["tg_skip_replies"] = int(bool(body["tg_skip_replies"]))
 
     if not vals:
         return {"error": "nothing to change"}
@@ -2830,6 +2833,8 @@ function drawCfg(streams){
                value="${s.tg_min_likes||0}"></label>
       <label class="cfgchk"><input type="checkbox" data-k="tg_skip_retweets"
         ${s.tg_skip_retweets?"checked":""}> Skip retweets</label>
+      <label class="cfgchk"><input type="checkbox" data-k="tg_skip_replies"
+        ${s.tg_skip_replies?"checked":""}> Skip replies</label>
 
       <div class="cfgsave">
         <button class="cfgbtn primary" data-save>Save settings</button>

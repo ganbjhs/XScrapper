@@ -570,7 +570,15 @@ class Store:
                               "tg_enabled": "INTEGER NOT NULL DEFAULT 0",
                               "tg_chat_id": "TEXT",
                               "tg_min_likes": "INTEGER NOT NULL DEFAULT 0",
-                              "tg_skip_retweets": "INTEGER NOT NULL DEFAULT 0"}}
+                              "tg_skip_retweets": "INTEGER NOT NULL DEFAULT 0",
+                              # Belt and braces against replies. X's own
+                              # "-filter:replies" is a SEARCH hint, not a
+                              # guarantee — and it does nothing at all for a
+                              # stream collected some other way (a List, or a
+                              # query written without it). Filtering on our own
+                              # is_reply column at delivery time is the only
+                              # check that cannot be talked round.
+                              "tg_skip_replies": "INTEGER NOT NULL DEFAULT 0"}}
         added = []
         for table, cols in wanted.items():
             have = {r["name"] for r in self.db.execute(f"PRAGMA table_info({table})")}
