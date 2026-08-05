@@ -1640,16 +1640,30 @@ async def run_webhook(tmp):
         print("== telegram ==")
         msgs = wh.tg_format(
             [{"tweet_id": 1, "author_display_name": "A & B", "author_username": "ab",
-              "text": "<script>x</script>", "url": "https://t.co/abc", "like_count": 3}],
+              "text": "R & D <script>x</script>", "url": "https://t.co/abc", "like_count": 3}],
             {1: ["ui:from:RajeshGupta5766 -filter:replies -filter:retweets"]})
         ok(len(msgs) == 1 and "&amp;" in msgs[0] and "&lt;script&gt;" in msgs[0],
            "telegram escapes the three characters its HTML mode cares about")
         ok("<a href" not in msgs[0],
            "no hyperlink markup — the tweet's own t.co link is left as written")
-        ok("ui:from:" not in msgs[0],
-           "the stream label is NOT printed — the query is machine noise, the "
-           "@handle already identifies the account")
-        ok("@ab" in msgs[0], "and the handle is there")
+        ok("ui:from:" not in msgs[0], "no stream label")
+        ok("@ab" not in msgs[0] and "A &amp; B" not in msgs[0],
+           "no handle and no display name — the message is the tweet, nothing else")
+        ok("♥" not in msgs[0] and "3" not in msgs[0], "no like count")
+
+        plain = wh.tg_format([{
+            "tweet_id": 5, "author_display_name": "Someone", "author_username": "someone",
+            "text": "just the words https://t.co/keepThis",
+            "url": "https://x.com/someone/status/5", "like_count": 99}])[0]
+        ok(plain == "just the words https://t.co/keepThis",
+           "the message is EXACTLY the tweet text, byte for byte")
+
+        media_only = wh.tg_format([{
+            "tweet_id": 6, "author_display_name": "S", "author_username": "s",
+            "text": "", "url": "https://x.com/s/status/6", "like_count": 0}])[0]
+        ok(media_only == "https://x.com/s/status/6",
+           "a post with no text falls back to its link — Telegram rejects an "
+           "empty message, so the post would otherwise be lost")
 
         # One message per tweet is the whole point: several posts packed into one
         # block cannot be forwarded, replied to or deleted individually.

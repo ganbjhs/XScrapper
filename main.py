@@ -635,6 +635,9 @@ def _add_telegram(sub):
                     help="How many recent tweets to send (default 3).")
     tg.add_argument("--list", action="store_true",
                     help="List every stream that sends to Telegram.")
+    tg.add_argument("--resend", action="store_true",
+                    help="Deliver the last --limit tweets AGAIN, once "
+                         "(use after changing the message format).")
     tg.set_defaults(func=cmd_telegram)
 
 
@@ -1039,6 +1042,31 @@ async def cmd_telegram(args) -> int:
             _log(f"No Telegram-enabled stream called {args.label!r}. "
                  f"Configured: {', '.join(repr(t.stream_label) for t in targets)}")
             return EXIT_CONFIG
+
+        if args.resend:
+            # Rewind the cursor so tweets already delivered are sent AGAIN, once.
+            # The normal loop then carries on from wherever it lands, so this is
+            # a one-shot replay and not a permanent change of position — useful
+            # exactly when the FORMAT changed and what already arrived is the
+            # old shape.
+            cur = await st.webhook_cursor(hook.label)
+            rows = [dict(r) for r in st.db.execute(
+                "SELECT t.collected_ms, t.tweet_id FROM tweets t WHERE t.source = 'result' "
+                "AND EXISTS (SELECT 1 FROM tweet_hits h JOIN streams s USING(stream_id) "
+                "            WHERE h.tweet_id = t.tweet_id AND s.label = ?) "
+                "ORDER BY t.collected_ms DESC, t.tweet_id DESC LIMIT ?",
+                (args.label, max(1, args.limit)))]
+            if not rows:
+                _log(f"{args.label!r} has no collected tweets to resend.")
+                return EXIT_OK
+            oldest = rows[-1]
+            _log(f"Rewinding {hook.label!r} to just before its last "
+                 f"{len(rows)} tweet(s); they will be delivered again, once.")
+            await st.webhook_advance(hook.label, oldest["collected_ms"],
+                                     oldest["tweet_id"] - 1, cur.get("sent") or 0)
+            _log("Done. The running watcher picks this up within a couple of "
+                 "seconds — nothing to restart.")
+            return EXIT_OK
 
         # Newest first for the pick, then reversed so the channel reads oldest
         # to newest like a normal delivery would.

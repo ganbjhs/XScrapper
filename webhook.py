@@ -149,18 +149,21 @@ def tg_format(rows: list, labels_for: dict | None = None) -> list:
     """
     Render tweets into Telegram messages — EXACTLY ONE MESSAGE PER TWEET.
 
-    Three deliberate choices, each of which was the other way round before:
+    THE MESSAGE IS THE TWEET AND NOTHING ELSE. No display name, no @handle, no
+    like count, no stream label, no permalink of ours — just the text as the
+    author wrote it, which already ends with the t.co link X attaches to the
+    post. Everything that used to sit around it was our framing of someone
+    else's words, and in a channel you read all day that framing is most of what
+    is on screen.
 
-      * One tweet per message, never packed. See TG_GAP_S above for the price.
-      * NO stream label. It used to print the label the tweet matched, which for
-        a dashboard-created search is the whole query —
-        "ui:from:RajeshGupta5766 -filter:replies -filter:retweets" — a line of
-        machine noise above every post. The @handle already says whose post it
-        is, which is the only part of that string anyone was reading.
-      * NO link line of our own. The tweet text already ends with the t.co link
-        X attaches to the post, so adding a permalink underneath printed the
-        same destination twice. The text is left exactly as the author wrote it
-        and exactly as X shortened it.
+    Each of those was added at some point and each is deliberately gone:
+
+      * the stream label printed the whole query for a dashboard-created search
+        ("ui:from:RajeshGupta5766 -filter:replies -filter:retweets"),
+      * the permalink duplicated the t.co already in the text,
+      * the name/handle/likes header repeated what the linked post shows anyway.
+
+    One tweet per message, never packed. See TG_GAP_S above for the price.
 
     HTML rather than Markdown: tweet text is full of underscores, asterisks and
     brackets, and Telegram's Markdown parser rejects the whole message if they
@@ -172,14 +175,8 @@ def tg_format(rows: list, labels_for: dict | None = None) -> list:
     """
     out = []
     for r in rows:
-        who = _tg_escape(r.get("author_display_name") or r.get("author_username") or "?")
-        handle = _tg_escape(r.get("author_username") or "")
-        likes = r.get("like_count") or 0
-
-        def build(body, _who=who, _handle=handle, _likes=likes):
-            return (f"<b>{_who}</b> <i>@{_handle}</i>\n"
-                    f"{_tg_escape(body)}\n"
-                    f"♥ {_likes}")
+        def build(body):
+            return _tg_escape(body)
 
         # A tweet longer than a whole message is trimmed rather than dropped: a
         # truncated post you can click through beats silence.
@@ -189,6 +186,10 @@ def tg_format(rows: list, labels_for: dict | None = None) -> list:
         # of an entity — "&amp;" becoming "&am" — and Telegram rejects the whole
         # message as malformed HTML.
         raw = (r.get("text") or "").strip()
+        # A media-only post can have no text at all. Telegram rejects an empty
+        # message, so fall back to the link rather than losing the post.
+        if not raw:
+            raw = r.get("url") or f"https://x.com/i/status/{r['tweet_id']}"
         block = build(raw)
         while len(block) > TG_MAX_CHARS and raw:
             raw = raw[:max(0, len(raw) - (len(block) - TG_MAX_CHARS) - 16)]
