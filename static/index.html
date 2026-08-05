@@ -9,6 +9,8 @@
 
 
 <header>
+  <button id="ctlbtn" type="button" aria-expanded="false"
+          title="Show search and filters">&#9776;</button>
   <div class="brand"><span class="logo">◎</span>Collector</div>
   <div class="seg" role="tablist" aria-label="Source">
     <button type="button" class="segbtn" aria-selected="true" onclick="switchPlatform('x',this)"><span class="mk x">&#120143;</span>X</button>
@@ -17,11 +19,13 @@
   </div>
 
   <span id="xctl" class="hdrctl">
+    <!-- PRIMARY ROW. Everything here is used every session: find something,
+         bound it in time, narrow it, or go and fetch more. -->
     <select id="src" title="What the Get new tweets button should fetch">
       <option value="search">words</option>
       <option value="list">a list</option>
     </select>
-    <input id="q" placeholder="Type words to find in the tweets you have saved…" autofocus>
+    <input id="q" placeholder="Search your saved tweets…" autofocus>
     <button class="primary" id="go">Search</button>
     <!-- Duration is top-level, not inside Filters. It is the control you change
          most and the one that most changes what "no results" means, so hiding
@@ -38,24 +42,36 @@
     </select>
     <button id="filtbtn" title="Narrow what is shown, without asking X for anything">
       &#9776; Filters <span id="filtcount" class="filtcount" hidden></span></button>
-    <select id="pages" title="How many tweets to ask X for">
-      <option value="1">about 20 tweets</option>
-      <option value="3">about 60 tweets</option>
-      <option value="5" selected>about 100 tweets</option>
-      <option value="10">about 200 tweets</option>
-      <option value="25">about 500 tweets</option>
-    </select>
-    <button id="getnew" title="Asks X for tweets you do not have yet">Get new tweets</button>
-    <button id="csv">Download</button>
-    <label class="livetog" title="Checks for tweets saved since you loaded this page. It does not contact X, so it is free.">
-      <input type="checkbox" id="autorefresh" checked>
-      <span id="livedot"></span>Auto-update
-      <select id="everysec">
-        <option value="15" selected>every 15s</option>
-        <option value="30">every 30s</option>
-        <option value="60">every 60s</option>
-      </select>
-    </label>
+    <button id="getnew" class="accent" title="Asks X for tweets you do not have yet">&#9889; Get new</button>
+
+    <!-- SECONDARY. Real controls, just not every-session ones: how much to ask
+         X for, exporting, and the live-refresh cadence. Eight visible controls
+         became five, and the header stopped wrapping to three rows. Kept as a
+         plain <details> so it needs no JS and closes with Escape. -->
+    <details id="moremenu">
+      <summary title="More controls">&#8943;</summary>
+      <div class="menu">
+        <label>How many to fetch
+          <select id="pages" title="How many tweets to ask X for">
+            <option value="1">about 20 tweets</option>
+            <option value="3">about 60 tweets</option>
+            <option value="5" selected>about 100 tweets</option>
+            <option value="10">about 200 tweets</option>
+            <option value="25">about 500 tweets</option>
+          </select></label>
+        <button id="csv">Download CSV</button>
+        <label class="livetog" title="Checks for tweets saved since you loaded this page. It does not contact X, so it is free.">
+          <input type="checkbox" id="autorefresh" checked>
+          <span id="livedot"></span>Auto-update
+        </label>
+        <label>Check every
+          <select id="everysec">
+            <option value="15" selected>15 seconds</option>
+            <option value="30">30 seconds</option>
+            <option value="60">60 seconds</option>
+          </select></label>
+      </div>
+    </details>
   </span>
 
   <span id="igctl" class="hdrctl" hidden>

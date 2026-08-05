@@ -754,3 +754,31 @@ document.addEventListener("visibilitychange", () => { if (!document.hidden) tick
 
 status(); search().then(() => setLive(true)); risks();
 setInterval(() => { status(); risks(); }, 15000);
+
+/* The mobile controls toggle.
+   Session-scoped, not persisted: someone who opens the controls to run one
+   search should not find them still open tomorrow, having forgotten why the
+   feed starts halfway down the screen. */
+(function(){
+  const btn = document.getElementById("ctlbtn");
+  if (!btn) return;
+  const open = sessionStorage.getItem("ctl-open") === "1";
+  document.body.classList.toggle("ctl-open", open);
+  btn.setAttribute("aria-expanded", String(open));
+  btn.onclick = () => {
+    const now = !document.body.classList.contains("ctl-open");
+    document.body.classList.toggle("ctl-open", now);
+    btn.setAttribute("aria-expanded", String(now));
+    sessionStorage.setItem("ctl-open", now ? "1" : "0");
+  };
+  // A menu that cannot be dismissed by clicking away feels stuck.
+  document.addEventListener("click", (e) => {
+    const m = document.getElementById("moremenu");
+    if (m && m.open && !m.contains(e.target)) m.open = false;
+  });
+  document.addEventListener("keydown", (e) => {
+    if (e.key !== "Escape") return;
+    const m = document.getElementById("moremenu");
+    if (m) m.open = false;
+  });
+})();
