@@ -1640,22 +1640,39 @@ async def run_webhook(tmp):
         print("== telegram ==")
         msgs = wh.tg_format(
             [{"tweet_id": 1, "author_display_name": "A & B", "author_username": "ab",
-              "text": "<script>x</script>", "url": "https://x.com/1", "like_count": 3}],
-            {1: ["politicians"]})
+              "text": "<script>x</script>", "url": "https://t.co/abc", "like_count": 3}],
+            {1: ["ui:from:RajeshGupta5766 -filter:replies -filter:retweets"]})
         ok(len(msgs) == 1 and "&amp;" in msgs[0] and "&lt;script&gt;" in msgs[0],
            "telegram escapes the three characters its HTML mode cares about")
-        ok("open on X" in msgs[0], "and every tweet carries a link back")
+        ok("https://t.co/abc" in msgs[0] and "<a href" not in msgs[0],
+           "the post link is a bare, copyable URL rather than a hidden hyperlink")
+        ok("ui:from:" not in msgs[0],
+           "the stream label is NOT printed — the query is machine noise, the "
+           "@handle already identifies the account")
+        ok("@ab" in msgs[0], "and the handle is there")
+
+        # One message per tweet is the whole point: several posts packed into one
+        # block cannot be forwarded, replied to or deleted individually.
+        many = [{"tweet_id": i, "author_display_name": "n", "author_username": "n",
+                 "text": "short", "url": "https://x.com/", "like_count": 0}
+                for i in range(12)]
+        ok(len(wh.tg_format(many)) == 12,
+           "12 tweets produce 12 separate messages, never packed together")
 
         big = [{"tweet_id": i, "author_display_name": "n", "author_username": "n",
                 "text": "y" * 900, "url": "https://x.com/", "like_count": 0}
                for i in range(12)]
-        packed = wh.tg_format(big, {})
-        ok(len(packed) > 1 and all(len(m) <= wh.TG_MAX_CHARS for m in packed),
-           f"long runs are split into messages under Telegram's limit ({len(packed)} messages)")
+        packed = wh.tg_format(big)
+        ok(len(packed) == 12 and all(len(m) <= wh.TG_MAX_CHARS for m in packed),
+           "long tweets stay one-per-message and each is under Telegram's limit")
+
+        ok(wh.TG_GAP_S >= 3.0,
+           f"the gap between sends respects ~20 messages/minute per group "
+           f"({wh.TG_GAP_S}s) — required now that every tweet is its own message")
 
         huge = wh.tg_format(
             [{"tweet_id": 1, "author_display_name": "n", "author_username": "n",
-              "text": "z" * 9000, "url": "https://x.com/1", "like_count": 0}], {})
+              "text": "z" * 9000, "url": "https://x.com/1", "like_count": 0}])
         ok(len(huge) == 1 and len(huge[0]) <= wh.TG_MAX_CHARS,
            "one oversized tweet is trimmed rather than dropped or rejected")
 

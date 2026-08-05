@@ -123,13 +123,19 @@ def _tweet_json(row: dict, labels: list) -> dict:
 # formatting and the transport differ, which is the whole reason this lives
 # beside webhooks instead of being its own subsystem.
 #
-# Telegram's limits are strict and enforced by them, not by us: about 30
-# messages a second overall and roughly 20 a minute into one group. Batching
-# several tweets into one message is therefore not a nicety — a busy list would
-# otherwise trip the limit within a minute and start collecting 429s.
+# ONE TWEET PER MESSAGE. Tweets used to be packed together up to TG_MAX_CHARS,
+# which was cheaper but unreadable: several unrelated posts ran into one wall of
+# text with no way to forward, reply to or delete a single one.
+#
+# The cost of that choice is real and is paid here. Telegram allows about 30
+# messages a second overall but only ~20 a minute INTO ONE GROUP, so one message
+# per tweet means the gap between sends is what keeps us under the limit — hence
+# TG_GAP_S below is 3.2s, not the 1.2s that sufficed when messages were packed.
+# A batch of 20 therefore takes just over a minute to land. That is the correct
+# trade: arriving a minute later is a nuisance, collecting 429s is an outage.
 TELEGRAM_API = "https://api.telegram.org"
 TG_MAX_CHARS = 3500          # the hard cap is 4096; leave room for the footer
-TG_GAP_S = 1.2               # between messages, to stay well under the limit
+TG_GAP_S = 3.2               # ~20 messages/minute into one group, Telegram's cap
 
 
 def _tg_escape(s: str) -> str:
@@ -137,29 +143,42 @@ def _tg_escape(s: str) -> str:
     return (s or "").replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
 
 
-def tg_format(rows: list, labels_for: dict) -> list:
+def tg_format(rows: list, labels_for: dict | None = None) -> list:
     """
-    Render tweets into Telegram messages, packed up to TG_MAX_CHARS.
+    Render tweets into Telegram messages — EXACTLY ONE MESSAGE PER TWEET.
+
+    Three deliberate choices, each of which was the other way round before:
+
+      * One tweet per message, never packed. See TG_GAP_S above for the price.
+      * NO stream label. It used to print the label the tweet matched, which for
+        a dashboard-created search is the whole query —
+        "ui:from:RajeshGupta5766 -filter:replies -filter:retweets" — a line of
+        machine noise above every post. The @handle already says whose post it
+        is, which is the only part of that string anyone was reading.
+      * A bare URL, not a hyperlink. "open on X" hid the address behind a word;
+        the plain link is visible, copyable and forwardable, and Telegram makes
+        it clickable anyway.
 
     HTML rather than Markdown: tweet text is full of underscores, asterisks and
     brackets, and Telegram's Markdown parser rejects the whole message if they
     do not balance. Escaping three characters for HTML always works; escaping
     Markdown correctly does not.
+
+    labels_for is accepted and ignored so the webhook path can keep calling this
+    with the same shape it always has.
     """
-    out, buf = [], []
-    size = 0
+    out = []
     for r in rows:
         who = _tg_escape(r.get("author_display_name") or r.get("author_username") or "?")
         handle = _tg_escape(r.get("author_username") or "")
-        tags = ", ".join(_tg_escape(x) for x in labels_for.get(r["tweet_id"], []))
         url = r.get("url") or f"https://x.com/i/status/{r['tweet_id']}"
         likes = r.get("like_count") or 0
 
-        def build(body, _who=who, _handle=handle, _tags=tags, _url=url, _likes=likes):
-            return (f"<b>{_who}</b> <i>@{_handle}</i>"
-                    + (f" · {_tags}" if _tags else "")
-                    + f"\n{_tg_escape(body)}\n"
-                    f"♥ {_likes} · <a href=\"{_tg_escape(_url)}\">open on X</a>")
+        def build(body, _who=who, _handle=handle, _url=url, _likes=likes):
+            return (f"<b>{_who}</b> <i>@{_handle}</i>\n"
+                    f"{_tg_escape(body)}\n"
+                    f"♥ {_likes}\n"
+                    f"{_tg_escape(_url)}")
 
         # A tweet longer than a whole message is trimmed rather than dropped: a
         # truncated post you can click through beats silence.
@@ -167,21 +186,13 @@ def tg_format(rows: list, labels_for: dict) -> list:
         # The RAW text is trimmed and escaped afterwards, never the other way
         # round. Cutting an already-escaped string can slice through the middle
         # of an entity — "&amp;" becoming "&am" — and Telegram rejects the whole
-        # message as malformed HTML, so one long tweet would have taken its
-        # entire batch down with it. Iterating also copes with escaping making
-        # the text longer than it started.
+        # message as malformed HTML.
         raw = (r.get("text") or "").strip()
         block = build(raw)
         while len(block) > TG_MAX_CHARS and raw:
             raw = raw[:max(0, len(raw) - (len(block) - TG_MAX_CHARS) - 16)]
             block = build(raw + "…")
-        if buf and size + len(block) + 2 > TG_MAX_CHARS:
-            out.append("\n\n".join(buf))
-            buf, size = [], 0
-        buf.append(block)
-        size += len(block) + 2
-    if buf:
-        out.append("\n\n".join(buf))
+        out.append(block)
     return out
 
 
@@ -210,10 +221,13 @@ async def tg_send(client, token: str, chat_id: str, text: str,
 
 
 async def deliver_telegram(client, hook, store, rows: list) -> tuple[bool, str]:
-    """Send a batch to Telegram, respecting their rate limit between messages."""
-    labels_for = {r["tweet_id"]: await store.stream_labels_for(r["tweet_id"])
-                  for r in rows}
-    for i, msg in enumerate(tg_format(rows, labels_for)):
+    """Send a batch to Telegram, respecting their rate limit between messages.
+
+    No stream lookup here any more: the message no longer prints the label, so
+    the per-tweet stream_labels_for query it needed is a database round trip
+    per tweet for a line nobody wanted.
+    """
+    for i, msg in enumerate(tg_format(rows)):
         if i:
             await asyncio.sleep(TG_GAP_S)
         ok, err = await tg_send(client, hook.token, hook.chat_id, msg,
