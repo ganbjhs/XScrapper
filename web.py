@@ -2213,6 +2213,19 @@ _DASH_BODY = r"""</style></head><body>
     </select>
     <input id="q" placeholder="Type words to find in the tweets you have saved…" autofocus>
     <button class="primary" id="go">Search</button>
+    <!-- Duration is top-level, not inside Filters. It is the control you change
+         most and the one that most changes what "no results" means, so hiding
+         it behind a panel made an empty feed look like a broken collector. -->
+    <select id="since" title="Only tweets POSTED inside this window">
+      <option value="1h">1 hour</option>
+      <option value="6h">6 hours</option>
+      <option value="12h">12 hours</option>
+      <option value="24h" selected>Last 24 hours</option>
+      <option value="48h">Last 48 hours</option>
+      <option value="7d">Last 7 days</option>
+      <option value="30d">Last 30 days</option>
+      <option value="">Any time</option>
+    </select>
     <button id="filtbtn" title="Narrow what is shown, without asking X for anything">
       &#9776; Filters <span id="filtcount" class="filtcount" hidden></span></button>
     <select id="pages" title="How many tweets to ask X for">
@@ -2283,12 +2296,6 @@ _DASH_BODY = r"""</style></head><body>
       <input id="author" placeholder="from @someone"></label>
     <label>From date <input id="f_from" type="date"></label>
     <label>To date <input id="f_to" type="date"></label>
-    <label>Posted within
-      <select id="since">
-        <option value="">Any time</option><option value="1h">Past hour</option>
-        <option value="6h">Past 6 hours</option><option value="24h">Past day</option>
-        <option value="7d">Past week</option>
-      </select></label>
   </div>
   <div class="filtrow">
     <label class="filtchk"><input type="checkbox" id="f_verified"> Verified only</label>
@@ -2540,12 +2547,18 @@ const FILTER_LABELS = {
   has_media: "has media", no_retweets: "no retweets",
 };
 
+function durationLabel(){
+  const el = $("#since");
+  return el && el.value ? el.options[el.selectedIndex].text.toLowerCase() : "";
+}
+
 function describeFilters(){
   const p = params();
   const bits = [];
   for (const [k, name] of Object.entries(FILTER_LABELS)) {
     const v = p.get(k);
     if (!v) continue;
+    if (k === "since") { bits.push(durationLabel()); continue; }
     bits.push(v === "1" ? name : `${name} ${v}`);
   }
   return bits;
@@ -2578,8 +2591,18 @@ async function search(append){
     ? `showing ${loaded} of ${lastTotal}` : "nothing found";
 
   if (!d.rows || !d.rows.length){
-    if (!append) $("#results").innerHTML = `<p class="muted">No saved tweets match that.
-      ${$("#q").value.trim() ? 'Press <b>Get new tweets</b> to ask X for them.' : ''}</p>`;
+    if (!append) {
+      const win = durationLabel();
+      $("#results").innerHTML = `<div class="empty">`
+        + (win ? `Nothing posted in the ${esc(win)}.`
+               : `No saved tweets match that.`)
+        + `<br><span class="muted">`
+        + (win ? `Widen <b>Duration</b> above to see older tweets. `
+               : ``)
+        + ($("#q").value.trim()
+            ? 'Or press <b>Get new tweets</b> to ask X for them.' : '')
+        + `</span></div>`;
+    }
     return;
   }
   const html = d.rows.map(card).join("");
@@ -2994,8 +3017,9 @@ $("#q").addEventListener("keydown", e => { if (e.key === "Enter") search(); });
 // keystroke of "min followers" would fire a query per digit and make 10000
 // pass through 1, 10, 100 and 1000 on the way.
 $("#order").addEventListener("change", search);
+$("#since").addEventListener("change", () => { refreshFilterChrome(); search(); });
 
-const FILTER_IDS = ["author","since","minlikes","lang","media","noretweets",
+const FILTER_IDS = ["author","minlikes","lang","media","noretweets",
                     "f_min_views","f_min_followers","f_from","f_to",
                     "f_category","f_verified"];
 FILTER_IDS.forEach(id => {
