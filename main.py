@@ -635,6 +635,9 @@ def _add_telegram(sub):
                     help="How many recent tweets to send (default 3).")
     tg.add_argument("--list", action="store_true",
                     help="List every stream that sends to Telegram.")
+    tg.add_argument("--skip", type=int, default=0,
+                    help="Skip this many of the newest tweets first, so "
+                         "--skip 6 --limit 10 sends the ten before the last six.")
     tg.add_argument("--resend", action="store_true",
                     help="Deliver the last --limit tweets AGAIN, once "
                          "(use after changing the message format).")
@@ -1070,14 +1073,21 @@ async def cmd_telegram(args) -> int:
 
         # Newest first for the pick, then reversed so the channel reads oldest
         # to newest like a normal delivery would.
+        #
+        # --skip walks BACKWARDS through the history: skip 6, limit 10 sends the
+        # ten posts immediately older than the six most recent. That is the
+        # normal shape of "send the batch before the one you just sent", and
+        # doing it by rewinding the cursor instead would resend the six as well.
         rows = [dict(r) for r in st.db.execute(
             "SELECT t.* FROM tweets t WHERE t.source = 'result' AND EXISTS ("
             "  SELECT 1 FROM tweet_hits h JOIN streams s USING(stream_id) "
             "  WHERE h.tweet_id = t.tweet_id AND s.label = ?) "
-            "ORDER BY t.created_ms DESC LIMIT ?", (args.label, max(1, args.limit)))]
+            "ORDER BY t.created_ms DESC LIMIT ? OFFSET ?",
+            (args.label, max(1, args.limit), max(0, args.skip)))]
         if not rows:
-            _log(f"{args.label!r} has no collected tweets yet, so there is "
-                 f"nothing to send. Let it poll once first.")
+            where = f" past the newest {args.skip}" if args.skip else ""
+            _log(f"{args.label!r} has no collected tweets{where}, so there is "
+                 f"nothing to send.")
             return EXIT_OK
         rows.reverse()
 
@@ -1131,10 +1141,21 @@ def _telegram_streams(cfg, existing_labels, log=None) -> list:
     try:
         con = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
         con.row_factory = sqlite3.Row
-        rows = con.execute(
-            "SELECT label, query, list_id, tab, paused, min_interval_s, "
-            "       max_pages_per_poll "
-            "FROM streams WHERE tg_enabled = 1").fetchall()
+        try:
+            # watched = 1 is the same promise for watchlist-compiled streams
+            # that tg_enabled = 1 makes for dashboard searches: "keep checking
+            # this", with no config.toml entry to point at.
+            rows = con.execute(
+                "SELECT label, query, list_id, tab, paused, min_interval_s, "
+                "       max_pages_per_poll "
+                "FROM streams WHERE tg_enabled = 1 OR watched = 1").fetchall()
+        except sqlite3.OperationalError:
+            # A database from before the watchlists migration has no `watched`
+            # column. Its Telegram streams must still be picked up.
+            rows = con.execute(
+                "SELECT label, query, list_id, tab, paused, min_interval_s, "
+                "       max_pages_per_poll "
+                "FROM streams WHERE tg_enabled = 1").fetchall()
         con.close()
     except sqlite3.Error as e:
         if log:
@@ -1174,7 +1195,9 @@ async def cmd_watch(args) -> int:
     if args.all or not args.stream:
         extra = _telegram_streams(cfg, {s.label for s in streams}, log=_log)
         for s in extra:
-            _log(f"[watch] + {s.label}  (watched because Telegram is on for it)")
+            why = ("a dashboard watchlist compiles to it"
+                   if s.label.startswith("wl:") else "Telegram is on for it")
+            _log(f"[watch] + {s.label}  (watched because {why})")
         streams = streams + extra
 
     if not streams:
