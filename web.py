@@ -1254,8 +1254,19 @@ def _ig_posts(q):
     if not rp.exists():
         return {"count": 0, "posts": [], "next_cursor": None}
     import store_ig
+
+    # `since` accepts the same windows the X side uses ("24h", "7d", …) so one
+    # habit works on both tabs. store_ig.query has always supported the bound;
+    # only this endpoint never passed it through.
+    since = None
+    if q.get("since"):
+        ms = store_mod.parse_window(q["since"])
+        if ms:
+            since = int(ms / 1000)      # store_ig keys on taken_at, unix SECONDS
+
     with store_ig.Store(rp) as st:
         rows = st.query(limit=int(q.get("limit") or 30),
+                        since=since,
                         source=q.get("source") or None,
                         username=q.get("username") or None,
                         before_pk=int(q["cursor"]) if q.get("cursor") else None)
@@ -2150,7 +2161,22 @@ _DASH_BODY = r"""</style></head><body>
 
   <span id="igctl" class="hdrctl" hidden>
     <input id="ig_q" placeholder="Filter Instagram posts by @username…">
+    <select id="ig_since" title="Only posts published inside this window">
+      <option value="24h" selected>past 24 hours</option>
+      <option value="1h">past hour</option>
+      <option value="7d">past week</option>
+      <option value="">any time</option>
+    </select>
     <button id="ig_refresh">Refresh</button>
+    <label class="livetog" title="Re-reads the local database. It never contacts Instagram, so it is free and cannot be rate limited.">
+      <input type="checkbox" id="ig_autorefresh" checked>
+      <span id="ig_livedot"></span>Live
+      <select id="ig_everysec">
+        <option value="30" selected>every 30s</option>
+        <option value="60">every 60s</option>
+        <option value="300">every 5m</option>
+      </select>
+    </label>
   </span>
 
   <a href="/logout" class="muted" style="font-size:13px;margin-left:auto">Sign out</a>
@@ -2306,7 +2332,10 @@ function switchPlatform(p, el){
   document.getElementById('view-ig').hidden = (p !== 'ig');
   document.getElementById('xctl').hidden  = (p !== 'x');
   document.getElementById('igctl').hidden = (p !== 'ig');
-  if(p === 'ig') loadIG();
+  // Only the visible tab polls. Leaving both timers running would re-query the
+  // database for a view nobody is looking at.
+  if(p === 'ig'){ loadIG(); setIGLive(document.getElementById('ig_autorefresh').checked); }
+  else { setIGLive(false); }
 }
 
 function igCard(pst){
@@ -2351,15 +2380,48 @@ async function loadIGPosts(){
   var el = document.getElementById('ig-results');
   try{
     var qv = (document.getElementById('ig_q').value || '').trim().replace(/^@/, '');
-    var d = await api('/api/ig/posts?limit=50' + (qv ? '&username=' + encodeURIComponent(qv) : ''));
+    var sn = document.getElementById('ig_since').value;
+    var d = await api('/api/ig/posts?limit=50'
+      + (qv ? '&username=' + encodeURIComponent(qv) : '')
+      + (sn ? '&since=' + encodeURIComponent(sn) : ''));
+
+    // An empty result inside a WINDOW means something different from an empty
+    // database, and saying "nothing collected yet" when 200 posts exist just
+    // older than a day sends you hunting a bug that is not there.
+    var windowName = document.getElementById('ig_since');
+    var label = windowName.options[windowName.selectedIndex].text;
     el.innerHTML = (d.posts && d.posts.length)
       ? d.posts.map(igCard).join('')
-      : '<div class="empty">No Instagram posts collected yet.<br><span class="muted">Run <code>python3 collect_ig.py run</code> once a source is added.</span></div>';
+      : (sn
+          ? '<div class="empty">Nothing posted in the ' + esc(label) + '.'
+            + '<br><span class="muted">The collector is watching; this is what '
+            + '"no new posts" looks like. Widen the window to see older ones.</span></div>'
+          : '<div class="empty">No Instagram posts collected yet.'
+            + '<br><span class="muted">Run <code>python3 collect_ig.py run</code> '
+            + 'once a source is added.</span></div>');
   }catch(e){ el.innerHTML = '<span class="muted">could not load Instagram posts</span>'; }
+}
+
+/* Live re-read of the LOCAL database — it never calls Instagram, so unlike the
+   collector it costs nothing and can run as often as you like. Kept separate
+   from the X timer so switching tabs does not leave the other one polling. */
+var igTimer = null;
+function setIGLive(on){
+  var dot = document.getElementById('ig_livedot');
+  if (dot) dot.classList.toggle('on', on);
+  if (igTimer) clearInterval(igTimer);
+  igTimer = on
+    ? setInterval(function(){ if (!document.hidden) loadIG(); },
+                  parseInt(document.getElementById('ig_everysec').value, 10) * 1000)
+    : null;
 }
 
 document.getElementById('ig_refresh').onclick = loadIG;
 document.getElementById('ig_q').addEventListener('keydown', function(e){ if(e.key === 'Enter') loadIGPosts(); });
+document.getElementById('ig_since').onchange = loadIGPosts;
+document.getElementById('ig_autorefresh').onchange = function(){ setIGLive(this.checked); };
+document.getElementById('ig_everysec').onchange = function(){
+  setIGLive(document.getElementById('ig_autorefresh').checked); };
 </script>
 
 """
