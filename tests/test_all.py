@@ -1644,8 +1644,8 @@ async def run_webhook(tmp):
             {1: ["ui:from:RajeshGupta5766 -filter:replies -filter:retweets"]})
         ok(len(msgs) == 1 and "&amp;" in msgs[0] and "&lt;script&gt;" in msgs[0],
            "telegram escapes the three characters its HTML mode cares about")
-        ok("https://t.co/abc" in msgs[0] and "<a href" not in msgs[0],
-           "the post link is a bare, copyable URL rather than a hidden hyperlink")
+        ok("<a href" not in msgs[0],
+           "no hyperlink markup — the tweet's own t.co link is left as written")
         ok("ui:from:" not in msgs[0],
            "the stream label is NOT printed — the query is machine noise, the "
            "@handle already identifies the account")
@@ -1666,25 +1666,19 @@ async def run_webhook(tmp):
         ok(len(packed) == 12 and all(len(m) <= wh.TG_MAX_CHARS for m in packed),
            "long tweets stay one-per-message and each is under Telegram's limit")
 
-        # X appends a t.co link to its own media. Printed above our permalink it
-        # showed the same destination twice.
-        selflink = wh.tg_format([{
+        # ONE link per message, and it is the tweet's own. We add none: X already
+        # ends the text with a t.co pointing at the post, so a permalink of ours
+        # underneath printed the same destination twice.
+        onelink = wh.tg_format([{
             "tweet_id": 9, "author_display_name": "R", "author_username": "r",
             "text": "look at this https://t.co/selfLink1",
             "urls": "[]", "media_urls": '["https://pbs.twimg.com/media/x.jpg"]',
             "url": "https://x.com/r/status/9", "like_count": 1}])[0]
-        ok("t.co/selfLink1" not in selflink,
-           "X's self-link to its own media is stripped — one link per message")
-        ok("https://x.com/r/status/9" in selflink, "the permalink stays")
-
-        shared = wh.tg_format([{
-            "tweet_id": 10, "author_display_name": "N", "author_username": "n",
-            "text": "read the report https://t.co/article22",
-            "urls": '["https://example.com/report"]', "media_urls": "[]",
-            "url": "https://x.com/n/status/10", "like_count": 1}])[0]
-        ok("t.co/article22" in shared,
-           "a link the AUTHOR shared is kept — there the t.co is the point of "
-           "the post, not duplication")
+        ok(onelink.count("http") == 1,
+           "exactly one link in the message — the tweet's own t.co")
+        ok("t.co/selfLink1" in onelink, "the text is passed through untouched")
+        ok("x.com/r/status/9" not in onelink,
+           "and no permalink of ours is appended")
 
         ok(wh.TG_GAP_S >= 3.0,
            f"the gap between sends respects ~20 messages/minute per group "

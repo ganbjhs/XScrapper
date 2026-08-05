@@ -31,7 +31,6 @@ import asyncio
 import hashlib
 import hmac
 import json
-import re
 import os
 import time
 
@@ -144,32 +143,6 @@ def _tg_escape(s: str) -> str:
     return (s or "").replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
 
 
-_TRAILING_TCO = re.compile(r"(?:\s+https?://t\.co/\w+)+\s*$")
-
-
-def _strip_self_link(text: str, row: dict) -> str:
-    """
-    Drop the t.co link X appends to its OWN media, so the message carries one
-    link instead of two.
-
-    A tweet with a photo or video ends with a shortened link that resolves back
-    to the tweet itself — it is not something the author typed. Printing it
-    above our permalink showed the same destination twice.
-
-    The rule is conservative and reads the data rather than guessing: `urls`
-    holds the links the AUTHOR actually shared, so a trailing t.co is only
-    removed when that list is empty. A tweet linking to a news article keeps its
-    link, because there the t.co is the point of the post.
-    """
-    if not text:
-        return text
-    try:
-        shared = json.loads(row.get("urls") or "[]")
-    except (TypeError, ValueError):
-        shared = []
-    if shared:
-        return text
-    return _TRAILING_TCO.sub("", text)
 
 
 def tg_format(rows: list, labels_for: dict | None = None) -> list:
@@ -184,9 +157,10 @@ def tg_format(rows: list, labels_for: dict | None = None) -> list:
         "ui:from:RajeshGupta5766 -filter:replies -filter:retweets" — a line of
         machine noise above every post. The @handle already says whose post it
         is, which is the only part of that string anyone was reading.
-      * A bare URL, not a hyperlink. "open on X" hid the address behind a word;
-        the plain link is visible, copyable and forwardable, and Telegram makes
-        it clickable anyway.
+      * NO link line of our own. The tweet text already ends with the t.co link
+        X attaches to the post, so adding a permalink underneath printed the
+        same destination twice. The text is left exactly as the author wrote it
+        and exactly as X shortened it.
 
     HTML rather than Markdown: tweet text is full of underscores, asterisks and
     brackets, and Telegram's Markdown parser rejects the whole message if they
@@ -200,14 +174,12 @@ def tg_format(rows: list, labels_for: dict | None = None) -> list:
     for r in rows:
         who = _tg_escape(r.get("author_display_name") or r.get("author_username") or "?")
         handle = _tg_escape(r.get("author_username") or "")
-        url = r.get("url") or f"https://x.com/i/status/{r['tweet_id']}"
         likes = r.get("like_count") or 0
 
-        def build(body, _who=who, _handle=handle, _url=url, _likes=likes):
+        def build(body, _who=who, _handle=handle, _likes=likes):
             return (f"<b>{_who}</b> <i>@{_handle}</i>\n"
                     f"{_tg_escape(body)}\n"
-                    f"♥ {_likes}\n"
-                    f"{_tg_escape(_url)}")
+                    f"♥ {_likes}")
 
         # A tweet longer than a whole message is trimmed rather than dropped: a
         # truncated post you can click through beats silence.
@@ -216,7 +188,7 @@ def tg_format(rows: list, labels_for: dict | None = None) -> list:
         # round. Cutting an already-escaped string can slice through the middle
         # of an entity — "&amp;" becoming "&am" — and Telegram rejects the whole
         # message as malformed HTML.
-        raw = _strip_self_link((r.get("text") or "").strip(), r).strip()
+        raw = (r.get("text") or "").strip()
         block = build(raw)
         while len(block) > TG_MAX_CHARS and raw:
             raw = raw[:max(0, len(raw) - (len(block) - TG_MAX_CHARS) - 16)]
