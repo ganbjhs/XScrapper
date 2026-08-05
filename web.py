@@ -967,8 +967,29 @@ def _save_telegram(body):
             "chat_id": os.getenv("TELEGRAM_CHAT_ID", "")}
 
 
+# How many real tweets "Send a test" puts in the channel. Three is enough to
+# see the format, the pacing and the links without filling the group.
+TG_TEST_COUNT = 3
+
+
 def _test_telegram(body):
-    """Send one real message, so 'saved' and 'working' are not confused."""
+    """
+    Send a few REAL tweets, so 'saved' and 'working' are not confused.
+
+    This used to post one fixed line — "Connected. Tweets will arrive here." —
+    which proved the bot token and the chat id and nothing else. Every failure
+    this project actually had lived in the part that line skipped: the stream
+    wiring, the delivery loop, the formatter. A test that cannot fail the way
+    the system fails is not a test.
+
+    So it now sends the newest few collected tweets through the SAME formatter
+    the collector uses. What lands in the group is exactly what a real delivery
+    looks like, one tweet per message.
+
+    The delivery cursor is deliberately untouched: a test that consumed tweets
+    would make normal delivery skip them, so proving it works would cost you the
+    very messages you were proving it with.
+    """
     import webhook as wh
 
     token = wh.telegram_token()
@@ -978,15 +999,36 @@ def _test_telegram(body):
     if not chat:
         return {"error": "No chat id — tell me where to send it."}
 
+    # Prefer the stream the test was launched from, so the sample is the one you
+    # are configuring rather than whatever happens to be newest overall.
+    p = {"limit": TG_TEST_COUNT, "order": "desc"}
+    if body.get("stream"):
+        p["stream"] = body["stream"]
+    try:
+        rows = _query_tweets(p).get("rows") or []
+    except Exception:
+        rows = []
+
+    msgs = wh.tg_format(rows) if rows else [
+        "<b>X Collector</b>\nConnected. No tweets collected yet, so this is a "
+        "plain check of the bot token and chat id."]
+
     async def go():
         import httpx
         async with httpx.AsyncClient() as client:
-            return await wh.tg_send(
-                client, token, chat,
-                "<b>X Collector</b>\nConnected. Tweets will arrive here.")
+            for i, msg in enumerate(msgs):
+                if i:
+                    await asyncio.sleep(wh.TG_GAP_S)
+                ok, err = await wh.tg_send(client, token, chat, msg)
+                if not ok:
+                    return False, err
+            return True, ""
 
-    ok, err = _run(go(), timeout=40)
-    return {"ok": ok} if ok else {"error": err}
+    # The timeout must cover the pacing: TG_GAP_S between each send, plus room
+    # for Telegram to be slow on the last one.
+    budget = int(30 + wh.TG_GAP_S * len(msgs)) + 1
+    ok, err = _run(go(), timeout=budget)
+    return {"ok": ok, "sent": len(msgs), "real": bool(rows)} if ok else {"error": err}
 
 
 # --------------------------------------------------------------------------
@@ -1800,12 +1842,36 @@ _CSS_MODERN = r"""
   /* Saving stream settings. The button is the only thing that sends them, so
      it reads as the primary action, and "not sent yet" sits beside it — an
      unsent change must never look the same as a saved one. */
-  .cfgsave{display:flex;align-items:center;gap:8px;margin-top:10px}
-  .cfgbtn.primary{border-color:var(--accent);color:var(--accent);font-weight:600}
+  /* The per-stream settings panel. It had NO styles at all — every rule below
+     was missing, so in a ~280px sidebar the labels wrapped around their own
+     inputs ("Only if it has at least [0] likes Skip retweets") and the whole
+     thing read as debris. Controls stack; nothing shares a line with a control
+     it does not belong to. */
+  .streamcfg{background:var(--bg);border:1px solid var(--line);
+             border-radius:var(--radius);padding:12px;margin:6px 0 10px}
+  .cfghead{font-size:11px;text-transform:uppercase;letter-spacing:.05em;
+           color:var(--dim);margin:14px 0 6px;font-weight:600}
+  .cfghead:first-child{margin-top:0}
+  .cfgrow{display:flex;flex-direction:column;gap:4px;
+          font-size:12px;color:var(--dim);margin-bottom:8px}
+  .cfgrow input,.cfgrow select{font:inherit;color:var(--fg);background:var(--panel);
+      border:1px solid var(--line);border-radius:8px;padding:6px 9px;width:100%}
+  .cfgrow input:focus,.cfgrow select:focus{outline:none;border-color:var(--accent)}
+  .cfgchk{display:flex;align-items:flex-start;gap:7px;font-size:12.5px;
+          color:var(--fg);margin-bottom:7px;line-height:1.4}
+  .cfgchk input{margin-top:2px;flex:0 0 auto}
+  .cfgbtn{width:100%;margin-bottom:6px;font-size:12.5px;padding:7px 10px;
+          text-align:center}
+
+  .cfgsave{display:flex;flex-direction:column;gap:0;margin-top:12px}
+  /* NOT a colour override. button.primary is already white-on-blue; setting
+     color here made the label blue on blue and the button read as an empty
+     box. */
+  .cfgbtn.primary{font-weight:600}
   .cfgbtn.primary:disabled{opacity:.5;cursor:default}
-  .cfgdirty{font-size:12px;color:var(--warn)}
+  .cfgdirty{font-size:12px;color:var(--warn);text-align:center;margin-top:2px}
   .cfgbtn.danger{border-color:var(--warn);color:var(--warn)}
-  .cfgnote{font-size:11px;color:var(--dim);margin:2px 0 8px 22px;line-height:1.45}
+  .cfgnote{font-size:11px;color:var(--dim);margin:0 0 10px 22px;line-height:1.45}
 
   /* Filters panel. These rules MUST live in _CSS_MODERN — the dashboard page is
      built as _CSS_CORE + _CSS_MODERN, so a rule dropped into any other <style>
@@ -2759,14 +2825,15 @@ function drawCfg(streams){
       <label class="cfgrow">Send where
         <input data-k="tg_chat_id" placeholder="e.g. -1003964750953 or @mychannel"
                value="${esc(s.tg_chat_id||"")}"></label>
-      <label class="cfgrow">Only if it has at least
-        <input data-k="tg_min_likes" type="number" min="0" style="width:70px"
-               value="${s.tg_min_likes||0}"> likes</label>
+      <label class="cfgrow">Only if it has at least this many likes
+        <input data-k="tg_min_likes" type="number" min="0"
+               value="${s.tg_min_likes||0}"></label>
       <label class="cfgchk"><input type="checkbox" data-k="tg_skip_retweets"
         ${s.tg_skip_retweets?"checked":""}> Skip retweets</label>
 
       <div class="cfgsave">
         <button class="cfgbtn primary" data-save>Save settings</button>
+        <button class="cfgbtn" data-tgtest>Send 3 test tweets</button>
         <span class="cfgdirty" data-dirty hidden>not sent yet</span>
       </div>
 
@@ -2818,6 +2885,27 @@ function drawCfg(streams){
           ? `Saved. Sending <b>${esc(label)}</b> to Telegram ${esc(body.tg_chat_id || "(default chat)")}.`
           : `Saved settings for <b>${esc(label)}</b>.`, "ok");
         await status();
+      } catch (e) { banner(esc(e.message), "err"); }
+      finally { btn.disabled = false; }
+    };
+
+    // Tests THIS stream with THIS panel's chat id, including one you have
+    // typed but not yet saved — otherwise "test" would check the old value and
+    // tell you the new one works.
+    box.querySelector("[data-tgtest]").onclick = async (ev) => {
+      const btn = ev.currentTarget;
+      const chat = (box.querySelector('[data-k="tg_chat_id"]').value || "").trim();
+      btn.disabled = true;
+      banner("Sending 3 real tweets to Telegram…");
+      try {
+        const d = await api("/api/settings/telegram/test", {
+          method:"POST", headers:{"Content-Type":"application/json"},
+          body: JSON.stringify({chat_id: chat, stream: label})
+        });
+        banner(d.error ? "Telegram said: " + esc(d.error)
+             : (d.real ? `Sent ${d.sent} real tweet(s) from <b>${esc(label)}</b>, one per message.`
+                       : "Bot and chat id work, but this stream has no tweets yet."),
+               d.error ? "err" : "ok");
       } catch (e) { banner(esc(e.message), "err"); }
       finally { btn.disabled = false; }
     };
