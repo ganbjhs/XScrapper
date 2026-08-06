@@ -393,6 +393,12 @@ def _query_tweets(p):
     # position you can resume from.
     order = "ASC" if (p.get("order") == "asc" or cursoring) else "DESC"
     order_by = "t.collected_ms, t.tweet_id" if p.get("since_collected_ms") else "t.tweet_id"
+    # Engagement sorts, whitelisted — never while cursoring: a cursor position
+    # only means something on a stable time order.
+    _SORTS = {"likes": "t.like_count DESC, t.tweet_id DESC",
+              "views": "t.view_count DESC, t.tweet_id DESC"}
+    if not cursoring and p.get("sort") in _SORTS:
+        order_by, order = _SORTS[p["sort"]], ""
     limit = min(int(p.get("limit") or 50), 500)
     offset = int(p.get("offset") or 0)
 

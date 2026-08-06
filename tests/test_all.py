@@ -1443,6 +1443,8 @@ def test_filters(tmp):
     print()
     print("== numeric thresholds ==")
     ok(n(min_views="1000") == 2, "Min views is a floor, not an exact match")
+    got = [r["tweet_id"] for r in web._query_tweets({"sort": "views"})["rows"]]
+    ok(got == ["3", "1", "2"], f"sort=views orders by engagement, not by time ({got})")
     ok(n(min_followers="1000000") == 1, "Min followers likewise")
     ok(n(lang="hi") == 1, "Language still narrows")
     ok(n(min_views="99999999") == 0, "a threshold nothing meets returns nothing, cleanly")

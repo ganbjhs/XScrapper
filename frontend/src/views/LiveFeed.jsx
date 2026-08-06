@@ -26,9 +26,29 @@ const normIg = (p) => ({
     : [],
 });
 
+const DUR_MS = { "1h": 36e5, "6h": 216e5, "12h": 432e5, "24h": 864e5,
+                 "48h": 1728e5, "7d": 6048e5, "30d": 2592e6 };
+const DUR_LABEL = { "1h": "Last 1 hour", "6h": "Last 6 hours", "12h": "Last 12 hours",
+                    "24h": "Last 24 hours", "48h": "Last 48 hours",
+                    "7d": "Last 7 days", "30d": "Last 30 days", all: "All time" };
+
+function Pill({ label, value, onChange, options }) {
+  return (
+    <label className="fpill">
+      <span>{label}:</span>
+      <select value={value} onChange={(e) => onChange(e.target.value)}>
+        {options.map(([v, text, disabled]) => (
+          <option key={v} value={v} disabled={disabled}>{text}</option>
+        ))}
+      </select>
+    </label>
+  );
+}
+
 export default function LiveFeed({ onMenu }) {
   const { project, projectsError } = useProject();
   const pid = project?.project_id;
+  const [flt, setFlt] = useState({ source: "all", sort: "latest", dur: "24h" });
 
   const metrics = useApi(() => api.metrics(), [], { every: 30_000 });
   const status = useApi(() => api.status(), [], { every: 30_000 });
@@ -38,7 +58,14 @@ export default function LiveFeed({ onMenu }) {
   const feed = useApi(
     async () => {
       const [x, ig] = await Promise.all([
-        pid ? api.tweets({ project: pid, limit: 30 }) : Promise.resolve({ rows: [] }),
+        pid
+          ? api.tweets({
+              project: pid, limit: 50,
+              since: flt.dur !== "all" ? flt.dur : undefined,
+              sort: flt.sort === "likes" || flt.sort === "views" ? flt.sort : undefined,
+              order: flt.sort === "oldest" ? "asc" : undefined,
+            })
+          : Promise.resolve({ rows: [] }),
         api.igPosts({ limit: 10 }).catch(() => ({ posts: [] })),
       ]);
       const rows = [
@@ -48,7 +75,7 @@ export default function LiveFeed({ onMenu }) {
       rows.sort((a, b) => Date.parse(b.collected_at || 0) - Date.parse(a.collected_at || 0));
       return rows;
     },
-    [pid],
+    [pid, flt.dur, flt.sort],
     // The stream below is the real-time path; this refetch is the safety net
     // that also picks up Instagram (which the stream does not carry yet).
     { every: 60_000 },
@@ -91,9 +118,25 @@ export default function LiveFeed({ onMenu }) {
     return out;
   }, [pushed, feed.data]);
   const keyOf = (t) => `${t.platform}:${t.tweet_id}`;
+  // The filter bar applies to everything on screen — fetched backlog and
+  // stream-pushed posts alike (the server pre-filters the backlog; this
+  // repeats the rule locally so live arrivals obey it too).
+  const filtered = useMemo(() => {
+    const cutoff = flt.dur !== "all" ? Date.now() - DUR_MS[flt.dur] : 0;
+    const out = latest.filter((t) =>
+      (flt.source === "all" || t.platform === flt.source) &&
+      (!cutoff || Date.parse(t.created_at || 0) >= cutoff));
+    const by = {
+      latest: (a, b) => Date.parse(b.collected_at || 0) - Date.parse(a.collected_at || 0),
+      oldest: (a, b) => Date.parse(a.collected_at || 0) - Date.parse(b.collected_at || 0),
+      likes: (a, b) => (b.like_count || 0) - (a.like_count || 0),
+      views: (a, b) => (b.view_count || 0) - (a.view_count || 0),
+    }[flt.sort];
+    return by ? [...out].sort(by) : out;
+  }, [latest, flt]);
   const visible = useMemo(
-    () => (shownIds ? latest.filter((t) => shownIds.has(keyOf(t))) : latest),
-    [latest, shownIds],
+    () => (shownIds ? filtered.filter((t) => shownIds.has(keyOf(t))) : filtered),
+    [filtered, shownIds],
   );
   useEffect(() => {
     setShownIds((prev) => {
@@ -107,7 +150,7 @@ export default function LiveFeed({ onMenu }) {
     });
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [latest, feed.data]);
-  const fresh = shownIds ? latest.length - visible.length : 0;
+  const fresh = shownIds ? filtered.length - visible.length : 0;
 
   const m = metrics.data;
   // The pid of a live collector process — the one honest signal that posts
@@ -175,6 +218,20 @@ export default function LiveFeed({ onMenu }) {
         </div>
       </section>
 
+      <div className="fbar">
+        <Pill label="Source" value={flt.source}
+              onChange={(v) => setFlt((s) => ({ ...s, source: v }))}
+              options={[["all", "All"], ["x", "X / Twitter"],
+                        ["instagram", "Instagram"], ["facebook", "Facebook (soon)", true]]} />
+        <Pill label="Sort" value={flt.sort}
+              onChange={(v) => setFlt((s) => ({ ...s, sort: v }))}
+              options={[["latest", "Latest first"], ["oldest", "Oldest first"],
+                        ["likes", "Most liked"], ["views", "Most viewed"]]} />
+        <Pill label="Duration" value={flt.dur}
+              onChange={(v) => setFlt((s) => ({ ...s, dur: v }))}
+              options={Object.entries(DUR_LABEL)} />
+      </div>
+
       <div className="cols">
         <section>
           <div className="feed-head">
@@ -185,7 +242,13 @@ export default function LiveFeed({ onMenu }) {
                 ▲ {fresh} new post{fresh === 1 ? "" : "s"}
               </button>
             )}
-            <span className="right">Newest first · by collected time</span>
+            <span className="right">
+              {{ latest: "Newest first · by collected time",
+                 oldest: "Oldest first · by collected time",
+                 likes: "Most liked first",
+                 views: "Most viewed first" }[flt.sort]}
+              {" · "}{DUR_LABEL[flt.dur].toLowerCase()}
+            </span>
           </div>
 
           {projectsError && <ErrorState error={projectsError} />}
