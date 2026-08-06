@@ -50,7 +50,7 @@ export default function LiveFeed({ onMenu }) {
   const pid = project?.project_id;
   const [flt, setFlt] = useState({ source: "all", sort: "latest", dur: "24h" });
 
-  const metrics = useApi(() => api.metrics(), [], { every: 30_000 });
+  const metrics = useApi(() => api.metrics(pid), [pid], { every: 30_000 });
   const status = useApi(() => api.status(), [], { every: 30_000 });
   const delivery = useApi(() => api.delivery(pid), [pid], { every: 15_000 });
   const wls = useApi(() => (pid ? api.watchlists(pid) : Promise.resolve({ watchlists: [] })), [pid]);

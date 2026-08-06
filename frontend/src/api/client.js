@@ -36,7 +36,7 @@ const qs = (p) => {
 
 export const api = {
   status: () => request("/api/status"),
-  metrics: () => request("/api/metrics"),
+  metrics: (project) => request(`/api/metrics${qs({ project })}`),
   guard: () => request("/api/guard"),
   activity: (p) => request(`/api/activity${qs(p)}`),
   delivery: (project) => request(`/api/delivery${qs({ project })}`),

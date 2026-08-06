@@ -1011,21 +1011,47 @@ def _delivery_json(q=None):
         pid = 0
 
     targets = []
-    try:
-        for h in _CFG.enabled_webhooks():
-            targets.append({"label": h.label, "name": h.label, "kind": "webhook",
-                            "url": h.url, "streams": list(h.streams or []),
-                            "scope": "global", "enabled": True})
-    except Exception:
-        pass
 
     with _connect() as con:
+        # Which projects each stream feeds — a stream-scoped target belongs to
+        # exactly those projects' Delivery pages, not to everyone's.
+        stream_projects: dict = {}
+        try:
+            for r in con.execute(
+                    "SELECT s.label, ps.project_id FROM streams s "
+                    "JOIN project_streams ps USING(stream_id)"):
+                stream_projects.setdefault(r["label"], set()).add(r["project_id"])
+        except sqlite3.Error:
+            pass
+
+        def _projects_of(labels):
+            got = set()
+            for lbl in labels:
+                got |= stream_projects.get(lbl, set())
+            return got
+
+        try:
+            for h in _CFG.enabled_webhooks():
+                projs = _projects_of(h.streams or [])
+                if pid and h.streams and projs and pid not in projs:
+                    continue      # scoped to streams in OTHER projects
+                targets.append({"label": h.label, "name": h.label, "kind": "webhook",
+                                "url": h.url, "streams": list(h.streams or []),
+                                "scope": "global" if not h.streams else sorted(projs) or "global",
+                                "enabled": True})
+        except Exception:
+            pass
+
         try:
             for r in con.execute(
                     "SELECT label FROM streams WHERE tg_enabled = 1 ORDER BY label"):
+                projs = stream_projects.get(r["label"], set())
+                if pid and projs and pid not in projs:
+                    continue      # this stream's Telegram belongs elsewhere
                 targets.append({"label": f"tg:{r['label']}", "name": r["label"],
                                 "kind": "telegram", "url": "Telegram",
-                                "streams": [r["label"]], "scope": "global",
+                                "streams": [r["label"]],
+                                "scope": sorted(projs) or "global",
                                 "enabled": True})
         except sqlite3.Error:
             pass
@@ -1100,11 +1126,20 @@ def _activity_json(q):
     return {"polls": [dict(r) for r in rows]}
 
 
-def _metrics_json():
+def _metrics_json(q=None):
     """
     The stat strip and the 7-day chart, from what is actually stored. Days are
     UTC to match every other timestamp in the store.
+
+    ?project=N scopes every number to that project's streams — a project's
+    dashboard must describe THAT project, never the whole machine. (Instagram
+    sources are not project-mapped yet, so the IG series reads zero in a
+    project-scoped view rather than lying with a global count.)
     """
+    try:
+        pid = int((q or {}).get("project") or 0)
+    except (TypeError, ValueError):
+        pid = 0
     out = {"today": {"collected": 0, "photos": 0, "videos": 0,
                      "median_lag_ms": None, "p95_lag_ms": None},
            "per_day": [], "totals": {"tweets": 0}}
@@ -1113,36 +1148,45 @@ def _metrics_json():
     midnight = (now_ms // day_ms) * day_ms
     week_ago = midnight - 6 * day_ms
 
+    scope = ""
+    scope_params: list = []
+    if pid:
+        scope = (" AND EXISTS (SELECT 1 FROM tweet_hits ph "
+                 "   JOIN project_streams ps ON ps.stream_id = ph.stream_id "
+                 "   WHERE ph.tweet_id = t.tweet_id AND ps.project_id = ?)")
+        scope_params = [pid]
+
     if _CFG.db_results.exists():
         with _connect() as con:
             out["totals"]["tweets"] = con.execute(
-                "SELECT COUNT(*) c FROM tweets WHERE source = 'result'"
-            ).fetchone()["c"]
+                f"SELECT COUNT(*) c FROM tweets t WHERE t.source = 'result'{scope}",
+                scope_params).fetchone()["c"]
             r = con.execute(
                 "SELECT COUNT(*) c, "
-                "  SUM(CASE WHEN media_json LIKE '%\"photo\"%' THEN 1 ELSE 0 END) p, "
-                "  SUM(CASE WHEN media_json LIKE '%\"video\"%' "
-                "        OR media_json LIKE '%\"gif\"%' THEN 1 ELSE 0 END) v "
-                "FROM tweets WHERE source = 'result' AND collected_ms >= ?",
-                (midnight,)).fetchone()
+                "  SUM(CASE WHEN t.media_json LIKE '%\"photo\"%' THEN 1 ELSE 0 END) p, "
+                "  SUM(CASE WHEN t.media_json LIKE '%\"video\"%' "
+                "        OR t.media_json LIKE '%\"gif\"%' THEN 1 ELSE 0 END) v "
+                f"FROM tweets t WHERE t.source = 'result' AND t.collected_ms >= ?{scope}",
+                [midnight, *scope_params]).fetchone()
             out["today"].update(collected=r["c"], photos=r["p"] or 0,
                                 videos=r["v"] or 0)
             lags = [x["lag_ms"] for x in con.execute(
-                "SELECT lag_ms FROM tweets WHERE source = 'result' "
-                "AND collected_ms >= ? AND lag_ms IS NOT NULL", (midnight,))]
+                "SELECT t.lag_ms FROM tweets t WHERE t.source = 'result' "
+                f"AND t.collected_ms >= ? AND t.lag_ms IS NOT NULL{scope}",
+                [midnight, *scope_params])]
             if lags:
                 out["today"]["median_lag_ms"] = store_mod._percentile(lags, 50)
                 out["today"]["p95_lag_ms"] = store_mod._percentile(lags, 95)
             by_day = {int(r["d"]): r["c"] for r in con.execute(
-                "SELECT collected_ms / ? AS d, COUNT(*) c FROM tweets "
-                "WHERE source = 'result' AND collected_ms >= ? GROUP BY d",
-                (day_ms, week_ago))}
+                "SELECT t.collected_ms / ? AS d, COUNT(*) c FROM tweets t "
+                f"WHERE t.source = 'result' AND t.collected_ms >= ?{scope} GROUP BY d",
+                [day_ms, week_ago, *scope_params])}
     else:
         by_day = {}
 
     ig_by_day = {}
     rp = _CFG.root / "ig_results.db"
-    if rp.exists():
+    if rp.exists() and not pid:
         try:
             con = sqlite3.connect(f"file:{rp}?mode=ro", uri=True, timeout=5)
             con.row_factory = sqlite3.Row
@@ -2165,7 +2209,7 @@ class Handler(BaseHTTPRequestHandler):
             if u.path == "/api/activity":
                 return self._send(200, _activity_json(q))
             if u.path == "/api/metrics":
-                return self._send(200, _metrics_json())
+                return self._send(200, _metrics_json(q))
             if u.path == "/api/login/frame":
                 s = _LOGIN["session"]
                 if s is None:
