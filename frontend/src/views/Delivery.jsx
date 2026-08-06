@@ -79,8 +79,63 @@ function AddTargetModal({ pid, onDone, onClose }) {
   );
 }
 
+function BackfillModal({ t, onClose }) {
+  const [since, setSince] = useState("24h");
+  const [limit, setLimit] = useState("20");
+  const [busy, setBusy] = useState(false);
+  const [result, setResult] = useState(null);
+
+  const send = async () => {
+    setBusy(true);
+    setResult(null);
+    try {
+      const r = await api.deliveryBackfill({
+        target_id: t.target_id, since, limit: Number(limit) || 20,
+      });
+      setResult(`✓ Sent ${r.sent} post${r.sent === 1 ? "" : "s"}${r.note ? ` — ${r.note}` : ""}`);
+    } catch (e) {
+      setResult(`✗ ${String(e.message || e)}`);
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  return (
+    <Modal title={`Send past posts to “${t.name}”`} onClose={onClose}
+           sub="A one-time send of already-collected posts, oldest first. Live delivery is untouched — nothing gets duplicated.">
+      <div className="field">
+        <label htmlFor="bfsince">Posts from the last…</label>
+        <select id="bfsince" value={since} onChange={(e) => setSince(e.target.value)}>
+          <option value="1h">1 hour</option><option value="6h">6 hours</option>
+          <option value="12h">12 hours</option><option value="24h">24 hours</option>
+          <option value="48h">48 hours</option><option value="7d">7 days</option>
+          <option value="30d">30 days</option>
+        </select>
+      </div>
+      <div className="field">
+        <label htmlFor="bflimit">At most (Telegram allows ~20/min; max 50)</label>
+        <input id="bflimit" inputMode="numeric" value={limit}
+               onChange={(e) => setLimit(e.target.value)} />
+      </div>
+      {result && (
+        <div style={{ marginTop: 12, fontWeight: 600 }}
+             className={result.startsWith("✓") ? "st-good" : "st-crit"}>
+          {result}
+        </div>
+      )}
+      <div className="row">
+        <button className="btn btn-ghost" onClick={onClose}>Close</button>
+        <button className="btn btn-brand" disabled={busy} onClick={send}>
+          {busy ? "Sending… (paced for Telegram)" : "Send"}
+        </button>
+      </div>
+    </Modal>
+  );
+}
+
 function TargetPanel({ t, reload }) {
   const own = t.target_id != null;
+  const [backfilling, setBackfilling] = useState(false);
   return (
     <div className="panel">
       <div className="phead">
@@ -129,6 +184,11 @@ function TargetPanel({ t, reload }) {
                   }}>
             {t.enabled ? "Pause" : "Resume"}
           </button>
+          {t.kind === "telegram" && (
+            <button className="btn btn-ghost btn-sm" onClick={() => setBackfilling(true)}>
+              Send past posts…
+            </button>
+          )}
           <span style={{ flex: 1 }} />
           <button className="btn btn-danger btn-sm"
                   onClick={async () => { await api.removeDeliveryTarget(t.target_id); reload(); }}>
@@ -136,6 +196,7 @@ function TargetPanel({ t, reload }) {
           </button>
         </div>
       )}
+      {backfilling && <BackfillModal t={t} onClose={() => setBackfilling(false)} />}
     </div>
   );
 }

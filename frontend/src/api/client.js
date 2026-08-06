@@ -51,6 +51,8 @@ export const api = {
     request("/api/delivery/targets/update", { method: "POST", body }),
   removeDeliveryTarget: (target_id) =>
     request("/api/delivery/targets/remove", { method: "POST", body: { target_id } }),
+  deliveryBackfill: (body) =>
+    request("/api/delivery/backfill", { method: "POST", body }),
   tweets: (p) => request(`/api/tweets${qs(p)}`),
   igPosts: (p) => request(`/api/ig/posts${qs(p)}`),
   igStatus: () => request("/api/ig/status"),

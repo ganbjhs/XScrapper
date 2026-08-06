@@ -44,6 +44,21 @@ function withLinks(text) {
   );
 }
 
+function Pfp({ t, name }) {
+  const [broken, setBroken] = React.useState(false);
+  if (t.author_avatar && !broken) {
+    return (
+      <img className="pfp" src={t.author_avatar} alt="" loading="lazy"
+           style={{ objectFit: "cover" }} onError={() => setBroken(true)} />
+    );
+  }
+  return (
+    <div className="pfp" style={{ background: pfpColor(t.author_username) }}>
+      {name.slice(0, 2).toUpperCase()}
+    </div>
+  );
+}
+
 export default function PostCard({ t, onPin, onUnpin }) {
   const name = t.author_display_name || t.author_username || "unknown";
   const media = t.media || [];
@@ -51,9 +66,7 @@ export default function PostCard({ t, onPin, onUnpin }) {
     <article className={`card${media.length ? "" : " nomedia"}`}>
       <div>
         <div className="chead">
-          <div className="pfp" style={{ background: pfpColor(t.author_username) }}>
-            {name.slice(0, 2).toUpperCase()}
-          </div>
+          <Pfp t={t} name={name} />
           <b>{name}</b>
           <span className="handle">@{t.author_username}</span>
           <span className={`badge platform-${t.platform === "instagram" ? "ig" : "x"}`}>

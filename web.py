@@ -433,6 +433,14 @@ def _row_to_json(r):
         d["media"] = json.loads(d.pop("media_json", None) or "[]")
     except (TypeError, ValueError):
         d["media"] = []
+    # The author's profile picture. Never extracted into a column, but the
+    # full payload was kept (R9 again) — so it is right there in raw_json,
+    # at read time, for every tweet ever collected.
+    try:
+        d["author_avatar"] = (json.loads(d.get("raw_json") or "{}")
+                              .get("user", {}).get("profileImageUrl"))
+    except (TypeError, ValueError, AttributeError):
+        d["author_avatar"] = None
     # JS loses integer precision above 2^53, and tweet ids are well past it.
     d["tweet_id"] = str(d["tweet_id"])
     d.pop("raw_json", None)
@@ -1338,6 +1346,73 @@ def _delivery_target_update(body):
         vals["enabled"] = int(bool(body["enabled"]))
     ok_ = _with_store(lambda st: st.update_delivery_target(tid, vals))
     return {"ok": True} if ok_ else {"error": f"no target {tid}"}
+
+
+def _delivery_backfill(body):
+    """
+    One-shot: send PAST posts (by posted time, within a window) to a Telegram
+    target. Exists because normal delivery deliberately starts from NOW — the
+    moment you add a target for a handle you just started watching, the
+    history that was collected before the target existed would otherwise
+    never reach the channel.
+
+    Sends oldest-first so the channel reads chronologically, paced to
+    Telegram's per-group rate limit, capped, and NEVER moves the delivery
+    cursor — live delivery continues exactly as before, with no duplicates
+    (everything sent here sits behind the cursor already).
+    """
+    import webhook as wh
+
+    try:
+        tid = int(body.get("target_id") or 0)
+    except (TypeError, ValueError):
+        return {"error": "target_id must be a number"}
+    with _connect() as con:
+        row = con.execute("SELECT * FROM delivery_targets WHERE target_id = ?",
+                          (tid,)).fetchone()
+    if not row:
+        return {"error": f"no target {tid}"}
+    if row["kind"] != "telegram":
+        return {"error": "history send is for Telegram targets (a webhook "
+                         "receiver should read your API instead)"}
+    token = wh.telegram_token()
+    if not token:
+        return {"error": "TELEGRAM_BOT_TOKEN is not set in .env"}
+    try:
+        since_ms = store_mod.parse_window(body.get("since") or "24h")
+    except ValueError as e:
+        return {"error": str(e)}
+    try:
+        limit = min(50, max(1, int(body.get("limit") or 20)))
+    except (TypeError, ValueError):
+        return {"error": "limit must be a whole number"}
+
+    with _connect() as con:
+        rows = [dict(r) for r in con.execute(
+            "SELECT t.* FROM tweets t WHERE t.source = 'result' "
+            "AND t.created_ms >= ? "
+            "AND EXISTS (SELECT 1 FROM tweet_hits ph JOIN project_streams ps "
+            "            ON ps.stream_id = ph.stream_id "
+            "            WHERE ph.tweet_id = t.tweet_id AND ps.project_id = ?) "
+            "ORDER BY t.created_ms ASC LIMIT ?",
+            (since_ms or 0, row["project_id"], limit))]
+    if not rows:
+        return {"sent": 0, "note": "nothing collected in that window for this project"}
+
+    async def go():
+        import httpx
+        sent = 0
+        async with httpx.AsyncClient() as client:
+            for i, msg in enumerate(wh.tg_format(rows)):
+                if i:
+                    await asyncio.sleep(wh.TG_GAP_S)
+                ok_, err = await wh.tg_send(client, token, row["chat_id"], msg)
+                if not ok_:
+                    return {"sent": sent, "error": err}
+                sent += 1
+        return {"sent": sent}
+    # 50 messages at Telegram pace is ~160s; the request waits it out.
+    return _run(go(), timeout=280)
 
 
 def _delivery_target_remove(body):
@@ -2264,6 +2339,8 @@ class Handler(BaseHTTPRequestHandler):
                 return self._send(200, _delivery_target_update(body))
             if u.path == "/api/delivery/targets/remove":
                 return self._send(200, _delivery_target_remove(body))
+            if u.path == "/api/delivery/backfill":
+                return self._send(200, _delivery_backfill(body))
             if u.path == "/api/alerts":
                 return self._send(200, _alert_post(body))
             if u.path == "/api/alerts/update":
