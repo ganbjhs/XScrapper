@@ -21,6 +21,7 @@ text column.
 
 import csv
 import json
+import re
 import sqlite3
 import time
 from dataclasses import dataclass
@@ -470,6 +471,93 @@ CREATE TABLE IF NOT EXISTS webhook_state (
 
 -- Delivery walks tweets in collection order, which is not the primary key.
 CREATE INDEX IF NOT EXISTS ix_tweets_delivery ON tweets(collected_ms, tweet_id);
+
+-- ---------------------------------------------------------------------------
+-- Projects and watchlists (the dashboard's organizing layer).
+--
+-- A PROJECT groups watchlists and feeds for one client/beat. Scraper accounts
+-- and the collector stay global — a project is a VIEW over streams, never its
+-- own collection machinery. A WATCHLIST is a list of handles the user manages
+-- in the dashboard; it COMPILES into ordinary streams (the unit the collector
+-- already understands), so nothing downstream of here changes:
+--
+--   kind='query'  ->  one '(from:a OR from:b ...)' search stream per chunk of
+--                     handles (X's query length caps a chunk at ~20)
+--   kind='xlist'  ->  one list_id stream (an X List, external or promoted)
+--
+-- Compiled streams are named 'wl:<watchlist_id>:<n>' and carry watched=1 so
+-- the watcher picks them up without a config.toml entry (same mechanism as
+-- tg_enabled). project_streams maps EVERY stream a project sees — compiled
+-- ones and manually attached ones alike — so "this project's tweets" is one
+-- join, not special cases.
+CREATE TABLE IF NOT EXISTS projects (
+  project_id  INTEGER PRIMARY KEY AUTOINCREMENT,
+  name        TEXT NOT NULL UNIQUE,
+  archived    INTEGER NOT NULL DEFAULT 0,
+  created_at  TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS watchlists (
+  watchlist_id INTEGER PRIMARY KEY AUTOINCREMENT,
+  project_id   INTEGER NOT NULL,
+  name         TEXT NOT NULL,
+  kind         TEXT NOT NULL DEFAULT 'query',   -- 'query' | 'xlist'
+  list_id      TEXT,                            -- when kind='xlist'
+  created_at   TEXT NOT NULL,
+  UNIQUE(project_id, name)
+);
+
+CREATE TABLE IF NOT EXISTS watchlist_members (
+  watchlist_id INTEGER NOT NULL,
+  handle       TEXT NOT NULL,                   -- lowercase, no '@'
+  display_name TEXT,
+  user_id      TEXT,                            -- filled when resolved
+  added_at     TEXT NOT NULL,
+  PRIMARY KEY (watchlist_id, handle)
+) WITHOUT ROWID;
+
+CREATE TABLE IF NOT EXISTS project_streams (
+  project_id INTEGER NOT NULL,
+  stream_id  INTEGER NOT NULL,
+  PRIMARY KEY (project_id, stream_id)
+) WITHOUT ROWID;
+
+-- Collections: curation boards. An editor pins posts from the feed or search
+-- into a named board ("Floods — day 2") and hands the board off (CSV today;
+-- other shapes can follow). Pinning is a REFERENCE to the tweets table, never
+-- a copy — the post stays exactly one row, and unpinning deletes nothing.
+CREATE TABLE IF NOT EXISTS collections (
+  collection_id INTEGER PRIMARY KEY AUTOINCREMENT,
+  project_id    INTEGER NOT NULL,
+  name          TEXT NOT NULL,
+  created_at    TEXT NOT NULL,
+  UNIQUE(project_id, name)
+);
+
+CREATE TABLE IF NOT EXISTS collection_items (
+  collection_id INTEGER NOT NULL,
+  tweet_id      INTEGER NOT NULL,
+  added_ms      INTEGER NOT NULL,
+  PRIMARY KEY (collection_id, tweet_id)
+) WITHOUT ROWID;
+
+-- Velocity alerts: "this scope is posting far above its usual pace." Counts
+-- only — no sentiment, no AI (analysis stays in Watch-Tower). A rule scopes
+-- to one watchlist or a whole project, compares the last hour against the
+-- trailing day's hourly average, and pings Telegram through the same
+-- machinery streams already use. last_fired_ms is the cooldown anchor: a
+-- surge that lasts three hours should ping a few times, not sixty.
+CREATE TABLE IF NOT EXISTS alerts (
+  alert_id      INTEGER PRIMARY KEY AUTOINCREMENT,
+  project_id    INTEGER NOT NULL,
+  watchlist_id  INTEGER,                       -- NULL = the whole project
+  threshold     REAL NOT NULL DEFAULT 3.0,     -- × the usual hourly pace
+  min_posts     INTEGER NOT NULL DEFAULT 10,   -- floor: quiet scopes never fire
+  tg_chat_id    TEXT,                          -- NULL = TELEGRAM_CHAT_ID env
+  enabled       INTEGER NOT NULL DEFAULT 1,
+  last_fired_ms INTEGER NOT NULL DEFAULT 0,
+  created_at    TEXT NOT NULL
+);
 """
 
 
@@ -503,6 +591,24 @@ def parse_window(spec: str | None) -> int | None:
         return int(dt.timestamp() * 1000)
     except ValueError as e:
         raise ValueError(f"Cannot parse time {spec!r}. Use ISO, or 30m / 6h / 3d.") from e
+
+
+# An X handle: 1–15 word characters, with or without a leading '@'. Also
+# accepts a pasted profile URL ('x.com/NatGeo' or 'https://twitter.com/NatGeo').
+_HANDLE_RE = re.compile(r"^[A-Za-z0-9_]{1,15}$")
+
+
+def normalize_handle(raw) -> str | None:
+    """'@NatGeo' / 'natgeo' / 'https://x.com/NatGeo' -> 'natgeo'; None if invalid."""
+    s = str(raw or "").strip()
+    if "/" in s:
+        for host in ("x.com/", "twitter.com/"):
+            if host in s:
+                s = s.split(host, 1)[1]
+                break
+        s = s.split("/", 1)[0].split("?", 1)[0]
+    s = s.lstrip("@").strip()
+    return s.lower() if _HANDLE_RE.match(s) else None
 
 
 def _percentile(values: list[int], pct: float) -> int:
@@ -564,6 +670,12 @@ class Store:
         wanted = {"polls": {"rl_reset": "INTEGER"},
                   "tweets": {"media_json": "TEXT"},
                   "streams": {"list_id": "TEXT",
+                              # "The watcher should poll this even though
+                              # config.toml never heard of it." Watchlist-
+                              # compiled streams set it; the same mechanism
+                              # tg_enabled already provides for dashboard
+                              # searches, made explicit instead of implied.
+                              "watched": "INTEGER NOT NULL DEFAULT 0",
                               "paused": "INTEGER NOT NULL DEFAULT 0",
                               "min_interval_s": "REAL",
                               "max_pages_per_poll": "INTEGER",
@@ -595,6 +707,31 @@ class Store:
 
         if "media_json" in added:
             self._backfill_media()
+
+        # Every pre-projects database gets a "Default" project holding its
+        # existing streams, so nothing vanishes from the dashboard when the
+        # projects layer arrives. Runs exactly once — the projects table being
+        # non-empty is the marker, so a user who later renames or rearranges
+        # is never fought by the migration.
+        if not self.db.execute("SELECT 1 FROM projects LIMIT 1").fetchone():
+            now = _iso_ms(int(time.time() * 1000))
+            self.db.execute(
+                "INSERT INTO projects(name, created_at) VALUES('Default', ?)", (now,))
+
+        # Adopt orphan streams — anything in NO project — into the oldest one.
+        # config.toml can grow a [[streams]] block and the watcher will
+        # ensure_stream it long after the one-shot backfill above ran; without
+        # this, that stream's tweets would be invisible to every project feed
+        # while still being collected. Watchlist-compiled streams are attached
+        # to their own project at compile time, so this never touches them.
+        oldest = self.db.execute(
+            "SELECT project_id FROM projects ORDER BY project_id LIMIT 1").fetchone()
+        if oldest:
+            self.db.execute(
+                "INSERT OR IGNORE INTO project_streams(project_id, stream_id) "
+                "SELECT ?, s.stream_id FROM streams s WHERE NOT EXISTS "
+                "  (SELECT 1 FROM project_streams ps WHERE ps.stream_id = s.stream_id)",
+                (oldest["project_id"],))
 
     def _backfill_media(self) -> int:
         """
@@ -659,6 +796,388 @@ class Store:
              _iso_ms(int(time.time() * 1000))),
         )
         return cur.lastrowid
+
+    # ----------------------------------------------------------------------
+    # projects & watchlists
+    # ----------------------------------------------------------------------
+    #
+    # See the schema comment: a watchlist is dashboard state that COMPILES into
+    # ordinary streams. All the write paths live here so web.py stays a thin
+    # validator, and the offline tests can exercise the whole lifecycle with no
+    # HTTP involved.
+
+    # Handles per compiled '(from:a OR from:b ...)' query. X caps search query
+    # length; 20 fifteen-char handles plus glue sits comfortably under it.
+    WATCHLIST_CHUNK = 20
+
+    async def projects(self, include_archived: bool = False) -> list:
+        rows = self.db.execute(
+            "SELECT p.*, "
+            "  (SELECT COUNT(*) FROM watchlists w WHERE w.project_id = p.project_id) AS watchlists, "
+            "  (SELECT COUNT(*) FROM project_streams ps WHERE ps.project_id = p.project_id) AS streams "
+            "FROM projects p "
+            + ("" if include_archived else "WHERE p.archived = 0 ")
+            + "ORDER BY p.project_id").fetchall()
+        return [dict(r) for r in rows]
+
+    async def create_project(self, name: str) -> dict:
+        name = (name or "").strip()
+        if not name:
+            return {"error": "a project needs a name"}
+        try:
+            cur = self.db.execute(
+                "INSERT INTO projects(name, created_at) VALUES(?, ?)",
+                (name, _iso_ms(int(time.time() * 1000))))
+        except sqlite3.IntegrityError:
+            return {"error": f"a project called {name!r} already exists"}
+        return {"project_id": cur.lastrowid, "name": name}
+
+    async def set_project_archived(self, project_id: int, archived: bool) -> bool:
+        cur = self.db.execute(
+            "UPDATE projects SET archived = ? WHERE project_id = ?",
+            (int(bool(archived)), int(project_id)))
+        return cur.rowcount > 0
+
+    async def project_stream_ids(self, project_id: int) -> list:
+        return [r["stream_id"] for r in self.db.execute(
+            "SELECT stream_id FROM project_streams WHERE project_id = ?",
+            (int(project_id),))]
+
+    async def attach_stream(self, project_id: int, stream_id: int) -> None:
+        self.db.execute(
+            "INSERT OR IGNORE INTO project_streams(project_id, stream_id) VALUES(?,?)",
+            (int(project_id), int(stream_id)))
+
+    async def watchlists(self, project_id: int) -> list:
+        out = []
+        for w in self.db.execute(
+                "SELECT * FROM watchlists WHERE project_id = ? ORDER BY watchlist_id",
+                (int(project_id),)).fetchall():
+            members = [dict(m) for m in self.db.execute(
+                "SELECT handle, display_name, user_id, added_at "
+                "FROM watchlist_members WHERE watchlist_id = ? ORDER BY handle",
+                (w["watchlist_id"],))]
+            streams = [dict(s) for s in self.db.execute(
+                "SELECT s.stream_id, s.label, s.paused, "
+                "       COUNT(h.tweet_id) AS tweets "
+                "FROM streams s LEFT JOIN tweet_hits h USING(stream_id) "
+                "WHERE s.label LIKE ? GROUP BY s.stream_id ORDER BY s.label",
+                (f"wl:{w['watchlist_id']}:%",))]
+            d = dict(w)
+            d["members"] = members
+            d["streams"] = streams
+            out.append(d)
+        return out
+
+    async def create_watchlist(self, project_id: int, name: str,
+                               kind: str = "query", list_id: str = "") -> dict:
+        name = (name or "").strip()
+        if not name:
+            return {"error": "a watchlist needs a name"}
+        if kind not in ("query", "xlist"):
+            return {"error": "kind must be 'query' or 'xlist'"}
+        if kind == "xlist" and not (list_id or "").strip():
+            return {"error": "an xlist watchlist needs the X List id"}
+        if not self.db.execute("SELECT 1 FROM projects WHERE project_id = ?",
+                               (int(project_id),)).fetchone():
+            return {"error": f"no project {project_id}"}
+        try:
+            cur = self.db.execute(
+                "INSERT INTO watchlists(project_id, name, kind, list_id, created_at) "
+                "VALUES(?,?,?,?,?)",
+                (int(project_id), name, kind, (list_id or "").strip() or None,
+                 _iso_ms(int(time.time() * 1000))))
+        except sqlite3.IntegrityError:
+            return {"error": f"this project already has a watchlist called {name!r}"}
+        wid = cur.lastrowid
+        if kind == "xlist":
+            await self.compile_watchlist(wid)
+        return {"watchlist_id": wid, "name": name, "kind": kind}
+
+    async def set_watchlist_members(self, watchlist_id: int,
+                                    add: list | None = None,
+                                    remove: list | None = None) -> dict:
+        """
+        Add/remove handles, then recompile. Handles are normalized (no '@',
+        lowercase) and validated BEFORE anything is written: one bad handle
+        rejects the whole request, so a typo never half-applies.
+        """
+        w = self.db.execute("SELECT * FROM watchlists WHERE watchlist_id = ?",
+                            (int(watchlist_id),)).fetchone()
+        if not w:
+            return {"error": f"no watchlist {watchlist_id}"}
+
+        adds, bad = [], []
+        for h in (add or []):
+            n = normalize_handle(h)
+            (adds if n else bad).append(n or str(h))
+        if bad:
+            return {"error": "not valid X handles: " + ", ".join(repr(b) for b in bad)}
+        removes = [normalize_handle(h) for h in (remove or [])]
+        removes = [h for h in removes if h]
+
+        now = _iso_ms(int(time.time() * 1000))
+        for h in adds:
+            self.db.execute(
+                "INSERT OR IGNORE INTO watchlist_members(watchlist_id, handle, added_at) "
+                "VALUES(?,?,?)", (int(watchlist_id), h, now))
+        for h in removes:
+            self.db.execute(
+                "DELETE FROM watchlist_members WHERE watchlist_id = ? AND handle = ?",
+                (int(watchlist_id), h))
+
+        compiled = await self.compile_watchlist(int(watchlist_id))
+        return {"watchlist_id": int(watchlist_id),
+                "added": len(adds), "removed": len(removes), **compiled}
+
+    async def compile_watchlist(self, watchlist_id: int) -> dict:
+        """
+        Rebuild the streams a watchlist stands for.
+
+        Deterministic from the member list: chunk N handles into groups of
+        WATCHLIST_CHUNK (sorted, so membership — not insertion order — decides
+        the chunks), one '(from:a OR from:b ...)' stream per chunk, labelled
+        'wl:<id>:<n>'. A chunk that falls out of use is PAUSED, never deleted:
+        its tweet_hits are attribution history, and pausing is what
+        forget_stream is for if the operator truly wants it gone.
+
+        Every compiled stream carries watched=1 (the watcher polls it without a
+        config.toml entry) and is attached to the watchlist's project.
+        """
+        w = self.db.execute("SELECT * FROM watchlists WHERE watchlist_id = ?",
+                            (int(watchlist_id),)).fetchone()
+        if not w:
+            return {"error": f"no watchlist {watchlist_id}"}
+
+        labels = []
+        if w["kind"] == "xlist":
+            label = f"wl:{w['watchlist_id']}:0"
+            sid = await self.ensure_stream(label, "", "Latest", True,
+                                           list_id=w["list_id"] or "")
+            self.db.execute(
+                "UPDATE streams SET watched = 1, paused = 0 WHERE stream_id = ?", (sid,))
+            await self.attach_stream(w["project_id"], sid)
+            labels.append(label)
+        else:
+            handles = [r["handle"] for r in self.db.execute(
+                "SELECT handle FROM watchlist_members WHERE watchlist_id = ? "
+                "ORDER BY handle", (int(watchlist_id),))]
+            for n in range(0, len(handles), self.WATCHLIST_CHUNK):
+                chunk = handles[n:n + self.WATCHLIST_CHUNK]
+                label = f"wl:{w['watchlist_id']}:{n // self.WATCHLIST_CHUNK}"
+                query = "(" + " OR ".join(f"from:{h}" for h in chunk) + ")"
+                sid = await self.ensure_stream(label, query, "Latest", True)
+                self.db.execute(
+                    "UPDATE streams SET watched = 1, paused = 0 WHERE stream_id = ?",
+                    (sid,))
+                await self.attach_stream(w["project_id"], sid)
+                labels.append(label)
+
+        # Chunks beyond the current count (members shrank, or kind changed):
+        # paused and un-watched, keeping their collected history attributable.
+        for r in self.db.execute("SELECT stream_id, label FROM streams WHERE label LIKE ?",
+                                 (f"wl:{w['watchlist_id']}:%",)).fetchall():
+            if r["label"] not in labels:
+                self.db.execute(
+                    "UPDATE streams SET paused = 1, watched = 0 WHERE stream_id = ?",
+                    (r["stream_id"],))
+        return {"streams": labels}
+
+    async def delete_watchlist(self, watchlist_id: int) -> dict:
+        """
+        Remove the watchlist and STOP its collection; keep collected tweets.
+
+        Compiled streams are paused + un-watched rather than deleted — same
+        reasoning as compile_watchlist's retirement path. Destroying the data
+        stays an explicit per-stream forget_stream(delete_tweets=True).
+        """
+        w = self.db.execute("SELECT * FROM watchlists WHERE watchlist_id = ?",
+                            (int(watchlist_id),)).fetchone()
+        if not w:
+            return {"error": f"no watchlist {watchlist_id}"}
+        self.db.execute(
+            "UPDATE streams SET paused = 1, watched = 0 WHERE label LIKE ?",
+            (f"wl:{w['watchlist_id']}:%",))
+        self.db.execute("DELETE FROM watchlist_members WHERE watchlist_id = ?",
+                        (int(watchlist_id),))
+        self.db.execute("DELETE FROM watchlists WHERE watchlist_id = ?",
+                        (int(watchlist_id),))
+        return {"removed": True, "streams_paused": True, "tweets_kept": True}
+
+    # ----------------------------------------------------------------------
+    # collections (curation boards)
+    # ----------------------------------------------------------------------
+
+    async def collections(self, project_id: int) -> list:
+        return [dict(r) for r in self.db.execute(
+            "SELECT c.*, COUNT(i.tweet_id) AS items "
+            "FROM collections c LEFT JOIN collection_items i USING(collection_id) "
+            "WHERE c.project_id = ? GROUP BY c.collection_id ORDER BY c.collection_id",
+            (int(project_id),))]
+
+    async def create_collection(self, project_id: int, name: str) -> dict:
+        name = (name or "").strip()
+        if not name:
+            return {"error": "a collection needs a name"}
+        if not self.db.execute("SELECT 1 FROM projects WHERE project_id = ?",
+                               (int(project_id),)).fetchone():
+            return {"error": f"no project {project_id}"}
+        try:
+            cur = self.db.execute(
+                "INSERT INTO collections(project_id, name, created_at) VALUES(?,?,?)",
+                (int(project_id), name, _iso_ms(int(time.time() * 1000))))
+        except sqlite3.IntegrityError:
+            return {"error": f"this project already has a collection called {name!r}"}
+        return {"collection_id": cur.lastrowid, "name": name}
+
+    async def delete_collection(self, collection_id: int) -> dict:
+        if not self.db.execute("SELECT 1 FROM collections WHERE collection_id = ?",
+                               (int(collection_id),)).fetchone():
+            return {"error": f"no collection {collection_id}"}
+        self.db.execute("DELETE FROM collection_items WHERE collection_id = ?",
+                        (int(collection_id),))
+        self.db.execute("DELETE FROM collections WHERE collection_id = ?",
+                        (int(collection_id),))
+        return {"removed": True, "tweets_kept": True}
+
+    async def collection_pin(self, collection_id: int,
+                             add: list | None = None,
+                             remove: list | None = None) -> dict:
+        """
+        Pin/unpin posts. Only ids that exist in tweets are pinned — a stale id
+        (from a page open across a data wipe) is reported, not stored, so a
+        board can never hold a reference that renders as a hole.
+        """
+        if not self.db.execute("SELECT 1 FROM collections WHERE collection_id = ?",
+                               (int(collection_id),)).fetchone():
+            return {"error": f"no collection {collection_id}"}
+        now = int(time.time() * 1000)
+        pinned, missing = 0, []
+        for t in (add or []):
+            try:
+                tid = int(t)
+            except (TypeError, ValueError):
+                missing.append(str(t)); continue
+            if self.db.execute("SELECT 1 FROM tweets WHERE tweet_id = ?",
+                               (tid,)).fetchone():
+                self.db.execute(
+                    "INSERT OR IGNORE INTO collection_items(collection_id, tweet_id, added_ms) "
+                    "VALUES(?,?,?)", (int(collection_id), tid, now))
+                pinned += 1
+            else:
+                missing.append(str(t))
+        removed = 0
+        for t in (remove or []):
+            try:
+                tid = int(t)
+            except (TypeError, ValueError):
+                continue
+            cur = self.db.execute(
+                "DELETE FROM collection_items WHERE collection_id = ? AND tweet_id = ?",
+                (int(collection_id), tid))
+            removed += cur.rowcount
+        out = {"pinned": pinned, "removed": removed}
+        if missing:
+            out["not_found"] = missing
+        return out
+
+    async def collection_rows(self, collection_id: int) -> list:
+        """The board's posts, newest pin first, as full tweet rows."""
+        return [dict(r) for r in self.db.execute(
+            "SELECT t.*, i.added_ms FROM collection_items i "
+            "JOIN tweets t USING(tweet_id) WHERE i.collection_id = ? "
+            "ORDER BY i.added_ms DESC, t.tweet_id DESC", (int(collection_id),))]
+
+    # ----------------------------------------------------------------------
+    # velocity alerts
+    # ----------------------------------------------------------------------
+
+    async def alerts(self, project_id: int = 0, enabled_only: bool = False) -> list:
+        where, params = [], []
+        if project_id:
+            where.append("a.project_id = ?"); params.append(int(project_id))
+        if enabled_only:
+            where.append("a.enabled = 1")
+        rows = self.db.execute(
+            "SELECT a.*, w.name AS watchlist_name, p.name AS project_name "
+            "FROM alerts a "
+            "LEFT JOIN watchlists w USING(watchlist_id) "
+            "JOIN projects p ON p.project_id = a.project_id "
+            + (f"WHERE {' AND '.join(where)} " if where else "")
+            + "ORDER BY a.alert_id", params).fetchall()
+        return [dict(r) for r in rows]
+
+    async def create_alert(self, project_id: int, watchlist_id=None,
+                           threshold: float = 3.0, min_posts: int = 10,
+                           tg_chat_id: str = "") -> dict:
+        if not self.db.execute("SELECT 1 FROM projects WHERE project_id = ?",
+                               (int(project_id),)).fetchone():
+            return {"error": f"no project {project_id}"}
+        if watchlist_id and not self.db.execute(
+                "SELECT 1 FROM watchlists WHERE watchlist_id = ? AND project_id = ?",
+                (int(watchlist_id), int(project_id))).fetchone():
+            return {"error": f"no watchlist {watchlist_id} in this project"}
+        try:
+            threshold = max(1.1, float(threshold))
+            min_posts = max(1, int(min_posts))
+        except (TypeError, ValueError):
+            return {"error": "threshold and min_posts must be numbers"}
+        cur = self.db.execute(
+            "INSERT INTO alerts(project_id, watchlist_id, threshold, min_posts, "
+            " tg_chat_id, created_at) VALUES(?,?,?,?,?,?)",
+            (int(project_id), int(watchlist_id) if watchlist_id else None,
+             threshold, min_posts, (tg_chat_id or "").strip() or None,
+             _iso_ms(int(time.time() * 1000))))
+        return {"alert_id": cur.lastrowid}
+
+    async def update_alert(self, alert_id: int, values: dict) -> bool:
+        allowed = ("enabled", "threshold", "min_posts", "tg_chat_id")
+        cols = [k for k in values if k in allowed]
+        if not cols:
+            return False
+        cur = self.db.execute(
+            f"UPDATE alerts SET {', '.join(f'{c} = ?' for c in cols)} "
+            "WHERE alert_id = ?", [*(values[c] for c in cols), int(alert_id)])
+        return cur.rowcount > 0
+
+    async def delete_alert(self, alert_id: int) -> bool:
+        return self.db.execute("DELETE FROM alerts WHERE alert_id = ?",
+                               (int(alert_id),)).rowcount > 0
+
+    async def alert_fired(self, alert_id: int, now_ms: int) -> None:
+        self.db.execute("UPDATE alerts SET last_fired_ms = ? WHERE alert_id = ?",
+                        (int(now_ms), int(alert_id)))
+
+    async def alert_scope_streams(self, alert: dict) -> list:
+        """The stream ids an alert watches — its watchlist's, or its project's."""
+        if alert.get("watchlist_id"):
+            return [r["stream_id"] for r in self.db.execute(
+                "SELECT stream_id FROM streams WHERE label LIKE ?",
+                (f"wl:{alert['watchlist_id']}:%",))]
+        return await self.project_stream_ids(alert["project_id"])
+
+    async def scope_velocity(self, stream_ids: list, now_ms: int) -> tuple:
+        """
+        (posts in the last hour, usual hourly pace) for a set of streams.
+
+        The baseline is the trailing 24h ENDING AN HOUR AGO — the surge being
+        measured must not sit inside its own yardstick, or a real spike
+        halves its own ratio.
+        """
+        if not stream_ids:
+            return 0, 0.0
+        marks = ",".join("?" * len(stream_ids))
+        hour_ago = now_ms - 3_600_000
+        day_before = hour_ago - 86_400_000
+        last_hour = self.db.execute(
+            f"SELECT COUNT(DISTINCT tweet_id) c FROM tweet_hits "
+            f"WHERE stream_id IN ({marks}) AND first_seen_ms > ?",
+            [*stream_ids, hour_ago]).fetchone()["c"]
+        prev = self.db.execute(
+            f"SELECT COUNT(DISTINCT tweet_id) c FROM tweet_hits "
+            f"WHERE stream_id IN ({marks}) AND first_seen_ms > ? AND first_seen_ms <= ?",
+            [*stream_ids, day_before, hour_ago]).fetchone()["c"]
+        return last_hour, prev / 24.0
 
     # ----------------------------------------------------------------------
     # webhook delivery

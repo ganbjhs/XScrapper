@@ -24,5 +24,10 @@ venv/
 .mypy_cache/
 .ruff_cache/
 
+# Frontend. node_modules never; dist IS committed on purpose: the VPS deploys
+# by `git pull` and runs no Node at all, so the built app must travel in git.
+# Rebuild before committing UI changes: cd frontend && npm run build
+frontend/node_modules/
+
 # OS
 .DS_Store

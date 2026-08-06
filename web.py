@@ -285,6 +285,21 @@ def _query_tweets(p):
         where.append("s.label = ?")
         params.append(p["stream"])
 
+    if p.get("project"):
+        # Everything any of this project's streams collected. EXISTS rather
+        # than a join so a tweet hit by two of the project's streams appears
+        # once, not twice.
+        try:
+            pid = int(p["project"])
+        except (TypeError, ValueError):
+            pid = 0
+        if pid:
+            where.append(
+                "EXISTS (SELECT 1 FROM tweet_hits ph JOIN project_streams ps "
+                "        ON ps.stream_id = ph.stream_id "
+                "        WHERE ph.tweet_id = t.tweet_id AND ps.project_id = ?)")
+            params.append(pid)
+
     if p.get("q"):
         # Free text across the tweet and its author.
         where.append("(t.text LIKE ? OR t.author_username LIKE ? OR t.author_display_name LIKE ?)")
@@ -424,6 +439,16 @@ def _status():
     import auth
 
     out = {"accounts": [], "streams": [], "totals": {}, "db": str(_CFG.db_results)}
+
+    # Is anything actually collecting? The dashboard only reads the database;
+    # without a live watcher the whole page is a photograph, not a feed — and
+    # that difference must be shouted, not inferred. (This is exactly the
+    # confusion a real user hit: settings tuned, dashboard open, watcher never
+    # started, and nothing said so.)
+    try:
+        out["watcher_pid"] = auth.read_watcher_pid(_CFG.root)
+    except Exception:
+        out["watcher_pid"] = None
 
     async def _accounts():
         api = auth.open_api(_CFG.db_accounts)
@@ -921,6 +946,402 @@ def _stream_remove(body):
         except Exception as e:
             res["warning"] = f"config.toml no longer loads: {e}"
     return res
+
+
+# --------------------------------------------------------------------------
+# the live stream (SSE)
+# --------------------------------------------------------------------------
+
+# How often the stream re-checks the database. The collector's own floor is
+# 5s between polls, so 1.5s here means a post is on screen within a couple of
+# seconds of being stored while costing one cheap local read per tick.
+LIVE_TICK_S = 1.5
+
+
+def _live_rows(con, last_ms: int, last_tweet_id: int, project: int = 0,
+               limit: int = 50) -> list:
+    """
+    Everything collected past the cursor, oldest first — the identical
+    composite-cursor walk the webhook sender does (see store.tweets_after),
+    so the live feed can never disagree with delivery about what "new" means.
+    Factored out of the SSE loop so the test suite can exercise it without
+    holding a streaming connection open.
+    """
+    where = ["t.source = 'result'",
+             "(t.collected_ms > ? OR (t.collected_ms = ? AND t.tweet_id > ?))"]
+    params = [last_ms, last_ms, last_tweet_id]
+    if project:
+        where.append(
+            "EXISTS (SELECT 1 FROM tweet_hits ph JOIN project_streams ps "
+            "        ON ps.stream_id = ph.stream_id "
+            "        WHERE ph.tweet_id = t.tweet_id AND ps.project_id = ?)")
+        params.append(project)
+    rows = con.execute(
+        f"SELECT t.* FROM tweets t WHERE {' AND '.join(where)} "
+        "ORDER BY t.collected_ms, t.tweet_id LIMIT ?", [*params, limit]).fetchall()
+    return [_row_to_json(r) for r in rows]
+
+
+# --------------------------------------------------------------------------
+# read-only views the SPA needs: delivery, activity, metrics
+# --------------------------------------------------------------------------
+
+def _delivery_json():
+    """
+    Where every delivery target stands. The number that matters is `behind`:
+    how many collected tweets sit past the target's cursor — the same
+    composite-cursor arithmetic the sender itself uses, so the dashboard and
+    the sender can never disagree about what "caught up" means.
+    """
+    out = {"targets": []}
+    if not _CFG.db_results.exists():
+        return out
+
+    targets = []
+    try:
+        for h in _CFG.enabled_webhooks():
+            targets.append({"label": h.label, "kind": "webhook", "url": h.url,
+                            "streams": list(h.streams or [])})
+    except Exception:
+        pass
+
+    with _connect() as con:
+        try:
+            for r in con.execute(
+                    "SELECT label FROM streams WHERE tg_enabled = 1 ORDER BY label"):
+                targets.append({"label": f"tg:{r['label']}", "kind": "telegram",
+                                "url": "Telegram", "streams": [r["label"]]})
+        except sqlite3.Error:
+            pass
+
+        for t in targets:
+            row = con.execute("SELECT * FROM webhook_state WHERE label = ?",
+                              (t["label"],)).fetchone()
+            cur = dict(row) if row else {
+                "last_ms": 0, "last_tweet_id": 0, "sent": 0, "failures": 0,
+                "next_attempt_ms": 0, "last_error": None, "last_ok_ms": None}
+
+            where = ["t.source = 'result'",
+                     "(t.collected_ms > ? OR (t.collected_ms = ? AND t.tweet_id > ?))"]
+            params = [cur["last_ms"], cur["last_ms"], cur["last_tweet_id"]]
+            if t["streams"]:
+                where.append(
+                    "EXISTS (SELECT 1 FROM tweet_hits h JOIN streams s USING(stream_id) "
+                    "        WHERE h.tweet_id = t.tweet_id AND s.label IN "
+                    f"       ({','.join('?' * len(t['streams']))}))")
+                params += t["streams"]
+            behind = 0
+            if cur["last_ms"] or cur["sent"]:
+                behind = con.execute(
+                    f"SELECT COUNT(*) c FROM tweets t WHERE {' AND '.join(where)}",
+                    params).fetchone()["c"]
+
+            out["targets"].append({
+                **t, "sent": cur["sent"], "failures": cur["failures"],
+                "behind": behind, "last_ok_ms": cur["last_ok_ms"],
+                "last_error": cur["last_error"],
+                "started": bool(cur["last_ms"] or cur["sent"]),
+            })
+    return out
+
+
+def _activity_json(q):
+    """The recent poll history — what the collector actually did, and when."""
+    if not _CFG.db_results.exists():
+        return {"polls": []}
+    limit = min(int(q.get("limit") or 100), 500)
+    with _connect() as con:
+        rows = con.execute(
+            "SELECT p.poll_id, s.label, p.kind, p.started_ms, p.finished_ms, "
+            "       p.account, p.pages, p.results, p.new_tweets, p.stop_reason, "
+            "       p.lag_p50_ms, p.error "
+            "FROM polls p JOIN streams s USING(stream_id) "
+            "ORDER BY p.poll_id DESC LIMIT ?", (limit,)).fetchall()
+    return {"polls": [dict(r) for r in rows]}
+
+
+def _metrics_json():
+    """
+    The stat strip and the 7-day chart, from what is actually stored. Days are
+    UTC to match every other timestamp in the store.
+    """
+    out = {"today": {"collected": 0, "photos": 0, "videos": 0,
+                     "median_lag_ms": None, "p95_lag_ms": None},
+           "per_day": [], "totals": {"tweets": 0}}
+    day_ms = 86_400_000
+    now_ms = int(time.time() * 1000)
+    midnight = (now_ms // day_ms) * day_ms
+    week_ago = midnight - 6 * day_ms
+
+    if _CFG.db_results.exists():
+        with _connect() as con:
+            out["totals"]["tweets"] = con.execute(
+                "SELECT COUNT(*) c FROM tweets WHERE source = 'result'"
+            ).fetchone()["c"]
+            r = con.execute(
+                "SELECT COUNT(*) c, "
+                "  SUM(CASE WHEN media_json LIKE '%\"photo\"%' THEN 1 ELSE 0 END) p, "
+                "  SUM(CASE WHEN media_json LIKE '%\"video\"%' "
+                "        OR media_json LIKE '%\"gif\"%' THEN 1 ELSE 0 END) v "
+                "FROM tweets WHERE source = 'result' AND collected_ms >= ?",
+                (midnight,)).fetchone()
+            out["today"].update(collected=r["c"], photos=r["p"] or 0,
+                                videos=r["v"] or 0)
+            lags = [x["lag_ms"] for x in con.execute(
+                "SELECT lag_ms FROM tweets WHERE source = 'result' "
+                "AND collected_ms >= ? AND lag_ms IS NOT NULL", (midnight,))]
+            if lags:
+                out["today"]["median_lag_ms"] = store_mod._percentile(lags, 50)
+                out["today"]["p95_lag_ms"] = store_mod._percentile(lags, 95)
+            by_day = {int(r["d"]): r["c"] for r in con.execute(
+                "SELECT collected_ms / ? AS d, COUNT(*) c FROM tweets "
+                "WHERE source = 'result' AND collected_ms >= ? GROUP BY d",
+                (day_ms, week_ago))}
+    else:
+        by_day = {}
+
+    ig_by_day = {}
+    rp = _CFG.root / "ig_results.db"
+    if rp.exists():
+        try:
+            con = sqlite3.connect(f"file:{rp}?mode=ro", uri=True, timeout=5)
+            con.row_factory = sqlite3.Row
+            # store_ig keys taken_at in unix SECONDS.
+            ig_by_day = {int(r["d"]): r["c"] for r in con.execute(
+                "SELECT (taken_at * 1000) / ? AS d, COUNT(*) c FROM posts "
+                "WHERE taken_at * 1000 >= ? GROUP BY d", (day_ms, week_ago))}
+            con.close()
+        except Exception:
+            pass
+
+    for i in range(7):
+        ms = week_ago + i * day_ms
+        d = ms // day_ms
+        out["per_day"].append({
+            "day": datetime.datetime.fromtimestamp(
+                ms / 1000, tz=datetime.timezone.utc).strftime("%d %b"),
+            "x": by_day.get(d, 0), "ig": ig_by_day.get(d, 0)})
+    return out
+
+
+# --------------------------------------------------------------------------
+# projects & watchlists — thin validators over the Store methods
+# --------------------------------------------------------------------------
+#
+# All writes AND reads go through _with_store rather than the read-only
+# _connect(): opening the Store runs the migration, so the first dashboard
+# that touches these endpoints creates the tables and the Default project on
+# a pre-projects database instead of erroring on a missing table.
+
+def _projects_json():
+    return {"projects": _with_store(
+        lambda st: st.projects(include_archived=True))}
+
+
+def _project_post(body):
+    if "archived" in body:
+        try:
+            pid = int(body.get("project_id") or 0)
+        except (TypeError, ValueError):
+            return {"error": "project_id must be a number"}
+        ok = _with_store(lambda st: st.set_project_archived(pid, body["archived"]))
+        return {"ok": True} if ok else {"error": f"no project {pid}"}
+    return _with_store(lambda st: st.create_project(body.get("name") or ""))
+
+
+def _watchlists_json(q):
+    try:
+        pid = int(q.get("project") or 0)
+    except (TypeError, ValueError):
+        pid = 0
+    if not pid:
+        return {"error": "which project? pass ?project=<id>"}
+    return {"watchlists": _with_store(lambda st: st.watchlists(pid))}
+
+
+def _watchlist_post(body):
+    try:
+        pid = int(body.get("project") or 0)
+    except (TypeError, ValueError):
+        return {"error": "project must be a number"}
+    if not pid:
+        return {"error": "which project?"}
+    kind = (body.get("kind") or "query").strip()
+    raw_list = str(body.get("list_id") or "").strip()
+    if kind == "xlist" and raw_list:
+        # Accept the whole URL, exactly like config.toml and /api/fetch do.
+        from config import ConfigError, _parse_list_id
+        try:
+            raw_list = _parse_list_id(raw_list, "watchlist")
+        except ConfigError as e:
+            return {"error": str(e)}
+
+    async def go(st):
+        made = await st.create_watchlist(pid, body.get("name") or "", kind, raw_list)
+        if "error" in made:
+            return made
+        handles = body.get("handles") or []
+        if handles and kind == "query":
+            upd = await st.set_watchlist_members(made["watchlist_id"], add=handles)
+            if "error" in upd:
+                # The name is taken but the handles were bad: report both facts
+                # rather than leaving a silently empty watchlist.
+                made["warning"] = upd["error"]
+            else:
+                made.update(upd)
+        return made
+    return _with_store(go)
+
+
+def _watchlist_members(body):
+    try:
+        wid = int(body.get("watchlist_id") or 0)
+    except (TypeError, ValueError):
+        return {"error": "watchlist_id must be a number"}
+    return _with_store(lambda st: st.set_watchlist_members(
+        wid, add=body.get("add") or [], remove=body.get("remove") or []))
+
+
+def _watchlist_remove(body):
+    try:
+        wid = int(body.get("watchlist_id") or 0)
+    except (TypeError, ValueError):
+        return {"error": "watchlist_id must be a number"}
+    return _with_store(lambda st: st.delete_watchlist(wid))
+
+
+# --------------------------------------------------------------------------
+# alerts — thin validators over the Store methods
+# --------------------------------------------------------------------------
+
+def _alerts_json(q):
+    try:
+        pid = int(q.get("project") or 0)
+    except (TypeError, ValueError):
+        pid = 0
+    if not pid:
+        return {"error": "which project? pass ?project=<id>"}
+    return {"alerts": _with_store(lambda st: st.alerts(pid)),
+            "telegram_ready": bool(os.getenv("TELEGRAM_BOT_TOKEN", "").strip()),
+            "default_chat": bool(os.getenv("TELEGRAM_CHAT_ID", "").strip())}
+
+
+def _alert_post(body):
+    try:
+        pid = int(body.get("project") or 0)
+    except (TypeError, ValueError):
+        return {"error": "project must be a number"}
+    wid = body.get("watchlist_id") or None
+    chat = str(body.get("tg_chat_id") or "").strip()
+    if chat and not re.fullmatch(r"-?\d{1,20}|@[A-Za-z0-9_]{4,32}", chat):
+        return {"error": "a chat id is a number like -1001234567890, "
+                         "or a public channel like @mychannel"}
+    return _with_store(lambda st: st.create_alert(
+        pid, wid, body.get("threshold", 3.0), body.get("min_posts", 10), chat))
+
+
+def _alert_update(body):
+    try:
+        aid = int(body.get("alert_id") or 0)
+    except (TypeError, ValueError):
+        return {"error": "alert_id must be a number"}
+    vals = {}
+    if "enabled" in body:
+        vals["enabled"] = int(bool(body["enabled"]))
+    if "threshold" in body:
+        try:
+            vals["threshold"] = max(1.1, float(body["threshold"]))
+        except (TypeError, ValueError):
+            return {"error": "threshold must be a number"}
+    if "min_posts" in body:
+        try:
+            vals["min_posts"] = max(1, int(body["min_posts"]))
+        except (TypeError, ValueError):
+            return {"error": "min_posts must be a whole number"}
+    ok_ = _with_store(lambda st: st.update_alert(aid, vals))
+    return {"ok": True} if ok_ else {"error": f"no alert {aid} (or nothing to change)"}
+
+
+def _alert_remove(body):
+    try:
+        aid = int(body.get("alert_id") or 0)
+    except (TypeError, ValueError):
+        return {"error": "alert_id must be a number"}
+    ok_ = _with_store(lambda st: st.delete_alert(aid))
+    return {"ok": True} if ok_ else {"error": f"no alert {aid}"}
+
+
+# --------------------------------------------------------------------------
+# collections — thin validators over the Store methods
+# --------------------------------------------------------------------------
+
+def _collections_json(q):
+    try:
+        pid = int(q.get("project") or 0)
+    except (TypeError, ValueError):
+        pid = 0
+    if not pid:
+        return {"error": "which project? pass ?project=<id>"}
+    return {"collections": _with_store(lambda st: st.collections(pid))}
+
+
+def _collection_post(body):
+    try:
+        pid = int(body.get("project") or 0)
+    except (TypeError, ValueError):
+        return {"error": "project must be a number"}
+    return _with_store(lambda st: st.create_collection(pid, body.get("name") or ""))
+
+
+def _collection_remove(body):
+    try:
+        cid = int(body.get("collection_id") or 0)
+    except (TypeError, ValueError):
+        return {"error": "collection_id must be a number"}
+    return _with_store(lambda st: st.delete_collection(cid))
+
+
+def _collection_pin(body):
+    try:
+        cid = int(body.get("collection_id") or 0)
+    except (TypeError, ValueError):
+        return {"error": "collection_id must be a number"}
+    return _with_store(lambda st: st.collection_pin(
+        cid, add=body.get("add") or [], remove=body.get("remove") or []))
+
+
+def _collection_items_json(q):
+    try:
+        cid = int(q.get("id") or 0)
+    except (TypeError, ValueError):
+        cid = 0
+    if not cid:
+        return {"error": "which collection? pass ?id=<id>"}
+    rows = _with_store(lambda st: st.collection_rows(cid))
+    return {"count": len(rows), "rows": [_row_to_json(r) for r in rows]}
+
+
+def _collection_export_csv(q):
+    """The board as CSV — the same frozen column set the exporter uses."""
+    try:
+        cid = int(q.get("id") or 0)
+    except (TypeError, ValueError):
+        cid = 0
+    rows = _with_store(lambda st: st.collection_rows(cid)) if cid else []
+    import csv as _csv
+    import io as _io
+    buf = _io.StringIO()
+    w = _csv.DictWriter(buf, fieldnames=store_mod.FIELDS, extrasaction="ignore")
+    w.writeheader()
+    for r in rows:
+        rec = dict(r)
+        for k in ("hashtags", "mentions", "urls", "media_urls"):
+            try:
+                rec[k] = json.loads(rec.get(k) or "[]")
+            except (TypeError, ValueError):
+                rec[k] = []
+        w.writerow(store_mod.to_csv_row(rec, store_mod.FIELDS))
+    return buf.getvalue()
 
 
 def _drop_stream_from_config(label: str) -> bool:
@@ -1457,6 +1878,86 @@ class Handler(BaseHTTPRequestHandler):
         ctype = _STATIC_TYPES.get(target.suffix.lower(), "application/octet-stream")
         return self._send(200, target.read_bytes(), ctype)
 
+    def _sse_live(self, q):
+        """
+        GET /api/live — a Server-Sent Events stream of newly collected posts.
+
+        One long-lived response per viewer; each tick is a read-only local
+        query, so a browser tab costs the collector nothing. Runs on this
+        request's own thread (ThreadingHTTPServer), streams until the client
+        goes away, and sends a comment ping on quiet ticks so a dead
+        connection is noticed within seconds rather than held forever.
+
+        `Connection: close` on purpose: without a Content-Length the browser
+        reads until EOF, which is exactly what a stream wants — and it stops
+        this socket being reused for a second request it could never serve.
+        """
+        try:
+            project = int(q.get("project") or 0)
+        except (TypeError, ValueError):
+            project = 0
+
+        self.send_response(200)
+        self.send_header("Content-Type", "text/event-stream")
+        self.send_header("Cache-Control", "no-store")
+        self.send_header("Connection", "close")
+        self.end_headers()
+
+        # Start from NOW: the page already loaded its backlog over /api/tweets;
+        # replaying history here would double every post on screen.
+        last_ms = int(time.time() * 1000)
+        last_id = 0
+        quiet = 0
+        try:
+            self.wfile.write(b": connected\n\n")
+            self.wfile.flush()
+            while True:
+                if _CFG.db_results.exists():
+                    try:
+                        with _connect() as con:
+                            rows = _live_rows(con, last_ms, last_id, project)
+                    except sqlite3.Error:
+                        rows = []
+                    for r in rows:
+                        last_ms = r["collected_ms"]
+                        last_id = int(r["tweet_id"])
+                        body = json.dumps(r, ensure_ascii=False)
+                        self.wfile.write(f"event: post\ndata: {body}\n\n".encode())
+                    if rows:
+                        quiet = 0
+                        self.wfile.flush()
+                quiet += 1
+                if quiet >= 10:      # ~15s of nothing: prove the pipe is alive
+                    quiet = 0
+                    self.wfile.write(b": ping\n\n")
+                    self.wfile.flush()
+                time.sleep(LIVE_TICK_S)
+        except (BrokenPipeError, ConnectionResetError, OSError):
+            return  # the viewer left; nothing to clean up
+
+    def _serve_app(self, path: str):
+        """
+        Serve the built SPA (frontend/dist) under /app, if it has been built.
+
+        Same traversal guard as /static/. Any /app path that is not a real
+        file falls back to index.html — that is what client-side routing
+        needs: /app/watchlists is a React route, not a file on disk. In
+        production nginx serves dist/ directly and this route goes unused;
+        its point is that `python3 main.py serve` alone gives the full UI.
+        """
+        dist = APP_DIST_DIR.resolve()
+        index = dist / "index.html"
+        if not index.is_file():
+            return self._send(404, {
+                "error": "the new dashboard is not built",
+                "detail": "run: cd frontend && npm install && npm run build"})
+        rel = unquote(path[len("/app"):]).lstrip("/")
+        target = (dist / rel).resolve() if rel else index
+        if not target.is_relative_to(dist) or not target.is_file():
+            target = index
+        ctype = _STATIC_TYPES.get(target.suffix.lower(), "application/octet-stream")
+        return self._send(200, target.read_bytes(), ctype)
+
     def _send(self, code, body, ctype="application/json; charset=utf-8", extra=None):
         if isinstance(body, (dict, list)):
             body = json.dumps(body, ensure_ascii=False)
@@ -1507,6 +2008,8 @@ class Handler(BaseHTTPRequestHandler):
                                   "text/html; charset=utf-8")
             if u.path.startswith("/static/"):
                 return self._serve_static(u.path)
+            if u.path == "/app" or u.path.startswith("/app/"):
+                return self._serve_app(u.path)
             if u.path in ("/accounts", "/accounts/"):
                 return self._send(200, ACCOUNTS_PAGE, "text/html; charset=utf-8")
             if u.path == "/signin":
@@ -1541,6 +2044,31 @@ class Handler(BaseHTTPRequestHandler):
                 if not _CFG.db_results.exists():
                     return self._send(200, {"total": 0, "rows": []})
                 return self._send(200, _query_tweets(q))
+            if u.path == "/api/projects":
+                return self._send(200, _projects_json())
+            if u.path == "/api/watchlists":
+                return self._send(200, _watchlists_json(q))
+            if u.path == "/api/delivery":
+                return self._send(200, _delivery_json())
+            if u.path == "/api/live":
+                return self._sse_live(q)
+            if u.path == "/api/alerts":
+                return self._send(200, _alerts_json(q))
+            if u.path == "/api/collections":
+                return self._send(200, _collections_json(q))
+            if u.path == "/api/collections/items":
+                return self._send(200, _collection_items_json(q))
+            if u.path == "/api/collections/export":
+                name = (q.get("name") or "collection").strip() or "collection"
+                safe = re.sub(r"[^A-Za-z0-9_-]+", "_", name)[:60]
+                return self._send(200, _collection_export_csv(q),
+                                  "text/csv; charset=utf-8",
+                                  {"Content-Disposition":
+                                   f'attachment; filename="{safe}.csv"'})
+            if u.path == "/api/activity":
+                return self._send(200, _activity_json(q))
+            if u.path == "/api/metrics":
+                return self._send(200, _metrics_json())
             if u.path == "/api/login/frame":
                 s = _LOGIN["session"]
                 if s is None:
@@ -1577,6 +2105,26 @@ class Handler(BaseHTTPRequestHandler):
                 return self._send(200, _login_act(body))
             if u.path == "/api/login/cancel":
                 return self._send(200, _login_cancel())
+            if u.path == "/api/projects":
+                return self._send(200, _project_post(body))
+            if u.path == "/api/watchlists":
+                return self._send(200, _watchlist_post(body))
+            if u.path == "/api/watchlists/members":
+                return self._send(200, _watchlist_members(body))
+            if u.path == "/api/watchlists/remove":
+                return self._send(200, _watchlist_remove(body))
+            if u.path == "/api/alerts":
+                return self._send(200, _alert_post(body))
+            if u.path == "/api/alerts/update":
+                return self._send(200, _alert_update(body))
+            if u.path == "/api/alerts/remove":
+                return self._send(200, _alert_remove(body))
+            if u.path == "/api/collections":
+                return self._send(200, _collection_post(body))
+            if u.path == "/api/collections/pin":
+                return self._send(200, _collection_pin(body))
+            if u.path == "/api/collections/remove":
+                return self._send(200, _collection_remove(body))
             if u.path == "/api/stream/settings":
                 return self._send(200, _stream_settings(body))
             if u.path == "/api/stream/remove":
@@ -1987,6 +2535,7 @@ start();
 # parts. There is no build step and no Node — you edit the file and reload.
 
 STATIC_DIR = Path(__file__).resolve().parent / "static"
+APP_DIST_DIR = Path(__file__).resolve().parent / "frontend" / "dist"
 
 _STATIC_TYPES = {".html": "text/html; charset=utf-8",
                  ".css": "text/css; charset=utf-8",

@@ -1505,6 +1505,343 @@ def test_telegram_watch_rule(tmp):
 
 
 # ==========================================================================
+# projects & watchlists: dashboard state that compiles into streams
+# ==========================================================================
+
+def test_projects_watchlists(tmp):
+    """
+    The projects layer: a watchlist is handles in the database, compiled into
+    ordinary '(from:…)' streams the collector already knows how to poll.
+    """
+    import sqlite3
+
+    import main
+    import store as store_mod
+    import web
+
+    db = pathlib.Path(tmp) / "results.db"
+
+    print("== handle normalization ==")
+    nh = store_mod.normalize_handle
+    ok(nh("@NatGeo") == "natgeo", "leading @ is stripped, case folded")
+    ok(nh("https://x.com/NatGeo?s=20") == "natgeo", "a pasted profile URL works")
+    ok(nh("twitter.com/NatGeo/status/1") == "natgeo", "so does the old domain")
+    ok(nh("not a handle") is None, "spaces are rejected")
+    ok(nh("abcdefghijklmnop") is None, "16 chars is longer than X allows")
+    ok(nh("") is None and nh(None) is None, "empty input is rejected, not crashed on")
+
+    print()
+    print("== migration: the Default project ==")
+
+    async def seed():
+        st = store_mod.Store(db, False)
+        await st.open()
+        await st.ensure_stream("politicians", "", "Latest", True, list_id="999")
+        await st.close()
+        # Second open must not create a second Default or re-link anything.
+        st = store_mod.Store(db, False)
+        await st.open()
+        projs = await st.projects()
+        await st.close()
+        return projs
+
+    projs = asyncio.run(seed())
+    ok(len(projs) == 1 and projs[0]["name"] == "Default",
+       "an upgraded database gets exactly one Default project")
+    con = sqlite3.connect(db); con.row_factory = sqlite3.Row
+    linked = con.execute(
+        "SELECT COUNT(*) c FROM project_streams ps JOIN streams s USING(stream_id) "
+        "WHERE s.label = 'politicians'").fetchone()["c"]
+    con.close()
+    ok(linked == 1, "existing streams are attached to Default, so nothing vanishes")
+
+    print()
+    print("== watchlist -> compiled streams ==")
+
+    async def lifecycle():
+        st = store_mod.Store(db, False)
+        await st.open()
+        out = {}
+        out["proj"] = await st.create_project("Elections 2026")
+        out["dup"] = await st.create_project("Elections 2026")
+        pid = out["proj"]["project_id"]
+        out["wl"] = await st.create_watchlist(pid, "Cabinet")
+        wid = out["wl"]["watchlist_id"]
+        # 45 handles -> 3 chunks of 20/20/5
+        handles = [f"user{i:03d}" for i in range(45)]
+        out["set"] = await st.set_watchlist_members(wid, add=handles)
+        # Snapshot chunk 0 NOW — later steps (shrink, delete) rewrite it.
+        out["q0"] = dict(st.db.execute(
+            "SELECT query, watched, paused FROM streams WHERE label = ?",
+            (f"wl:{wid}:0",)).fetchone())
+        out["wls"] = await st.watchlists(pid)
+        # One bad handle rejects the WHOLE request — nothing half-applies.
+        out["bad"] = await st.set_watchlist_members(
+            wid, add=["fine_handle", "not a handle"])
+        out["after_bad"] = await st.watchlists(pid)
+        # Shrink to 5 members -> 1 live chunk, the other two retired.
+        out["shrunk"] = await st.set_watchlist_members(
+            wid, remove=[f"user{i:03d}" for i in range(40)])
+        # An xlist watchlist compiles to a single list-backed stream.
+        out["xl"] = await st.create_watchlist(pid, "Big permanent", "xlist", "777")
+        out["wls2"] = await st.watchlists(pid)
+        out["gone"] = await st.delete_watchlist(wid)
+        out["wls3"] = await st.watchlists(pid)
+        out["pid"], out["wid"] = pid, wid
+        await st.close()
+        return out
+
+    r = asyncio.run(lifecycle())
+    ok("error" in r["dup"], "a duplicate project name is refused")
+    ok(r["set"]["streams"] == [f"wl:{r['wid']}:0", f"wl:{r['wid']}:1", f"wl:{r['wid']}:2"],
+       f"45 handles compile into 3 chunked streams ({r['set']['streams']})")
+    wl = r["wls"][0]
+    ok(len(wl["members"]) == 45, "every handle is stored")
+    ok(len(wl["streams"]) == 3, "the watchlist reports its compiled streams")
+
+    con = sqlite3.connect(db); con.row_factory = sqlite3.Row
+    q0 = r["q0"]
+    ok(q0["query"].startswith("(from:user000 OR from:user001"),
+       "a chunk is an OR of from: terms, in sorted order")
+    ok(q0["query"].count("from:") == 20, "a chunk holds at most 20 handles")
+    ok(q0["watched"] == 1 and q0["paused"] == 0,
+       "compiled streams are watched — the watcher polls them with no config entry")
+    plinked = con.execute(
+        "SELECT COUNT(*) c FROM project_streams ps JOIN streams s USING(stream_id) "
+        "WHERE ps.project_id = ? AND s.label LIKE ?",
+        (r["pid"], f"wl:{r['wid']}:%")).fetchone()["c"]
+    ok(plinked == 3, "compiled streams belong to the watchlist's project")
+
+    ok("error" in r["bad"], "one invalid handle rejects the whole request")
+    ok(len(r["after_bad"][0]["members"]) == 45,
+       "and the valid handle in the same request was NOT half-applied")
+
+    retired = con.execute(
+        "SELECT label, watched, paused FROM streams WHERE label IN (?,?)",
+        (f"wl:{r['wid']}:1", f"wl:{r['wid']}:2")).fetchall()
+    ok(all(x["paused"] == 1 and x["watched"] == 0 for x in retired),
+       "shrinking retires surplus chunks: paused, not deleted")
+    ok(r["shrunk"]["streams"] == [f"wl:{r['wid']}:0"],
+       "5 members need exactly one live chunk")
+
+    xl_label = r["xl"]["watchlist_id"]
+    xl = con.execute("SELECT list_id, watched FROM streams WHERE label = ?",
+                     (f"wl:{xl_label}:0",)).fetchone()
+    ok(xl["list_id"] == "777" and xl["watched"] == 1,
+       "an xlist watchlist compiles to one watched list-backed stream")
+
+    ok(r["gone"]["removed"] and not any(w["watchlist_id"] == r["wid"] for w in r["wls3"]),
+       "deleting a watchlist removes it from the dashboard")
+    dead = con.execute(
+        "SELECT watched, paused FROM streams WHERE label = ?",
+        (f"wl:{r['wid']}:0",)).fetchone()
+    ok(dead["paused"] == 1 and dead["watched"] == 0,
+       "…and stops its collection without destroying what it collected")
+    con.close()
+
+    print()
+    print("== the watcher picks compiled streams up ==")
+
+    class Cfg:
+        db_results = db
+
+    got = main._telegram_streams(Cfg(), set(), log=lambda m: None)
+    labels = sorted(s.label for s in got)
+    ok(f"wl:{xl_label}:0" in labels,
+       f"a live compiled stream is watched with no config.toml entry ({labels})")
+    ok(f"wl:{r['wid']}:0" not in labels,
+       "a retired one is not")
+
+    print()
+    print("== the project filter on /api/tweets ==")
+
+    con = sqlite3.connect(db); con.row_factory = sqlite3.Row
+    info = list(con.execute("PRAGMA table_info(tweets)"))
+    required = [x[1] for x in info if x[3] and x[4] is None and not x[5]]
+    text_cols = {x[1] for x in info if "TEXT" in (x[2] or "").upper()}
+    sid_in = con.execute("SELECT stream_id FROM streams WHERE label = ?",
+                         (f"wl:{xl_label}:0",)).fetchone()["stream_id"]
+    sid_out = con.execute("SELECT stream_id FROM streams WHERE label = 'politicians'"
+                          ).fetchone()["stream_id"]
+    for tid, sid in ((11, sid_in), (12, sid_in), (13, sid_out)):
+        row = {c: ("" if c in text_cols else 0) for c in required}
+        row.update(tweet_id=tid, created_ms=1, collected_ms=1, source="result")
+        cols = ",".join(row)
+        con.execute(f"INSERT INTO tweets({cols}) VALUES({','.join('?' * len(row))})",
+                    list(row.values()))
+        con.execute("INSERT INTO tweet_hits(stream_id, tweet_id, first_seen_ms) "
+                    "VALUES(?,?,1)", (sid, tid))
+    con.commit()
+    con.close()
+
+    web._CFG = Cfg()
+    all_n = web._query_tweets({})["total"]
+    proj_n = web._query_tweets({"project": str(r["pid"])})["total"]
+    ok(all_n == 3, f"without the filter, every stored tweet shows ({all_n})")
+    ok(proj_n == 2, f"project= narrows to what that project's streams collected ({proj_n})")
+    ok(web._query_tweets({"project": "nonsense"})["total"] == 3,
+       "an unparseable project id narrows nothing rather than erroring")
+
+    print()
+    print("== the live stream cursor ==")
+    con = sqlite3.connect(db); con.row_factory = sqlite3.Row
+    rows_all = web._live_rows(con, 0, 0)
+    ok(len(rows_all) == 3, "from cursor zero, every stored tweet replays, oldest first")
+    ok([int(x["tweet_id"]) for x in rows_all] == sorted(int(x["tweet_id"]) for x in rows_all),
+       "in collection order — the same walk delivery uses")
+    ok(len(web._live_rows(con, 0, 0, project=r["pid"])) == 2,
+       "the project scope holds on the live stream too")
+    first = rows_all[0]
+    resumed = web._live_rows(con, first["collected_ms"], int(first["tweet_id"]))
+    ok(len(resumed) == 2 and int(resumed[0]["tweet_id"]) != int(first["tweet_id"]),
+       "the composite cursor resumes without repeating or skipping")
+    con.close()
+
+
+# ==========================================================================
+# collections: curation boards over collected tweets
+# ==========================================================================
+
+def test_collections(tmp):
+    """Boards reference tweets, never copy them; unpinning destroys nothing."""
+    import sqlite3
+
+    import store as store_mod
+
+    db = pathlib.Path(tmp) / "results.db"
+
+    async def run():
+        st = store_mod.Store(db, False)
+        await st.open()
+        out = {}
+        pid = (await st.create_project("Newsroom"))["project_id"]
+
+        # Two minimal tweets to pin.
+        info = list(st.db.execute("PRAGMA table_info(tweets)"))
+        required = [x[1] for x in info if x[3] and x[4] is None and not x[5]]
+        text_cols = {x[1] for x in info if "TEXT" in (x[2] or "").upper()}
+        for tid in (101, 102):
+            row = {c: ("" if c in text_cols else 0) for c in required}
+            row.update(tweet_id=tid, created_ms=tid, collected_ms=tid, source="result")
+            st.db.execute(
+                f"INSERT INTO tweets({','.join(row)}) VALUES({','.join('?' * len(row))})",
+                list(row.values()))
+
+        out["made"] = await st.create_collection(pid, "Floods day 2")
+        cid = out["made"]["collection_id"]
+        out["dup"] = await st.create_collection(pid, "Floods day 2")
+        out["pin"] = await st.collection_pin(cid, add=[101, 102, 999])
+        out["repin"] = await st.collection_pin(cid, add=[101])
+        out["rows"] = await st.collection_rows(cid)
+        out["unpin"] = await st.collection_pin(cid, remove=[101])
+        out["rows2"] = await st.collection_rows(cid)
+        out["lists"] = await st.collections(pid)
+        out["gone"] = await st.delete_collection(cid)
+        out["tweets_left"] = st.db.execute(
+            "SELECT COUNT(*) c FROM tweets").fetchone()["c"]
+        await st.close()
+        return out
+
+    r = asyncio.run(run())
+    ok("error" in r["dup"], "a duplicate board name in one project is refused")
+    ok(r["pin"]["pinned"] == 2 and r["pin"].get("not_found") == ["999"],
+       "real posts pin; a stale id is reported, never stored as a hole")
+    ok(len(r["rows"]) == 2, "the board holds exactly the pinned posts")
+    ok(r["repin"]["pinned"] == 1 and len(r["rows"]) == 2,
+       "pinning the same post twice stays one entry")
+    ok(r["unpin"]["removed"] == 1 and len(r["rows2"]) == 1,
+       "unpinning removes from the board only")
+    ok(r["lists"][0]["items"] == 1, "the board list reports its live count")
+    ok(r["gone"]["removed"] and r["tweets_left"] == 2,
+       "deleting a whole board leaves every collected tweet in place")
+
+
+# ==========================================================================
+# velocity alerts: counts, thresholds, cooldown
+# ==========================================================================
+
+def test_alerts(tmp):
+    """The whole pipeline: rule -> pace measurement -> fire -> cooldown."""
+    import alerts as al
+    import store as store_mod
+
+    print("== the decision, on its own ==")
+    ok(al.decide(30, 5.0, 3.0, 10) == (True, 6.0),
+       "30/hour against a usual 5/hour is 6x - fires at threshold 3")
+    ok(al.decide(12, 5.0, 3.0, 10)[0] is False,
+       "2.4x does not clear a 3x threshold")
+    ok(al.decide(8, 0.5, 3.0, 10)[0] is False,
+       "a big ratio still never fires under min_posts - quiet scopes stay quiet")
+    ok(al.decide(40, 0.0, 3.0, 10) == (True, None),
+       "no history yet + a real burst fires, with no ratio to report")
+
+    print()
+    print("== end to end against a store ==")
+    db = pathlib.Path(tmp) / "results.db"
+
+    async def run():
+        st = store_mod.Store(db, False)
+        await st.open()
+        out = {}
+        pid = (await st.create_project("Desk"))["project_id"]
+        wid = (await st.create_watchlist(pid, "Cabinet"))["watchlist_id"]
+        await st.set_watchlist_members(wid, add=["someone"])
+        sid = st.db.execute("SELECT stream_id FROM streams WHERE label = ?",
+                            (f"wl:{wid}:0",)).fetchone()["stream_id"]
+
+        now = 2_000_000_000_000  # fixed clock: the test owns time
+        info = list(st.db.execute("PRAGMA table_info(tweets)"))
+        required = [x[1] for x in info if x[3] and x[4] is None and not x[5]]
+        text_cols = {x[1] for x in info if "TEXT" in (x[2] or "").upper()}
+
+        def put(tid, ms):
+            row = {c: ("" if c in text_cols else 0) for c in required}
+            row.update(tweet_id=tid, created_ms=ms, collected_ms=ms, source="result")
+            st.db.execute(
+                f"INSERT INTO tweets({','.join(row)}) VALUES({','.join('?' * len(row))})",
+                list(row.values()))
+            st.db.execute(
+                "INSERT INTO tweet_hits(stream_id, tweet_id, first_seen_ms) VALUES(?,?,?)",
+                (sid, tid, ms))
+
+        # Usual pace: 24 posts spread over the prior day = 1/hour.
+        for i in range(24):
+            put(1000 + i, now - 3_600_000 - (i + 1) * 3_500_000 // 1)
+        # The surge: 12 posts in the last hour = 12x usual.
+        for i in range(12):
+            put(2000 + i, now - i * 60_000)
+
+        out["made"] = await st.create_alert(pid, wid, threshold=3.0, min_posts=10)
+        aid = out["made"]["alert_id"]
+
+        sent = []
+        async def record(alert, msg):
+            sent.append(msg)
+            return True, ""
+
+        out["fired1"] = await al.tick(st, None, log=lambda m: None,
+                                      send=record, now_ms=now)
+        out["fired2"] = await al.tick(st, None, log=lambda m: None,
+                                      send=record, now_ms=now + 60_000)
+        out["fired3"] = await al.tick(st, None, log=lambda m: None,
+                                      send=record, now_ms=now + al.COOLDOWN_MS + 60_000)
+        out["sent"] = sent
+        out["disabled"] = await st.update_alert(aid, {"enabled": 0})
+        out["fired4"] = await al.tick(st, None, log=lambda m: None,
+                                      send=record, now_ms=now + al.COOLDOWN_MS * 3)
+        await st.close()
+        return out
+
+    r = asyncio.run(run())
+    ok(r["fired1"] == 1, "a 12x surge over a 3x rule fires once")
+    ok("Cabinet" in r["sent"][0] and "12 posts" in r["sent"][0],
+       f"the ping names the scope and the count: {r['sent'][0][:70]}")
+    ok(r["fired2"] == 0, "a minute later the cooldown holds - no spam")
+    ok(r["fired3"] == 1, "after the cooldown a continuing surge pings again")
+    ok(r["disabled"] and r["fired4"] == 0, "a paused rule never fires")
+
+
+# ==========================================================================
 # runner
 # ==========================================================================
 
@@ -1533,6 +1870,24 @@ async def run_webhook(tmp):
     ok(not wh.verify(secret, old, body, wh.sign(secret, old, body)),
        "an hour-old delivery is refused (replay)")
     ok(not wh.verify(secret, ts, body, ""), "a missing signature is refused")
+
+    print()
+    print("== payload media ==")
+    row = {"tweet_id": 5, "text": "clip",
+           "media_json": _json.dumps([{"type": "video",
+                                       "url": "https://video.twimg.com/v.mp4",
+                                       "thumb": "https://pbs.twimg.com/t.jpg",
+                                       "duration": 12.3}]),
+           "media_urls": _json.dumps(["https://video.twimg.com/v.mp4"])}
+    j = wh._tweet_json(row, [])
+    ok(j["media"] == [{"type": "video", "url": "https://video.twimg.com/v.mp4",
+                       "thumb": "https://pbs.twimg.com/t.jpg", "duration": 12.3}],
+       "the payload carries structured media — type, url and the video THUMBNAIL — "
+       "not just the flat mp4 list (a receiver cannot show a still it never got)")
+    ok(j["media_urls"] == ["https://video.twimg.com/v.mp4"],
+       "and the frozen flat media_urls shape is untouched")
+    ok(wh._tweet_json({"tweet_id": 5, "media_json": "not-json"}, [])["media"] == [],
+       "malformed media_json degrades to [] rather than blocking delivery")
 
     print()
     print("== delivery ==")
@@ -1581,6 +1936,10 @@ async def run_webhook(tmp):
             ok(len(ids) == len(set(ids)) == 5, "batching produces no duplicates")
             ok(all(isinstance(i, str) for i in ids),
                "tweet_id crosses the wire as a string (2^53 safety)")
+            ok(all("media" in x and isinstance(x["media"], list)
+                   for _, p in got for x in p["tweets"]),
+               "every delivered tweet carries the structured media list, so "
+               "images and video thumbnails reach the receiver")
             ok(await wh.pump(hook, st, client, log=lambda m: None) == 0,
                "nothing new means nothing sent")
 
@@ -1821,6 +2180,15 @@ def main():
 
         section("telegram (switching it on is what makes a stream watched)")
         test_telegram_watch_rule(fresh("tgwatch"))
+
+        section("projects & watchlists (dashboard state -> compiled streams)")
+        test_projects_watchlists(fresh("projects"))
+
+        section("collections (curation boards)")
+        test_collections(fresh("collections"))
+
+        section("velocity alerts (pace, threshold, cooldown)")
+        test_alerts(fresh("alerts"))
 
         section("webhook (signing, cursor, receiver outage)")
         asyncio.run(run_webhook(fresh("webhook")))

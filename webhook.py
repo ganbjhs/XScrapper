@@ -108,6 +108,16 @@ def _tweet_json(row: dict, labels: list) -> dict:
             out[k] = json.loads(row.get(k) or "[]")
         except (TypeError, ValueError):
             out[k] = []
+    # The structured media view — [{type, url, thumb, duration?}] — is what the
+    # dashboard renders from, and it is the ONLY place a video's thumbnail
+    # exists (media_urls is a flat list of the mp4/photo URLs). Leaving it out
+    # meant the receiver could never show an image or a video still without
+    # re-deriving it, which Watch-Tower rightly does not do. Same degrade-to-[]
+    # rule as the other JSON columns: a malformed row must not stop delivery.
+    try:
+        out["media"] = json.loads(row.get("media_json") or "[]")
+    except (TypeError, ValueError):
+        out["media"] = []
     for k in ("is_retweet", "is_reply", "is_quote"):
         out[k] = bool(out.get(k))
     out["streams"] = labels
@@ -441,10 +451,19 @@ async def run(cfg, store, log=print, stop: asyncio.Event | None = None) -> None:
     """
     import httpx
 
+    import alerts as _alerts
+
     announced = set()
+    last_alert_check = 0.0
 
     async with httpx.AsyncClient(follow_redirects=False) as client:
         while stop is None or not stop.is_set():
+            # Velocity alerts ride this loop: it already has the client, the
+            # store, and the never-take-the-loop-down discipline. One check a
+            # minute; tick() itself never raises.
+            if time.time() - last_alert_check >= _alerts.CHECK_EVERY_S:
+                last_alert_check = time.time()
+                await _alerts.tick(store, client, log=log)
             targets = list(cfg.enabled_webhooks())
             try:
                 targets += await telegram_targets(store, log=log)
