@@ -73,7 +73,9 @@ export default function LiveFeed({ onMenu }) {
         ...(ig.posts || []).map(normIg),
       ];
       rows.sort((a, b) => Date.parse(b.collected_at || 0) - Date.parse(a.collected_at || 0));
-      return rows;
+      // xTotal is the SERVER's count for the window — the true number even
+      // when more matched than the page we fetched.
+      return { rows, xTotal: x.total ?? (x.rows || []).length };
     },
     [pid, flt.dur, flt.sort],
     // The stream below is the real-time path; this refetch is the safety net
@@ -134,16 +136,17 @@ export default function LiveFeed({ onMenu }) {
   // screen yet (first load, project switch, empty feed) there is nothing to
   // interrupt — reveal immediately.
   const [shownIds, setShownIds] = useState(null);
+  const feedRows = feed.data?.rows;
   const latest = useMemo(() => {
     const seen = new Set();
     const out = [];
-    for (const t of [...pushed, ...(feed.data || [])]) {
+    for (const t of [...pushed, ...(feedRows || [])]) {
       const k = `${t.platform}:${t.tweet_id}`;
       if (!seen.has(k)) { seen.add(k); out.push(t); }
     }
     out.sort((a, b) => Date.parse(b.collected_at || 0) - Date.parse(a.collected_at || 0));
     return out;
-  }, [pushed, feed.data]);
+  }, [pushed, feedRows]);
   const keyOf = (t) => `${t.platform}:${t.tweet_id}`;
   // The filter bar applies to everything on screen — fetched backlog and
   // stream-pushed posts alike (the server pre-filters the backlog; this
@@ -172,11 +175,11 @@ export default function LiveFeed({ onMenu }) {
       // never "new" — only stream-pushed posts wait behind the pill.
       if (!prev) return new Set(latest.map(keyOf));
       const next = new Set(prev);
-      for (const t of feed.data || []) next.add(keyOf(t));
+      for (const t of feedRows || []) next.add(keyOf(t));
       return next.size === prev.size ? prev : next;
     });
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [latest, feed.data]);
+  }, [latest, feedRows]);
   const fresh = shownIds ? filtered.length - visible.length : 0;
 
   const m = metrics.data;
@@ -271,6 +274,16 @@ export default function LiveFeed({ onMenu }) {
         <section>
           <div className="feed-head">
             <h2>Incoming</h2>
+            <span className="newpill" style={{ cursor: "default" }} title="posts matching the filters above">
+              {fmtN(
+                flt.source === "instagram"
+                  ? filtered.filter((t) => t.platform === "instagram").length
+                  : flt.source === "x"
+                    ? feed.data?.xTotal ?? 0
+                    : (feed.data?.xTotal ?? 0) +
+                      filtered.filter((t) => t.platform === "instagram").length,
+              )}{" "}posts
+            </span>
             {fresh > 0 && (
               <button className="newpill"
                       onClick={() => setShownIds(new Set(latest.map(keyOf)))}>

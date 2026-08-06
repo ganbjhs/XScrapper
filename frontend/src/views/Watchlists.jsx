@@ -174,6 +174,7 @@ function WatchlistCard({ w, onChanged }) {
   const [err, setErr] = useState("");
   const [busy, setBusy] = useState(false);
   const [confirming, setConfirming] = useState(false);
+  const [editing, setEditing] = useState(null);   // {old, val}
 
   const change = async (add, remove) => {
     setBusy(true);
@@ -209,7 +210,11 @@ function WatchlistCard({ w, onChanged }) {
           <div style={{ margin: "8px 0 4px" }}>
             {w.members.map((mb) => (
               <span className="tag" key={mb.handle}>
-                {w.kind === "keywords" ? mb.handle : `@${mb.handle}`}
+                <button style={{ font: "inherit", color: "inherit", padding: 0 }}
+                        title="click to edit" disabled={busy}
+                        onClick={() => setEditing({ old: mb.handle, val: mb.handle })}>
+                  {w.kind === "keywords" ? mb.handle : `@${mb.handle}`}
+                </button>
                 <button aria-label={`remove ${mb.handle}`} disabled={busy}
                         onClick={() => change([], [mb.handle])}>✕</button>
               </span>
@@ -254,6 +259,27 @@ function WatchlistCard({ w, onChanged }) {
       {err && <div className="err" style={{ color: "var(--critical)", fontSize: 13, marginTop: 8 }}>{err}</div>}
 
       {w.kind !== "xlist" && <FiltersPanel w={w} onChanged={onChanged} />}
+
+      {editing && (
+        <Modal title={w.kind === "keywords" ? "Edit keyword rule" : "Edit handle"}
+               sub="The collection query rebuilds automatically on save."
+               onClose={() => setEditing(null)}>
+          <div className="field">
+            <label htmlFor="edm">{w.kind === "keywords" ? "Rule" : "Handle"}</label>
+            <input id="edm" value={editing.val} autoFocus
+                   onChange={(e) => setEditing((s) => ({ ...s, val: e.target.value }))}
+                   onKeyDown={(e) => e.key === "Enter" && editing.val.trim() &&
+                     (change([editing.val], [editing.old]), setEditing(null))} />
+          </div>
+          <div className="row">
+            <button className="btn btn-ghost" onClick={() => setEditing(null)}>Cancel</button>
+            <button className="btn btn-brand" disabled={!editing.val.trim() || busy}
+                    onClick={() => { change([editing.val], [editing.old]); setEditing(null); }}>
+              Save
+            </button>
+          </div>
+        </Modal>
+      )}
 
       {confirming && (
         <Modal title={`Delete “${w.name}”?`} onClose={() => setConfirming(false)}
