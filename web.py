@@ -1348,6 +1348,35 @@ def _delivery_target_update(body):
     return {"ok": True} if ok_ else {"error": f"no target {tid}"}
 
 
+def _date_window(body):
+    """
+    (lo_ms, hi_ms, error) for a history send: either exact dates —
+    from_date/to_date as yyyy-mm-dd, BOTH days inclusive, so July is
+    2026-07-01 → 2026-07-31 — or a rolling `since` window ('24h', '7d').
+    Exact dates win when both are supplied.
+    """
+    fd, td = body.get("from_date"), body.get("to_date")
+    if fd or td:
+        lo = _day_ms(fd) if fd else None
+        if lo is None:
+            return 0, 0, "from_date must be a real date (yyyy-mm-dd)"
+        if td:
+            hi = _day_ms(td)
+            if hi is None:
+                return 0, 0, "to_date must be a real date (yyyy-mm-dd)"
+            hi += 86_400_000          # inclusive of the whole 'to' day
+        else:
+            hi = int(time.time() * 1000)
+        if hi <= lo:
+            return 0, 0, "to_date is before from_date"
+        return lo, hi, None
+    try:
+        lo = store_mod.parse_window(body.get("since") or "24h") or 0
+    except ValueError as e:
+        return 0, 0, str(e)
+    return lo, int(time.time() * 1000) + 86_400_000, None
+
+
 def _delivery_backfill(body):
     """
     One-shot: send PAST posts (by posted time, within a window) to a Telegram
@@ -1378,10 +1407,9 @@ def _delivery_backfill(body):
     token = wh.telegram_token()
     if not token:
         return {"error": "TELEGRAM_BOT_TOKEN is not set in .env"}
-    try:
-        since_ms = store_mod.parse_window(body.get("since") or "24h")
-    except ValueError as e:
-        return {"error": str(e)}
+    lo, hi, err = _date_window(body)
+    if err:
+        return {"error": err}
     try:
         limit = min(50, max(1, int(body.get("limit") or 20)))
     except (TypeError, ValueError):
@@ -1390,12 +1418,12 @@ def _delivery_backfill(body):
     with _connect() as con:
         rows = [dict(r) for r in con.execute(
             "SELECT t.* FROM tweets t WHERE t.source = 'result' "
-            "AND t.created_ms >= ? "
+            "AND t.created_ms >= ? AND t.created_ms < ? "
             "AND EXISTS (SELECT 1 FROM tweet_hits ph JOIN project_streams ps "
             "            ON ps.stream_id = ph.stream_id "
             "            WHERE ph.tweet_id = t.tweet_id AND ps.project_id = ?) "
             "ORDER BY t.created_ms ASC LIMIT ?",
-            (since_ms or 0, row["project_id"], limit))]
+            (lo, hi, row["project_id"], limit))]
     if not rows:
         return {"sent": 0, "note": "nothing collected in that window for this project"}
 

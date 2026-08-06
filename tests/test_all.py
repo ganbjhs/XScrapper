@@ -1445,6 +1445,18 @@ def test_filters(tmp):
     ok(n(min_views="1000") == 2, "Min views is a floor, not an exact match")
     got = [r["tweet_id"] for r in web._query_tweets({"sort": "views"})["rows"]]
     ok(got == ["3", "1", "2"], f"sort=views orders by engagement, not by time ({got})")
+
+    print()
+    print("== the history-send date window ==")
+    lo, hi, err = web._date_window({"from_date": "2026-07-01", "to_date": "2026-07-31"})
+    ok(err is None and (hi - lo) == 31 * 86_400_000,
+       "July 1–31 covers exactly 31 whole days, both ends inclusive")
+    ok(web._date_window({"from_date": "2026-07-31", "to_date": "2026-07-01"})[2],
+       "a backwards range is refused, not silently empty")
+    ok(web._date_window({"from_date": "not-a-date"})[2],
+       "an unparseable date is an error, not 'everything ever'")
+    lo2, hi2, err2 = web._date_window({"since": "24h"})
+    ok(err2 is None and lo2 > 0, "the rolling presets still work")
     ok(n(min_followers="1000000") == 1, "Min followers likewise")
     ok(n(lang="hi") == 1, "Language still narrows")
     ok(n(min_views="99999999") == 0, "a threshold nothing meets returns nothing, cleanly")

@@ -80,7 +80,10 @@ function AddTargetModal({ pid, onDone, onClose }) {
 }
 
 function BackfillModal({ t, onClose }) {
+  const [mode, setMode] = useState("recent");
   const [since, setSince] = useState("24h");
+  const [fromDate, setFromDate] = useState("");
+  const [toDate, setToDate] = useState("");
   const [limit, setLimit] = useState("20");
   const [busy, setBusy] = useState(false);
   const [result, setResult] = useState(null);
@@ -89,9 +92,14 @@ function BackfillModal({ t, onClose }) {
     setBusy(true);
     setResult(null);
     try {
-      const r = await api.deliveryBackfill({
-        target_id: t.target_id, since, limit: Number(limit) || 20,
-      });
+      const body = { target_id: t.target_id, limit: Number(limit) || 20 };
+      if (mode === "dates") {
+        body.from_date = fromDate;
+        body.to_date = toDate || undefined;
+      } else {
+        body.since = since;
+      }
+      const r = await api.deliveryBackfill(body);
       setResult(`✓ Sent ${r.sent} post${r.sent === 1 ? "" : "s"}${r.note ? ` — ${r.note}` : ""}`);
     } catch (e) {
       setResult(`✗ ${String(e.message || e)}`);
@@ -104,14 +112,36 @@ function BackfillModal({ t, onClose }) {
     <Modal title={`Send past posts to “${t.name}”`} onClose={onClose}
            sub="A one-time send of already-collected posts, oldest first. Live delivery is untouched — nothing gets duplicated.">
       <div className="field">
-        <label htmlFor="bfsince">Posts from the last…</label>
-        <select id="bfsince" value={since} onChange={(e) => setSince(e.target.value)}>
-          <option value="1h">1 hour</option><option value="6h">6 hours</option>
-          <option value="12h">12 hours</option><option value="24h">24 hours</option>
-          <option value="48h">48 hours</option><option value="7d">7 days</option>
-          <option value="30d">30 days</option>
+        <label htmlFor="bfmode">Pick posts by</label>
+        <select id="bfmode" value={mode} onChange={(e) => setMode(e.target.value)}>
+          <option value="recent">The last… (quick presets)</option>
+          <option value="dates">Exact dates (e.g. all of July)</option>
         </select>
       </div>
+      {mode === "recent" ? (
+        <div className="field">
+          <label htmlFor="bfsince">Posts from the last…</label>
+          <select id="bfsince" value={since} onChange={(e) => setSince(e.target.value)}>
+            <option value="1h">1 hour</option><option value="6h">6 hours</option>
+            <option value="12h">12 hours</option><option value="24h">24 hours</option>
+            <option value="48h">48 hours</option><option value="7d">7 days</option>
+            <option value="30d">30 days</option>
+          </select>
+        </div>
+      ) : (
+        <>
+          <div className="field">
+            <label htmlFor="bffrom">From (posted date, inclusive)</label>
+            <input id="bffrom" type="date" value={fromDate}
+                   onChange={(e) => setFromDate(e.target.value)} />
+          </div>
+          <div className="field">
+            <label htmlFor="bfto">To (inclusive — leave blank for “until now”)</label>
+            <input id="bfto" type="date" value={toDate}
+                   onChange={(e) => setToDate(e.target.value)} />
+          </div>
+        </>
+      )}
       <div className="field">
         <label htmlFor="bflimit">At most (Telegram allows ~20/min; max 50)</label>
         <input id="bflimit" inputMode="numeric" value={limit}
@@ -125,7 +155,8 @@ function BackfillModal({ t, onClose }) {
       )}
       <div className="row">
         <button className="btn btn-ghost" onClick={onClose}>Close</button>
-        <button className="btn btn-brand" disabled={busy} onClick={send}>
+        <button className="btn btn-brand" disabled={busy || (mode === "dates" && !fromDate)}
+                onClick={send}>
           {busy ? "Sending… (paced for Telegram)" : "Send"}
         </button>
       </div>
