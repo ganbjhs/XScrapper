@@ -68,6 +68,8 @@ export const api = {
     request("/api/watchlists/members", { method: "POST", body: { watchlist_id, add, remove } }),
   removeWatchlist: (watchlist_id) =>
     request("/api/watchlists/remove", { method: "POST", body: { watchlist_id } }),
+  watchlistFilters: (watchlist_id, filters) =>
+    request("/api/watchlists/filters", { method: "POST", body: { watchlist_id, filters } }),
 
   streamSettings: (body) => request("/api/stream/settings", { method: "POST", body }),
 

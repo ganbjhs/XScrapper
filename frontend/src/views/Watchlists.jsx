@@ -94,6 +94,81 @@ const splitAdd = (kind, raw) =>
     ? raw.split(/,|\n/).map((s) => s.trim()).filter(Boolean)
     : raw.split(/[\s,]+/).filter(Boolean);
 
+const FILTER_BOXES = [
+  ["skip_retweets", "No retweets"],
+  ["skip_quotes", "No quote tweets"],
+  ["skip_replies", "No replies"],
+  ["only_media", "Only posts with media"],
+  ["skip_links", "No link posts"],
+  ["verified_only", "Verified (blue) only"],
+];
+
+function FiltersPanel({ w, onChanged }) {
+  const [open, setOpen] = useState(false);
+  const [f, setF] = useState(w.filters || {});
+  const [busy, setBusy] = useState(false);
+  const [msg, setMsg] = useState("");
+
+  const active = Object.keys(w.filters || {}).length;
+  const save = async () => {
+    setBusy(true);
+    setMsg("");
+    try {
+      await api.watchlistFilters(w.watchlist_id, f);
+      setMsg("✓ Saved — collection uses the new filters from its next check");
+      onChanged();
+    } catch (e) {
+      setMsg(`✗ ${String(e.message || e)}`);
+    } finally {
+      setBusy(false);
+    }
+  };
+  const box = (key, label) => (
+    <label className="check" key={key}>
+      <input type="checkbox" checked={!!f[key]}
+             onChange={(e) => setF((s) => ({ ...s, [key]: e.target.checked }))} />
+      {label}
+    </label>
+  );
+
+  return (
+    <div style={{ marginTop: 12, borderTop: "1px solid var(--ring)", paddingTop: 10 }}>
+      <button className="btn btn-ghost btn-sm" onClick={() => setOpen(!open)}>
+        Collection filters{active ? ` (${active} active)` : ""} {open ? "▴" : "▾"}
+      </button>
+      {open && (
+        <div style={{ marginTop: 10 }}>
+          <div className="filters" style={{ marginBottom: 8 }}>
+            {FILTER_BOXES.map(([k, l]) => box(k, l))}
+          </div>
+          <div className="filters" style={{ marginBottom: 8 }}>
+            <input placeholder="language (hi, en…)" value={f.lang || ""}
+                   style={{ width: 150 }}
+                   onChange={(e) => setF((s) => ({ ...s, lang: e.target.value }))} />
+            <input placeholder="min likes" inputMode="numeric" value={f.min_likes || ""}
+                   style={{ width: 110 }}
+                   onChange={(e) => setF((s) => ({ ...s, min_likes: e.target.value }))} />
+            <input placeholder="min retweets" inputMode="numeric" value={f.min_retweets || ""}
+                   style={{ width: 120 }}
+                   onChange={(e) => setF((s) => ({ ...s, min_retweets: e.target.value }))} />
+            <button className="btn btn-brand btn-sm" disabled={busy} onClick={save}>
+              Save filters
+            </button>
+          </div>
+          {msg && (
+            <div className={msg.startsWith("✓") ? "st-good" : "st-crit"}
+                 style={{ fontSize: 12.5, fontWeight: 600 }}>{msg}</div>
+          )}
+          <div style={{ color: "var(--ink-3)", fontSize: 12 }}>
+            Applies at collection time — filtered posts are never fetched at
+            all. Already-collected posts stay.
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
 function WatchlistCard({ w, onChanged }) {
   const [adding, setAdding] = useState("");
   const [err, setErr] = useState("");
@@ -177,6 +252,8 @@ function WatchlistCard({ w, onChanged }) {
         </div>
       )}
       {err && <div className="err" style={{ color: "var(--critical)", fontSize: 13, marginTop: 8 }}>{err}</div>}
+
+      {w.kind !== "xlist" && <FiltersPanel w={w} onChanged={onChanged} />}
 
       {confirming && (
         <Modal title={`Delete “${w.name}”?`} onClose={() => setConfirming(false)}

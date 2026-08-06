@@ -1294,6 +1294,15 @@ def _watchlist_members(body):
         wid, add=body.get("add") or [], remove=body.get("remove") or []))
 
 
+def _watchlist_filters(body):
+    try:
+        wid = int(body.get("watchlist_id") or 0)
+    except (TypeError, ValueError):
+        return {"error": "watchlist_id must be a number"}
+    return _with_store(lambda st: st.set_watchlist_filters(
+        wid, body.get("filters") or {}))
+
+
 def _watchlist_remove(body):
     try:
         wid = int(body.get("watchlist_id") or 0)
@@ -2355,6 +2364,8 @@ class Handler(BaseHTTPRequestHandler):
                 return self._send(200, _watchlist_post(body))
             if u.path == "/api/watchlists/members":
                 return self._send(200, _watchlist_members(body))
+            if u.path == "/api/watchlists/filters":
+                return self._send(200, _watchlist_filters(body))
             if u.path == "/api/watchlists/remove":
                 return self._send(200, _watchlist_remove(body))
             if u.path == "/api/streams/attach":

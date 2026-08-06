@@ -1806,6 +1806,14 @@ def test_keywords_and_project_delivery(tmp):
         out["q"] = st.db.execute("SELECT query FROM streams WHERE label = ?",
                                  (f"wl:{wid}:0",)).fetchone()["query"]
         out["badd"] = await st.set_watchlist_members(wid, add=['broken "quote'])
+        # Filters recompile every stream with the operator suffix.
+        out["setf"] = await st.set_watchlist_filters(
+            wid, {"skip_retweets": True, "skip_quotes": True})
+        out["qf"] = st.db.execute("SELECT query FROM streams WHERE label = ?",
+                                  (f"wl:{wid}:0",)).fetchone()["query"]
+        out["clearf"] = await st.set_watchlist_filters(wid, {})
+        out["qc"] = st.db.execute("SELECT query FROM streams WHERE label = ?",
+                                  (f"wl:{wid}:0",)).fetchone()["query"]
 
         # Stream assignment: B takes over a stream, A lets it go.
         sid = st.db.execute("SELECT stream_id FROM streams WHERE label = ?",
@@ -1858,6 +1866,23 @@ def test_keywords_and_project_delivery(tmp):
     ok(r["q"] == '("exact phrase" OR #tag OR (finance gst))',
        f"terms OR-combine into one X query ({r['q']})")
     ok("error" in r["badd"], "a bad term rejects the request, nothing half-applies")
+    ok(r["qf"].endswith(" -filter:retweets -filter:quote"),
+       f"saving filters recompiles the stream with the suffix ({r['qf']!r})")
+    ok(r["qc"] == r["q"], "clearing filters restores the bare query")
+
+    print()
+    print("== collection filters ==")
+    nf, fs = store_mod.normalize_filters, store_mod.filters_suffix
+    clean, e = nf({"skip_retweets": True, "skip_quotes": True, "lang": "HI",
+                   "min_likes": "50", "skip_replies": False})
+    ok(e is None and clean == {"skip_retweets": True, "skip_quotes": True,
+                               "lang": "hi", "min_likes": 50},
+       "checkboxes normalize; off-boxes and empties drop out")
+    ok(fs(clean) == " -filter:retweets -filter:quote lang:hi min_faves:50",
+       f"filters compile to X advanced-search operators ({fs(clean)!r})")
+    ok(nf({"nonsense": True})[1], "an unknown filter key is an error, never ignored")
+    ok(nf({"lang": "hindi"})[1], "a wrong language code is refused with guidance")
+    ok(fs({}) == "", "no filters means an untouched query")
 
     print()
     print("== stream assignment ==")

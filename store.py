@@ -658,6 +658,63 @@ def compile_term(term: str) -> str:
     return term
 
 
+# The collection-filter checkboxes and what each compiles to. One honest
+# caveat, learned the hard way (see RULEBOOK on "-filter:replies"): these are
+# HINTS to X's search — honoured well in practice, but not contractual. The
+# webhook/Telegram side additionally filters on our own parsed is_retweet /
+# is_reply columns, which is the check that actually holds.
+WATCHLIST_FILTERS = {
+    "skip_retweets": "-filter:retweets",
+    "skip_replies":  "-filter:replies",
+    "skip_quotes":   "-filter:quote",
+    "only_media":    "filter:media",
+    "skip_links":    "-filter:links",
+    "verified_only": "filter:blue_verified",
+}
+
+
+def normalize_filters(raw) -> tuple:
+    """(clean_dict, error). Unknown keys rejected — a typo must not silently
+    become 'no filter'."""
+    if not isinstance(raw, dict):
+        return None, "filters must be an object"
+    out = {}
+    for k, v in raw.items():
+        if k in WATCHLIST_FILTERS:
+            if v:
+                out[k] = True
+        elif k == "lang":
+            s = str(v or "").strip().lower()
+            if s:
+                if not re.fullmatch(r"[a-z]{2,3}", s):
+                    return None, "lang must be a 2–3 letter code like hi or en"
+                out["lang"] = s
+        elif k in ("min_likes", "min_retweets"):
+            try:
+                n = int(v or 0)
+            except (TypeError, ValueError):
+                return None, f"{k} must be a whole number"
+            if n > 0:
+                out[k] = n
+        else:
+            return None, f"unknown filter {k!r}"
+    return out, None
+
+
+def filters_suffix(filters: dict) -> str:
+    """The query tail a filter set compiles to, deterministic order."""
+    if not filters:
+        return ""
+    parts = [op for key, op in WATCHLIST_FILTERS.items() if filters.get(key)]
+    if filters.get("lang"):
+        parts.append(f"lang:{filters['lang']}")
+    if filters.get("min_likes"):
+        parts.append(f"min_faves:{filters['min_likes']}")
+    if filters.get("min_retweets"):
+        parts.append(f"min_retweets:{filters['min_retweets']}")
+    return (" " + " ".join(parts)) if parts else ""
+
+
 def _percentile(values: list[int], pct: float) -> int:
     if not values:
         return 0
@@ -716,6 +773,10 @@ class Store:
         # default in order to leave it alone.
         wanted = {"polls": {"rl_reset": "INTEGER"},
                   "tweets": {"media_json": "TEXT"},
+                  # Collection filters, as JSON — checkboxes in the UI that
+                  # compile into X advanced-search operators on every one of
+                  # the watchlist's streams. See WATCHLIST_FILTERS.
+                  "watchlists": {"filters": "TEXT"},
                   "streams": {"list_id": "TEXT",
                               # "The watcher should poll this even though
                               # config.toml never heard of it." Watchlist-
@@ -935,8 +996,31 @@ class Store:
             d = dict(w)
             d["members"] = members
             d["streams"] = streams
+            try:
+                d["filters"] = json.loads(d.get("filters") or "{}")
+            except (TypeError, ValueError):
+                d["filters"] = {}
             out.append(d)
         return out
+
+    async def set_watchlist_filters(self, watchlist_id: int, raw) -> dict:
+        """Save the checkbox filters and recompile — the running watcher picks
+        the changed queries up on its next cycle for those streams."""
+        w = self.db.execute("SELECT * FROM watchlists WHERE watchlist_id = ?",
+                            (int(watchlist_id),)).fetchone()
+        if not w:
+            return {"error": f"no watchlist {watchlist_id}"}
+        if w["kind"] == "xlist":
+            return {"error": "an X-List watchlist collects the list timeline "
+                             "as-is — search filters cannot apply to it. Use a "
+                             "handle watchlist for filtered collection."}
+        clean, err = normalize_filters(raw or {})
+        if err:
+            return {"error": err}
+        self.db.execute("UPDATE watchlists SET filters = ? WHERE watchlist_id = ?",
+                        (json.dumps(clean) if clean else None, int(watchlist_id)))
+        compiled = await self.compile_watchlist(int(watchlist_id))
+        return {"watchlist_id": int(watchlist_id), "filters": clean, **compiled}
 
     async def create_watchlist(self, project_id: int, name: str,
                                kind: str = "query", list_id: str = "") -> dict:
@@ -1021,6 +1105,11 @@ class Store:
                             (int(watchlist_id),)).fetchone()
         if not w:
             return {"error": f"no watchlist {watchlist_id}"}
+        try:
+            flt = json.loads(w["filters"] or "{}") if "filters" in w.keys() else {}
+        except (TypeError, ValueError):
+            flt = {}
+        suffix = filters_suffix(flt)
 
         labels = []
         if w["kind"] == "xlist":
@@ -1049,7 +1138,7 @@ class Store:
                 chunks.append(cur)
             for n, chunk in enumerate(chunks):
                 label = f"wl:{w['watchlist_id']}:{n}"
-                query = "(" + " OR ".join(chunk) + ")"
+                query = "(" + " OR ".join(chunk) + ")" + suffix
                 sid = await self.ensure_stream(label, query, "Latest", True)
                 self.db.execute(
                     "UPDATE streams SET watched = 1, paused = 0 WHERE stream_id = ?",
@@ -1063,7 +1152,7 @@ class Store:
             for n in range(0, len(handles), self.WATCHLIST_CHUNK):
                 chunk = handles[n:n + self.WATCHLIST_CHUNK]
                 label = f"wl:{w['watchlist_id']}:{n // self.WATCHLIST_CHUNK}"
-                query = "(" + " OR ".join(f"from:{h}" for h in chunk) + ")"
+                query = "(" + " OR ".join(f"from:{h}" for h in chunk) + ")" + suffix
                 sid = await self.ensure_stream(label, query, "Latest", True)
                 self.db.execute(
                     "UPDATE streams SET watched = 1, paused = 0 WHERE stream_id = ?",
