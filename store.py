@@ -547,6 +547,24 @@ CREATE TABLE IF NOT EXISTS collection_items (
 -- trailing day's hourly average, and pings Telegram through the same
 -- machinery streams already use. last_fired_ms is the cooldown anchor: a
 -- surge that lasts three hours should ping a few times, not sixty.
+-- Delivery targets created from the dashboard, scoped to a project. The
+-- config.toml [[webhooks]] path still works and stays global; these are the
+-- per-project ones. A webhook's SECRET is never stored here — secret_env
+-- names a variable in .env, same rule as everywhere else. The cursor for a
+-- target is keyed 'dt:<target_id>' in webhook_state, so renames are free.
+CREATE TABLE IF NOT EXISTS delivery_targets (
+  target_id  INTEGER PRIMARY KEY AUTOINCREMENT,
+  project_id INTEGER NOT NULL,
+  kind       TEXT NOT NULL,                 -- 'webhook' | 'telegram'
+  name       TEXT NOT NULL,                 -- human label ("Watch-Tower")
+  url        TEXT,                          -- webhook
+  secret_env TEXT,                          -- webhook: NAME of the .env var
+  chat_id    TEXT,                          -- telegram
+  batch_size INTEGER NOT NULL DEFAULT 50,
+  enabled    INTEGER NOT NULL DEFAULT 1,
+  created_at TEXT NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS alerts (
   alert_id      INTEGER PRIMARY KEY AUTOINCREMENT,
   project_id    INTEGER NOT NULL,
@@ -609,6 +627,35 @@ def normalize_handle(raw) -> str | None:
         s = s.split("/", 1)[0].split("?", 1)[0]
     s = s.lstrip("@").strip()
     return s.lower() if _HANDLE_RE.match(s) else None
+
+
+def normalize_term(raw) -> str | None:
+    """
+    One keyword-watchlist term, cleaned. None if unusable.
+
+    A term is anything X's own search accepts: a word, a "quoted phrase",
+    a #hashtag, an @mention, a -exclusion — or several joined with AND
+    ('finance AND gst' means both words anywhere in the post, any order;
+    that is exactly what a space means to X, so AND compiles to a space).
+    Kept nearly raw on purpose: the search syntax is the feature, and
+    second-guessing it here would only forbid things X allows.
+    """
+    s = " ".join(str(raw or "").split())
+    if not s or len(s) > 120:
+        return None
+    if s.count('"') % 2:            # an unbalanced quote poisons the whole query
+        return None
+    if s.upper() in ("AND", "OR"):  # an operator alone matches nothing
+        return None
+    return s
+
+
+def compile_term(term: str) -> str:
+    """'finance AND gst' -> '(finance gst)'; anything else passes through."""
+    parts = re.split(r"\s+AND\s+", term, flags=re.IGNORECASE)
+    if len(parts) > 1:
+        return "(" + " ".join(p.strip() for p in parts if p.strip()) + ")"
+    return term
 
 
 def _percentile(values: list[int], pct: float) -> int:
@@ -848,6 +895,28 @@ class Store:
             "INSERT OR IGNORE INTO project_streams(project_id, stream_id) VALUES(?,?)",
             (int(project_id), int(stream_id)))
 
+    async def detach_stream(self, project_id: int, stream_id: int) -> bool:
+        """Unlink only — the stream, its tweets and its other projects stay."""
+        return self.db.execute(
+            "DELETE FROM project_streams WHERE project_id = ? AND stream_id = ?",
+            (int(project_id), int(stream_id))).rowcount > 0
+
+    async def streams_with_projects(self) -> list:
+        """Every stream, its size, and which projects it feeds — the map the
+        stream-assignment UI works from."""
+        out = []
+        for s in self.db.execute(
+                "SELECT s.stream_id, s.label, s.paused, s.list_id, "
+                "       COUNT(h.tweet_id) AS tweets "
+                "FROM streams s LEFT JOIN tweet_hits h USING(stream_id) "
+                "GROUP BY s.stream_id ORDER BY s.label").fetchall():
+            d = dict(s)
+            d["projects"] = [r["project_id"] for r in self.db.execute(
+                "SELECT project_id FROM project_streams WHERE stream_id = ?",
+                (s["stream_id"],))]
+            out.append(d)
+        return out
+
     async def watchlists(self, project_id: int) -> list:
         out = []
         for w in self.db.execute(
@@ -874,8 +943,8 @@ class Store:
         name = (name or "").strip()
         if not name:
             return {"error": "a watchlist needs a name"}
-        if kind not in ("query", "xlist"):
-            return {"error": "kind must be 'query' or 'xlist'"}
+        if kind not in ("query", "xlist", "keywords"):
+            return {"error": "kind must be 'query', 'keywords' or 'xlist'"}
         if kind == "xlist" and not (list_id or "").strip():
             return {"error": "an xlist watchlist needs the X List id"}
         if not self.db.execute("SELECT 1 FROM projects WHERE project_id = ?",
@@ -907,13 +976,17 @@ class Store:
         if not w:
             return {"error": f"no watchlist {watchlist_id}"}
 
+        # A member is a handle for 'query' watchlists, a search term for
+        # 'keywords' ones — same table, different validator.
+        norm = normalize_term if w["kind"] == "keywords" else normalize_handle
+        what = "search terms" if w["kind"] == "keywords" else "X handles"
         adds, bad = [], []
         for h in (add or []):
-            n = normalize_handle(h)
+            n = norm(h)
             (adds if n else bad).append(n or str(h))
         if bad:
-            return {"error": "not valid X handles: " + ", ".join(repr(b) for b in bad)}
-        removes = [normalize_handle(h) for h in (remove or [])]
+            return {"error": f"not valid {what}: " + ", ".join(repr(b) for b in bad)}
+        removes = [norm(h) for h in (remove or [])]
         removes = [h for h in removes if h]
 
         now = _iso_ms(int(time.time() * 1000))
@@ -958,6 +1031,31 @@ class Store:
                 "UPDATE streams SET watched = 1, paused = 0 WHERE stream_id = ?", (sid,))
             await self.attach_stream(w["project_id"], sid)
             labels.append(label)
+        elif w["kind"] == "keywords":
+            # Terms OR-combine; chunking is by QUERY LENGTH, not count — a
+            # keyword term can be 120 chars where a handle is at most 15.
+            terms = [compile_term(r["handle"]) for r in self.db.execute(
+                "SELECT handle FROM watchlist_members WHERE watchlist_id = ? "
+                "ORDER BY handle", (int(watchlist_id),))]
+            chunks, cur = [], []
+            for t in terms:
+                cand = " OR ".join([*cur, t])
+                if cur and len(cand) > 400:      # X caps queries ~512; stay clear
+                    chunks.append(cur)
+                    cur = [t]
+                else:
+                    cur.append(t)
+            if cur:
+                chunks.append(cur)
+            for n, chunk in enumerate(chunks):
+                label = f"wl:{w['watchlist_id']}:{n}"
+                query = "(" + " OR ".join(chunk) + ")"
+                sid = await self.ensure_stream(label, query, "Latest", True)
+                self.db.execute(
+                    "UPDATE streams SET watched = 1, paused = 0 WHERE stream_id = ?",
+                    (sid,))
+                await self.attach_stream(w["project_id"], sid)
+                labels.append(label)
         else:
             handles = [r["handle"] for r in self.db.execute(
                 "SELECT handle FROM watchlist_members WHERE watchlist_id = ? "
@@ -1087,6 +1185,80 @@ class Store:
             "SELECT t.*, i.added_ms FROM collection_items i "
             "JOIN tweets t USING(tweet_id) WHERE i.collection_id = ? "
             "ORDER BY i.added_ms DESC, t.tweet_id DESC", (int(collection_id),))]
+
+    # ----------------------------------------------------------------------
+    # delivery targets (per-project, dashboard-managed)
+    # ----------------------------------------------------------------------
+
+    async def delivery_targets(self, project_id: int = 0,
+                               enabled_only: bool = False) -> list:
+        where, params = [], []
+        if project_id:
+            where.append("project_id = ?"); params.append(int(project_id))
+        if enabled_only:
+            where.append("enabled = 1")
+        return [dict(r) for r in self.db.execute(
+            "SELECT * FROM delivery_targets "
+            + (f"WHERE {' AND '.join(where)} " if where else "")
+            + "ORDER BY target_id", params)]
+
+    async def create_delivery_target(self, project_id: int, kind: str,
+                                     name: str, url: str = "",
+                                     secret_env: str = "", chat_id: str = "",
+                                     batch_size: int = 50) -> dict:
+        if not self.db.execute("SELECT 1 FROM projects WHERE project_id = ?",
+                               (int(project_id),)).fetchone():
+            return {"error": f"no project {project_id}"}
+        name = (name or "").strip()
+        if not name:
+            return {"error": "a target needs a name"}
+        if kind == "webhook":
+            url = (url or "").strip()
+            secret_env = (secret_env or "").strip()
+            if not url.startswith(("http://", "https://")):
+                return {"error": "a webhook needs a full http(s) URL"}
+            if not re.fullmatch(r"[A-Z][A-Z0-9_]*", secret_env or ""):
+                return {"error": "secret_env must NAME an .env variable, like "
+                                 "WEBHOOK_SECRET_MAIN (never the secret itself)"}
+        elif kind == "telegram":
+            chat_id = (chat_id or "").strip()
+            if not re.fullmatch(r"-?\d{1,20}|@[A-Za-z0-9_]{4,32}", chat_id or ""):
+                return {"error": "a chat id is a number like -1001234567890, "
+                                 "or a public channel like @mychannel"}
+        else:
+            return {"error": "kind must be 'webhook' or 'telegram'"}
+        try:
+            batch_size = min(200, max(1, int(batch_size)))
+        except (TypeError, ValueError):
+            return {"error": "batch_size must be a whole number"}
+        cur = self.db.execute(
+            "INSERT INTO delivery_targets(project_id, kind, name, url, secret_env, "
+            " chat_id, batch_size, created_at) VALUES(?,?,?,?,?,?,?,?)",
+            (int(project_id), kind, name, url or None, secret_env or None,
+             chat_id or None, batch_size, _iso_ms(int(time.time() * 1000))))
+        return {"target_id": cur.lastrowid}
+
+    async def update_delivery_target(self, target_id: int, values: dict) -> bool:
+        cols = [k for k in values if k in ("enabled", "batch_size")]
+        if not cols:
+            return False
+        return self.db.execute(
+            f"UPDATE delivery_targets SET {', '.join(f'{c} = ?' for c in cols)} "
+            "WHERE target_id = ?",
+            [*(values[c] for c in cols), int(target_id)]).rowcount > 0
+
+    async def delete_delivery_target(self, target_id: int) -> bool:
+        row = self.db.execute("SELECT 1 FROM delivery_targets WHERE target_id = ?",
+                              (int(target_id),)).fetchone()
+        if not row:
+            return False
+        self.db.execute("DELETE FROM delivery_targets WHERE target_id = ?",
+                        (int(target_id),))
+        # The cursor row goes too: a recreated target must start from NOW,
+        # not from wherever a dead namesake had reached.
+        self.db.execute("DELETE FROM webhook_state WHERE label = ?",
+                        (f"dt:{int(target_id)}",))
+        return True
 
     # ----------------------------------------------------------------------
     # velocity alerts
@@ -1247,13 +1419,17 @@ class Store:
         self.db.execute("UPDATE webhook_state SET sent = 0 WHERE label = ?", (label,))
 
     async def tweets_after(self, last_ms: int, last_tweet_id: int, limit: int,
-                           labels: list | None = None) -> list:
+                           labels: list | None = None,
+                           project_id: int | None = None) -> list:
         """
         The next batch to deliver, oldest first.
 
         Strict ordering on the composite cursor: rows collected in the same
         millisecond are broken by tweet_id, so no row is ever visited twice and
-        none is skipped.
+        none is skipped. `project_id` scopes a per-project target to the
+        tweets its project's streams collected — resolved at read time, so a
+        watchlist edited today changes what delivers tomorrow, with no
+        re-configuration step.
         """
         where = ["t.source = 'result'",
                  "(t.collected_ms > ? OR (t.collected_ms = ? AND t.tweet_id > ?))"]
@@ -1265,6 +1441,12 @@ class Store:
                 "        WHERE h.tweet_id = t.tweet_id AND s.label IN "
                 f"       ({','.join('?' * len(labels))}))")
             params += list(labels)
+        if project_id:
+            where.append(
+                "EXISTS (SELECT 1 FROM tweet_hits ph JOIN project_streams ps "
+                "        ON ps.stream_id = ph.stream_id "
+                "        WHERE ph.tweet_id = t.tweet_id AND ps.project_id = ?)")
+            params.append(int(project_id))
 
         rows = self.db.execute(
             f"SELECT * FROM tweets t WHERE {' AND '.join(where)} "

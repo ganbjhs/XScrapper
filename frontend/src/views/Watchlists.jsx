@@ -19,6 +19,9 @@ function CreateModal({ pid, onDone, onClose }) {
     try {
       const body = { project: pid, name, kind };
       if (kind === "xlist") body.list_id = listId;
+      else if (kind === "keywords")
+        // One rule per LINE — a rule may contain spaces and AND.
+        body.handles = handles.split(/\n+/).map((s) => s.trim()).filter(Boolean);
       else body.handles = handles.split(/[\s,]+/).filter(Boolean);
       const made = await api.createWatchlist(body);
       if (made.warning) setErr(made.warning);
@@ -45,6 +48,7 @@ function CreateModal({ pid, onDone, onClose }) {
         <label htmlFor="wkind">Type</label>
         <select id="wkind" value={kind} onChange={(e) => setKind(e.target.value)}>
           <option value="query">Handles (built here — no X List needed)</option>
+          <option value="keywords">Keywords (topics, phrases, AND combinations)</option>
           <option value="xlist">Existing X List (fastest polling)</option>
         </select>
       </div>
@@ -53,6 +57,18 @@ function CreateModal({ pid, onDone, onClose }) {
           <label htmlFor="wlist">X List URL or id</label>
           <input id="wlist" value={listId} onChange={(e) => setListId(e.target.value)}
                  placeholder="https://x.com/i/lists/1234567890123456789" />
+        </div>
+      ) : kind === "keywords" ? (
+        <div className="field">
+          <label htmlFor="whandles">Keywords — one per line</label>
+          <textarea id="whandles" rows="5" value={handles}
+                    onChange={(e) => setHandles(e.target.value)}
+                    placeholder={'finance AND gst\n"vishnu deo sai"\n#Chhattisgarh\nbudget -filter:retweets'} />
+          <div style={{ color: "var(--ink-3)", fontSize: 12, marginTop: 6 }}>
+            Each line is one rule; lines combine as OR. <b>AND</b> between words
+            means the post must contain both, in any order. Quotes = exact
+            phrase. X search operators pass through.
+          </div>
         </div>
       ) : (
         <div className="field">
@@ -72,6 +88,11 @@ function CreateModal({ pid, onDone, onClose }) {
     </Modal>
   );
 }
+
+const splitAdd = (kind, raw) =>
+  kind === "keywords"
+    ? raw.split(/,|\n/).map((s) => s.trim()).filter(Boolean)
+    : raw.split(/[\s,]+/).filter(Boolean);
 
 function WatchlistCard({ w, onChanged }) {
   const [adding, setAdding] = useState("");
@@ -108,30 +129,34 @@ function WatchlistCard({ w, onChanged }) {
         </span>
       </div>
 
-      {w.kind === "query" && (
+      {w.kind !== "xlist" && (
         <>
           <div style={{ margin: "8px 0 4px" }}>
             {w.members.map((mb) => (
               <span className="tag" key={mb.handle}>
-                @{mb.handle}
+                {w.kind === "keywords" ? mb.handle : `@${mb.handle}`}
                 <button aria-label={`remove ${mb.handle}`} disabled={busy}
                         onClick={() => change([], [mb.handle])}>✕</button>
               </span>
             ))}
             {w.members.length === 0 && (
               <span style={{ color: "var(--ink-3)", fontSize: 13 }}>
-                No handles yet — add some below.
+                {w.kind === "keywords" ? "No keywords yet — add some below."
+                                       : "No handles yet — add some below."}
               </span>
             )}
           </div>
           <div className="filters" style={{ marginTop: 10, marginBottom: 0 }}>
-            <input value={adding} placeholder="@handle, profile URL, or several separated by spaces"
+            <input value={adding}
+                   placeholder={w.kind === "keywords"
+                     ? 'finance AND gst  —  or several rules separated by commas'
+                     : "@handle, profile URL, or several separated by spaces"}
                    style={{ flex: 1, minWidth: 200 }}
                    onChange={(e) => setAdding(e.target.value)}
                    onKeyDown={(e) => e.key === "Enter" && adding.trim() &&
-                     change(adding.split(/[\s,]+/).filter(Boolean), [])} />
+                     change(splitAdd(w.kind, adding), [])} />
             <button className="btn btn-brand btn-sm" disabled={busy || !adding.trim()}
-                    onClick={() => change(adding.split(/[\s,]+/).filter(Boolean), [])}>
+                    onClick={() => change(splitAdd(w.kind, adding), [])}>
               Add
             </button>
             <button className="btn btn-danger btn-sm" onClick={() => setConfirming(true)}>
@@ -173,6 +198,75 @@ function WatchlistCard({ w, onChanged }) {
   );
 }
 
+function StreamsManager({ pid }) {
+  const { data, error, reload } = useApi(() => api.streamAssignments(), []);
+  const [open, setOpen] = useState(false);
+  const [pick, setPick] = useState("");
+  if (error) return null;
+  const streams = data?.streams || [];
+  const mine = streams.filter((s) => s.projects.includes(pid));
+  const others = streams.filter((s) => !s.projects.includes(pid));
+
+  return (
+    <div className="panel" style={{ marginTop: 22 }}>
+      <div className="phead">
+        <h3>Streams in this project</h3>
+        <span className="right">
+          what actually feeds this project's feed &amp; delivery ·{" "}
+          <button className="btn btn-ghost btn-sm" onClick={() => setOpen(!open)}>
+            {open ? "Hide" : "Manage"}
+          </button>
+        </span>
+      </div>
+      {open && (
+        <>
+          {mine.map((s) => (
+            <div className="wl-row" key={s.stream_id}>
+              <div className="who">
+                <b style={{ overflowWrap: "anywhere" }}>{s.label}</b>
+                <small>
+                  {s.tweets.toLocaleString()} collected
+                  {s.paused ? " · paused" : ""}
+                  {s.projects.length > 1 ? ` · in ${s.projects.length} projects` : ""}
+                </small>
+              </div>
+              <div className="right">
+                <button className="btn btn-ghost btn-sm"
+                        onClick={async () => { await api.detachStream(pid, s.stream_id); reload(); }}>
+                  Remove from project
+                </button>
+              </div>
+            </div>
+          ))}
+          {mine.length === 0 && (
+            <div className="kv"><span>Nothing attached</span><b /></div>
+          )}
+          {others.length > 0 && (
+            <div className="filters" style={{ marginTop: 12, marginBottom: 0 }}>
+              <select value={pick} onChange={(e) => setPick(e.target.value)} style={{ flex: 1 }}>
+                <option value="">Attach an existing stream…</option>
+                {others.map((s) => (
+                  <option key={s.stream_id} value={s.stream_id}>
+                    {s.label} ({s.tweets.toLocaleString()} collected)
+                  </option>
+                ))}
+              </select>
+              <button className="btn btn-brand btn-sm" disabled={!pick}
+                      onClick={async () => { await api.attachStream(pid, Number(pick)); setPick(""); reload(); }}>
+                Attach
+              </button>
+            </div>
+          )}
+          <div style={{ color: "var(--ink-3)", fontSize: 12, marginTop: 10 }}>
+            Removing a stream only changes what this project shows and
+            delivers — the stream, its collection, and its posts stay.
+          </div>
+        </>
+      )}
+    </div>
+  );
+}
+
 export default function Watchlists({ onMenu }) {
   const { project } = useProject();
   const pid = project?.project_id;
@@ -200,6 +294,8 @@ export default function Watchlists({ onMenu }) {
       {(data?.watchlists || []).map((w) => (
         <WatchlistCard key={w.watchlist_id} w={w} onChanged={reload} />
       ))}
+
+      {pid && <StreamsManager pid={pid} />}
 
       {creating && pid && (
         <CreateModal pid={pid} onDone={reload} onClose={() => setCreating(false)} />

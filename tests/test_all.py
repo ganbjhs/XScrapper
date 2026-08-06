@@ -1759,6 +1759,113 @@ def test_collections(tmp):
 
 
 # ==========================================================================
+# keywords, stream assignment, per-project delivery
+# ==========================================================================
+
+def test_keywords_and_project_delivery(tmp):
+    import sqlite3
+
+    import store as store_mod
+    import webhook as wh
+
+    db = pathlib.Path(tmp) / "results.db"
+
+    print("== keyword terms ==")
+    nt, ct = store_mod.normalize_term, store_mod.compile_term
+    ok(nt("  finance   AND gst ") == "finance AND gst", "whitespace collapses")
+    ok(nt('"vishnu deo sai"') == '"vishnu deo sai"', "phrases pass through")
+    ok(nt('bad "quote') is None, "an unbalanced quote is rejected, not sent to X")
+    ok(nt("AND") is None, "a bare operator is rejected")
+    ok(ct("finance AND gst") == "(finance gst)",
+       "AND compiles to X's implicit-and (a space), grouped")
+    ok(ct("finance and GST") == "(finance GST)", "AND is case-insensitive")
+    ok(ct("#Chhattisgarh") == "#Chhattisgarh", "plain terms pass through")
+
+    async def run():
+        st = store_mod.Store(db, False)
+        await st.open()
+        out = {}
+        pid_a = (await st.create_project("A"))["project_id"]
+        pid_b = (await st.create_project("B"))["project_id"]
+
+        wid = (await st.create_watchlist(pid_a, "Topics", "keywords"))["watchlist_id"]
+        out["set"] = await st.set_watchlist_members(
+            wid, add=["finance AND gst", '"exact phrase"', "#tag"])
+        out["q"] = st.db.execute("SELECT query FROM streams WHERE label = ?",
+                                 (f"wl:{wid}:0",)).fetchone()["query"]
+        out["badd"] = await st.set_watchlist_members(wid, add=['broken "quote'])
+
+        # Stream assignment: B takes over a stream, A lets it go.
+        sid = st.db.execute("SELECT stream_id FROM streams WHERE label = ?",
+                            (f"wl:{wid}:0",)).fetchone()["stream_id"]
+        await st.attach_stream(pid_b, sid)
+        out["both"] = [s for s in await st.streams_with_projects()
+                       if s["stream_id"] == sid][0]["projects"]
+        await st.detach_stream(pid_a, sid)
+        out["after"] = [s for s in await st.streams_with_projects()
+                        if s["stream_id"] == sid][0]["projects"]
+
+        # Per-project delivery: a target scoped to B sees only B's tweets.
+        info = list(st.db.execute("PRAGMA table_info(tweets)"))
+        required = [x[1] for x in info if x[3] and x[4] is None and not x[5]]
+        text_cols = {x[1] for x in info if "TEXT" in (x[2] or "").upper()}
+        other = st.db.execute(
+            "INSERT INTO streams(label, query, tab, created_at) "
+            "VALUES('elsewhere', 'q', 'Latest', 'x')").lastrowid
+        await st.attach_stream(pid_a, other)
+        for tid, s in ((11, sid), (12, sid), (13, other)):
+            row = {c: ("" if c in text_cols else 0) for c in required}
+            row.update(tweet_id=tid, created_ms=tid, collected_ms=tid, source="result")
+            st.db.execute(
+                f"INSERT INTO tweets({','.join(row)}) VALUES({','.join('?' * len(row))})",
+                list(row.values()))
+            st.db.execute("INSERT INTO tweet_hits(stream_id, tweet_id, first_seen_ms) "
+                          "VALUES(?,?,?)", (s, tid, tid))
+        out["b_rows"] = [r["tweet_id"] for r in
+                         await st.tweets_after(0, 0, 50, project_id=pid_b)]
+        out["all_rows"] = [r["tweet_id"] for r in await st.tweets_after(0, 0, 50)]
+
+        # Target CRUD + the sender's view of it.
+        out["bad_secret"] = await st.create_delivery_target(
+            pid_b, "webhook", "wt", "https://x.example/h", "not lowercase ok?")
+        out["made"] = await st.create_delivery_target(
+            pid_b, "webhook", "wt", "https://x.example/h", "WH_TEST_SECRET")
+        os.environ["WH_TEST_SECRET"] = "s3cret"
+        built = await wh.db_targets(st, log=lambda m: None)
+        out["built"] = [(t.label, t.kind, t.project_id, t.secret) for t in built]
+        os.environ.pop("WH_TEST_SECRET")
+        out["built_missing"] = await wh.db_targets(st, log=lambda m: None)
+        out["gone"] = await st.delete_delivery_target(out["made"]["target_id"])
+        out["pids"] = (pid_a, pid_b)
+        await st.close()
+        return out
+
+    r = asyncio.run(run())
+    print()
+    print("== keyword watchlists compile ==")
+    ok(r["q"] == '("exact phrase" OR #tag OR (finance gst))',
+       f"terms OR-combine into one X query ({r['q']})")
+    ok("error" in r["badd"], "a bad term rejects the request, nothing half-applies")
+
+    print()
+    print("== stream assignment ==")
+    pa, pb = r["pids"]
+    ok(sorted(r["both"]) == sorted([pa, pb]), "a stream can feed two projects at once")
+    ok(r["after"] == [pb], "detaching from one leaves the other untouched")
+
+    print()
+    print("== per-project delivery ==")
+    ok(r["b_rows"] == [11, 12], f"a project-scoped target sees only its posts ({r['b_rows']})")
+    ok(r["all_rows"] == [11, 12, 13], "an unscoped target still sees everything")
+    ok("error" in r["bad_secret"], "secret_env must be an ENV NAME, never a secret")
+    ok(r["built"] == [("dt:1", "webhook", pb, "s3cret")],
+       "a target builds into a sender with its secret from .env")
+    ok(r["built_missing"] == [],
+       "with the secret missing the target is skipped loudly, never sent unsigned")
+    ok(r["gone"], "targets delete cleanly (cursor row included)")
+
+
+# ==========================================================================
 # velocity alerts: counts, thresholds, cooldown
 # ==========================================================================
 
@@ -2191,6 +2298,9 @@ def main():
 
         section("velocity alerts (pace, threshold, cooldown)")
         test_alerts(fresh("alerts"))
+
+        section("keywords, stream assignment, per-project delivery")
+        test_keywords_and_project_delivery(fresh("kwdeliv"))
 
         section("webhook (signing, cursor, receiver outage)")
         asyncio.run(run_webhook(fresh("webhook")))

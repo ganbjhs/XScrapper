@@ -992,22 +992,30 @@ def _live_rows(con, last_ms: int, last_tweet_id: int, project: int = 0,
 # read-only views the SPA needs: delivery, activity, metrics
 # --------------------------------------------------------------------------
 
-def _delivery_json():
+def _delivery_json(q=None):
     """
     Where every delivery target stands. The number that matters is `behind`:
     how many collected tweets sit past the target's cursor — the same
     composite-cursor arithmetic the sender itself uses, so the dashboard and
     the sender can never disagree about what "caught up" means.
+
+    ?project=N narrows to that project's own targets plus the global ones
+    (config.toml webhooks and per-stream Telegram), which are marked as such.
     """
     out = {"targets": []}
     if not _CFG.db_results.exists():
         return out
+    try:
+        pid = int((q or {}).get("project") or 0)
+    except (TypeError, ValueError):
+        pid = 0
 
     targets = []
     try:
         for h in _CFG.enabled_webhooks():
-            targets.append({"label": h.label, "kind": "webhook", "url": h.url,
-                            "streams": list(h.streams or [])})
+            targets.append({"label": h.label, "name": h.label, "kind": "webhook",
+                            "url": h.url, "streams": list(h.streams or []),
+                            "scope": "global", "enabled": True})
     except Exception:
         pass
 
@@ -1015,8 +1023,28 @@ def _delivery_json():
         try:
             for r in con.execute(
                     "SELECT label FROM streams WHERE tg_enabled = 1 ORDER BY label"):
-                targets.append({"label": f"tg:{r['label']}", "kind": "telegram",
-                                "url": "Telegram", "streams": [r["label"]]})
+                targets.append({"label": f"tg:{r['label']}", "name": r["label"],
+                                "kind": "telegram", "url": "Telegram",
+                                "streams": [r["label"]], "scope": "global",
+                                "enabled": True})
+        except sqlite3.Error:
+            pass
+        try:
+            for r in con.execute(
+                    "SELECT * FROM delivery_targets "
+                    + ("WHERE project_id = ? " if pid else "")
+                    + "ORDER BY target_id", ([pid] if pid else [])):
+                targets.append({
+                    "label": f"dt:{r['target_id']}", "name": r["name"],
+                    "target_id": r["target_id"], "kind": r["kind"],
+                    "url": r["url"] or (r["chat_id"] and f"Telegram {r['chat_id']}") or "",
+                    "streams": [], "scope": r["project_id"],
+                    "project_id": r["project_id"], "enabled": bool(r["enabled"]),
+                    "secret_env": r["secret_env"], "chat_id": r["chat_id"],
+                    "secret_ready": bool(
+                        r["kind"] != "webhook"
+                        or os.getenv(r["secret_env"] or "", "").strip()),
+                })
         except sqlite3.Error:
             pass
 
@@ -1036,6 +1064,12 @@ def _delivery_json():
                     "        WHERE h.tweet_id = t.tweet_id AND s.label IN "
                     f"       ({','.join('?' * len(t['streams']))}))")
                 params += t["streams"]
+            if t.get("project_id"):
+                where.append(
+                    "EXISTS (SELECT 1 FROM tweet_hits ph JOIN project_streams ps "
+                    "        ON ps.stream_id = ph.stream_id "
+                    "        WHERE ph.tweet_id = t.tweet_id AND ps.project_id = ?)")
+                params.append(t["project_id"])
             behind = 0
             if cur["last_ms"] or cur["sent"]:
                 behind = con.execute(
@@ -1187,7 +1221,7 @@ def _watchlist_post(body):
         if "error" in made:
             return made
         handles = body.get("handles") or []
-        if handles and kind == "query":
+        if handles and kind in ("query", "keywords"):
             upd = await st.set_watchlist_members(made["watchlist_id"], add=handles)
             if "error" in upd:
                 # The name is taken but the handles were bad: report both facts
@@ -1214,6 +1248,61 @@ def _watchlist_remove(body):
     except (TypeError, ValueError):
         return {"error": "watchlist_id must be a number"}
     return _with_store(lambda st: st.delete_watchlist(wid))
+
+
+# --------------------------------------------------------------------------
+# stream assignments + delivery targets — thin validators
+# --------------------------------------------------------------------------
+
+def _stream_assignments_json():
+    return {"streams": _with_store(lambda st: st.streams_with_projects())}
+
+
+def _stream_assign(body, attach: bool):
+    try:
+        pid = int(body.get("project") or 0)
+        sid = int(body.get("stream_id") or 0)
+    except (TypeError, ValueError):
+        return {"error": "project and stream_id must be numbers"}
+    if not pid or not sid:
+        return {"error": "project and stream_id are required"}
+    if attach:
+        _with_store(lambda st: st.attach_stream(pid, sid))
+        return {"ok": True}
+    ok_ = _with_store(lambda st: st.detach_stream(pid, sid))
+    return {"ok": True} if ok_ else {"error": "that stream was not in this project"}
+
+
+def _delivery_target_post(body):
+    try:
+        pid = int(body.get("project") or 0)
+    except (TypeError, ValueError):
+        return {"error": "project must be a number"}
+    return _with_store(lambda st: st.create_delivery_target(
+        pid, (body.get("kind") or "").strip(), body.get("name") or "",
+        body.get("url") or "", body.get("secret_env") or "",
+        body.get("chat_id") or "", body.get("batch_size") or 50))
+
+
+def _delivery_target_update(body):
+    try:
+        tid = int(body.get("target_id") or 0)
+    except (TypeError, ValueError):
+        return {"error": "target_id must be a number"}
+    vals = {}
+    if "enabled" in body:
+        vals["enabled"] = int(bool(body["enabled"]))
+    ok_ = _with_store(lambda st: st.update_delivery_target(tid, vals))
+    return {"ok": True} if ok_ else {"error": f"no target {tid}"}
+
+
+def _delivery_target_remove(body):
+    try:
+        tid = int(body.get("target_id") or 0)
+    except (TypeError, ValueError):
+        return {"error": "target_id must be a number"}
+    ok_ = _with_store(lambda st: st.delete_delivery_target(tid))
+    return {"ok": True} if ok_ else {"error": f"no target {tid}"}
 
 
 # --------------------------------------------------------------------------
@@ -2055,7 +2144,9 @@ class Handler(BaseHTTPRequestHandler):
             if u.path == "/api/watchlists":
                 return self._send(200, _watchlists_json(q))
             if u.path == "/api/delivery":
-                return self._send(200, _delivery_json())
+                return self._send(200, _delivery_json(q))
+            if u.path == "/api/streams/assignments":
+                return self._send(200, _stream_assignments_json())
             if u.path == "/api/live":
                 return self._sse_live(q)
             if u.path == "/api/alerts":
@@ -2119,6 +2210,16 @@ class Handler(BaseHTTPRequestHandler):
                 return self._send(200, _watchlist_members(body))
             if u.path == "/api/watchlists/remove":
                 return self._send(200, _watchlist_remove(body))
+            if u.path == "/api/streams/attach":
+                return self._send(200, _stream_assign(body, True))
+            if u.path == "/api/streams/detach":
+                return self._send(200, _stream_assign(body, False))
+            if u.path == "/api/delivery/targets":
+                return self._send(200, _delivery_target_post(body))
+            if u.path == "/api/delivery/targets/update":
+                return self._send(200, _delivery_target_update(body))
+            if u.path == "/api/delivery/targets/remove":
+                return self._send(200, _delivery_target_remove(body))
             if u.path == "/api/alerts":
                 return self._send(200, _alert_post(body))
             if u.path == "/api/alerts/update":

@@ -39,7 +39,18 @@ export const api = {
   metrics: () => request("/api/metrics"),
   guard: () => request("/api/guard"),
   activity: (p) => request(`/api/activity${qs(p)}`),
-  delivery: () => request("/api/delivery"),
+  delivery: (project) => request(`/api/delivery${qs({ project })}`),
+  streamAssignments: () => request("/api/streams/assignments"),
+  attachStream: (project, stream_id) =>
+    request("/api/streams/attach", { method: "POST", body: { project, stream_id } }),
+  detachStream: (project, stream_id) =>
+    request("/api/streams/detach", { method: "POST", body: { project, stream_id } }),
+  createDeliveryTarget: (body) =>
+    request("/api/delivery/targets", { method: "POST", body }),
+  updateDeliveryTarget: (body) =>
+    request("/api/delivery/targets/update", { method: "POST", body }),
+  removeDeliveryTarget: (target_id) =>
+    request("/api/delivery/targets/remove", { method: "POST", body: { target_id } }),
   tweets: (p) => request(`/api/tweets${qs(p)}`),
   igPosts: (p) => request(`/api/ig/posts${qs(p)}`),
   igStatus: () => request("/api/ig/status"),

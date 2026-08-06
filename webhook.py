@@ -333,7 +333,8 @@ async def pump(hook, store, client, log=print, once: bool = False) -> int:
 
         rows = await store.tweets_after(
             cur["last_ms"], cur["last_tweet_id"], hook.batch_size,
-            labels=hook.streams or None)
+            labels=hook.streams or None,
+            project_id=getattr(hook, "project_id", None))
         if not rows:
             return sent
 
@@ -414,6 +415,60 @@ def telegram_token() -> str:
     return os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
 
 
+class DbTarget:
+    """
+    A dashboard-created, project-scoped delivery target (delivery_targets
+    row). Quacks like a WebhookCfg / TelegramTarget so `pump` treats all
+    three identically; the only new behavior is project_id, which
+    store.tweets_after resolves at read time.
+    """
+
+    streams = None            # scoping is by project, never by stream list
+    min_likes = 0
+    skip_retweets = False
+    skip_replies = False
+    max_age_h = 0
+    timeout_s = 15.0
+
+    def __init__(self, row, secret: str = "", token: str = ""):
+        self.label = f"dt:{row['target_id']}"
+        self.kind = row["kind"]
+        self.name = row["name"]
+        self.project_id = row["project_id"]
+        self.batch_size = row["batch_size"] or 50
+        self.url = row["url"] or TELEGRAM_API
+        self.secret = secret
+        self.token = token
+        self.chat_id = str(row["chat_id"] or "")
+
+
+async def db_targets(store, log=print) -> list:
+    """Build senders for every enabled dashboard-created target."""
+    out = []
+    try:
+        rows = await store.delivery_targets(enabled_only=True)
+    except Exception as e:
+        log(f"[delivery] could not read targets: {type(e).__name__}: {e}")
+        return out
+    for r in rows:
+        if r["kind"] == "webhook":
+            secret = os.getenv(r["secret_env"] or "", "").strip()
+            if not secret:
+                # A webhook with no secret is refused, same rule as
+                # config.toml targets: an unsigned delivery is forgeable.
+                log(f"[delivery:{r['name']}] {r['secret_env']} is not set in "
+                    f".env — target skipped")
+                continue
+            out.append(DbTarget(r, secret=secret))
+        else:
+            token = telegram_token()
+            if not token:
+                log(f"[delivery:{r['name']}] TELEGRAM_BOT_TOKEN missing — skipped")
+                continue
+            out.append(DbTarget(r, token=token))
+    return out
+
+
 async def telegram_targets(store, log=print) -> list:
     """Build a Telegram target for every stream that has it switched on."""
     token = telegram_token()
@@ -469,6 +524,7 @@ async def run(cfg, store, log=print, stop: asyncio.Event | None = None) -> None:
                 targets += await telegram_targets(store, log=log)
             except Exception as e:
                 log(f"[telegram] could not read settings: {type(e).__name__}: {e}")
+            targets += await db_targets(store, log=log)
 
             for h in targets:
                 if h.label not in announced:

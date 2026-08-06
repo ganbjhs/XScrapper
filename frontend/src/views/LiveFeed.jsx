@@ -52,7 +52,7 @@ export default function LiveFeed({ onMenu }) {
 
   const metrics = useApi(() => api.metrics(), [], { every: 30_000 });
   const status = useApi(() => api.status(), [], { every: 30_000 });
-  const delivery = useApi(() => api.delivery(), [], { every: 15_000 });
+  const delivery = useApi(() => api.delivery(pid), [pid], { every: 15_000 });
   const wls = useApi(() => (pid ? api.watchlists(pid) : Promise.resolve({ watchlists: [] })), [pid]);
 
   const feed = useApi(
