@@ -86,6 +86,33 @@ export default function LiveFeed({ onMenu }) {
   const [pushed, setPushed] = useState([]);
   const [liveOk, setLiveOk] = useState(false);
   const [pinTarget, setPinTarget] = useState(null);
+  const [fetching, setFetching] = useState(false);
+  const [fetchMsg, setFetchMsg] = useState("");
+
+  // Refresh = ask X for the newest posts RIGHT NOW (one page per stream),
+  // then the collector's normal cadence carries on. Not just a re-read.
+  const refreshNow = async (ack = false) => {
+    if (!pid || fetching) return;
+    setFetching(true);
+    setFetchMsg("");
+    try {
+      const r = await api.projectFetch(pid, ack);
+      setFetchMsg(`✓ ${r.new} new post${r.new === 1 ? "" : "s"} fetched`);
+      feed.reload(true);
+      metrics.reload(true);
+    } catch (e) {
+      const msg = String(e.message || e);
+      if (!ack && msg.startsWith("Warnings not acknowledged") &&
+          window.confirm(`${msg.replace("Warnings not acknowledged: ", "Guard warning:\n")}\n\nFetch anyway?`)) {
+        setFetching(false);
+        return refreshNow(true);
+      }
+      setFetchMsg(`✗ ${msg}`);
+    } finally {
+      setFetching(false);
+      setTimeout(() => setFetchMsg(""), 6000);
+    }
+  };
   useEffect(() => {
     if (!pid) return;
     setPushed([]);
@@ -169,7 +196,15 @@ export default function LiveFeed({ onMenu }) {
           <span className={`dot${!status.data ? " off" : !watcherUp ? " bad" : liveOk ? " pulse" : ""}`} />
           {!status.data ? "…" : !watcherUp ? "Collection off" : liveOk ? "Live" : "Collecting"}
         </span>
-        <button className="btn btn-brand" onClick={() => feed.reload()}>Refresh</button>
+        {fetchMsg && (
+          <span style={{ fontSize: 12.5, fontWeight: 600 }}
+                className={fetchMsg.startsWith("✓") ? "st-good" : "st-crit"}>
+            {fetchMsg}
+          </span>
+        )}
+        <button className="btn btn-brand" disabled={fetching} onClick={() => refreshNow()}>
+          {fetching ? "Fetching from X…" : "Refresh"}
+        </button>
       </PageHead>
 
       {status.data && !watcherUp && (
@@ -255,9 +290,19 @@ export default function LiveFeed({ onMenu }) {
           {feed.loading && !feed.data && <Loading label="Loading the feed…" />}
           {feed.error && !feed.data && <ErrorState error={feed.error} retry={feed.reload} />}
           {feed.data && visible.length === 0 && (
-            <Empty title="No posts collected yet">
-              Add a watchlist, then run the collector: <code>python3 main.py watch --all</code>
-            </Empty>
+            wlCount === 0 ? (
+              <Empty title="This project isn't watching anything yet">
+                Create a watchlist under <b>Watchlists</b> — collection starts
+                automatically{watcherUp ? " within a minute" : " once the collector is on"},
+                no commands needed.
+              </Empty>
+            ) : (
+              <Empty title="Nothing in this view yet">
+                {watcherUp
+                  ? "Collection is running. Try Refresh for an immediate fetch, or widen Duration to “All time” to see older posts."
+                  : "The collector is off (see the banner above) — nothing new can arrive until it starts."}
+              </Empty>
+            )
           )}
           {visible.map((t) => (
             <PostCard key={`${t.platform}:${t.tweet_id}`} t={t} onPin={setPinTarget} />

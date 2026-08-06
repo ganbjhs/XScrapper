@@ -748,6 +748,74 @@ def _fetch_live(query, tab="Latest", pages=1, ack=False, list_id=""):
         return _run(run())
 
 
+def _project_fetch(body):
+    """
+    The Refresh button's real work: poll each of the project's live streams
+    ONCE, one page each, right now — then the watcher's normal cadence
+    carries on. Same guard, same lock, same engine as /api/fetch, so a click
+    can never spend budget the guard would have refused.
+    """
+    import auth
+    import guard
+    from collector import poll_once
+    from config import StreamCfg
+    from engine import Engine
+
+    try:
+        pid = int(body.get("project") or 0)
+    except (TypeError, ValueError):
+        return {"error": "project must be a number"}
+    if not pid:
+        return {"error": "which project?"}
+
+    if not _CFG.db_results.exists():
+        return {"error": "nothing has been collected yet — create a watchlist first"}
+    with _connect() as con:
+        rows = con.execute(
+            "SELECT s.* FROM streams s JOIN project_streams ps USING(stream_id) "
+            "WHERE ps.project_id = ? AND s.paused = 0 "
+            "AND (s.query != '' OR s.list_id IS NOT NULL) "
+            "ORDER BY s.stream_id LIMIT 8", (pid,)).fetchall()
+    if not rows:
+        return {"error": "this project has no live streams — create a watchlist first"}
+
+    v = guard.assess(_CFG, action="fetch", cost=len(rows))
+    if v.blocked:
+        return {"error": v.summary(), "blocked": True, "guard": v.to_json()}
+    if v.warnings and not bool(body.get("ack")):
+        return {"error": "Warnings not acknowledged: "
+                         + "; ".join(w.title for w in v.warnings),
+                "blocked": True, "needs_ack": True, "guard": v.to_json()}
+
+    async def run():
+        api = auth.open_api(_CFG.db_accounts)
+        names = await auth.active_usernames(api)
+        if not names:
+            return {"error": "No active X account is signed in — see Accounts & Sessions."}
+        st = store_mod.Store(_CFG.db_results, _CFG.defaults.keep_entry_json)
+        await st.open()
+        try:
+            eng = Engine(api)
+            total_new = total_pages = 0
+            polled = []
+            for r in rows:
+                s = StreamCfg(label=r["label"], query=r["query"] or "",
+                              list_id=r["list_id"] or "", tab=r["tab"] or "Latest")
+                s.max_pages_per_poll = 1
+                res = await poll_once(eng, st, s, r["stream_id"])
+                total_new += res.new
+                total_pages += res.pages
+                polled.append({"stream": r["label"], "new": res.new,
+                               "error": res.error})
+            return {"new": total_new, "streams": len(rows),
+                    "pages": total_pages, "polled": polled}
+        finally:
+            await st.close()
+
+    with _FETCH_LOCK:
+        return _run(run())
+
+
 def _reload_config():
     """
     Re-read config.toml into the process.
@@ -2415,6 +2483,8 @@ class Handler(BaseHTTPRequestHandler):
                         "Adding accounts needs DASH_USER/DASH_PASSWORD set in .env, "
                         "so the endpoint is behind a login."})
                 return self._send(200, _add_account(body))
+            if u.path == "/api/project/fetch":
+                return self._send(200, _project_fetch(body))
             if u.path == "/api/fetch":
                 query = (body.get("query") or "").strip()
                 raw_list = str(body.get("list_id") or "").strip()
