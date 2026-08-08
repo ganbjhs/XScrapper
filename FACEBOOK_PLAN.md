@@ -32,6 +32,22 @@ merge shape and the bandwidth cap (`proxy_pool.py`) stays.
 4. Profiles → groups → hashtag search, each behind an honest capability check.
 5. Standalone review, then the one-flag merge.
 
+### PROVEN (2026-08-08): headless browser + session works
+
+`fb_probe.py` on the server — headless Chrome, the burner session cookies,
+through the India residential proxy — **rendered real posts** on
+`www.facebook.com/narendramodi` (text, timestamps, reaction counts). So the
+transport is settled: **logged-in account + real browser engine**, not curl.
+
+- Cold load cost **~5 MB** (JS bundles) even with images/video/fonts blocked.
+  Mitigation the collector must use: **one warm browser reused across pages**
+  so Facebook's app caches and later loads are a fraction of that; block
+  media bytes (keep only URLs); watermark polling; the bandwidth meter
+  (`proxy_pool.py`) enforces the 1 GB cap.
+- `role="article"` returns posts AND visitor comments mixed — the extractor
+  must keep page posts (author = the page, has a permalink+timestamp) and
+  drop comments.
+
 ### Honest risks for the logged-in route
 
 - **Accounts get checkpointed/banned** — worse than Instagram. Burner
