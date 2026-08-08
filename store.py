@@ -918,6 +918,24 @@ class Store:
     # length; 20 fifteen-char handles plus glue sits comfortably under it.
     WATCHLIST_CHUNK = 20
 
+    # ---- global collection on/off (the dashboard's Start/Stop toggle) ----
+    #
+    # The collector PROCESS always runs (systemd keeps it up). This flag just
+    # tells it whether to actually poll — so the dashboard can pause/resume
+    # collection without any power to start or stop a system service, which
+    # would be a security hole. Read by the collector every cycle.
+
+    async def collection_paused(self) -> bool:
+        row = self.db.execute(
+            "SELECT value FROM meta WHERE key = 'collection_paused'").fetchone()
+        return bool(row and row["value"] == "1")
+
+    async def set_collection_paused(self, paused: bool) -> None:
+        self.db.execute(
+            "INSERT INTO meta(key, value) VALUES('collection_paused', ?) "
+            "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            ("1" if paused else "0",))
+
     async def projects(self, include_archived: bool = False) -> list:
         rows = self.db.execute(
             "SELECT p.*, "
@@ -988,7 +1006,7 @@ class Store:
                 "FROM watchlist_members WHERE watchlist_id = ? ORDER BY handle",
                 (w["watchlist_id"],))]
             streams = [dict(s) for s in self.db.execute(
-                "SELECT s.stream_id, s.label, s.paused, "
+                "SELECT s.stream_id, s.label, s.paused, s.min_interval_s, "
                 "       COUNT(h.tweet_id) AS tweets "
                 "FROM streams s LEFT JOIN tweet_hits h USING(stream_id) "
                 "WHERE s.label LIKE ? GROUP BY s.stream_id ORDER BY s.label",
@@ -996,6 +1014,8 @@ class Store:
             d = dict(w)
             d["members"] = members
             d["streams"] = streams
+            # The current check-interval override (seconds), or None = default.
+            d["interval_s"] = streams[0]["min_interval_s"] if streams else None
             try:
                 d["filters"] = json.loads(d.get("filters") or "{}")
             except (TypeError, ValueError):
@@ -1169,6 +1189,29 @@ class Store:
                     "UPDATE streams SET paused = 1, watched = 0 WHERE stream_id = ?",
                     (r["stream_id"],))
         return {"streams": labels}
+
+    async def set_watchlist_interval(self, watchlist_id: int, seconds) -> dict:
+        """
+        How often to re-check this watchlist — applied to all its compiled
+        streams' min_interval_s. None/0 clears the override (back to the
+        config default). The running collector re-reads this every poll
+        (apply_settings), so a change takes effect on the next cycle.
+        """
+        w = self.db.execute("SELECT 1 FROM watchlists WHERE watchlist_id = ?",
+                            (int(watchlist_id),)).fetchone()
+        if not w:
+            return {"error": f"no watchlist {watchlist_id}"}
+        if seconds in (None, "", 0, "0"):
+            val = None
+        else:
+            try:
+                val = max(5, int(seconds))
+            except (TypeError, ValueError):
+                return {"error": "interval must be a whole number of seconds"}
+        self.db.execute(
+            "UPDATE streams SET min_interval_s = ? WHERE label LIKE ?",
+            (val, f"wl:{int(watchlist_id)}:%"))
+        return {"watchlist_id": int(watchlist_id), "min_interval_s": val}
 
     async def delete_watchlist(self, watchlist_id: int) -> dict:
         """

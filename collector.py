@@ -301,6 +301,54 @@ class Collector:
                 "last_poll_ts": 0.0,
             }
 
+    async def discover_new_streams(self) -> int:
+        """
+        Pick up streams added to the database AFTER this collector started.
+
+        A watchlist created in the dashboard compiles to `watched = 1` streams;
+        a collector that read its list only at startup would ignore them until
+        a restart — which is exactly the "my new project isn't collecting" bug.
+        This re-scans on a slow cadence and ADDS any it hasn't seen, so a new
+        watchlist begins collecting within a minute, no restart.
+
+        Additive only: it never drops a stream. A deleted or paused watchlist
+        is already handled — its streams go `paused = 1`, and apply_settings
+        skips paused rows every poll.
+        """
+        import config as _config
+
+        try:
+            rows = self.store.db.execute(
+                "SELECT label, query, list_id, tab FROM streams "
+                "WHERE (watched = 1 OR tg_enabled = 1) AND paused = 0 "
+                "AND (query != '' OR list_id IS NOT NULL)").fetchall()
+        except Exception:
+            return 0
+
+        added = 0
+        for r in rows:
+            if r["label"] in self.stream_ids:
+                continue
+            s = _config.StreamCfg(
+                label=r["label"], query=r["query"] or "",
+                list_id=r["list_id"] or "", tab=r["tab"] or "Latest",
+                watermark=True)
+            sid = await self.store.ensure_stream(
+                s.label, s.query, s.tab, s.watermark, s.list_id or "")
+            self.stream_ids[s.label] = sid
+            wm = await self.store.get_watermark(sid)
+            self.state[s.label] = {
+                "interval": wm["interval_s"] if wm else s.min_interval_s,
+                "ewma": wm["ewma_rate"] if wm else 0.0,
+                "empty": wm["consecutive_empty"] if wm else 0,
+                "next_ms": 0, "last_poll_ts": 0.0,
+            }
+            self.streams.append(s)
+            added += 1
+            self.log(f"[watch] + {s.label}  (new watchlist stream — picked up "
+                     f"without a restart)")
+        return added
+
     def apply_settings(self, stream) -> bool:
         """
         Re-read this stream's dashboard settings. Returns False if it is paused.
@@ -391,6 +439,16 @@ class Collector:
         bits.append(f"next={interval:.0f}s")
         return "  ".join(bits)
 
+    def _paused(self) -> bool:
+        """The dashboard's global Start/Stop flag. Cheap indexed read; a bad
+        read never stops collection (fail open)."""
+        try:
+            row = self.store.db.execute(
+                "SELECT value FROM meta WHERE key = 'collection_paused'").fetchone()
+            return bool(row and row[0] == "1")
+        except Exception:
+            return False
+
     async def run_once(self) -> list[PollResult]:
         return list(
             await asyncio.gather(*(self.poll_stream(s) for s in self.streams))
@@ -400,13 +458,28 @@ class Collector:
         """Poll every stream on its own schedule until stopped."""
         deadline = (time.time() + duration) if duration else None
         tasks: dict[str, asyncio.Task] = {}
+        last_discover = 0.0
         try:
             while True:
                 if deadline and time.time() >= deadline:
                     break
                 now_ms = int(time.time() * 1000)
 
-                for s in self.streams:
+                # Re-scan for watchlists added since startup, ~once a minute, so
+                # a new project starts collecting on its own. Cheap: one indexed
+                # read from a DB this process already holds open.
+                if time.time() - last_discover >= 60:
+                    last_discover = time.time()
+                    try:
+                        await self.discover_new_streams()
+                    except Exception as e:
+                        self.log(f"[watch] stream discovery error: {e!r}")
+
+                # Global pause: let in-flight polls finish and clean up, but
+                # launch no new ones while collection is switched off.
+                paused = self._paused()
+
+                for s in list(self.streams):
                     st = self.state[s.label]
                     running = tasks.get(s.label)
                     if running and not running.done():
@@ -420,7 +493,7 @@ class Collector:
                             self.log(f"[{s.label}] poll task failed: {exc!r}")
                             st["next_ms"] = int((time.time() + s.min_interval_s) * 1000)
                         tasks.pop(s.label, None)
-                    if now_ms >= st["next_ms"]:
+                    if not paused and now_ms >= st["next_ms"]:
                         tasks[s.label] = asyncio.create_task(self.poll_stream(s))
 
                 await asyncio.sleep(0.25)

@@ -1,5 +1,39 @@
 # Facebook Collection — Plan
 
+## CONFIG DECISION (2026-08-08) — run from the server's own IP, hard bandwidth cap
+
+Proven this session: **logged-in Facebook loads fine from the server's own IP**
+(no residential proxy needed). The VPS has **4 TB/month**, so Facebook does NOT
+have to use the tiny 1 GB Webshare pool — it runs on the server's big pipe,
+like X does. That removes the bandwidth crisis, with two guards so it can
+never "waste GB in seconds":
+
+- **Hard monthly byte cap** (`proxy_pool.py` meter) — set well under 4 TB
+  (e.g. 200 GB). When hit, Facebook fetching refuses instead of overrunning.
+  The meter counts every response, cold or warm.
+- **Gentle cadence + page cap**: one page-worth per poll (newest posts only,
+  watermark stop), a few checks a day per page — not every 15 min. FB pages
+  post a few times daily; there is nothing to gain from hammering them.
+- Block image/video/font bytes (keep URLs) so a render is text + data only.
+
+Facebook settings live in **`.env`** (not config.toml — keeps the strict
+config parser untouched):
+
+```
+FB_ENABLED=1
+FB_C_USER=...            # burner account (fresh, uncheckpointed)
+FB_XS=...                # its xs cookie
+FB_USE_PROXY=0          # 0 = server IP (uses the 4 TB); 1 = residential pool
+FB_MONTHLY_CAP_GB=200   # the runaway guard
+FB_MAX_PAGES=1          # pages fetched per poll (newest only)
+FB_INTERVAL_S=21600     # per-source check gap (default 6h)
+```
+
+Next, when a fresh account is provided: pin it to ONE steady IP, plug the two
+cookies into `.env`, run `engine_fb` from the server, confirm it collects
+within the cap, then wire `store_fb` + the Facebook watchlist source and it
+shows on the dashboard.
+
 ## FINDINGS (2026-08-08) — logged-out is dead; going logged-in
 
 Tested real fetches through the Webshare residential proxy against

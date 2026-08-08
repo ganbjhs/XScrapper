@@ -464,6 +464,15 @@ def _status():
     except Exception:
         out["watcher_pid"] = None
 
+    # The Start/Stop toggle's state.
+    try:
+        with _connect() as con:
+            row = con.execute(
+                "SELECT value FROM meta WHERE key = 'collection_paused'").fetchone()
+            out["collection_paused"] = bool(row and row["value"] == "1")
+    except Exception:
+        out["collection_paused"] = False
+
     async def _accounts():
         api = auth.open_api(_CFG.db_accounts)
         return await auth.health(api, _CFG)
@@ -1360,6 +1369,15 @@ def _watchlist_members(body):
         return {"error": "watchlist_id must be a number"}
     return _with_store(lambda st: st.set_watchlist_members(
         wid, add=body.get("add") or [], remove=body.get("remove") or []))
+
+
+def _watchlist_interval(body):
+    try:
+        wid = int(body.get("watchlist_id") or 0)
+    except (TypeError, ValueError):
+        return {"error": "watchlist_id must be a number"}
+    return _with_store(lambda st: st.set_watchlist_interval(
+        wid, body.get("seconds")))
 
 
 def _watchlist_filters(body):
@@ -2434,6 +2452,8 @@ class Handler(BaseHTTPRequestHandler):
                 return self._send(200, _watchlist_members(body))
             if u.path == "/api/watchlists/filters":
                 return self._send(200, _watchlist_filters(body))
+            if u.path == "/api/watchlists/interval":
+                return self._send(200, _watchlist_interval(body))
             if u.path == "/api/watchlists/remove":
                 return self._send(200, _watchlist_remove(body))
             if u.path == "/api/streams/attach":
@@ -2483,6 +2503,10 @@ class Handler(BaseHTTPRequestHandler):
                         "Adding accounts needs DASH_USER/DASH_PASSWORD set in .env, "
                         "so the endpoint is behind a login."})
                 return self._send(200, _add_account(body))
+            if u.path == "/api/collection":
+                paused = bool(body.get("paused"))
+                _with_store(lambda st: st.set_collection_paused(paused))
+                return self._send(200, {"collection_paused": paused})
             if u.path == "/api/project/fetch":
                 return self._send(200, _project_fetch(body))
             if u.path == "/api/fetch":

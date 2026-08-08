@@ -192,6 +192,12 @@ function WatchlistCard({ w, onChanged }) {
 
   const live = w.streams.filter((s) => !s.paused);
   const collected = w.streams.reduce((a, s) => a + (s.tweets || 0), 0);
+  const setInterval = async (seconds) => {
+    await api.watchlistInterval(w.watchlist_id, seconds);
+    onChanged();
+  };
+  // Current interval as a preset value ("" = default).
+  const curInterval = w.interval_s ? String(w.interval_s) : "";
 
   return (
     <div className="panel">
@@ -200,8 +206,26 @@ function WatchlistCard({ w, onChanged }) {
         <span className="right">
           {w.kind === "xlist"
             ? `X List ${w.list_id}`
-            : `${w.members.length} handles → ${live.length} stream${live.length === 1 ? "" : "s"}`}
+            : w.kind === "keywords"
+              ? `${w.members.length} keywords → ${live.length} stream${live.length === 1 ? "" : "s"}`
+              : `${w.members.length} handles → ${live.length} stream${live.length === 1 ? "" : "s"}`}
           {" · "}{fmtN(collected)} collected
+        </span>
+      </div>
+      <div className="filters" style={{ marginBottom: 4, marginTop: 2 }}>
+        <label className="fpill" style={{ padding: "7px 8px 7px 12px" }}>
+          <span>Check every</span>
+          <select value={curInterval} onChange={(e) => setInterval(e.target.value)}>
+            <option value="">default (~5–15 min, auto)</option>
+            <option value="300">5 minutes</option>
+            <option value="600">10 minutes</option>
+            <option value="900">15 minutes</option>
+            <option value="1800">30 minutes</option>
+            <option value="3600">1 hour</option>
+          </select>
+        </label>
+        <span style={{ color: "var(--ink-3)", fontSize: 12, alignSelf: "center" }}>
+          how often the collector re-checks this watchlist
         </span>
       </div>
 

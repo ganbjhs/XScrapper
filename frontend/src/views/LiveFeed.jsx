@@ -186,6 +186,11 @@ export default function LiveFeed({ onMenu }) {
   // The pid of a live collector process — the one honest signal that posts
   // can actually arrive. Accounts being signed in is NOT that signal.
   const watcherUp = Boolean(status.data?.watcher_pid);
+  const paused = Boolean(status.data?.collection_paused);
+  const toggleCollection = async () => {
+    await api.setCollection(!paused);
+    status.reload(true);
+  };
   const wlCount = wls.data?.watchlists?.length ?? 0;
   const handleCount = (wls.data?.watchlists || []).reduce((a, w) => a + w.members.length, 0);
   const wtTargets = (delivery.data?.targets || []).filter((t) => t.kind === "webhook");
@@ -196,14 +201,20 @@ export default function LiveFeed({ onMenu }) {
       <PageHead title="Live Feed" onMenu={onMenu}
                 sub={project ? `${project.name} — ${handleCount} handles · ${wlCount} watchlists` : "No project yet"}>
         <span className="chip-live">
-          <span className={`dot${!status.data ? " off" : !watcherUp ? " bad" : liveOk ? " pulse" : ""}`} />
-          {!status.data ? "…" : !watcherUp ? "Collection off" : liveOk ? "Live" : "Collecting"}
+          <span className={`dot${!status.data ? " off" : !watcherUp ? " bad" : paused ? " warn" : liveOk ? " pulse" : ""}`} />
+          {!status.data ? "…" : !watcherUp ? "Collection off"
+            : paused ? "Paused" : liveOk ? "Live" : "Collecting"}
         </span>
         {fetchMsg && (
           <span style={{ fontSize: 12.5, fontWeight: 600 }}
                 className={fetchMsg.startsWith("✓") ? "st-good" : "st-crit"}>
             {fetchMsg}
           </span>
+        )}
+        {watcherUp && (
+          <button className="btn btn-ghost" onClick={toggleCollection}>
+            {paused ? "▶ Start collection" : "⏸ Pause collection"}
+          </button>
         )}
         <button className="btn btn-brand" disabled={fetching} onClick={() => refreshNow()}>
           {fetching ? "Fetching from X…" : "Refresh"}
@@ -214,8 +225,15 @@ export default function LiveFeed({ onMenu }) {
         <div className="banner-crit" role="alert">
           <b>Collection is OFF.</b> This page is showing what was collected
           earlier — nothing new will arrive and nothing is being sent to
-          Watch-Tower. Start the collector in a terminal and leave it running:
-          <code style={{ marginLeft: 6 }}>python3 main.py watch --all</code>
+          Watch-Tower. Start the collector service on the server once:
+          <code style={{ marginLeft: 6 }}>systemctl start xscraper-watch</code>
+        </div>
+      )}
+      {status.data && watcherUp && paused && (
+        <div className="banner-crit" role="alert"
+             style={{ borderLeftColor: "var(--warning)", background: "color-mix(in srgb, var(--warning) 8%, var(--surface))" }}>
+          <b style={{ color: "var(--warn-text)" }}>Collection is paused.</b> Nothing
+          new is being collected. Click <b>▶ Start collection</b> above to resume.
         </div>
       )}
 

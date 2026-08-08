@@ -55,6 +55,8 @@ export const api = {
     request("/api/delivery/backfill", { method: "POST", body }),
   projectFetch: (project, ack) =>
     request("/api/project/fetch", { method: "POST", body: { project, ack } }),
+  setCollection: (paused) =>
+    request("/api/collection", { method: "POST", body: { paused } }),
   tweets: (p) => request(`/api/tweets${qs(p)}`),
   igPosts: (p) => request(`/api/ig/posts${qs(p)}`),
   igStatus: () => request("/api/ig/status"),
@@ -72,6 +74,8 @@ export const api = {
     request("/api/watchlists/remove", { method: "POST", body: { watchlist_id } }),
   watchlistFilters: (watchlist_id, filters) =>
     request("/api/watchlists/filters", { method: "POST", body: { watchlist_id, filters } }),
+  watchlistInterval: (watchlist_id, seconds) =>
+    request("/api/watchlists/interval", { method: "POST", body: { watchlist_id, seconds } }),
 
   streamSettings: (body) => request("/api/stream/settings", { method: "POST", body }),
 

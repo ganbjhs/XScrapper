@@ -1871,6 +1871,54 @@ def test_keywords_and_project_delivery(tmp):
     ok(r["qc"] == r["q"], "clearing filters restores the bare query")
 
     print()
+    print("== a new watchlist is picked up without a restart ==")
+    from collector import Collector
+
+    async def discovery():
+        st = store_mod.Store(db, False)
+        await st.open()
+        # Collector starts with an empty stream set (nothing existed yet).
+        col = Collector(engine=None, store=st, streams=[], log=lambda *a: None)
+        await col.prepare()
+        n0 = await col.discover_new_streams()
+        # Now a watchlist is created AFTER the collector started.
+        pid = (await st.create_project("Live"))["project_id"]
+        wid = (await st.create_watchlist(pid, "New"))["watchlist_id"]
+        await st.set_watchlist_members(wid, add=["someone", "another"])
+        n1 = await col.discover_new_streams()
+        n2 = await col.discover_new_streams()   # idempotent — no double-add
+        labels = [s.label for s in col.streams]
+        # Interval control writes through to the stream.
+        await st.set_watchlist_interval(wid, 900)
+        iv = st.db.execute("SELECT min_interval_s FROM streams WHERE label = ?",
+                           (f"wl:{wid}:0",)).fetchone()["min_interval_s"]
+        await st.close()
+        return n0, n1, n2, labels, wid, iv
+
+    # The global Start/Stop flag the collector honors.
+    async def pauseflag():
+        st = store_mod.Store(db, False)
+        await st.open()
+        col = Collector(engine=None, store=st, streams=[], log=lambda *a: None)
+        a = col._paused()
+        await st.set_collection_paused(True)
+        b = col._paused()
+        await st.set_collection_paused(False)
+        c = col._paused()
+        await st.close()
+        return a, b, c
+    pa, pb, pc = asyncio.run(pauseflag())
+    ok(pa is False and pb is True and pc is False,
+       "the Start/Stop flag round-trips and the collector reads it")
+
+    d0, d1, d2, dlabels, dwid, div = asyncio.run(discovery())
+    ok(d1 == 1 and f"wl:{dwid}:0" in dlabels,
+       f"a watchlist created after startup is discovered and polled — the exact "
+       f"'new project not collecting' fix ({dlabels})")
+    ok(d2 == 0, "re-scanning does not add the same stream twice")
+    ok(div == 900, "the per-watchlist 'check every' interval writes to its streams")
+
+    print()
     print("== collection filters ==")
     nf, fs = store_mod.normalize_filters, store_mod.filters_suffix
     clean, e = nf({"skip_retweets": True, "skip_quotes": True, "lang": "HI",
