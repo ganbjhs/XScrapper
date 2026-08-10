@@ -2039,7 +2039,12 @@ def _fb_status(q=None):
         pid = 0
     out = {"sources": [], "totals": {"posts": 0}, "enabled": False}
     rp = _CFG.root / "fb_results.db"
-    out["enabled"] = bool(os.getenv("FB_C_USER", "").strip())
+    # Configured if ANY login path exists: raw cookies, email+password, or a
+    # session already saved on disk from an earlier successful login.
+    out["enabled"] = bool(
+        (os.getenv("FB_C_USER", "").strip() and os.getenv("FB_XS", "").strip())
+        or (os.getenv("FB_EMAIL", "").strip() and os.getenv("FB_PASSWORD", ""))
+        or (_CFG.root / os.getenv("FB_STATE_PATH", "fb_state.json")).exists())
     if rp.exists():
         try:
             import store_fb
@@ -2088,6 +2093,55 @@ def _fb_source_post(body):
             return {"ok": True, "removed": label}
         st.add_source(label, project_id=pid)
     return {"ok": True, "label": label}
+
+
+# Only one Facebook fetch at a time — a second would launch a second headless
+# browser on the same burner session and invite a checkpoint.
+_FB_FETCH_LOCK = threading.Lock()
+
+
+def _fb_fetch(body):
+    """
+    The Facebook "Fetch now" button: run ONE collection pass immediately, from
+    the dashboard, so nobody needs a terminal. Same shared loop as the X fetch;
+    reports how many new posts it saved plus the raw run log so a bad login or
+    checkpoint is visible in the UI rather than silent.
+    """
+    rp = _CFG.root / "fb_results.db"
+    try:
+        pid = int(body.get("project") or 0)
+    except (TypeError, ValueError):
+        pid = 0
+
+    import store_fb
+    srcs = []
+    if rp.exists():
+        try:
+            with store_fb.Store(rp) as st:
+                srcs = st.sources(project_id=pid or None, enabled_only=True)
+        except Exception as e:
+            return {"error": f"{type(e).__name__}: {e}"}
+    if not srcs:
+        return {"error": "Add a Facebook page first (the Facebook pages panel), "
+                         "then press Fetch."}
+
+    from collect_fb import _can_log_in, run_once
+    if not _can_log_in():
+        return {"error": "Facebook login isn't set up on the server yet — add "
+                         "FB_EMAIL/FB_PASSWORD (or FB_C_USER/FB_XS) to .env and "
+                         "restart the dashboard, then try again."}
+
+    if not _FB_FETCH_LOCK.acquire(blocking=False):
+        return {"error": "A Facebook fetch is already running — give it a moment."}
+    try:
+        logs: list = []
+        n = _run(run_once(str(rp), project_id=pid or None,
+                          log=lambda m: logs.append(str(m))), timeout=240)
+        return {"ok": True, "new": n, "sources": len(srcs), "log": logs}
+    except Exception as e:
+        return {"error": f"{type(e).__name__}: {e}"}
+    finally:
+        _FB_FETCH_LOCK.release()
 
 
 def _ig_status():
@@ -2572,6 +2626,8 @@ class Handler(BaseHTTPRequestHandler):
                 return self._send(200, {"collection_paused": paused})
             if u.path == "/api/fb/source":
                 return self._send(200, _fb_source_post(body))
+            if u.path == "/api/fb/fetch":
+                return self._send(200, _fb_fetch(body))
             if u.path == "/api/project/fetch":
                 return self._send(200, _project_fetch(body))
             if u.path == "/api/fetch":

@@ -13,6 +13,8 @@ profiles/
 results.*
 fb_results.db*
 fb_meter.db*
+fb_state.json
+fb_dump*.html
 browser-check.jpg
 exports/
 logs/

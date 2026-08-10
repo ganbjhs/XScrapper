@@ -66,6 +66,8 @@ export const api = {
     request("/api/fb/source", { method: "POST", body: { project, label, action: "add" } }),
   fbRemoveSource: (label) =>
     request("/api/fb/source", { method: "POST", body: { label, action: "remove" } }),
+  fbFetch: (project) =>
+    request("/api/fb/fetch", { method: "POST", body: { project } }),
 
   projects: () => request("/api/projects"),
   createProject: (name) => request("/api/projects", { method: "POST", body: { name } }),

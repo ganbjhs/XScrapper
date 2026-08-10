@@ -23,7 +23,7 @@ import time
 import store_fb
 
 
-async def collect_source(engine, store, source, *, max_scroll=1, log=print) -> int:
+async def collect_source(engine, store, source, *, max_scroll=4, log=print) -> int:
     """One pass over a source. Returns how many new posts were saved."""
     posts = await engine.fetch_page(source["label"], max_scroll=max_scroll)
     if not posts:
@@ -52,17 +52,32 @@ async def collect_source(engine, store, source, *, max_scroll=1, log=print) -> i
     return new
 
 
-async def run_once(store_path="fb_results.db", *, max_scroll=1, log=print) -> int:
+def _can_log_in() -> bool:
+    """Any usable way in: saved session, raw cookies, or email+password."""
+    if os.path.exists(os.getenv("FB_STATE_PATH", "fb_state.json")):
+        return True
+    if os.getenv("FB_C_USER") and os.getenv("FB_XS"):
+        return True
+    if os.getenv("FB_EMAIL") and os.getenv("FB_PASSWORD"):
+        return True
+    return False
+
+
+async def run_once(store_path="fb_results.db", *, max_scroll=4,
+                   project_id=None, log=print) -> int:
     from engine_fb import FacebookEngine
 
     st = store_fb.Store(store_path).open()
     try:
         sources = st.sources(enabled_only=True)
+        if project_id:
+            sources = [s for s in sources if s.get("project_id") == project_id]
         if not sources:
-            log("[fb] no enabled sources — add one with `collect_fb.py add-source`")
+            log("[fb] no enabled sources — add a page first")
             return 0
-        if not os.getenv("FB_C_USER") or not os.getenv("FB_XS"):
-            log("[fb] FB_C_USER / FB_XS not set in the environment — cannot log in")
+        if not _can_log_in():
+            log("[fb] no Facebook login available — set FB_C_USER/FB_XS or "
+                "FB_EMAIL/FB_PASSWORD in .env")
             return 0
         total = 0
         async with FacebookEngine(log=log) as eng:
@@ -91,7 +106,7 @@ def main() -> int:
     rn = sub.add_parser("run")
     rn.add_argument("--loop", action="store_true")
     rn.add_argument("--every", type=int, default=int(os.getenv("FB_INTERVAL_S", "21600")))
-    rn.add_argument("--scroll", type=int, default=1)
+    rn.add_argument("--scroll", type=int, default=4)
 
     args = ap.parse_args()
 

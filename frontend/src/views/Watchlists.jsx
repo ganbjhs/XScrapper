@@ -399,6 +399,8 @@ function FacebookSources({ pid }) {
   const [adding, setAdding] = useState("");
   const [busy, setBusy] = useState(false);
   const [msg, setMsg] = useState("");
+  const [fetching, setFetching] = useState(false);
+  const [result, setResult] = useState(null);
   if (error) return null;
   const sources = data?.sources || [];
 
@@ -413,15 +415,55 @@ function FacebookSources({ pid }) {
     finally { setBusy(false); }
   };
 
+  const fetchNow = async () => {
+    setFetching(true); setResult(null); setMsg("");
+    try {
+      const r = await api.fbFetch(pid);
+      if (r.error) setMsg(r.error);
+      else setResult(r);
+      reload();
+    } catch (e) { setMsg(String(e.message || e)); }
+    finally { setFetching(false); }
+  };
+
   return (
     <div className="panel" style={{ marginTop: 16 }}>
       <div className="phead">
         <h3><span className="badge platform-fb" style={{ marginRight: 8 }}>f</span>Facebook pages</h3>
-        <span className="right">{data?.totals?.posts ?? 0} collected · project-scoped</span>
+        <span className="right" style={{ display: "flex", gap: 10, alignItems: "center" }}>
+          <span>{data?.totals?.posts ?? 0} collected</span>
+          <button className="btn btn-brand btn-sm" disabled={fetching || sources.length === 0}
+                  onClick={fetchNow}>
+            {fetching ? "Fetching…" : "Fetch now"}
+          </button>
+        </span>
       </div>
       {!data?.enabled && (
         <div className="kv"><span>Not set up</span>
-          <b className="st-warn">add FB_C_USER / FB_XS to .env on the server</b></div>
+          <b className="st-warn">add FB_EMAIL / FB_PASSWORD (or FB_C_USER / FB_XS) to .env on the server</b></div>
+      )}
+      {fetching && (
+        <div style={{ color: "var(--ink-3)", fontSize: 12.5, margin: "6px 0" }}>
+          Opening Facebook on the server and reading newest posts — this takes up to a minute.
+        </div>
+      )}
+      {result && (
+        <div style={{ fontSize: 12.5, margin: "6px 0" }}>
+          <b style={{ color: result.new > 0 ? "var(--brand)" : "var(--ink-2)" }}>
+            {result.new > 0
+              ? `${result.new} new post${result.new === 1 ? "" : "s"} collected`
+              : "No new posts this time"}
+          </b>{" "}
+          — open the Live Feed (Source: Facebook) to see them.
+          {Array.isArray(result.log) && result.log.length > 0 && (
+            <pre style={{ whiteSpace: "pre-wrap", background: "var(--surface-2)",
+                          padding: "8px 10px", borderRadius: 8, marginTop: 6,
+                          fontSize: 11.5, color: "var(--ink-3)", maxHeight: 160,
+                          overflow: "auto" }}>
+              {result.log.join("\n")}
+            </pre>
+          )}
+        </div>
       )}
       <div style={{ margin: "8px 0 4px" }}>
         {sources.map((s) => (

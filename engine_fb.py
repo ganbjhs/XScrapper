@@ -103,6 +103,12 @@ class FacebookEngine:
         self.log = log
         self.meter_db = meter_db
         self.cap_bytes = int(float(os.getenv("FB_MONTHLY_CAP_GB", "200")) * 1e9)
+        # Where the whole logged-in session (cookies incl. the browser's OWN
+        # datr) is saved between runs, so the session is reused instead of
+        # replayed cold every time — the reuse is what stops the logouts.
+        self.state_path = os.getenv("FB_STATE_PATH", "fb_state.json")
+        self.email = os.getenv("FB_EMAIL", "").strip()
+        self.password = os.getenv("FB_PASSWORD", "")
         self._pw = self._browser = self._ctx = self._page = None
 
     async def __aenter__(self):
@@ -118,24 +124,33 @@ class FacebookEngine:
         self._browser = await self._pw.chromium.launch(
             headless=True, proxy=proxy,
             args=["--no-sandbox", "--disable-dev-shm-usage"])
-        self._ctx = await self._browser.new_context(
-            user_agent=MOBILE_UA, viewport={"width": 412, "height": 2400},
-            locale="en-US")
-        # c_user + xs are the session; datr is the browser/device fingerprint
-        # Facebook ties the session to. Replaying xs WITHOUT datr makes Facebook
-        # treat it as a hijacked session and log it out — so datr is important
-        # for the session to survive. sb is a secondary device cookie if present.
-        cookies = [
-            {"name": "c_user", "value": os.getenv("FB_C_USER", ""),
-             "domain": ".facebook.com", "path": "/"},
-            {"name": "xs", "value": os.getenv("FB_XS", ""),
-             "domain": ".facebook.com", "path": "/"}]
-        for name, env in (("datr", "FB_DATR"), ("sb", "FB_SB")):
-            val = os.getenv(env, "")
-            if val:
-                cookies.append({"name": name, "value": val,
-                                "domain": ".facebook.com", "path": "/"})
-        await self._ctx.add_cookies(cookies)
+
+        # Prefer a saved session (it carries the browser's own datr, so Facebook
+        # keeps it logged in). Fall back to the raw cookies from .env on first
+        # run; the login-with-password path below rebuilds the session if both
+        # are stale.
+        ctx_kw = dict(user_agent=MOBILE_UA,
+                      viewport={"width": 412, "height": 2400}, locale="en-US")
+        if os.path.exists(self.state_path):
+            ctx_kw["storage_state"] = self.state_path
+            self._ctx = await self._browser.new_context(**ctx_kw)
+            self.log(f"[fb] reusing saved session {self.state_path}")
+        else:
+            self._ctx = await self._browser.new_context(**ctx_kw)
+            cookies = []
+            if os.getenv("FB_C_USER") and os.getenv("FB_XS"):
+                cookies = [
+                    {"name": "c_user", "value": os.getenv("FB_C_USER", ""),
+                     "domain": ".facebook.com", "path": "/"},
+                    {"name": "xs", "value": os.getenv("FB_XS", ""),
+                     "domain": ".facebook.com", "path": "/"}]
+                for name, env in (("datr", "FB_DATR"), ("sb", "FB_SB")):
+                    val = os.getenv(env, "")
+                    if val:
+                        cookies.append({"name": name, "value": val,
+                                        "domain": ".facebook.com", "path": "/"})
+            if cookies:
+                await self._ctx.add_cookies(cookies)
 
         async def route(r):
             await (r.abort() if r.request.resource_type in BLOCK else r.continue_())
@@ -162,6 +177,56 @@ class FacebookEngine:
             if self._pw:
                 await self._pw.stop()
 
+    async def _save_state(self):
+        """Persist the whole logged-in session so the next run reuses it."""
+        try:
+            await self._ctx.storage_state(path=self.state_path)
+        except Exception as e:
+            self.log(f"[fb] could not save session: {type(e).__name__}: {e}")
+
+    @staticmethod
+    def _is_login_wall(url: str) -> bool:
+        u = url or ""
+        return ("login" in u or "/?next=" in u or "checkpoint" in u
+                or "/recover/" in u)
+
+    async def _login(self) -> bool:
+        """
+        Log in with FB_EMAIL / FB_PASSWORD in the real browser, so Facebook
+        issues a fresh session bound to THIS browser's datr, and save it. This
+        is the durable fix for the session getting logged out: instead of
+        replaying borrowed cookies, we hold a session the browser itself owns.
+        """
+        if not (self.email and self.password):
+            self.log("[fb] logged out and no FB_EMAIL / FB_PASSWORD set — "
+                     "cannot re-login")
+            return False
+        p = self._page
+        try:
+            await p.goto("https://m.facebook.com/login.php",
+                         wait_until="domcontentloaded", timeout=60000)
+            await p.wait_for_timeout(2500)
+            await p.fill('input[name="email"]', self.email)
+            await p.fill('input[name="pass"]', self.password)
+            # The button's name/shape varies; try the common ones in order.
+            for sel in ('button[name="login"]', 'input[name="login"]',
+                        'button[type="submit"]', '[data-testid="royal_login_button"]'):
+                el = await p.query_selector(sel)
+                if el:
+                    await el.click()
+                    break
+            await p.wait_for_timeout(7000)
+        except Exception as e:
+            self.log(f"[fb] login attempt failed: {type(e).__name__}: {e}")
+            return False
+        if self._is_login_wall(p.url):
+            self.log(f"[fb] login did not complete — wrong password, or Facebook "
+                     f"is asking for a checkpoint/2FA. url={p.url}")
+            return False
+        await self._save_state()
+        self.log("[fb] logged in with password; session saved")
+        return True
+
     async def fetch_page(self, handle: str, max_scroll: int = 4) -> list:
         """
         Newest posts of one Facebook page, as normalized records. Refuses if the
@@ -174,23 +239,30 @@ class FacebookEngine:
             return []
 
         self._bytes = 0
+        url = f"https://www.facebook.com/{handle}"
         try:
-            await self._page.goto(f"https://www.facebook.com/{handle}",
-                                  wait_until="domcontentloaded", timeout=60000)
+            await self._page.goto(url, wait_until="domcontentloaded", timeout=60000)
+            await self._page.wait_for_timeout(2500)
+            # If Facebook bounced us to a login/checkpoint wall, the session is
+            # dead. Try to log back in with the password (fresh datr) and retry
+            # once — that is the whole point of holding email+password.
+            if self._is_login_wall(self._page.url):
+                self.log(f"[fb] {handle}: session logged out — attempting re-login")
+                if await self._login():
+                    await self._page.goto(url, wait_until="domcontentloaded",
+                                          timeout=60000)
+                    await self._page.wait_for_timeout(2500)
+                if self._is_login_wall(self._page.url):
+                    self.log(f"[fb] {handle}: NOT LOGGED IN — session expired and "
+                             f"re-login failed. url={self._page.url}")
+                    _record_bytes(self.meter_db, self._bytes)
+                    return []
             # Wait for the feed to actually render its post blocks.
             try:
                 await self._page.wait_for_selector('[role="article"]', timeout=20000)
             except Exception:
                 pass
-            await self._page.wait_for_timeout(3000)
-            # If Facebook bounced us to a login/checkpoint wall, the session is
-            # dead — say so plainly instead of silently returning 0 posts.
-            cur = self._page.url
-            if "login" in cur or "/?next=" in cur or "checkpoint" in cur:
-                self.log(f"[fb] {handle}: NOT LOGGED IN — session expired "
-                         f"(refresh FB_XS + FB_DATR in .env). url={cur}")
-                _record_bytes(self.meter_db, self._bytes)
-                return []
+            await self._page.wait_for_timeout(2000)
             # Scroll with JS, not the mouse wheel — a wheel event over a reel
             # thumbnail hover-opens a reel dialog and hijacks the extraction.
             for _ in range(max(0, max_scroll)):
@@ -202,6 +274,9 @@ class FacebookEngine:
             _record_bytes(self.meter_db, self._bytes)
             return []
         _record_bytes(self.meter_db, self._bytes)
+        # We reached the page logged in — refresh the saved session so its
+        # cookies (and any rotated datr) carry to the next run.
+        await self._save_state()
 
         posts = []
         for r in raw:
