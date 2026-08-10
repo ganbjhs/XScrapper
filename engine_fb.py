@@ -81,6 +81,31 @@ _EXTRACT_JS = r"""
   for (const e of document.querySelectorAll('[role]')) {
     const r = e.getAttribute('role'); roles[r] = (roles[r] || 0) + 1;
   }
+  // Every link on the page (href + its short text), so the real permalink
+  // shape is visible even when it does not match the patterns above.
+  const allLinks = [...new Set([...document.querySelectorAll('a[href]')]
+    .map(a => a.href))].slice(0, 45);
+  // Climb from each long text block to the first ancestor that also holds an
+  // image and links — that ancestor IS the post container on layouts without
+  // role="article". Report its tag/attrs/links so the selector can be written.
+  const longs = [...document.querySelectorAll('div[dir="auto"]')]
+    .filter(d => (d.innerText || "").trim().length > 60).slice(0, 5);
+  const containers = longs.map(d => {
+    let el = d;
+    for (let i = 0; i < 9 && el; i++) {
+      const hasImg = el.querySelector('img[src*="fbcdn"], img[src*="scontent"]');
+      const links = [...new Set([...el.querySelectorAll('a[href]')].map(a => a.href))];
+      if (hasImg && links.length) {
+        return { tag: el.tagName, role: el.getAttribute('role'),
+                 attrs: el.getAttributeNames().slice(0, 12),
+                 dataft: el.getAttribute('data-ft'),
+                 links: links.slice(0, 8),
+                 text: (el.innerText || "").replace(/\s+/g, " ").trim().slice(0, 80) };
+      }
+      el = el.parentElement;
+    }
+    return { none: (d.innerText || "").replace(/\s+/g, " ").trim().slice(0, 60) };
+  });
   const diag = {
     url: location.href,
     title: document.title,
@@ -89,6 +114,8 @@ _EXTRACT_JS = r"""
     permalinks: permaAll.length,
     roles: roles,
     sample: [...new Set(permaAll)].slice(0, 5),
+    all_links: allLinks,
+    containers: containers,
     body_head: (document.body ? document.body.innerText : "")
       .replace(/\s+/g, " ").trim().slice(0, 240),
   };
@@ -339,6 +366,13 @@ class FacebookEngine:
             if diag.get("sample"):
                 self.log(f"[fb] {handle}: links={diag['sample']}")
             self.log(f"[fb] {handle}: text={diag.get('body_head')!r}")
+            if len(posts) == 0:
+                # The two fields that let the extractor be rewritten for this
+                # layout: every link on the page, and the post-container shape.
+                self.log("[fb] all_links=" +
+                         json.dumps(diag.get("all_links"))[:1600])
+                self.log("[fb] containers=" +
+                         json.dumps(diag.get("containers"))[:1800])
         return posts
 
 
