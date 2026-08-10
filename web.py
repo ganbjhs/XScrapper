@@ -2031,6 +2031,65 @@ LOGIN_PAGE = """<!doctype html>
 </form></body></html>"""
 
 
+def _fb_status(q=None):
+    """Facebook sources + totals for a project (or all)."""
+    try:
+        pid = int((q or {}).get("project") or 0)
+    except (TypeError, ValueError):
+        pid = 0
+    out = {"sources": [], "totals": {"posts": 0}, "enabled": False}
+    rp = _CFG.root / "fb_results.db"
+    out["enabled"] = bool(os.getenv("FB_C_USER", "").strip())
+    if rp.exists():
+        try:
+            import store_fb
+            with store_fb.Store(rp) as st:
+                out["sources"] = st.sources(project_id=pid or None)
+                out["totals"] = {"posts": st.total(pid or None)}
+        except Exception as e:
+            out["error"] = f"{type(e).__name__}: {e}"
+    return out
+
+
+def _fb_posts(q):
+    """Collected Facebook posts, newest first, in the shared feed shape."""
+    rp = _CFG.root / "fb_results.db"
+    if not rp.exists():
+        return {"count": 0, "posts": []}
+    import store_fb
+    try:
+        pid = int(q.get("project") or 0)
+    except (TypeError, ValueError):
+        pid = 0
+    since_ms = None
+    if q.get("since"):
+        since_ms = store_mod.parse_window(q["since"])
+    limit = min(int(q.get("limit") or 50), 200)
+    with store_fb.Store(rp) as st:
+        rows = st.recent(project_id=pid or None, limit=limit, since_ms=since_ms)
+    return {"count": len(rows), "posts": [store_fb.to_feed(r) for r in rows]}
+
+
+def _fb_source_post(body):
+    """Add or remove a Facebook page source for a project."""
+    import store_fb
+    action = body.get("action") or "add"
+    label = re.sub(r"[^A-Za-z0-9_.-]", "", str(body.get("label") or "")).strip(".")
+    try:
+        pid = int(body.get("project") or 0)
+    except (TypeError, ValueError):
+        return {"error": "project must be a number"}
+    if not label:
+        return {"error": "a Facebook page name is required"}
+    rp = _CFG.root / "fb_results.db"
+    with store_fb.Store(rp) as st:
+        if action == "remove":
+            st.remove_source(label)
+            return {"ok": True, "removed": label}
+        st.add_source(label, project_id=pid)
+    return {"ok": True, "label": label}
+
+
 def _ig_status():
     """Instagram accounts + sources + totals for the dashboard's Instagram view."""
     import sqlite3
@@ -2423,6 +2482,10 @@ class Handler(BaseHTTPRequestHandler):
                 return self._send(200, _ig_status())
             if u.path == "/api/ig/posts":
                 return self._send(200, _ig_posts(q))
+            if u.path == "/api/fb/status":
+                return self._send(200, _fb_status(q))
+            if u.path == "/api/fb/posts":
+                return self._send(200, _fb_posts(q))
             return self._send(404, {"error": "not found"})
         except Exception as e:
             import traceback
@@ -2507,6 +2570,8 @@ class Handler(BaseHTTPRequestHandler):
                 paused = bool(body.get("paused"))
                 _with_store(lambda st: st.set_collection_paused(paused))
                 return self._send(200, {"collection_paused": paused})
+            if u.path == "/api/fb/source":
+                return self._send(200, _fb_source_post(body))
             if u.path == "/api/project/fetch":
                 return self._send(200, _project_fetch(body))
             if u.path == "/api/fetch":

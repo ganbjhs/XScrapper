@@ -11,6 +11,8 @@ profiles/
 
 # Outputs
 results.*
+fb_results.db*
+fb_meter.db*
 browser-check.jpg
 exports/
 logs/

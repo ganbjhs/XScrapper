@@ -69,9 +69,10 @@ export default function PostCard({ t, onPin, onUnpin }) {
           <Pfp t={t} name={name} />
           <b>{name}</b>
           <span className="handle">@{t.author_username}</span>
-          <span className={`badge platform-${t.platform === "instagram" ? "ig" : "x"}`}>
-            {t.platform === "instagram" ? "IG" : "𝕏"}
-          </span>
+          {(() => {
+            const P = { instagram: ["ig", "IG"], facebook: ["fb", "f"] }[t.platform] || ["x", "𝕏"];
+            return <span className={`badge platform-${P[0]}`}>{P[1]}</span>;
+          })()}
           {t.lag_ms != null && (
             <span className="badge lag">
               lag <b>{fmtLag(t.lag_ms)}</b>
@@ -93,10 +94,10 @@ export default function PostCard({ t, onPin, onUnpin }) {
         </div>
         <div className="cactions">
           <a href={t.url} target="_blank" rel="noreferrer">
-            Open on {t.platform === "instagram" ? "Instagram" : "X"}
+            Open on {{ instagram: "Instagram", facebook: "Facebook" }[t.platform] || "X"}
           </a>
           <button onClick={() => navigator.clipboard?.writeText(t.url)}>Copy link</button>
-          {onPin && t.platform !== "instagram" && (
+          {onPin && t.platform === "x" && (
             <button onClick={() => onPin(t)}>+ Collection</button>
           )}
           {onUnpin && <button onClick={() => onUnpin(t)}>Unpin</button>}

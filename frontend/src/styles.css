@@ -187,6 +187,7 @@ header.top .grow { flex: 1; }
 .badge { font-size: 10.5px; font-weight: 700; border-radius: 999px; padding: 2.5px 9px; }
 .badge.platform-x { background: color-mix(in srgb, var(--series-1) 14%, transparent); color: var(--series-1); }
 .badge.platform-ig { background: color-mix(in srgb, var(--series-2) 14%, transparent); color: var(--series-2); }
+.badge.platform-fb { background: color-mix(in srgb, #1877f2 16%, transparent); color: #1877f2; }
 .badge.lag { background: var(--brand-softer); color: var(--ink-2); border: 1px solid var(--ring); font-weight: 600; }
 .badge.lag b { color: var(--good-text); }
 .badge.rt { background: var(--brand-softer); color: var(--ink-3); border: 1px solid var(--ring); font-weight: 600; }

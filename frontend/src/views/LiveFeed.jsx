@@ -57,7 +57,7 @@ export default function LiveFeed({ onMenu }) {
 
   const feed = useApi(
     async () => {
-      const [x, ig] = await Promise.all([
+      const [x, ig, fb] = await Promise.all([
         pid
           ? api.tweets({
               project: pid, limit: 50,
@@ -67,10 +67,13 @@ export default function LiveFeed({ onMenu }) {
             })
           : Promise.resolve({ rows: [] }),
         api.igPosts({ limit: 10 }).catch(() => ({ posts: [] })),
+        pid ? api.fbPosts({ project: pid, limit: 25 }).catch(() => ({ posts: [] }))
+            : Promise.resolve({ posts: [] }),
       ]);
       const rows = [
         ...(x.rows || []).map((r) => ({ ...r, platform: "x" })),
         ...(ig.posts || []).map(normIg),
+        ...(fb.posts || []),   // already in feed shape (store_fb.to_feed)
       ];
       rows.sort((a, b) => Date.parse(b.collected_at || 0) - Date.parse(a.collected_at || 0));
       // xTotal is the SERVER's count for the window — the true number even
@@ -278,7 +281,7 @@ export default function LiveFeed({ onMenu }) {
         <Pill label="Source" value={flt.source}
               onChange={(v) => setFlt((s) => ({ ...s, source: v }))}
               options={[["all", "All"], ["x", "X / Twitter"],
-                        ["instagram", "Instagram"], ["facebook", "Facebook (soon)", true]]} />
+                        ["instagram", "Instagram"], ["facebook", "Facebook"]]} />
         <Pill label="Sort" value={flt.sort}
               onChange={(v) => setFlt((s) => ({ ...s, sort: v }))}
               options={[["latest", "Latest first"], ["oldest", "Oldest first"],
@@ -294,12 +297,12 @@ export default function LiveFeed({ onMenu }) {
             <h2>Incoming</h2>
             <span className="newpill" style={{ cursor: "default" }} title="posts matching the filters above">
               {fmtN(
-                flt.source === "instagram"
-                  ? filtered.filter((t) => t.platform === "instagram").length
-                  : flt.source === "x"
-                    ? feed.data?.xTotal ?? 0
+                flt.source === "x"
+                  ? feed.data?.xTotal ?? 0
+                  : flt.source === "instagram" || flt.source === "facebook"
+                    ? filtered.filter((t) => t.platform === flt.source).length
                     : (feed.data?.xTotal ?? 0) +
-                      filtered.filter((t) => t.platform === "instagram").length,
+                      filtered.filter((t) => t.platform !== "x").length,
               )}{" "}posts
             </span>
             {fresh > 0 && (

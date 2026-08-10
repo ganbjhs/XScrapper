@@ -60,6 +60,12 @@ export const api = {
   tweets: (p) => request(`/api/tweets${qs(p)}`),
   igPosts: (p) => request(`/api/ig/posts${qs(p)}`),
   igStatus: () => request("/api/ig/status"),
+  fbPosts: (p) => request(`/api/fb/posts${qs(p)}`),
+  fbStatus: (project) => request(`/api/fb/status${qs({ project })}`),
+  fbAddSource: (project, label) =>
+    request("/api/fb/source", { method: "POST", body: { project, label, action: "add" } }),
+  fbRemoveSource: (label) =>
+    request("/api/fb/source", { method: "POST", body: { label, action: "remove" } }),
 
   projects: () => request("/api/projects"),
   createProject: (name) => request("/api/projects", { method: "POST", body: { name } }),

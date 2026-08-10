@@ -2035,6 +2035,54 @@ def test_alerts(tmp):
     ok(r["disabled"] and r["fired4"] == 0, "a paused rule never fires")
 
 
+def test_facebook(tmp):
+    """The Facebook store + collect loop (offline; engine is server-only)."""
+    import store_fb
+    import collect_fb
+    import engine_fb
+
+    db = pathlib.Path(tmp) / "fb_results.db"
+    st = store_fb.Store(db).open()
+    st.add_source("narendramodi", project_id=7)
+
+    print("== bandwidth cap ==")
+    meter = str(pathlib.Path(tmp) / "m.db")
+    ok(engine_fb._bandwidth_ok(meter, 1000)[0], "under cap: fetch allowed")
+    engine_fb._record_bytes(meter, 1200)
+    ok(not engine_fb._bandwidth_ok(meter, 1000)[0],
+       "over the monthly cap: fetching refuses (no runaway)")
+
+    print()
+    print("== store + collect ==")
+
+    class FakeEng:
+        async def fetch_page(self, handle, max_scroll=1):
+            return [
+                {"post_id": f"{handle}:1", "page": handle, "url": "u1",
+                 "created_ms": 1785000000000, "author_name": "Modi", "text": "a",
+                 "media": [{"type": "video", "url": "v", "thumb": "t"}]},
+                {"post_id": f"{handle}:2", "page": handle, "url": "u2",
+                 "created_ms": 1785000600000, "author_name": "Modi", "text": "b",
+                 "media": []},
+            ]
+
+    src = st.sources(enabled_only=True)[0]
+    n1 = asyncio.run(collect_fb.collect_source(FakeEng(), st, src))
+    n2 = asyncio.run(collect_fb.collect_source(FakeEng(), st, src))
+    ok(n1 == 2, "first pass saves both posts")
+    ok(n2 == 0, "second pass dedups on post id — nothing doubles")
+    ok(st.total(project_id=7) == 2, "project-scoped total is right")
+    ok(st.watermark("narendramodi") == 1785000600000, "watermark advances to newest")
+
+    feed = store_fb.to_feed(st.recent(project_id=7)[0])
+    ok(feed["platform"] == "facebook", "posts map to the shared feed shape")
+    vid = [r for r in st.recent(project_id=7) if store_fb.to_feed(r)["media"]]
+    ok(any(store_fb.to_feed(r)["media"] and store_fb.to_feed(r)["media"][0].get("thumb")
+           for r in st.recent(project_id=7)),
+       "a Facebook video carries its thumbnail through to the feed/delivery shape")
+    st.close()
+
+
 # ==========================================================================
 # runner
 # ==========================================================================
@@ -2380,6 +2428,9 @@ def main():
 
         section("collections (curation boards)")
         test_collections(fresh("collections"))
+
+        section("facebook (store, cap, collect loop)")
+        test_facebook(fresh("facebook"))
 
         section("velocity alerts (pace, threshold, cooldown)")
         test_alerts(fresh("alerts"))

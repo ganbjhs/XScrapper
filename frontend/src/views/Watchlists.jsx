@@ -394,6 +394,65 @@ function StreamsManager({ pid }) {
   );
 }
 
+function FacebookSources({ pid }) {
+  const { data, error, reload } = useApi(() => api.fbStatus(pid), [pid]);
+  const [adding, setAdding] = useState("");
+  const [busy, setBusy] = useState(false);
+  const [msg, setMsg] = useState("");
+  if (error) return null;
+  const sources = data?.sources || [];
+
+  const add = async () => {
+    setBusy(true); setMsg("");
+    try {
+      for (const name of adding.split(/[\s,]+/).filter(Boolean)) {
+        await api.fbAddSource(pid, name);
+      }
+      setAdding(""); reload();
+    } catch (e) { setMsg(String(e.message || e)); }
+    finally { setBusy(false); }
+  };
+
+  return (
+    <div className="panel" style={{ marginTop: 16 }}>
+      <div className="phead">
+        <h3><span className="badge platform-fb" style={{ marginRight: 8 }}>f</span>Facebook pages</h3>
+        <span className="right">{data?.totals?.posts ?? 0} collected · project-scoped</span>
+      </div>
+      {!data?.enabled && (
+        <div className="kv"><span>Not set up</span>
+          <b className="st-warn">add FB_C_USER / FB_XS to .env on the server</b></div>
+      )}
+      <div style={{ margin: "8px 0 4px" }}>
+        {sources.map((s) => (
+          <span className="tag" key={s.label}>
+            {s.label}
+            <button aria-label={`remove ${s.label}`}
+                    onClick={async () => { await api.fbRemoveSource(s.label); reload(); }}>✕</button>
+          </span>
+        ))}
+        {sources.length === 0 && (
+          <span style={{ color: "var(--ink-3)", fontSize: 13 }}>
+            No Facebook pages yet — add a page's handle (from its URL, e.g. “narendramodi”).
+          </span>
+        )}
+      </div>
+      <div className="filters" style={{ marginTop: 10, marginBottom: 0 }}>
+        <input value={adding} placeholder="facebook page handle, e.g. narendramodi"
+               style={{ flex: 1, minWidth: 200 }}
+               onChange={(e) => setAdding(e.target.value)}
+               onKeyDown={(e) => e.key === "Enter" && adding.trim() && add()} />
+        <button className="btn btn-brand btn-sm" disabled={busy || !adding.trim()} onClick={add}>Add page</button>
+      </div>
+      {msg && <div style={{ color: "var(--critical)", fontSize: 12.5, marginTop: 8 }}>{msg}</div>}
+      <div style={{ color: "var(--ink-3)", fontSize: 12, marginTop: 8 }}>
+        Facebook runs on the server’s own bandwidth with a monthly cap — it checks each page a few
+        times a day, newest posts only.
+      </div>
+    </div>
+  );
+}
+
 export default function Watchlists({ onMenu }) {
   const { project } = useProject();
   const pid = project?.project_id;
@@ -422,6 +481,7 @@ export default function Watchlists({ onMenu }) {
         <WatchlistCard key={w.watchlist_id} w={w} onChanged={reload} />
       ))}
 
+      {pid && <FacebookSources pid={pid} />}
       {pid && <StreamsManager pid={pid} />}
 
       {creating && pid && (
