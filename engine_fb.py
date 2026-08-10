@@ -30,8 +30,14 @@ import re
 import sqlite3
 import time
 
-MOBILE_UA = ("Mozilla/5.0 (Linux; Android 12; Pixel 6) AppleWebKit/537.36 "
-             "(KHTML, like Gecko) Chrome/120.0 Mobile Safari/537.36")
+# A DESKTOP user-agent, deliberately. A mobile UA makes Facebook serve the
+# "WebLite/Bloks" shell — content renders, but every post is a tap-to-open
+# JavaScript button with NO permalink and NO role="article", which is
+# impossible to extract from (this cost us a long debugging session, see
+# BLUEPRINT). The desktop site renders each post as a real role="article" with
+# a real permalink link, which is what the extractor needs.
+DESKTOP_UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+              "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
 BLOCK = {"image", "media", "font"}
 
 # Extract candidate posts from the rendered mobile page. Facebook wraps each
@@ -177,8 +183,8 @@ class FacebookEngine:
         # keeps it logged in). Fall back to the raw cookies from .env on first
         # run; the login-with-password path below rebuilds the session if both
         # are stale.
-        ctx_kw = dict(user_agent=MOBILE_UA,
-                      viewport={"width": 412, "height": 2400}, locale="en-US")
+        ctx_kw = dict(user_agent=DESKTOP_UA,
+                      viewport={"width": 1366, "height": 2600}, locale="en-US")
         if os.path.exists(self.state_path):
             ctx_kw["storage_state"] = self.state_path
             self._ctx = await self._browser.new_context(**ctx_kw)
@@ -251,7 +257,7 @@ class FacebookEngine:
             return False
         p = self._page
         try:
-            await p.goto("https://m.facebook.com/login.php",
+            await p.goto("https://www.facebook.com/login.php",
                          wait_until="domcontentloaded", timeout=60000)
             await p.wait_for_timeout(2500)
             await p.fill('input[name="email"]', self.email)
@@ -275,60 +281,7 @@ class FacebookEngine:
         self.log("[fb] logged in with password; session saved")
         return True
 
-    async def fetch_page(self, handle: str, max_scroll: int = 4) -> list:
-        """
-        Newest posts of one Facebook page, as normalized records. Refuses if the
-        monthly byte cap is spent (returns [] and logs), so it can never overrun.
-        """
-        ok, used = _bandwidth_ok(self.meter_db, self.cap_bytes)
-        if not ok:
-            self.log(f"[fb] monthly bandwidth cap reached ({used/1e9:.1f} GB) — "
-                     f"skipping {handle}")
-            return []
-
-        self._bytes = 0
-        url = f"https://www.facebook.com/{handle}"
-        try:
-            await self._page.goto(url, wait_until="domcontentloaded", timeout=60000)
-            await self._page.wait_for_timeout(2500)
-            # If Facebook bounced us to a login/checkpoint wall, the session is
-            # dead. Try to log back in with the password (fresh datr) and retry
-            # once — that is the whole point of holding email+password.
-            if self._is_login_wall(self._page.url):
-                self.log(f"[fb] {handle}: session logged out — attempting re-login")
-                if await self._login():
-                    await self._page.goto(url, wait_until="domcontentloaded",
-                                          timeout=60000)
-                    await self._page.wait_for_timeout(2500)
-                if self._is_login_wall(self._page.url):
-                    self.log(f"[fb] {handle}: NOT LOGGED IN — session expired and "
-                             f"re-login failed. url={self._page.url}")
-                    _record_bytes(self.meter_db, self._bytes)
-                    return []
-            # Wait for the feed to actually render its post blocks.
-            try:
-                await self._page.wait_for_selector('[role="article"]', timeout=20000)
-            except Exception:
-                pass
-            await self._page.wait_for_timeout(2000)
-            # Scroll with JS, not the mouse wheel — a wheel event over a reel
-            # thumbnail hover-opens a reel dialog and hijacks the extraction.
-            for _ in range(max(0, max_scroll)):
-                await self._page.evaluate("window.scrollBy(0, 2500)")
-                await self._page.wait_for_timeout(2500)
-            res = await self._page.evaluate(_EXTRACT_JS)
-        except Exception as e:
-            self.log(f"[fb] fetch {handle} failed: {type(e).__name__}: {e}")
-            _record_bytes(self.meter_db, self._bytes)
-            return []
-        _record_bytes(self.meter_db, self._bytes)
-        # We reached the page logged in — refresh the saved session so its
-        # cookies (and any rotated datr) carry to the next run.
-        await self._save_state()
-
-        raw = res.get("posts", []) if isinstance(res, dict) else (res or [])
-        diag = res.get("diag") if isinstance(res, dict) else None
-
+    def _build_posts(self, handle, raw):
         posts = []
         for r in raw:
             if not r.get("permalink"):      # drop comments / non-post articles
@@ -340,20 +293,87 @@ class FacebookEngine:
                 "post_id": f"{handle}:{pid}",
                 "page": handle,
                 "url": r["permalink"],
-                "created_ms": None,          # FB mobile hides exact time; fill later
+                "created_ms": None,          # exact time filled later if available
                 "author_name": r.get("author"),
                 "text": r.get("text") or "",
                 "like_count": None, "comment_count": None, "share_count": None,
                 "media": [{"type": "photo", "url": u, "thumb": u} for u in r.get("media", [])],
             })
-        self.log(f"[fb] {handle}: {len(posts)} posts, {self._bytes//1024} KB")
-        # Always surface what the page held — from the SAME render as extraction,
-        # so it can never be skipped. When 0 posts parse, this line is what tells
-        # us why. Also written to fb_diag.json for the button to read back.
+        return posts
+
+    async def _attempt(self, url, handle, max_scroll, allow_login):
+        """One navigate+extract against a given URL. Returns (posts, diag)."""
+        await self._page.goto(url, wait_until="domcontentloaded", timeout=60000)
+        await self._page.wait_for_timeout(2500)
+        if allow_login and self._is_login_wall(self._page.url):
+            self.log(f"[fb] {handle}: session logged out — attempting re-login")
+            if await self._login():
+                await self._page.goto(url, wait_until="domcontentloaded", timeout=60000)
+                await self._page.wait_for_timeout(2500)
+            if self._is_login_wall(self._page.url):
+                self.log(f"[fb] {handle}: NOT LOGGED IN — re-login failed. "
+                         f"url={self._page.url}")
+                return [], None
+        try:
+            await self._page.wait_for_selector('[role="article"]', timeout=20000)
+        except Exception:
+            pass
+        await self._page.wait_for_timeout(2000)
+        for _ in range(max(0, max_scroll)):
+            await self._page.evaluate("window.scrollBy(0, 2500)")
+            await self._page.wait_for_timeout(2500)
+        res = await self._page.evaluate(_EXTRACT_JS)
+        raw = res.get("posts", []) if isinstance(res, dict) else (res or [])
+        diag = res.get("diag") if isinstance(res, dict) else None
+        return self._build_posts(handle, raw), diag
+
+    async def fetch_page(self, handle: str, max_scroll: int = 4) -> list:
+        """
+        Newest posts of one Facebook page, as normalized records. Refuses if the
+        monthly byte cap is spent (returns [] and logs), so it can never overrun.
+
+        Tries the desktop site first (real role="article" posts), then falls
+        back to mbasic (server-rendered HTML, cleanest of all) if the desktop
+        render yields nothing — Facebook A/B tests its layouts, so having two
+        surfaces to try makes collection resilient.
+        """
+        ok, used = _bandwidth_ok(self.meter_db, self.cap_bytes)
+        if not ok:
+            self.log(f"[fb] monthly bandwidth cap reached ({used/1e9:.1f} GB) — "
+                     f"skipping {handle}")
+            return []
+
+        self._bytes = 0
+        posts, diag, source = [], None, "www"
+        try:
+            posts, diag = await self._attempt(
+                f"https://www.facebook.com/{handle}", handle, max_scroll,
+                allow_login=True)
+        except Exception as e:
+            self.log(f"[fb] fetch {handle} (www) failed: {type(e).__name__}: {e}")
+
+        if not posts:
+            # mbasic: no JavaScript, posts are plain <article> with story links.
+            source = "mbasic"
+            try:
+                p2, d2 = await self._attempt(
+                    f"https://mbasic.facebook.com/{handle}", handle,
+                    max_scroll=2, allow_login=False)
+                if p2:
+                    posts, diag = p2, d2
+                elif d2 is not None:
+                    diag = d2
+            except Exception as e:
+                self.log(f"[fb] fetch {handle} (mbasic) failed: {type(e).__name__}: {e}")
+
+        _record_bytes(self.meter_db, self._bytes)
+        await self._save_state()
+
+        self.log(f"[fb] {handle}: {len(posts)} posts via {source}, "
+                 f"{self._bytes//1024} KB")
         if diag is not None:
             diag["handle"] = handle
             diag["parsed"] = len(posts)
-            diag["blocks"] = len(raw)
             try:
                 with open(os.getenv("FB_DIAG_PATH", "fb_diag.json"), "w") as f:
                     json.dump(diag, f)
@@ -361,14 +381,9 @@ class FacebookEngine:
                 pass
             self.log(f"[fb] {handle}: diag — title={diag.get('title')!r} "
                      f"articles={diag.get('articles')} feed={diag.get('feed')} "
-                     f"blocks={len(raw)} permalinks={diag.get('permalinks')} "
+                     f"permalinks={diag.get('permalinks')} "
                      f"roles={json.dumps(diag.get('roles'))}")
-            if diag.get("sample"):
-                self.log(f"[fb] {handle}: links={diag['sample']}")
-            self.log(f"[fb] {handle}: text={diag.get('body_head')!r}")
             if len(posts) == 0:
-                # The two fields that let the extractor be rewritten for this
-                # layout: every link on the page, and the post-container shape.
                 self.log("[fb] all_links=" +
                          json.dumps(diag.get("all_links"))[:1600])
                 self.log("[fb] containers=" +

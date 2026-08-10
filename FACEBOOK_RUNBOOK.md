@@ -5,26 +5,44 @@ on the **server's own IP** (uses the 4 TB VPS bandwidth, not the residential
 pool), with a **hard monthly byte cap** so it can never run away. These steps
 turn it on.
 
-## 1. Put the burner session in `.env` (on the server)
+## 1. Put the account in `.env` (on the server)
+
+The robust way is **email + password** — the collector logs in with a real
+browser on the server, so Facebook issues a session bound to that browser's own
+`datr`, and it saves the whole session to `fb_state.json` and reuses it. No
+cookie hand-copying, and no "session expired" logouts.
 
 ```
 FB_ENABLED=1
-FB_C_USER=<c_user cookie>
-FB_XS=<xs cookie>
-FB_DATR=<datr cookie>     # REQUIRED — without it the session gets logged out
-FB_USE_PROXY=0            # 0 = server IP (recommended, uses 4 TB)
+FB_EMAIL=the-account@example.com
+FB_PASSWORD=the-password
+FB_USE_PROXY=0            # 0 = server IP (recommended, uses the 4 TB VPS)
 FB_MONTHLY_CAP_GB=200     # the runaway guard
 FB_INTERVAL_S=21600       # 6h between checks per page
 ```
 
-Grab all three cookies (`c_user`, `xs`, `datr`) from a real desktop-Chrome
-login: F12 → Application → Cookies → https://www.facebook.com. `datr` is the
-device fingerprint Facebook ties the session to — replaying `xs` without it
-makes Facebook treat the session as hijacked and log it straight out.
+Cookies (`FB_C_USER` / `FB_XS` / `FB_DATR`) are still accepted as an alternative
+seed, but they die within a day or two unless `datr` matches — the login path
+above avoids that entirely. After the first successful login, `fb_state.json`
+is the source of truth; delete it to force a fresh login.
 
-Keep this account gentle: it was just created, so let it rest a bit before the
-first run, and use it from ONE consistent IP (the server) — hopping IPs, or
-hammering a fresh account, is what gets Facebook accounts checkpointed.
+Keep the account gentle: use it from ONE consistent IP (the server). Hopping
+IPs, or hammering a fresh account, is what gets Facebook accounts checkpointed.
+If a run logs `NOT LOGGED IN` and re-login fails, Facebook is asking for a
+one-time "Was this you?" / 2FA confirmation — clear it once by logging into
+that account in a normal browser, then delete `fb_state.json` and re-run.
+
+## Why a DESKTOP user-agent (do not change this)
+
+The engine uses a **desktop** Chrome user-agent on purpose. A **mobile** UA makes
+Facebook serve its "WebLite / Bloks" shell: the page shows the post text and
+images, but every post is a tap-to-open JavaScript button with **no permalink
+and no `role="article"`** — literally nothing to extract. The desktop site
+renders each post as a real `role="article"` with a real permalink link, which
+is what the extractor keys on. If Facebook ever changes layout again and posts
+stop parsing, the "Fetch now" log prints `all_links=` and `containers=` — those
+show the real DOM shape to tune against. The engine also falls back to
+`mbasic.facebook.com` (plain HTML) when the desktop render yields nothing.
 
 ## 2. Add pages in the dashboard
 
@@ -32,16 +50,28 @@ Project → **Watchlists** → **Facebook pages** → type a page handle (from i
 URL, e.g. `narendramodi`) → Add. Pages are project-scoped: each project's feed
 and delivery see only its own Facebook pages.
 
-## 3. First run — confirm it collects
+## 3. First run — confirm it collects (from the dashboard)
+
+After adding the `.env` block, **restart the dashboard so it sees the vars**:
+
+```
+systemctl restart xscraper-web
+```
+
+Then in the dashboard: Project → **Watchlists** → **Facebook pages** →
+**Fetch now**. It logs in (first time takes ~a minute), saves the session, and
+shows `N new posts` plus a run log. Open **Live Feed → Source: Facebook** — the
+posts appear with a blue **f** badge.
+
+CLI alternative (same thing, from a shell):
 
 ```
 cd /opt/xscraper/app
-set -a; . ./.env; set +a          # load FB_* into the shell
+set -a; . ./.env; set +a
 .venv/bin/python3 collect_fb.py run
 ```
 
-You should see `[fb] <page>: N posts, K KB` then `+N new`. Open the dashboard →
-Live Feed → Source: **Facebook** — the posts appear with a blue **f** badge.
+You should see `[fb] <page>: N posts via www, K KB` then `+N new`.
 
 If it shows 0 posts, send me the run output; the extractor (one function in
 `engine_fb.py`) may need a small tune against the real page — everything else is

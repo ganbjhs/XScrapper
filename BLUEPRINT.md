@@ -191,6 +191,18 @@ signal. Health check: `/app` shows a green **Live** chip and no red banner.
   breakage loud instead of silent.
 - **`user_medias` wants the numeric pk, not the @name.** Validate IG sessions
   against the *feed* endpoint (`account_info` 403s on valid sessions).
+- **Facebook serves a mobile UA the useless "WebLite/Bloks" shell.** With a
+  mobile user-agent, a logged-in page renders post text + images but every post
+  is a JS button with NO permalink and NO `role="article"` — unextractable. The
+  engine therefore uses a **desktop UA** (real `role="article"` + permalinks),
+  with an `mbasic.facebook.com` fallback. Don't switch it back to mobile.
+- **Facebook logs out replayed cookies without `datr`.** `xs` replayed on a
+  browser whose `datr` differs is treated as a hijacked session and killed in
+  a request or two. The durable fix (and default): log in with
+  `FB_EMAIL`/`FB_PASSWORD` so the browser owns its `datr`, and persist the whole
+  session to `fb_state.json` for reuse. One steady IP (the server), no proxy.
+  When 0 posts parse, the "Fetch now" log prints `all_links=`/`containers=` —
+  the DOM shape to retune the extractor against.
 
 ## 9. Redesigning / extending
 
