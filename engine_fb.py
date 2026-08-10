@@ -227,6 +227,161 @@ _EXTRACT_JS = r"""
 """
 
 
+# --------------------------------------------------------------------------
+# GraphQL response parsing (the reliable path for a LOGGED-IN session)
+# --------------------------------------------------------------------------
+#
+# When logged in, Facebook does NOT embed the feed in the page — it fetches it
+# over background /graphql requests after load. So the most reliable extraction
+# is to capture those responses and pull the posts out of THEM. Each post is a
+# "Story" object; we read the same fields the on-page JSON would have carried
+# (id, permalink, time, text, author + profile picture, media, counts). Pure
+# functions so the whole thing is unit-tested offline.
+
+_PERMA_RE = re.compile(
+    r"/posts/|/story|story_fbid=|/videos/|/photos/|/permalink/|/reel/")
+
+
+def _is_perma(h) -> bool:
+    return bool(h and _PERMA_RE.search(h))
+
+
+def _iter_json_objects(blob: str):
+    """Facebook streams graphql as one JSON object, or several concatenated /
+    newline-delimited. Yield every object we can parse out of the blob."""
+    if not blob:
+        return
+    b = blob.strip()
+    if b.startswith("for (;;);"):
+        b = b[len("for (;;);"):]
+    try:
+        yield json.loads(b)
+        return
+    except Exception:
+        pass
+    for line in b.splitlines():
+        line = line.strip()
+        if not line or line[0] not in "{[":
+            continue
+        try:
+            yield json.loads(line)
+        except Exception:
+            continue
+
+
+def _deep_find(o, pred, depth=0):
+    if depth > 16 or not isinstance(o, (dict, list)):
+        return None
+    if isinstance(o, dict):
+        if pred(o):
+            return o
+        for v in o.values():
+            r = _deep_find(v, pred, depth + 1)
+            if r is not None:
+                return r
+    else:
+        for x in o:
+            r = _deep_find(x, pred, depth + 1)
+            if r is not None:
+                return r
+    return None
+
+
+def _deep_all(o, pred, acc=None, depth=0):
+    if acc is None:
+        acc = []
+    if depth > 16 or len(acc) > 40 or not isinstance(o, (dict, list)):
+        return acc
+    if isinstance(o, dict):
+        if pred(o):
+            acc.append(o)
+        for v in o.values():
+            _deep_all(v, pred, acc, depth + 1)
+    else:
+        for x in o:
+            _deep_all(x, pred, acc, depth + 1)
+    return acc
+
+
+def _walk_stories(o, out, seen, depth=0):
+    if depth > 18 or not isinstance(o, (dict, list)):
+        return
+    if isinstance(o, list):
+        for x in o:
+            _walk_stories(x, out, seen, depth + 1)
+        return
+    if o.get("__typename") == "Story" and (
+            o.get("post_id") or o.get("creation_time") or o.get("wwwURL")):
+        key = o.get("post_id") or o.get("id") or o.get("wwwURL")
+        if key not in seen:
+            seen.add(key)
+            out.append(o)
+    for v in o.values():
+        if isinstance(v, (dict, list)):
+            _walk_stories(v, out, seen, depth + 1)
+
+
+def _story_to_post(st: dict):
+    pid = st.get("post_id") or st.get("id")
+    perma = st.get("wwwURL") or st.get("url")
+    if not perma:
+        u = _deep_find(st, lambda o: isinstance(o.get("url"), str) and _is_perma(o["url"]))
+        perma = u["url"] if u else None
+    if not pid and not perma:
+        return None
+    msg = st.get("message") if isinstance(st.get("message"), dict) and st["message"].get("text") \
+        else _deep_find(st, lambda o: isinstance(o.get("text"), str) and isinstance(o.get("ranges"), list))
+    text = (msg or {}).get("text") or ""
+    actors = st.get("actors")
+    actor = actors[0] if isinstance(actors, list) and actors else \
+        _deep_find(st, lambda o: o.get("__typename") in ("User", "Page") and o.get("name"))
+    author = actor.get("name") if actor else None
+    avatar = None
+    if actor:
+        pp = actor.get("profile_picture")
+        avatar = (pp.get("uri") if isinstance(pp, dict) else None) or actor.get("profile_picture_url")
+    created_ms = st["creation_time"] * 1000 if st.get("creation_time") else None
+    media = []
+    for m in _deep_all(st, lambda o: o.get("__typename") in ("Photo", "Video", "GenericAttachmentMedia")):
+        if m.get("__typename") == "Video" or m.get("playable_url") or m.get("playable_url_quality_hd"):
+            thumb = ((m.get("preferred_thumbnail") or {}).get("image") or {}).get("uri") \
+                or (m.get("image") or {}).get("uri") or ""
+            url = m.get("playable_url_quality_hd") or m.get("playable_url") or thumb
+            if url or thumb:
+                media.append({"type": "video", "url": url or thumb, "thumb": thumb or url})
+        else:
+            uri = (m.get("image") or {}).get("uri") or (m.get("photo_image") or {}).get("uri") or ""
+            if uri:
+                media.append({"type": "photo", "url": uri, "thumb": uri})
+        if len(media) >= 6:
+            break
+    fbk = _deep_find(st, lambda o: o.get("reaction_count") or o.get("i18n_reaction_count")
+                     or o.get("comment_rendering_instance") or o.get("share_count"))
+    likes = (fbk.get("reaction_count") or {}).get("count") if fbk else None
+    comments = None
+    if fbk:
+        cri = fbk.get("comment_rendering_instance") or {}
+        comments = (cri.get("comments") or {}).get("total_count") or fbk.get("total_comment_count")
+    shares = (fbk.get("share_count") or {}).get("count") if fbk else None
+    return {"id": str(pid) if pid else _fallback_id(perma), "author": author,
+            "author_avatar": avatar, "permalink": perma, "text": text[:2000],
+            "created_ms": created_ms, "media": media,
+            "like_count": likes, "comment_count": comments, "share_count": shares}
+
+
+def _stories_from_graphql(blobs) -> list:
+    out, seen = [], set()
+    for b in blobs or []:
+        for obj in _iter_json_objects(b):
+            _walk_stories(obj, out, seen)
+    posts = []
+    for s in out:
+        p = _story_to_post(s)
+        if p:
+            posts.append(p)
+    return posts
+
+
 def _bandwidth_ok(meter_db, cap_bytes):
     month = time.strftime("%Y-%m", time.gmtime())
     con = sqlite3.connect(meter_db)
@@ -308,12 +463,24 @@ class FacebookEngine:
         await self._ctx.route("**/*", route)
 
         self._bytes = 0
+        self._gql = []          # captured graphql response bodies (per attempt)
+        self._gql_bytes = 0
 
         async def on_resp(resp):
             try:
                 cl = resp.headers.get("content-length")
                 if cl:
                     self._bytes += int(cl)
+            except Exception:
+                pass
+            # Capture the graphql responses that actually carry posts — this is
+            # where a logged-in session's feed data lives (not in the page).
+            try:
+                if "/graphql" in resp.url and self._gql_bytes < 12_000_000:
+                    body = await resp.text()
+                    if '"__typename":"Story"' in body or '"post_id"' in body:
+                        self._gql.append(body)
+                        self._gql_bytes += len(body)
             except Exception:
                 pass
         self._ctx.on("response", on_resp)
@@ -425,8 +592,10 @@ class FacebookEngine:
         return posts
 
     async def _attempt(self, url, handle, max_scroll, allow_login):
-        """One navigate+extract. Returns (posts, diag, method) — JSON preferred,
-        DOM as the fallback within the same render."""
+        """One navigate+extract. Returns (posts, diag, method). Order of trust:
+        captured graphql (logged-in feed data) > on-page JSON > DOM."""
+        self._gql = []          # only THIS attempt's graphql responses
+        self._gql_bytes = 0
         await self._page.goto(url, wait_until="domcontentloaded", timeout=60000)
         await self._page.wait_for_timeout(2500)
         if allow_login and self._is_login_wall(self._page.url):
@@ -448,11 +617,19 @@ class FacebookEngine:
             await self._page.wait_for_timeout(2500)
         res = await self._page.evaluate(_EXTRACT_JS)
         if not isinstance(res, dict):
-            return [], None, "none"
-        diag = res.get("diag")
+            res = {}
+        diag = res.get("diag") or {}
+        # 1) captured graphql (most reliable when logged in)
+        gql = _stories_from_graphql(self._gql)
+        diag["gql_responses"] = len(self._gql)
+        diag["gql_posts"] = len(gql)
+        if gql:
+            return self._build_from_json(handle, gql), diag, "gql"
+        # 2) on-page JSON
         jsonp = res.get("json_posts") or []
         if jsonp:
             return self._build_from_json(handle, jsonp), diag, "json"
+        # 3) DOM fallback
         return self._build_posts(handle, res.get("dom_posts") or []), diag, "dom"
 
     async def fetch_page(self, handle: str, max_scroll: int = 4) -> list:
@@ -508,6 +685,8 @@ class FacebookEngine:
             except Exception:
                 pass
             self.log(f"[fb] {handle}: diag — title={diag.get('title')!r} "
+                     f"gql_responses={diag.get('gql_responses')} "
+                     f"gql_posts={diag.get('gql_posts')} "
                      f"json_stories={diag.get('json_stories')} "
                      f"json_posts={diag.get('json_posts')} "
                      f"articles={diag.get('articles')} feed={diag.get('feed')} "

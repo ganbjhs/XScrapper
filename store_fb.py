@@ -32,6 +32,7 @@ CREATE TABLE IF NOT EXISTS posts (
   share_count   INTEGER,
   media_json    TEXT,                       -- [{type,url,thumb}] — same as X/IG
   author_avatar TEXT,                        -- the page's profile picture URL
+  sig           TEXT,                        -- content signature (2nd dedup key)
   source_label  TEXT,
   project_id    INTEGER
 );
@@ -56,7 +57,23 @@ CREATE TABLE IF NOT EXISTS sources (
 _MIGRATIONS = [
     ("sources", "interval_s", "ALTER TABLE sources ADD COLUMN interval_s INTEGER"),
     ("posts", "author_avatar", "ALTER TABLE posts ADD COLUMN author_avatar TEXT"),
+    ("posts", "sig", "ALTER TABLE posts ADD COLUMN sig TEXT"),
 ]
+
+
+def _signature(page, text):
+    """
+    A content signature that is the SAME for one real post no matter which path
+    (GraphQL / DOM / mbasic) or id scheme found it — so a post cannot appear
+    twice just because Facebook handed it to us with a different id. Built from
+    the page + its (normalized) caption; None for captionless posts, which fall
+    back to id-only dedup.
+    """
+    import hashlib
+    norm = " ".join(str(text or "").split())[:160].lower()
+    if len(norm) < 8:
+        return None
+    return hashlib.sha1(f"{page}\n{norm}".encode("utf-8", "ignore")).hexdigest()
 
 
 @dataclass
@@ -80,6 +97,9 @@ class Store:
             cols = {r["name"] for r in self.db.execute(f"PRAGMA table_info({table})")}
             if col not in cols:
                 self.db.execute(ddl)
+        # Index on the signature column — created after the migration so it
+        # exists whether the DB is new or upgraded.
+        self.db.execute("CREATE INDEX IF NOT EXISTS ix_fb_sig ON posts(sig)")
         self.db.commit()
         return self
 
@@ -148,23 +168,33 @@ class Store:
     # ---- posts ----
 
     def upsert(self, post: dict) -> bool:
-        """Insert one post; returns True if it was new. Dedup on post_id."""
-        exists = self.db.execute(
-            "SELECT 1 FROM posts WHERE post_id = ?", (post["post_id"],)).fetchone()
+        """
+        Insert one post; returns True if it was new. Dedup on TWO keys: the
+        post_id (exact), and a content signature (so the same caption on the
+        same page can't slip in twice under a different id scheme).
+        """
+        sig = _signature(post.get("page"), post.get("text"))
+        if sig:
+            exists = self.db.execute(
+                "SELECT 1 FROM posts WHERE post_id = ? OR sig = ?",
+                (post["post_id"], sig)).fetchone()
+        else:
+            exists = self.db.execute(
+                "SELECT 1 FROM posts WHERE post_id = ?", (post["post_id"],)).fetchone()
         if exists:
             return False
         self.db.execute(
             "INSERT INTO posts(post_id, page, url, created_ms, collected_ms, "
             " author_name, text, like_count, comment_count, share_count, "
-            " media_json, author_avatar, source_label, project_id) "
-            "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            " media_json, author_avatar, sig, source_label, project_id) "
+            "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
             (post["post_id"], post.get("page"), post.get("url"),
              post.get("created_ms"), int(time.time() * 1000),
              post.get("author_name"), post.get("text"),
              post.get("like_count"), post.get("comment_count"),
              post.get("share_count"),
              json.dumps(post.get("media") or []),
-             post.get("author_avatar"),
+             post.get("author_avatar"), sig,
              post.get("source_label") or post.get("page"),
              post.get("project_id")))
         return True

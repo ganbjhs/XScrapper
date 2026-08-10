@@ -98,16 +98,22 @@ hours. `user_medias` wants the numeric pk; validate sessions against the *feed*
 endpoint. The streamed-browser IG login is dead; cookie/password paths work.
 
 **Facebook.**
-- **Extract from the embedded JSON, not the visible DOM.** Facebook
-  server-renders every post into `<script type="application/json">` blobs (its
-  GraphQL/Relay store). The engine walks those and picks objects whose
-  `__typename === "Story"` — a stable discriminator that survives Facebook's
-  constant CSS/DOM reshuffles (visible-card selectors rotate every few weeks and
-  break; the JSON schema does not). This is where the profile picture, exact
-  post time, and reaction/comment/share counts come from. The old
-  `role="article"` DOM scrape is kept as an automatic fallback, and there is an
-  `mbasic.facebook.com` fallback beyond that — so a Facebook change degrades us,
-  never zeroes us.
+- **Read the data, not the layout. Three paths, best-first.** (1) Captured
+  **GraphQL** responses — when logged in, Facebook fetches the feed over
+  background `/graphql` requests rather than embedding it, so the engine
+  captures those response bodies and pulls posts out of them. (2) On-page
+  `<script type="application/json">` blobs (the logged-out case). (3) The old
+  `role="article"` **DOM** scrape, then `mbasic.facebook.com`. All the JSON
+  paths key on objects whose `__typename === "Story"` — a stable discriminator
+  that survives Facebook's CSS/DOM reshuffles (visible-card class names rotate
+  every few weeks; the story schema does not), and they carry the profile
+  picture, exact time, and reaction/comment/share counts the DOM can't give.
+  A Facebook change degrades us down the ladder, never to zero. The Fetch-now
+  log's `via www:gql|json|dom` says which path fed a run.
+- **Dedup on TWO keys.** A post is refused if its `post_id` was seen OR its
+  content signature (page + normalized caption) was — so the same post can't
+  slip in twice just because a different path handed it to us under a different
+  id scheme.
 - **Use a DESKTOP user-agent. Never switch it to mobile.** A mobile UA makes
   Facebook serve the "WebLite/Bloks" shell — post text and images render, but
   there is no post JSON and no `role="article"`, so BOTH extraction paths get

@@ -2105,6 +2105,38 @@ def test_facebook(tmp):
        "profile picture survives store → feed")
     ok(got["like_count"] == 33000 and got["created_at"],
        "reaction count and exact post time survive store → feed")
+
+    print()
+    print("== graphql parsing (logged-in feed data) ==")
+    sample = {"data": {"node": {"timeline_list_feed_units": {"edges": [{"node": {
+        "__typename": "Story", "post_id": "555", "creation_time": 1785000000,
+        "wwwURL": "https://www.facebook.com/narendramodi/posts/pfbidZZ",
+        "message": {"text": "Namaste India", "ranges": []},
+        "actors": [{"__typename": "Page", "name": "Narendra Modi",
+                    "profile_picture": {"uri": "https://cdn/modi.jpg"}}],
+        "attachments": [{"media": {"__typename": "Photo",
+                                   "image": {"uri": "https://cdn/pic1.jpg"}}}],
+        "feedback": {"reaction_count": {"count": 41000},
+                     "comment_rendering_instance": {"comments": {"total_count": 900}},
+                     "share_count": {"count": 700}},
+    }}]}}}}
+    gp = engine_fb._stories_from_graphql([json.dumps(sample)])
+    ok(len(gp) == 1 and gp[0]["id"] == "555", "a Story is pulled out of a graphql response")
+    ok(gp[0]["author"] == "Narendra Modi" and gp[0]["author_avatar"] == "https://cdn/modi.jpg",
+       "author name + profile picture come from the graphql payload")
+    ok(gp[0]["like_count"] == 41000 and gp[0]["media"][0]["url"] == "https://cdn/pic1.jpg",
+       "reaction count and media come from the graphql payload")
+
+    print()
+    print("== duplicate guard across id schemes ==")
+    a = {"post_id": "narendramodi:pfbidAAA", "page": "narendramodi",
+         "text": "One and the same caption here", "project_id": 7, "media": []}
+    b = {"post_id": "narendramodi:888888", "page": "narendramodi",
+         "text": "One and the same caption here", "project_id": 7, "media": []}
+    ok(st.upsert(a) is True, "first copy of a post saves")
+    ok(st.upsert(b) is False,
+       "the SAME post arriving with a different id is refused (content signature)")
+    st.db.commit()
     st.close()
 
 
