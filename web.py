@@ -2137,7 +2137,15 @@ def _fb_fetch(body):
         logs: list = []
         n = _run(run_once(str(rp), project_id=pid or None,
                           log=lambda m: logs.append(str(m))), timeout=240)
-        return {"ok": True, "new": n, "sources": len(srcs), "log": logs}
+        diag = None
+        try:
+            dp = _CFG.root / os.getenv("FB_DIAG_PATH", "fb_diag.json")
+            if dp.exists():
+                diag = json.loads(dp.read_text())
+        except Exception:
+            diag = None
+        return {"ok": True, "new": n, "sources": len(srcs), "log": logs,
+                "diag": diag}
     except Exception as e:
         return {"error": f"{type(e).__name__}: {e}"}
     finally:

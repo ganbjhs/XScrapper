@@ -24,6 +24,7 @@ The extractor is one function (`_EXTRACT_JS`) — the piece most likely to need 
 small tune after the first real run; everything else is stable.
 """
 
+import json
 import os
 import re
 import sqlite3
@@ -71,7 +72,27 @@ _EXTRACT_JS = r"""
     out.push({ id: idFrom(perma), author, permalink: perma,
                text: text.slice(0, 2000), media: [...new Set(imgs)].slice(0, 6) });
   }
-  return out;
+  // Diagnostics gathered from the SAME render, so if extraction returns nothing
+  // we still learn what the page held — surfaced in the "Fetch now" log, no
+  // terminal needed. Returned together so it can never be skipped.
+  const permaAll = [...document.querySelectorAll('a[href]')].map(a => a.href)
+    .filter(isPerma);
+  const roles = {};
+  for (const e of document.querySelectorAll('[role]')) {
+    const r = e.getAttribute('role'); roles[r] = (roles[r] || 0) + 1;
+  }
+  const diag = {
+    url: location.href,
+    title: document.title,
+    articles: document.querySelectorAll('[role="article"]').length,
+    feed: document.querySelectorAll('[role="feed"]').length,
+    permalinks: permaAll.length,
+    roles: roles,
+    sample: [...new Set(permaAll)].slice(0, 5),
+    body_head: (document.body ? document.body.innerText : "")
+      .replace(/\s+/g, " ").trim().slice(0, 240),
+  };
+  return { posts: out, diag };
 }
 """
 
@@ -268,7 +289,7 @@ class FacebookEngine:
             for _ in range(max(0, max_scroll)):
                 await self._page.evaluate("window.scrollBy(0, 2500)")
                 await self._page.wait_for_timeout(2500)
-            raw = await self._page.evaluate(_EXTRACT_JS)
+            res = await self._page.evaluate(_EXTRACT_JS)
         except Exception as e:
             self.log(f"[fb] fetch {handle} failed: {type(e).__name__}: {e}")
             _record_bytes(self.meter_db, self._bytes)
@@ -277,6 +298,9 @@ class FacebookEngine:
         # We reached the page logged in — refresh the saved session so its
         # cookies (and any rotated datr) carry to the next run.
         await self._save_state()
+
+        raw = res.get("posts", []) if isinstance(res, dict) else (res or [])
+        diag = res.get("diag") if isinstance(res, dict) else None
 
         posts = []
         for r in raw:
@@ -296,6 +320,25 @@ class FacebookEngine:
                 "media": [{"type": "photo", "url": u, "thumb": u} for u in r.get("media", [])],
             })
         self.log(f"[fb] {handle}: {len(posts)} posts, {self._bytes//1024} KB")
+        # Always surface what the page held — from the SAME render as extraction,
+        # so it can never be skipped. When 0 posts parse, this line is what tells
+        # us why. Also written to fb_diag.json for the button to read back.
+        if diag is not None:
+            diag["handle"] = handle
+            diag["parsed"] = len(posts)
+            diag["blocks"] = len(raw)
+            try:
+                with open(os.getenv("FB_DIAG_PATH", "fb_diag.json"), "w") as f:
+                    json.dump(diag, f)
+            except Exception:
+                pass
+            self.log(f"[fb] {handle}: diag — title={diag.get('title')!r} "
+                     f"articles={diag.get('articles')} feed={diag.get('feed')} "
+                     f"blocks={len(raw)} permalinks={diag.get('permalinks')} "
+                     f"roles={json.dumps(diag.get('roles'))}")
+            if diag.get("sample"):
+                self.log(f"[fb] {handle}: links={diag['sample']}")
+            self.log(f"[fb] {handle}: text={diag.get('body_head')!r}")
         return posts
 
 
