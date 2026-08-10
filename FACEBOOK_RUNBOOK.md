@@ -34,15 +34,17 @@ that account in a normal browser, then delete `fb_state.json` and re-run.
 
 ## Why a DESKTOP user-agent (do not change this)
 
-The engine uses a **desktop** Chrome user-agent on purpose. A **mobile** UA makes
-Facebook serve its "WebLite / Bloks" shell: the page shows the post text and
-images, but every post is a tap-to-open JavaScript button with **no permalink
-and no `role="article"`** — literally nothing to extract. The desktop site
-renders each post as a real `role="article"` with a real permalink link, which
-is what the extractor keys on. If Facebook ever changes layout again and posts
-stop parsing, the "Fetch now" log prints `all_links=` and `containers=` — those
-show the real DOM shape to tune against. The engine also falls back to
-`mbasic.facebook.com` (plain HTML) when the desktop render yields nothing.
+The engine reads each post from the **embedded JSON** Facebook ships in the page
+(matched by post type — layout-proof), and falls back to the visible
+`role="article"` DOM, then to `mbasic.facebook.com`, if that ever comes up
+empty. All of this needs the **desktop** Chrome user-agent: a **mobile** UA gets
+the "WebLite / Bloks" shell, which carries neither the post JSON nor real
+`role="article"` blocks — nothing to extract. Do not switch it to mobile.
+
+The JSON path also gives us the **profile picture, exact post time, and
+reaction/comment/share counts**. If posts ever stop parsing, the "Fetch now" log
+prints `json_stories=` / `json_posts=` (did the JSON have posts?) plus
+`all_links=` / `containers=` (the DOM shape) — enough to retune quickly.
 
 ## 2. Add pages in the dashboard
 

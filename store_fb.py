@@ -31,6 +31,7 @@ CREATE TABLE IF NOT EXISTS posts (
   comment_count INTEGER,
   share_count   INTEGER,
   media_json    TEXT,                       -- [{type,url,thumb}] — same as X/IG
+  author_avatar TEXT,                        -- the page's profile picture URL
   source_label  TEXT,
   project_id    INTEGER
 );
@@ -54,6 +55,7 @@ CREATE TABLE IF NOT EXISTS sources (
 # same additive-migration rule the X store follows.
 _MIGRATIONS = [
     ("sources", "interval_s", "ALTER TABLE sources ADD COLUMN interval_s INTEGER"),
+    ("posts", "author_avatar", "ALTER TABLE posts ADD COLUMN author_avatar TEXT"),
 ]
 
 
@@ -154,14 +156,15 @@ class Store:
         self.db.execute(
             "INSERT INTO posts(post_id, page, url, created_ms, collected_ms, "
             " author_name, text, like_count, comment_count, share_count, "
-            " media_json, source_label, project_id) "
-            "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            " media_json, author_avatar, source_label, project_id) "
+            "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
             (post["post_id"], post.get("page"), post.get("url"),
              post.get("created_ms"), int(time.time() * 1000),
              post.get("author_name"), post.get("text"),
              post.get("like_count"), post.get("comment_count"),
              post.get("share_count"),
              json.dumps(post.get("media") or []),
+             post.get("author_avatar"),
              post.get("source_label") or post.get("page"),
              post.get("project_id")))
         return True
@@ -209,6 +212,7 @@ def to_feed(row: dict) -> dict:
         "collected_at": collected,
         "author_username": row.get("page"),
         "author_display_name": row.get("author_name") or row.get("page"),
+        "author_avatar": row.get("author_avatar"),
         "media": media,
         "like_count": row.get("like_count"),
         "reply_count": row.get("comment_count"),

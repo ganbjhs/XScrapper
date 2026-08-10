@@ -98,12 +98,20 @@ hours. `user_medias` wants the numeric pk; validate sessions against the *feed*
 endpoint. The streamed-browser IG login is dead; cookie/password paths work.
 
 **Facebook.**
+- **Extract from the embedded JSON, not the visible DOM.** Facebook
+  server-renders every post into `<script type="application/json">` blobs (its
+  GraphQL/Relay store). The engine walks those and picks objects whose
+  `__typename === "Story"` — a stable discriminator that survives Facebook's
+  constant CSS/DOM reshuffles (visible-card selectors rotate every few weeks and
+  break; the JSON schema does not). This is where the profile picture, exact
+  post time, and reaction/comment/share counts come from. The old
+  `role="article"` DOM scrape is kept as an automatic fallback, and there is an
+  `mbasic.facebook.com` fallback beyond that — so a Facebook change degrades us,
+  never zeroes us.
 - **Use a DESKTOP user-agent. Never switch it to mobile.** A mobile UA makes
   Facebook serve the "WebLite/Bloks" shell — post text and images render, but
-  every post is a tap-to-open JS button with NO permalink and NO
-  `role="article"`, which is impossible to extract. The desktop site renders
-  real `role="article"` posts with real permalinks. There is an
-  `mbasic.facebook.com` fallback when the desktop render yields nothing.
+  there is no post JSON and no `role="article"`, so BOTH extraction paths get
+  nothing. The desktop site ships the JSON and the article DOM.
 - **Hold the session, don't replay borrowed cookies.** Log in with
   `FB_EMAIL`/`FB_PASSWORD` so the browser owns its own `datr`, and persist the
   whole session to `fb_state.json` for reuse. Replaying `xs` without a matching

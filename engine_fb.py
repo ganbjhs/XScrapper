@@ -40,10 +40,19 @@ DESKTOP_UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
               "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
 BLOCK = {"image", "media", "font"}
 
-# Extract candidate posts from the rendered mobile page. Facebook wraps each
-# post in role="article"; we read author, permalink, timestamp text, body, and
-# media image URLs (URLs only — bytes are blocked). Comments are dropped later
-# by keeping only articles that carry a post permalink.
+# Extract posts from the rendered page — two ways, best-first:
+#
+#   1. JSON (primary, layout-proof). Facebook server-renders every post's data
+#      into <script type="application/json"> blobs (its GraphQL/Relay store).
+#      We walk those blobs and pick objects whose __typename is "Story" — a
+#      STABLE discriminator that survives Facebook's constant CSS/DOM reshuffles
+#      (which is what breaks visible-DOM scrapers). From each Story we read id,
+#      permalink, exact time, text, author + PROFILE PICTURE, media, and the
+#      reaction/comment/share counts — none of which the visible DOM gives us
+#      reliably. This is how the commercial scrapers (Apify/Scrapfly) do it.
+#   2. DOM (fallback). role="article" blocks, kept for the case where the JSON
+#      shape shifts — so a Facebook change degrades us to the old behaviour
+#      instead of to zero.
 _EXTRACT_JS = r"""
 () => {
   // A stable id from a permalink. FB uses several shapes:
@@ -63,6 +72,92 @@ _EXTRACT_JS = r"""
   };
   const isPerma = (h) =>
     /\/posts\/|\/story|story_fbid=|\/videos\/|\/photos\/|\/permalink\/|\/reel\//.test(h);
+
+  // ---- generic JSON walkers (depth-capped so a huge blob can't hang) ----
+  const deepFind = (o, pred, d) => {
+    d = d || 0;
+    if (!o || typeof o !== 'object' || d > 14) return null;
+    if (pred(o)) return o;
+    if (Array.isArray(o)) { for (const x of o) { const r = deepFind(x, pred, d + 1); if (r) return r; } return null; }
+    for (const k in o) { const r = deepFind(o[k], pred, d + 1); if (r) return r; }
+    return null;
+  };
+  const deepAll = (o, pred, acc, d) => {
+    acc = acc || []; d = d || 0;
+    if (!o || typeof o !== 'object' || d > 14 || acc.length > 40) return acc;
+    if (pred(o)) acc.push(o);
+    if (Array.isArray(o)) { for (const x of o) deepAll(x, pred, acc, d + 1); return acc; }
+    for (const k in o) deepAll(o[k], pred, acc, d + 1);
+    return acc;
+  };
+
+  // ---- 1) JSON extraction ----
+  const stories = [];
+  const seen = new Set();
+  const collect = (o, d) => {
+    d = d || 0;
+    if (!o || typeof o !== 'object' || d > 16) return;
+    if (Array.isArray(o)) { for (const x of o) collect(x, d + 1); return; }
+    if (o.__typename === 'Story' && (o.post_id || o.creation_time || o.wwwURL || o.url)) {
+      const key = o.post_id || o.id || o.wwwURL || o.url;
+      if (!seen.has(key)) { seen.add(key); stories.push(o); }
+    }
+    for (const k in o) { const v = o[k]; if (v && typeof v === 'object') collect(v, d + 1); }
+  };
+  for (const s of document.querySelectorAll('script[type="application/json"]')) {
+    let data; try { data = JSON.parse(s.textContent); } catch (e) { continue; }
+    collect(data, 0);
+  }
+
+  const jsonPosts = [];
+  for (const st of stories) {
+    const id = st.post_id || st.id || null;
+    let perma = st.wwwURL || st.url || null;
+    if (!perma) { const u = deepFind(st, (o) => typeof o.url === 'string' && isPerma(o.url)); perma = u ? u.url : null; }
+    // message text: a node with a string .text and formatting ranges is the body
+    const msg = (st.message && typeof st.message.text === 'string')
+      ? st.message
+      : deepFind(st, (o) => o && typeof o.text === 'string' && Array.isArray(o.ranges));
+    const text = msg && msg.text ? msg.text : '';
+    // author + profile picture
+    const actor = (Array.isArray(st.actors) && st.actors[0])
+      ? st.actors[0]
+      : deepFind(st, (o) => o && (o.__typename === 'User' || o.__typename === 'Page') && o.name);
+    const author = actor ? (actor.name || null) : null;
+    const avatar = actor
+      ? ((actor.profile_picture && actor.profile_picture.uri) || actor.profile_picture_url || null)
+      : null;
+    const created_ms = st.creation_time ? st.creation_time * 1000 : null;
+    // media (URLs only)
+    const media = [];
+    for (const m of deepAll(st, (o) => o && (o.__typename === 'Photo' || o.__typename === 'Video' || o.__typename === 'GenericAttachmentMedia'))) {
+      if (m.__typename === 'Video' || m.playable_url || m.playable_url_quality_hd) {
+        const thumb = (m.preferred_thumbnail && m.preferred_thumbnail.image && m.preferred_thumbnail.image.uri) || (m.image && m.image.uri) || '';
+        const url = m.playable_url_quality_hd || m.playable_url || thumb;
+        if (url || thumb) media.push({ type: 'video', url: url || thumb, thumb: thumb || url });
+      } else {
+        const uri = (m.image && m.image.uri) || (m.photo_image && m.photo_image.uri) || (m.viewer_image && m.viewer_image.uri) || '';
+        if (uri) media.push({ type: 'photo', url: uri, thumb: uri });
+      }
+      if (media.length >= 6) break;
+    }
+    // reaction / comment / share counts
+    const fbk = deepFind(st, (o) => o && (o.reaction_count || o.i18n_reaction_count || o.comment_rendering_instance || o.share_count));
+    const likes = fbk && fbk.reaction_count ? fbk.reaction_count.count : null;
+    const comments = fbk
+      ? ((fbk.comment_rendering_instance && fbk.comment_rendering_instance.comments && fbk.comment_rendering_instance.comments.total_count) || fbk.total_comment_count || null)
+      : null;
+    const shares = fbk && fbk.share_count ? fbk.share_count.count : null;
+    if (!id && !perma) continue;
+    jsonPosts.push({
+      id: id ? String(id) : idFrom(perma),
+      author, author_avatar: avatar, permalink: perma,
+      text: (text || '').slice(0, 2000), created_ms, media,
+      like_count: likes, comment_count: comments, share_count: shares,
+    });
+  }
+
+  // ---- 2) DOM fallback ----
   const out = [];
   for (const a of document.querySelectorAll('[role="article"]')) {
     if (a.closest('[role="dialog"]')) continue;   // skip comment/reel popovers
@@ -115,6 +210,8 @@ _EXTRACT_JS = r"""
   const diag = {
     url: location.href,
     title: document.title,
+    json_stories: stories.length,
+    json_posts: jsonPosts.length,
     articles: document.querySelectorAll('[role="article"]').length,
     feed: document.querySelectorAll('[role="feed"]').length,
     permalinks: permaAll.length,
@@ -125,7 +222,7 @@ _EXTRACT_JS = r"""
     body_head: (document.body ? document.body.innerText : "")
       .replace(/\s+/g, " ").trim().slice(0, 240),
   };
-  return { posts: out, diag };
+  return { json_posts: jsonPosts, dom_posts: out, diag };
 }
 """
 
@@ -281,7 +378,32 @@ class FacebookEngine:
         self.log("[fb] logged in with password; session saved")
         return True
 
+    def _build_from_json(self, handle, items):
+        """Records from the JSON path — a real post_id is enough (no permalink
+        needed); synthesize a URL if Facebook didn't give one."""
+        posts = []
+        for r in items:
+            pid = r.get("id") or (r.get("permalink") and _fallback_id(r["permalink"]))
+            if not pid:
+                continue
+            url = r.get("permalink") or f"https://www.facebook.com/{handle}/posts/{pid}"
+            posts.append({
+                "post_id": f"{handle}:{pid}",
+                "page": handle,
+                "url": url,
+                "created_ms": r.get("created_ms"),
+                "author_name": r.get("author"),
+                "author_avatar": r.get("author_avatar"),
+                "text": r.get("text") or "",
+                "like_count": r.get("like_count"),
+                "comment_count": r.get("comment_count"),
+                "share_count": r.get("share_count"),
+                "media": r.get("media") or [],
+            })
+        return posts
+
     def _build_posts(self, handle, raw):
+        """Records from the DOM fallback — permalink required as the id source."""
         posts = []
         for r in raw:
             if not r.get("permalink"):      # drop comments / non-post articles
@@ -293,8 +415,9 @@ class FacebookEngine:
                 "post_id": f"{handle}:{pid}",
                 "page": handle,
                 "url": r["permalink"],
-                "created_ms": None,          # exact time filled later if available
+                "created_ms": None,          # DOM hides exact time
                 "author_name": r.get("author"),
+                "author_avatar": None,
                 "text": r.get("text") or "",
                 "like_count": None, "comment_count": None, "share_count": None,
                 "media": [{"type": "photo", "url": u, "thumb": u} for u in r.get("media", [])],
@@ -302,7 +425,8 @@ class FacebookEngine:
         return posts
 
     async def _attempt(self, url, handle, max_scroll, allow_login):
-        """One navigate+extract against a given URL. Returns (posts, diag)."""
+        """One navigate+extract. Returns (posts, diag, method) — JSON preferred,
+        DOM as the fallback within the same render."""
         await self._page.goto(url, wait_until="domcontentloaded", timeout=60000)
         await self._page.wait_for_timeout(2500)
         if allow_login and self._is_login_wall(self._page.url):
@@ -313,7 +437,7 @@ class FacebookEngine:
             if self._is_login_wall(self._page.url):
                 self.log(f"[fb] {handle}: NOT LOGGED IN — re-login failed. "
                          f"url={self._page.url}")
-                return [], None
+                return [], None, "none"
         try:
             await self._page.wait_for_selector('[role="article"]', timeout=20000)
         except Exception:
@@ -323,9 +447,13 @@ class FacebookEngine:
             await self._page.evaluate("window.scrollBy(0, 2500)")
             await self._page.wait_for_timeout(2500)
         res = await self._page.evaluate(_EXTRACT_JS)
-        raw = res.get("posts", []) if isinstance(res, dict) else (res or [])
-        diag = res.get("diag") if isinstance(res, dict) else None
-        return self._build_posts(handle, raw), diag
+        if not isinstance(res, dict):
+            return [], None, "none"
+        diag = res.get("diag")
+        jsonp = res.get("json_posts") or []
+        if jsonp:
+            return self._build_from_json(handle, jsonp), diag, "json"
+        return self._build_posts(handle, res.get("dom_posts") or []), diag, "dom"
 
     async def fetch_page(self, handle: str, max_scroll: int = 4) -> list:
         """
@@ -346,21 +474,21 @@ class FacebookEngine:
         self._bytes = 0
         posts, diag, source = [], None, "www"
         try:
-            posts, diag = await self._attempt(
+            posts, diag, method = await self._attempt(
                 f"https://www.facebook.com/{handle}", handle, max_scroll,
                 allow_login=True)
+            source = f"www:{method}"
         except Exception as e:
             self.log(f"[fb] fetch {handle} (www) failed: {type(e).__name__}: {e}")
 
         if not posts:
             # mbasic: no JavaScript, posts are plain <article> with story links.
-            source = "mbasic"
             try:
-                p2, d2 = await self._attempt(
+                p2, d2, m2 = await self._attempt(
                     f"https://mbasic.facebook.com/{handle}", handle,
                     max_scroll=2, allow_login=False)
                 if p2:
-                    posts, diag = p2, d2
+                    posts, diag, source = p2, d2, f"mbasic:{m2}"
                 elif d2 is not None:
                     diag = d2
             except Exception as e:
@@ -380,6 +508,8 @@ class FacebookEngine:
             except Exception:
                 pass
             self.log(f"[fb] {handle}: diag — title={diag.get('title')!r} "
+                     f"json_stories={diag.get('json_stories')} "
+                     f"json_posts={diag.get('json_posts')} "
                      f"articles={diag.get('articles')} feed={diag.get('feed')} "
                      f"permalinks={diag.get('permalinks')} "
                      f"roles={json.dumps(diag.get('roles'))}")

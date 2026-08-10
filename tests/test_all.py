@@ -2080,6 +2080,31 @@ def test_facebook(tmp):
     ok(any(store_fb.to_feed(r)["media"] and store_fb.to_feed(r)["media"][0].get("thumb")
            for r in st.recent(project_id=7)),
        "a Facebook video carries its thumbnail through to the feed/delivery shape")
+
+    print()
+    print("== JSON extraction path (layout-proof) ==")
+    eng = engine_fb.FacebookEngine()
+    items = [{
+        "id": "999", "author": "Narendra Modi",
+        "author_avatar": "https://scontent/pic.jpg", "permalink": None,
+        "text": "quit india", "created_ms": 1785000700000,
+        "media": [{"type": "photo", "url": "p.jpg", "thumb": "p.jpg"}],
+        "like_count": 33000, "comment_count": 2600, "share_count": 2500,
+    }]
+    built = eng._build_from_json("narendramodi", items)
+    ok(built[0]["post_id"] == "narendramodi:999", "a JSON post keys on its story id")
+    ok(built[0]["url"].endswith("/narendramodi/posts/999"),
+       "a missing permalink is synthesized from handle + id")
+    ok(built[0]["author_avatar"] == "https://scontent/pic.jpg",
+       "profile picture is carried from the JSON")
+    built[0]["project_id"] = 7
+    st.upsert(built[0]); st.db.commit()
+    row = [r for r in st.recent(project_id=7) if r["post_id"] == "narendramodi:999"][0]
+    got = store_fb.to_feed(row)
+    ok(got["author_avatar"] == "https://scontent/pic.jpg",
+       "profile picture survives store → feed")
+    ok(got["like_count"] == 33000 and got["created_at"],
+       "reaction count and exact post time survive store → feed")
     st.close()
 
 
