@@ -82,16 +82,19 @@ The organizing layer on top (all in `store.py` + `web.py`):
 | `api.py` | API-key service (hash-stored keys) serving Instagram posts to Watch-Tower |
 | `ig.py`, `ig_import.py`, `ig_login.py`, `ig_session.py` | Instagram session acquisition/persistence (cookie or password path; device pinned) |
 | `engine_ig.py`, `collect_ig.py`, `store_ig.py` | Instagram engine / poll loop / store (`ig_results.db`) |
+| `engine_fb.py`, `collect_fb.py`, `store_fb.py` | Facebook engine (desktop-UA headless render, password session, byte cap) / per-page scheduler / store (`fb_results.db`) |
+| `fb_debug.py` | Facebook page-structure diagnostic (standalone; also built into the Fetch-now log) |
 | `frontend/` | Vite + React SPA (source in `src/`, built `dist/` committed — the server never runs Node) |
 | `static/` | The classic dashboard's assets |
-| `deploy/` | VPS install: systemd units (`xscraper-web`, `xscraper-watch`), nginx, `setup.sh` (re-runnable) |
+| `deploy/` | VPS install: systemd units (`xscraper-web`, `xscraper-watch`, `xscraper-fb`), nginx, `setup.sh` (re-runnable) |
 | `tests/test_all.py` | The whole offline suite — no network, no budget spent. Run it after every change |
 | `tools/ig_probe.py` | Instagram session diagnostic |
 
 Data stores (all git-ignored, never commit): `accounts.db` (X sessions),
 `results.db` (tweets + organizing layer), `ig_accounts.db` / `ig_results.db`,
-`api_keys.db` (hashes only), `profiles/` (browser profiles + IG sidecars),
-`.env` (all secrets).
+`fb_results.db` (Facebook posts + project-scoped pages), `fb_state.json` (FB
+logged-in session), `fb_meter.db` (FB monthly bandwidth), `api_keys.db` (hashes
+only), `profiles/` (browser profiles + IG sidecars), `.env` (all secrets).
 
 ## 4. How data flows
 
@@ -218,13 +221,20 @@ signal. Health check: `/app` shows a green **Live** chip and no red banner.
 - Every change: `python3 tests/test_all.py` stays green, offline, and grows a
   test for the new behavior. The suite is the contract.
 
-**Parked roadmap** (build when asked, in this order of value): media
-archiving (local copies of media so deleted posts keep their evidence — cheap
-for thumbnails, opt-in per watchlist); DOCX rundown export for collections;
-promote-to-X-List browser automation; project-locked API keys (mandatory
-before a second API consumer); keyword alerts (same alert loop, LIKE-match on
-recent text); users & roles (editor vs viewer); Facebook (research spike
-only — no reliable free path known).
+**Done since first blueprint:** Facebook as a full third platform (desktop-UA
+render, password session, per-page intervals, server-IP + byte cap); keyword
+watchlists with AND; keyword-match highlighting in the feed; per-source Start/
+Pause and check intervals; the Refresh button fetching X and Facebook together.
 
-*History note: git history contains the retired docs this file replaced
-(PROJECT_CONTEXT.md, UI_REBUILD_PROMPT.md, UPGRADE_PLAN.md, DEPLOY_LIVE.md).*
+**Parked roadmap** (build when asked, in this order of value): media archiving
+(local copies of media so deleted posts keep their evidence — cheap for
+thumbnails, opt-in per watchlist); DOCX rundown export for collections;
+promote-to-X-List browser automation; project-locked API keys (mandatory before
+a second API consumer); keyword alerts (same alert loop, LIKE-match on recent
+text); users & roles (editor vs viewer); Facebook groups & keyword search
+(pages work today; groups/search are the next FB surfaces); pull-parity
+delivery view for IG/FB in the dashboard.
+
+*History note: git history contains the retired planning docs this file and the
+rulebook replaced (PROJECT_CONTEXT.md, UI_REBUILD_PROMPT.md, UPGRADE_PLAN.md,
+DEPLOY_LIVE.md, FACEBOOK_PLAN.md).*

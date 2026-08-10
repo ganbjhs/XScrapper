@@ -2,7 +2,7 @@
 engine_fb.py — fetch a Facebook page's newest posts via ONE warm headless
 browser, logged in with a burner session.
 
-Design settled this session (see FACEBOOK_PLAN.md):
+Design settled (see RULEBOOK.md §6 Facebook, and FACEBOOK_RUNBOOK.md):
   * runs from the SERVER's own IP by default (FB_USE_PROXY=0) — the VPS has
     4 TB, so Facebook does not touch the small residential pool;
   * a mobile user-agent — the mobile layout is lighter and its posts sit in

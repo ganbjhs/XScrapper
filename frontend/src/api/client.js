@@ -66,6 +66,10 @@ export const api = {
     request("/api/fb/source", { method: "POST", body: { project, label, action: "add" } }),
   fbRemoveSource: (label) =>
     request("/api/fb/source", { method: "POST", body: { label, action: "remove" } }),
+  fbSetInterval: (label, speed) =>
+    request("/api/fb/source", { method: "POST", body: { label, action: "interval", speed } }),
+  fbSetEnabled: (label, enabled) =>
+    request("/api/fb/source", { method: "POST", body: { label, action: "enable", enabled } }),
   fbFetch: (project) =>
     request("/api/fb/fetch", { method: "POST", body: { project } }),
 

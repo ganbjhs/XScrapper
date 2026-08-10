@@ -2049,7 +2049,13 @@ def _fb_status(q=None):
         try:
             import store_fb
             with store_fb.Store(rp) as st:
-                out["sources"] = st.sources(project_id=pid or None)
+                srcs = st.sources(project_id=pid or None)
+                # Map each page's stored interval back to the named speed the
+                # panel offers, so re-opening shows what is actually set.
+                inv = {v: k for k, v in FB_SPEEDS.items()}
+                for s in srcs:
+                    s["speed"] = inv.get(s.get("interval_s"), "")
+                out["sources"] = srcs
                 out["totals"] = {"posts": st.total(pid or None)}
         except Exception as e:
             out["error"] = f"{type(e).__name__}: {e}"
@@ -2075,8 +2081,14 @@ def _fb_posts(q):
     return {"count": len(rows), "posts": [store_fb.to_feed(r) for r in rows]}
 
 
+# The named check-cadences a Facebook page can be set to, seconds. Hours, not
+# minutes: pages post a few times a day and the browser render is heavy, so a
+# tighter cadence would spend bandwidth for nothing.
+FB_SPEEDS = {"1h": 3600, "3h": 10800, "6h": 21600, "12h": 43200, "24h": 86400}
+
+
 def _fb_source_post(body):
-    """Add or remove a Facebook page source for a project."""
+    """Add, remove, re-time, or pause/resume a Facebook page source."""
     import store_fb
     action = body.get("action") or "add"
     label = re.sub(r"[^A-Za-z0-9_.-]", "", str(body.get("label") or "")).strip(".")
@@ -2091,6 +2103,15 @@ def _fb_source_post(body):
         if action == "remove":
             st.remove_source(label)
             return {"ok": True, "removed": label}
+        if action == "interval":
+            speed = str(body.get("speed") or "")
+            if speed and speed not in FB_SPEEDS:
+                return {"error": f"speed must be one of: {', '.join(FB_SPEEDS)}"}
+            st.set_interval(label, FB_SPEEDS.get(speed))   # "" clears → default
+            return {"ok": True, "label": label, "speed": speed}
+        if action == "enable":
+            st.set_enabled(label, bool(body.get("enabled")))
+            return {"ok": True, "label": label, "enabled": bool(body.get("enabled"))}
         st.add_source(label, project_id=pid)
     return {"ok": True, "label": label}
 

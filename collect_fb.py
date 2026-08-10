@@ -91,6 +91,41 @@ async def run_once(store_path="fb_results.db", *, max_scroll=4,
         st.close()
 
 
+async def run_due(store_path="fb_results.db", *, default_interval=21600,
+                  max_scroll=4, log=print) -> int:
+    """
+    One scheduler tick: collect only the pages whose own interval has elapsed
+    since their last run (falling back to the default). This is what the --loop
+    service calls, so each page keeps its OWN cadence — the Facebook twin of the
+    per-watchlist "check every" on the X side. Opens the browser only when at
+    least one page is actually due, so idle ticks cost nothing.
+    """
+    from engine_fb import FacebookEngine
+
+    st = store_fb.Store(store_path).open()
+    try:
+        now = int(time.time())
+        due = [s for s in st.sources(enabled_only=True)
+               if now - (s.get("last_run") or 0) >= (s.get("interval_s") or default_interval)]
+        if not due:
+            return 0
+        if not _can_log_in():
+            log("[fb] no Facebook login available — set FB_C_USER/FB_XS or "
+                "FB_EMAIL/FB_PASSWORD in .env")
+            return 0
+        log(f"[fb] {len(due)} page(s) due")
+        total = 0
+        async with FacebookEngine(log=log) as eng:
+            for s in due:
+                try:
+                    total += await collect_source(eng, st, s, max_scroll=max_scroll, log=log)
+                except Exception as e:
+                    log(f"[fb] {s['label']} error: {type(e).__name__}: {e}")
+        return total
+    finally:
+        st.close()
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description="Collect Facebook page posts")
     ap.add_argument("--store", default="fb_results.db")
@@ -105,8 +140,15 @@ def main() -> int:
 
     rn = sub.add_parser("run")
     rn.add_argument("--loop", action="store_true")
-    rn.add_argument("--every", type=int, default=int(os.getenv("FB_INTERVAL_S", "21600")))
+    rn.add_argument("--every", type=int, default=int(os.getenv("FB_INTERVAL_S", "21600")),
+                    help="default cadence for pages with no per-page interval")
+    rn.add_argument("--tick", type=int, default=int(os.getenv("FB_TICK_S", "300")),
+                    help="how often the loop re-checks which pages are due")
     rn.add_argument("--scroll", type=int, default=4)
+
+    i = sub.add_parser("interval")
+    i.add_argument("label")
+    i.add_argument("seconds", type=int, help="0 clears the per-page override")
 
     args = ap.parse_args()
 
@@ -126,14 +168,27 @@ def main() -> int:
             st.remove_source(args.label)
         print(f"removed {args.label}")
         return 0
+    if args.cmd == "interval":
+        with store_fb.Store(args.store) as st:
+            st.set_interval(args.label, args.seconds)
+        print(f"{args.label}: check every "
+              f"{args.seconds}s" if args.seconds else f"{args.label}: interval cleared")
+        return 0
     if args.cmd == "run":
+        if not args.loop:
+            # One-shot: collect everything enabled, right now (ignores per-page
+            # cadence) — this is what the dashboard "Fetch now" button wants too.
+            n = asyncio.run(run_once(args.store, max_scroll=args.scroll))
+            print(f"[fb] pass complete: {n} new")
+            return 0
+
         async def loop():
+            # Per-page scheduler: wake on a short tick, collect only pages whose
+            # own interval has elapsed. Each page keeps its own cadence.
             while True:
-                n = await run_once(args.store, max_scroll=args.scroll)
-                print(f"[fb] pass complete: {n} new")
-                if not args.loop:
-                    return
-                await asyncio.sleep(max(60, args.every))
+                await run_due(args.store, default_interval=args.every,
+                              max_scroll=args.scroll)
+                await asyncio.sleep(max(60, args.tick))
         asyncio.run(loop())
         return 0
     return 1

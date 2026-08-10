@@ -44,9 +44,17 @@ CREATE TABLE IF NOT EXISTS sources (
   enabled        INTEGER NOT NULL DEFAULT 1,
   watermark_ms   INTEGER,                   -- newest posted-time seen; stop here
   last_run       INTEGER,
+  interval_s     INTEGER,                   -- per-page check cadence; NULL = default
   created_at     INTEGER NOT NULL
 );
 """
+
+# Columns added after the first release. Applied on open() so an existing
+# fb_results.db upgrades in place instead of erroring on a missing column —
+# same additive-migration rule the X store follows.
+_MIGRATIONS = [
+    ("sources", "interval_s", "ALTER TABLE sources ADD COLUMN interval_s INTEGER"),
+]
 
 
 @dataclass
@@ -65,6 +73,12 @@ class Store:
         self.db = sqlite3.connect(self.path, timeout=10)
         self.db.row_factory = sqlite3.Row
         self.db.executescript(SCHEMA)
+        # Additive migrations for databases created before a column existed.
+        for table, col, ddl in _MIGRATIONS:
+            cols = {r["name"] for r in self.db.execute(f"PRAGMA table_info({table})")}
+            if col not in cols:
+                self.db.execute(ddl)
+        self.db.commit()
         return self
 
     def close(self):
@@ -91,6 +105,18 @@ class Store:
 
     def remove_source(self, label):
         self.db.execute("DELETE FROM sources WHERE label = ?", (label,))
+        self.db.commit()
+
+    def set_interval(self, label, seconds):
+        """Per-page check cadence in seconds; None clears it (use the default)."""
+        self.db.execute("UPDATE sources SET interval_s = ? WHERE label = ?",
+                        (int(seconds) if seconds else None, label))
+        self.db.commit()
+
+    def set_enabled(self, label, enabled):
+        """Pause (0) or resume (1) a page without losing what it collected."""
+        self.db.execute("UPDATE sources SET enabled = ? WHERE label = ?",
+                        (int(bool(enabled)), label))
         self.db.commit()
 
     def sources(self, project_id=None, enabled_only=False):

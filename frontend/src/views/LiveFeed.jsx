@@ -100,9 +100,20 @@ export default function LiveFeed({ onMenu }) {
     if (!pid || fetching) return;
     setFetching(true);
     setFetchMsg("");
+    // Facebook runs a headless browser and takes ~a minute, so kick it off in
+    // the BACKGROUND — don't make the fast X refresh wait on it. When it lands,
+    // reload the feed and note how many Facebook posts arrived.
+    api.fbFetch(pid)
+      .then((fr) => {
+        if (fr && fr.new > 0) {
+          setFetchMsg(`✓ ${fr.new} new from Facebook`);
+          feed.reload(true);
+        }
+      })
+      .catch(() => { /* FB may be mid-run or unconfigured — never block X */ });
     try {
       const r = await api.projectFetch(pid, ack);
-      setFetchMsg(`✓ ${r.new} new post${r.new === 1 ? "" : "s"} fetched`);
+      setFetchMsg(`✓ ${r.new} new from X · checking Facebook…`);
       feed.reload(true);
       metrics.reload(true);
     } catch (e) {

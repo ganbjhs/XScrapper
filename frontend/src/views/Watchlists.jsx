@@ -1,7 +1,7 @@
 // Watchlist management: create (query- or X-List-backed), add/remove handles,
 // see the compiled streams, delete. Everything talks to the Phase 1 endpoints.
 import React, { useState } from "react";
-import { api, fmtN, useApi } from "../api/client.js";
+import { api, fmtAgo, fmtN, useApi } from "../api/client.js";
 import { PageHead, useProject } from "../App.jsx";
 import { Empty, ErrorState, Loading, Modal } from "../components/ui.jsx";
 
@@ -394,6 +394,10 @@ function StreamsManager({ pid }) {
   );
 }
 
+// Must match FB_SPEEDS in web.py — the named cadences a page can be checked at.
+const FB_SPEEDS = { "1h": "1 hour", "3h": "3 hours", "6h": "6 hours",
+                    "12h": "12 hours", "24h": "24 hours" };
+
 function FacebookSources({ pid }) {
   const { data, error, reload } = useApi(() => api.fbStatus(pid), [pid]);
   const [adding, setAdding] = useState("");
@@ -467,11 +471,34 @@ function FacebookSources({ pid }) {
       )}
       <div style={{ margin: "8px 0 4px" }}>
         {sources.map((s) => (
-          <span className="tag" key={s.label}>
-            {s.label}
-            <button aria-label={`remove ${s.label}`}
-                    onClick={async () => { await api.fbRemoveSource(s.label); reload(); }}>✕</button>
-          </span>
+          <div className="wl-row" key={s.label}
+               style={{ opacity: s.enabled ? 1 : 0.55 }}>
+            <div className="who">
+              <b>{s.label}{!s.enabled && " (paused)"}</b>
+              <small>
+                {fmtN(s.posts)} collected ·{" "}
+                {s.last_run ? `checked ${fmtAgo(s.last_run * 1000)}` : "not checked yet"}
+              </small>
+            </div>
+            <div className="right" style={{ display: "flex", gap: 6, alignItems: "center" }}>
+              <label className="fpill" title="how often this page is checked">
+                <span>every</span>
+                <select value={s.speed || ""}
+                        onChange={async (e) => { await api.fbSetInterval(s.label, e.target.value); reload(); }}>
+                  <option value="">default (6h)</option>
+                  {Object.entries(FB_SPEEDS).map(([v, t]) => (
+                    <option key={v} value={v}>{t}</option>
+                  ))}
+                </select>
+              </label>
+              <button className="btn btn-ghost btn-sm"
+                      onClick={async () => { await api.fbSetEnabled(s.label, !s.enabled); reload(); }}>
+                {s.enabled ? "Pause" : "Resume"}
+              </button>
+              <button className="btn btn-ghost btn-sm" aria-label={`remove ${s.label}`}
+                      onClick={async () => { await api.fbRemoveSource(s.label); reload(); }}>Remove</button>
+            </div>
+          </div>
         ))}
         {sources.length === 0 && (
           <span style={{ color: "var(--ink-3)", fontSize: 13 }}>
