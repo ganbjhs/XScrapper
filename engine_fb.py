@@ -121,11 +121,21 @@ class FacebookEngine:
         self._ctx = await self._browser.new_context(
             user_agent=MOBILE_UA, viewport={"width": 412, "height": 2400},
             locale="en-US")
-        await self._ctx.add_cookies([
+        # c_user + xs are the session; datr is the browser/device fingerprint
+        # Facebook ties the session to. Replaying xs WITHOUT datr makes Facebook
+        # treat it as a hijacked session and log it out — so datr is important
+        # for the session to survive. sb is a secondary device cookie if present.
+        cookies = [
             {"name": "c_user", "value": os.getenv("FB_C_USER", ""),
              "domain": ".facebook.com", "path": "/"},
             {"name": "xs", "value": os.getenv("FB_XS", ""),
-             "domain": ".facebook.com", "path": "/"}])
+             "domain": ".facebook.com", "path": "/"}]
+        for name, env in (("datr", "FB_DATR"), ("sb", "FB_SB")):
+            val = os.getenv(env, "")
+            if val:
+                cookies.append({"name": name, "value": val,
+                                "domain": ".facebook.com", "path": "/"})
+        await self._ctx.add_cookies(cookies)
 
         async def route(r):
             await (r.abort() if r.request.resource_type in BLOCK else r.continue_())
@@ -173,6 +183,14 @@ class FacebookEngine:
             except Exception:
                 pass
             await self._page.wait_for_timeout(3000)
+            # If Facebook bounced us to a login/checkpoint wall, the session is
+            # dead — say so plainly instead of silently returning 0 posts.
+            cur = self._page.url
+            if "login" in cur or "/?next=" in cur or "checkpoint" in cur:
+                self.log(f"[fb] {handle}: NOT LOGGED IN — session expired "
+                         f"(refresh FB_XS + FB_DATR in .env). url={cur}")
+                _record_bytes(self.meter_db, self._bytes)
+                return []
             # Scroll with JS, not the mouse wheel — a wheel event over a reel
             # thumbnail hover-opens a reel dialog and hijacks the extraction.
             for _ in range(max(0, max_scroll)):

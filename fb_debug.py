@@ -88,11 +88,17 @@ async def probe(url, label):
         ctx = await browser.new_context(
             user_agent=MOBILE_UA, viewport={"width": 412, "height": 2400},
             locale="en-US")
-        await ctx.add_cookies([
+        ck = [
             {"name": "c_user", "value": os.getenv("FB_C_USER", ""),
              "domain": ".facebook.com", "path": "/"},
             {"name": "xs", "value": os.getenv("FB_XS", ""),
-             "domain": ".facebook.com", "path": "/"}])
+             "domain": ".facebook.com", "path": "/"}]
+        for nm, ev in (("datr", "FB_DATR"), ("sb", "FB_SB")):
+            v = os.getenv(ev, "")
+            if v:
+                ck.append({"name": nm, "value": v,
+                           "domain": ".facebook.com", "path": "/"})
+        await ctx.add_cookies(ck)
         page = await ctx.new_page()
         print(f"\n===== {label}: {url} =====")
         try:
