@@ -156,9 +156,17 @@ export default function LiveFeed({ onMenu }) {
   // repeats the rule locally so live arrivals obey it too).
   const filtered = useMemo(() => {
     const cutoff = flt.dur !== "all" ? Date.now() - DUR_MS[flt.dur] : 0;
+    // Some sources (Facebook) don't expose an exact post time, so created_at is
+    // null. Fall back to collected time for the window test, and if even that
+    // won't parse, keep the post rather than silently hiding it — a just-
+    // collected post must never vanish from a recent-window view.
+    const inWindow = (t) => {
+      if (!cutoff) return true;
+      const v = Date.parse(t.created_at || t.collected_at || "");
+      return Number.isNaN(v) ? true : v >= cutoff;
+    };
     const out = latest.filter((t) =>
-      (flt.source === "all" || t.platform === flt.source) &&
-      (!cutoff || Date.parse(t.created_at || 0) >= cutoff));
+      (flt.source === "all" || t.platform === flt.source) && inWindow(t));
     const by = {
       latest: (a, b) => Date.parse(b.collected_at || 0) - Date.parse(a.collected_at || 0),
       oldest: (a, b) => Date.parse(a.collected_at || 0) - Date.parse(b.collected_at || 0),
@@ -194,6 +202,22 @@ export default function LiveFeed({ onMenu }) {
     await api.setCollection(!paused);
     status.reload(true);
   };
+  // Every term from this project's KEYWORD watchlists, so the feed can
+  // underline where each keyword-search hit actually matched. "a AND b" is two
+  // terms; surrounding quotes are stripped so a phrase highlights as the phrase.
+  const keywordTerms = useMemo(() => {
+    const set = new Set();
+    for (const w of wls.data?.watchlists || []) {
+      if (w.kind !== "keywords") continue;
+      for (const m of w.members || []) {
+        for (const piece of String(m.handle || "").split(/\s+AND\s+/i)) {
+          const term = piece.trim().replace(/^["']+|["']+$/g, "").trim();
+          if (term.length >= 2) set.add(term);
+        }
+      }
+    }
+    return [...set];
+  }, [wls.data]);
   const wlCount = wls.data?.watchlists?.length ?? 0;
   const handleCount = (wls.data?.watchlists || []).reduce((a, w) => a + w.members.length, 0);
   const wtTargets = (delivery.data?.targets || []).filter((t) => t.kind === "webhook");
@@ -339,7 +363,8 @@ export default function LiveFeed({ onMenu }) {
             )
           )}
           {visible.map((t) => (
-            <PostCard key={`${t.platform}:${t.tweet_id}`} t={t} onPin={setPinTarget} />
+            <PostCard key={`${t.platform}:${t.tweet_id}`} t={t}
+                      onPin={setPinTarget} terms={keywordTerms} />
           ))}
           {pinTarget && pid && (
             <CollectionPicker t={pinTarget} pid={pid} onClose={() => setPinTarget(null)} />

@@ -32,14 +32,33 @@ function Media({ media }) {
   );
 }
 
-// Turn bare URLs in tweet text into links; everything else stays text.
-function withLinks(text) {
+// Highlight any matched keyword terms inside a plain-text run. Split on the
+// terms (one capturing group, so matches land on odd indices) and wrap those
+// in <mark> — underlined + tinted via .kw in styles.css, so a keyword-search
+// hit is verifiable at a glance.
+function highlightTerms(text, terms, keyBase) {
+  if (!terms || terms.length === 0) return text;
+  const esc = terms
+    .map((t) => String(t).trim().replace(/[.*+?^${}()|[\]\\]/g, "\\$&"))
+    .filter(Boolean);
+  if (esc.length === 0) return text;
+  const re = new RegExp(`(${esc.join("|")})`, "gi");
+  return String(text).split(re).map((p, j) =>
+    p === "" ? null
+      : j % 2 === 1
+        ? <mark key={`${keyBase}-${j}`} className="kw">{p}</mark>
+        : p,
+  );
+}
+
+// Turn bare URLs into links, and highlight keyword-search terms in the rest.
+function withLinks(text, terms) {
   const parts = String(text || "").split(/(https?:\/\/\S+)/g);
   return parts.map((p, i) =>
     /^https?:\/\//.test(p) ? (
       <a key={i} href={p} target="_blank" rel="noreferrer">{p}</a>
     ) : (
-      p
+      highlightTerms(p, terms, i)
     ),
   );
 }
@@ -59,7 +78,7 @@ function Pfp({ t, name }) {
   );
 }
 
-export default function PostCard({ t, onPin, onUnpin }) {
+export default function PostCard({ t, onPin, onUnpin, terms }) {
   const name = t.author_display_name || t.author_username || "unknown";
   const media = t.media || [];
   return (
@@ -80,7 +99,7 @@ export default function PostCard({ t, onPin, onUnpin }) {
           )}
           {t.is_retweet ? <span className="badge rt">RT</span> : null}
         </div>
-        <p className="ctext">{withLinks(t.text)}</p>
+        <p className="ctext">{withLinks(t.text, terms)}</p>
         <div className="cwl">
           {t.streams?.length ? `Stream: ${t.streams.join(", ")} · ` : ""}
           collected {fmtAgo(t.collected_at)} · posted {fmtAgo(t.created_at)}

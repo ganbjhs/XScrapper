@@ -193,6 +193,19 @@ header.top .grow { flex: 1; }
 .badge.rt { background: var(--brand-softer); color: var(--ink-3); border: 1px solid var(--ring); font-weight: 600; }
 .ctext { margin: 10px 0 4px; line-height: 1.55; font-size: 14.5px; overflow-wrap: anywhere; white-space: pre-wrap; }
 .ctext a { color: var(--series-1); text-decoration: none; }
+/* A matched keyword-search term: tinted + underlined so a hit is verifiable
+   at a glance. */
+.ctext mark.kw {
+  background: color-mix(in srgb, var(--warning) 30%, transparent);
+  color: inherit;
+  border-radius: 3px;
+  padding: 0 1px;
+  text-decoration: underline;
+  text-decoration-color: var(--warning);
+  text-decoration-thickness: 2px;
+  text-underline-offset: 2px;
+  font-weight: 600;
+}
 .cwl { color: var(--ink-3); font-size: 12px; margin-top: 2px; }
 .cstats { display: flex; gap: 18px; color: var(--ink-3); font-size: 12.5px; margin-top: 10px; flex-wrap: wrap; }
 .cactions { display: flex; gap: 6px; margin-top: 12px; border-top: 1px solid var(--ring); padding-top: 10px; flex-wrap: wrap; }
