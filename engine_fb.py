@@ -476,9 +476,10 @@ class FacebookEngine:
             # Capture the graphql responses that actually carry posts — this is
             # where a logged-in session's feed data lives (not in the page).
             try:
-                if "/graphql" in resp.url and self._gql_bytes < 12_000_000:
+                if "/graphql" in resp.url and self._gql_bytes < 14_000_000:
                     body = await resp.text()
-                    if '"__typename":"Story"' in body or '"post_id"' in body:
+                    if ("post_id" in body or "Story" in body
+                            or "creation_time" in body):
                         self._gql.append(body)
                         self._gql_bytes += len(body)
             except Exception:
@@ -612,9 +613,13 @@ class FacebookEngine:
         except Exception:
             pass
         await self._page.wait_for_timeout(2000)
+        # Scroll to the bottom repeatedly: the first few posts are server-
+        # rendered, but "load more" (which fires the graphql feed request we
+        # capture) only triggers once you reach the end of what's loaded.
         for _ in range(max(0, max_scroll)):
-            await self._page.evaluate("window.scrollBy(0, 2500)")
-            await self._page.wait_for_timeout(2500)
+            await self._page.evaluate(
+                "window.scrollTo(0, document.body.scrollHeight)")
+            await self._page.wait_for_timeout(3000)
         res = await self._page.evaluate(_EXTRACT_JS)
         if not isinstance(res, dict):
             res = {}
@@ -632,7 +637,7 @@ class FacebookEngine:
         # 3) DOM fallback
         return self._build_posts(handle, res.get("dom_posts") or []), diag, "dom"
 
-    async def fetch_page(self, handle: str, max_scroll: int = 4) -> list:
+    async def fetch_page(self, handle: str, max_scroll: int = 8) -> list:
         """
         Newest posts of one Facebook page, as normalized records. Refuses if the
         monthly byte cap is spent (returns [] and logs), so it can never overrun.
