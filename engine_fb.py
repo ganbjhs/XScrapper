@@ -124,6 +124,7 @@ _EXTRACT_JS = r"""
       ? st.actors[0]
       : deepFind(st, (o) => o && (o.__typename === 'User' || o.__typename === 'Page') && o.name);
     const author = actor ? (actor.name || null) : null;
+    const author_url = actor ? (actor.url || null) : null;
     const avatar = actor
       ? ((actor.profile_picture && actor.profile_picture.uri) || actor.profile_picture_url || null)
       : null;
@@ -151,7 +152,7 @@ _EXTRACT_JS = r"""
     if (!id && !perma) continue;
     jsonPosts.push({
       id: id ? String(id) : idFrom(perma),
-      author, author_avatar: avatar, permalink: perma,
+      author, author_url, author_avatar: avatar, permalink: perma,
       text: (text || '').slice(0, 2000), created_ms, media,
       like_count: likes, comment_count: comments, share_count: shares,
     });
@@ -165,12 +166,13 @@ _EXTRACT_JS = r"""
     const perma = links.find(isPerma) || null;
     const head = a.querySelector('h2 a, h3 a, h4 a, strong a, a[aria-label]');
     const author = head ? head.innerText.trim() : null;
+    const author_url = head ? head.href : null;
     const bodies = [...a.querySelectorAll('div[dir="auto"]')]
       .map(d => d.innerText.trim()).filter(Boolean);
     const text = bodies.sort((x, y) => y.length - x.length)[0] || "";
     const imgs = [...a.querySelectorAll('img')].map(i => i.src)
       .filter(s => /scontent|fbcdn/.test(s) && !/s32x32|s40x40|p32x32|p24x24/.test(s));
-    out.push({ id: idFrom(perma), author, permalink: perma,
+    out.push({ id: idFrom(perma), author, author_url, permalink: perma,
                text: text.slice(0, 2000), media: [...new Set(imgs)].slice(0, 6) });
   }
   // Diagnostics gathered from the SAME render, so if extraction returns nothing
@@ -244,6 +246,22 @@ _PERMA_RE = re.compile(
 
 def _is_perma(h) -> bool:
     return bool(h and _PERMA_RE.search(h))
+
+
+def _handle_from_url(u):
+    """The page handle from a profile URL — 'narendramodi' from
+    facebook.com/narendramodi, or the numeric id from a profile.php?id= link.
+    This is how a post in a mixed feed is attributed back to its page."""
+    if not u:
+        return None
+    m = re.search(r"facebook\.com/([^/?#]+)", u)
+    if not m:
+        return None
+    seg = m.group(1)
+    if seg in ("profile.php", "people", "pages", "groups", "watch", "reel"):
+        m2 = re.search(r"[?&]id=(\d+)", u)
+        return m2.group(1) if m2 else None
+    return seg or None
 
 
 def _iter_json_objects(blob: str):
@@ -337,9 +355,12 @@ def _story_to_post(st: dict):
         _deep_find(st, lambda o: o.get("__typename") in ("User", "Page") and o.get("name"))
     author = actor.get("name") if actor else None
     avatar = None
+    author_handle = None
     if actor:
         pp = actor.get("profile_picture")
         avatar = (pp.get("uri") if isinstance(pp, dict) else None) or actor.get("profile_picture_url")
+        author_handle = actor.get("username") or _handle_from_url(actor.get("url")) \
+            or (str(actor.get("id")) if actor.get("id") else None)
     created_ms = st["creation_time"] * 1000 if st.get("creation_time") else None
     media = []
     for m in _deep_all(st, lambda o: o.get("__typename") in ("Photo", "Video", "GenericAttachmentMedia")):
@@ -364,7 +385,8 @@ def _story_to_post(st: dict):
         comments = (cri.get("comments") or {}).get("total_count") or fbk.get("total_comment_count")
     shares = (fbk.get("share_count") or {}).get("count") if fbk else None
     return {"id": str(pid) if pid else _fallback_id(perma), "author": author,
-            "author_avatar": avatar, "permalink": perma, "text": text[:2000],
+            "author_handle": author_handle, "author_avatar": avatar,
+            "permalink": perma, "text": text[:2000],
             "created_ms": created_ms, "media": media,
             "like_count": likes, "comment_count": comments, "share_count": shares}
 
@@ -570,6 +592,40 @@ class FacebookEngine:
             })
         return posts
 
+    def _build_feed(self, items):
+        """Records from a MIXED feed (Favorites) — each post is attributed to
+        its OWN author page, not a single handle. Media is normalized whether it
+        arrived as {type,url,thumb} dicts (JSON paths) or bare url strings (DOM)."""
+        posts = []
+        for r in items:
+            h = r.get("author_handle") or _handle_from_url(r.get("author_url"))
+            if not h:
+                continue
+            pid = r.get("id") or (r.get("permalink") and _fallback_id(r["permalink"]))
+            if not pid:
+                continue
+            media = []
+            for m in (r.get("media") or []):
+                if isinstance(m, str):
+                    media.append({"type": "photo", "url": m, "thumb": m})
+                elif isinstance(m, dict):
+                    media.append(m)
+            url = r.get("permalink") or f"https://www.facebook.com/{h}/posts/{pid}"
+            posts.append({
+                "post_id": f"{h}:{pid}",
+                "page": h,
+                "url": url,
+                "created_ms": r.get("created_ms"),
+                "author_name": r.get("author"),
+                "author_avatar": r.get("author_avatar"),
+                "text": r.get("text") or "",
+                "like_count": r.get("like_count"),
+                "comment_count": r.get("comment_count"),
+                "share_count": r.get("share_count"),
+                "media": media[:6],
+            })
+        return posts
+
     def _build_posts(self, handle, raw):
         """Records from the DOM fallback — permalink required as the id source."""
         posts = []
@@ -702,6 +758,84 @@ class FacebookEngine:
                          json.dumps(diag.get("all_links"))[:1600])
                 self.log("[fb] containers=" +
                          json.dumps(diag.get("containers"))[:1800])
+        return posts
+
+    async def fetch_favorites(self, max_scroll: int = 12) -> list:
+        """
+        Read the account's FAVORITES feed — a single real news feed of every
+        page the account has favorited. Because it is a genuine feed (not a page
+        profile), it infinite-scrolls and fires the graphql calls we capture, so
+        this is the path that yields the rich data. Each post is attributed back
+        to its own author page, so downstream can scope it to whichever project
+        tracks that page. Returns records for ALL authors in the feed.
+        """
+        ok, used = _bandwidth_ok(self.meter_db, self.cap_bytes)
+        if not ok:
+            self.log(f"[fb] monthly bandwidth cap reached ({used/1e9:.1f} GB) — "
+                     f"skipping favorites")
+            return []
+
+        self._bytes = 0
+        self._gql = []
+        self._gql_bytes = 0
+        url = os.getenv("FB_FAVORITES_URL",
+                        "https://www.facebook.com/?filter=favorites")
+        diag = {}
+        posts = []
+        source = "none"
+        try:
+            await self._page.goto(url, wait_until="domcontentloaded", timeout=60000)
+            await self._page.wait_for_timeout(3000)
+            if self._is_login_wall(self._page.url):
+                self.log("[fb] favorites: session logged out — attempting re-login")
+                if await self._login():
+                    await self._page.goto(url, wait_until="domcontentloaded", timeout=60000)
+                    await self._page.wait_for_timeout(3000)
+                if self._is_login_wall(self._page.url):
+                    self.log(f"[fb] favorites: NOT LOGGED IN. url={self._page.url}")
+                    _record_bytes(self.meter_db, self._bytes)
+                    return []
+            try:
+                await self._page.wait_for_selector('[role="article"]', timeout=20000)
+            except Exception:
+                pass
+            await self._page.wait_for_timeout(2000)
+            for _ in range(max(0, max_scroll)):
+                await self._page.evaluate(
+                    "window.scrollTo(0, document.body.scrollHeight)")
+                await self._page.wait_for_timeout(3000)
+            res = await self._page.evaluate(_EXTRACT_JS)
+            if isinstance(res, dict):
+                diag = res.get("diag") or {}
+            gql = _stories_from_graphql(self._gql)
+            diag["gql_responses"] = len(self._gql)
+            diag["gql_posts"] = len(gql)
+            if gql:
+                posts, source = self._build_feed(gql), "gql"
+            elif res.get("json_posts"):
+                posts, source = self._build_feed(res["json_posts"]), "json"
+            else:
+                posts, source = self._build_feed(res.get("dom_posts") or []), "dom"
+        except Exception as e:
+            self.log(f"[fb] favorites failed: {type(e).__name__}: {e}")
+
+        _record_bytes(self.meter_db, self._bytes)
+        await self._save_state()
+        authors = sorted({p["page"] for p in posts})
+        self.log(f"[fb] favorites: {len(posts)} posts from {len(authors)} pages "
+                 f"via {source}, {self._bytes//1024} KB")
+        try:
+            diag["handle"] = "favorites"
+            diag["parsed"] = len(posts)
+            diag["authors"] = authors[:40]
+            with open(os.getenv("FB_DIAG_PATH", "fb_diag.json"), "w") as f:
+                json.dump(diag, f)
+        except Exception:
+            pass
+        self.log(f"[fb] favorites: diag — title={diag.get('title')!r} "
+                 f"gql_responses={diag.get('gql_responses')} "
+                 f"gql_posts={diag.get('gql_posts')} "
+                 f"articles={diag.get('articles')} authors={authors[:20]}")
         return posts
 
 

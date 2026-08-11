@@ -79,6 +79,23 @@ If it shows 0 posts, send me the run output; the extractor (one function in
 `engine_fb.py`) may need a small tune against the real page — everything else is
 solid.
 
+## 3b. Favorites feed (richer data, the X-List equivalent)
+
+A page profile only server-renders its newest few posts and exposes no rich
+data. A real **feed** does. So for the best results, use the account's
+**Favorites** feed:
+
+1. Add your pages in the dashboard as usual (they define attribution).
+2. In the collector's Facebook account (a normal browser), add those same pages
+   to **Favorites**: Feeds → Favorites → Manage (up to 30).
+3. Collect the whole feed in one pass — dashboard: **Fetch Favorites feed**
+   (in the Facebook pages panel), or CLI: `.venv/bin/python3 collect_fb.py favorites`.
+
+Each post is attributed back to its own author page and stored under the
+project(s) that track it; favorited pages no project tracks are ignored. To make
+the always-on service use this feed instead of per-page checks, set
+`FB_MODE=favorites` in `.env` and restart `xscraper-fb`.
+
 ## 4. Run it continuously
 
 Simplest — a loop:

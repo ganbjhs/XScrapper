@@ -2137,7 +2137,56 @@ def test_facebook(tmp):
     ok(st.upsert(b) is False,
        "the SAME post arriving with a different id is refused (content signature)")
     st.db.commit()
+
+    print()
+    print("== favorites feed: per-author attribution ==")
+    feed_items = [
+        {"id": "10", "author": "Narendra Modi", "author_handle": "narendramodi",
+         "author_avatar": "a.jpg", "permalink": None, "text": "one",
+         "created_ms": 1785000000000, "media": [{"type": "photo", "url": "p", "thumb": "p"}]},
+        {"id": "11", "author": "Amit Shah", "author_handle": None,
+         "author_url": "https://www.facebook.com/amitshahofficial",
+         "permalink": None, "text": "two", "media": ["img.jpg"]},
+        {"id": "12", "author": "No Handle", "author_handle": None,
+         "author_url": None, "text": "three", "media": []},
+    ]
+    fed = eng._build_feed(feed_items)
+    ok(len(fed) == 2, "a post with no resolvable author page is dropped")
+    ok(fed[0]["post_id"] == "narendramodi:10", "post keyed on its OWN author page")
+    ok(fed[1]["page"] == "amitshahofficial",
+       "author page is recovered from the profile URL when no handle field")
+    ok(fed[1]["media"][0]["url"] == "img.jpg",
+       "bare-string media (DOM path) is normalized to the media shape")
     st.close()
+
+    print()
+    print("== favorites collection attributes to tracked pages only ==")
+    import engine_fb as _efb
+
+    class _FakeFav:
+        async def __aenter__(self): return self
+        async def __aexit__(self, *a): return False
+        async def fetch_favorites(self, max_scroll=12):
+            return [
+                {"post_id": "narendramodi:20", "page": "narendramodi", "url": "u",
+                 "text": "tracked page post", "media": [], "project_id": None},
+                {"post_id": "randompage:21", "page": "randompage", "url": "u2",
+                 "text": "untracked page post", "media": [], "project_id": None},
+            ]
+    _orig = _efb.FacebookEngine
+    _orig_login = collect_fb._can_log_in
+    _efb.FacebookEngine = lambda *a, **k: _FakeFav()
+    collect_fb._can_log_in = lambda: True     # no real FB creds in the test env
+    try:
+        got = asyncio.run(collect_fb.run_favorites(str(db)))
+    finally:
+        _efb.FacebookEngine = _orig
+        collect_fb._can_log_in = _orig_login
+    ok(got == 1, "only the post from a tracked page is saved (untracked page ignored)")
+    with store_fb.Store(db) as st2:
+        rows = [r for r in st2.recent(project_id=7) if r["post_id"] == "narendramodi:20"]
+        ok(len(rows) == 1 and rows[0]["project_id"] == 7,
+           "the favorites post is attributed to the project that tracks its page")
 
 
 # ==========================================================================

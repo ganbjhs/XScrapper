@@ -2091,7 +2091,23 @@ def _fb_source_post(body):
     """Add, remove, re-time, or pause/resume a Facebook page source."""
     import store_fb
     action = body.get("action") or "add"
-    label = re.sub(r"[^A-Za-z0-9_.-]", "", str(body.get("label") or "")).strip(".")
+    raw = str(body.get("label") or "").strip()
+    # Be forgiving about pasted URLs, but never let one become a "page":
+    #   - a feed/favorites URL is not a page at all -> reject with guidance
+    #   - a real page URL -> pull the handle out of it
+    low = raw.lower()
+    if "facebook.com" in low:
+        if any(t in low for t in ("filter=", "sk=", "/feed", "?filter", "favorites")):
+            return {"error": "That looks like the Favorites/feed URL, not a page. "
+                             "Use the “Fetch Favorites feed” button for that. Here, "
+                             "add just a page handle, e.g. narendramodi."}
+        m = re.search(r"facebook\.com/([^/?#]+)", raw)
+        if m:
+            raw = m.group(1)
+    if raw.lower() in ("profile.php", "people", "pages", "watch", "groups"):
+        return {"error": "Paste the page's handle (the part after facebook.com/), "
+                         "e.g. narendramodi."}
+    label = re.sub(r"[^A-Za-z0-9_.-]", "", raw).strip(".")
     try:
         pid = int(body.get("project") or 0)
     except (TypeError, ValueError):
@@ -2157,7 +2173,7 @@ def _fb_fetch(body):
     try:
         logs: list = []
         n = _run(run_once(str(rp), project_id=pid or None,
-                          log=lambda m: logs.append(str(m))), timeout=240)
+                          log=lambda m: logs.append(str(m))), timeout=300)
         diag = None
         try:
             dp = _CFG.root / os.getenv("FB_DIAG_PATH", "fb_diag.json")
@@ -2167,6 +2183,41 @@ def _fb_fetch(body):
             diag = None
         return {"ok": True, "new": n, "sources": len(srcs), "log": logs,
                 "diag": diag}
+    except Exception as e:
+        return {"error": f"{type(e).__name__}: {e}"}
+    finally:
+        _FB_FETCH_LOCK.release()
+
+
+def _fb_favorites(body):
+    """
+    Read the account's Favorites feed once and attribute posts to tracked pages
+    (across all projects). Global by nature — one burner account has one
+    favorites list — so it is not project-scoped.
+    """
+    rp = _CFG.root / "fb_results.db"
+    import store_fb
+    srcs = []
+    if rp.exists():
+        try:
+            with store_fb.Store(rp) as st:
+                srcs = st.sources(enabled_only=True)
+        except Exception as e:
+            return {"error": f"{type(e).__name__}: {e}"}
+    if not srcs:
+        return {"error": "Add the Facebook pages you track (in any project) first — "
+                         "the Favorites feed is attributed to them."}
+    from collect_fb import _can_log_in, run_favorites
+    if not _can_log_in():
+        return {"error": "Facebook login isn't set up on the server yet — add "
+                         "FB_EMAIL/FB_PASSWORD to .env and restart the dashboard."}
+    if not _FB_FETCH_LOCK.acquire(blocking=False):
+        return {"error": "A Facebook fetch is already running — give it a moment."}
+    try:
+        logs: list = []
+        n = _run(run_favorites(str(rp), log=lambda m: logs.append(str(m))),
+                 timeout=300)
+        return {"ok": True, "new": n, "log": logs}
     except Exception as e:
         return {"error": f"{type(e).__name__}: {e}"}
     finally:
@@ -2657,6 +2708,8 @@ class Handler(BaseHTTPRequestHandler):
                 return self._send(200, _fb_source_post(body))
             if u.path == "/api/fb/fetch":
                 return self._send(200, _fb_fetch(body))
+            if u.path == "/api/fb/favorites":
+                return self._send(200, _fb_favorites(body))
             if u.path == "/api/project/fetch":
                 return self._send(200, _project_fetch(body))
             if u.path == "/api/fetch":

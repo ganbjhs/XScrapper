@@ -430,12 +430,28 @@ function FacebookSources({ pid }) {
     finally { setFetching(false); }
   };
 
+  const fetchFavorites = async () => {
+    setFetching(true); setResult(null); setMsg("");
+    try {
+      const r = await api.fbFavorites();
+      if (r.error) setMsg(r.error);
+      else setResult({ ...r, favorites: true });
+      reload();
+    } catch (e) { setMsg(String(e.message || e)); }
+    finally { setFetching(false); }
+  };
+
   return (
     <div className="panel" style={{ marginTop: 16 }}>
       <div className="phead">
         <h3><span className="badge platform-fb" style={{ marginRight: 8 }}>f</span>Facebook pages</h3>
-        <span className="right" style={{ display: "flex", gap: 10, alignItems: "center" }}>
+        <span className="right" style={{ display: "flex", gap: 8, alignItems: "center" }}>
           <span>{data?.totals?.posts ?? 0} collected</span>
+          <button className="btn btn-ghost btn-sm" disabled={fetching || sources.length === 0}
+                  onClick={fetchFavorites}
+                  title="Read the account's Favorites feed once and attribute posts to your pages — richer data, one pass">
+            {fetching ? "…" : "Fetch Favorites feed"}
+          </button>
           <button className="btn btn-brand btn-sm" disabled={fetching || sources.length === 0}
                   onClick={fetchNow}>
             {fetching ? "Fetching…" : "Fetch now"}
@@ -517,6 +533,12 @@ function FacebookSources({ pid }) {
       <div style={{ color: "var(--ink-3)", fontSize: 12, marginTop: 8 }}>
         Facebook runs on the server’s own bandwidth with a monthly cap — it checks each page a few
         times a day, newest posts only.
+      </div>
+      <div style={{ color: "var(--ink-3)", fontSize: 12, marginTop: 6 }}>
+        <b>Favorites feed (richer):</b> in the collector’s Facebook account, add these pages to
+        <b> Favorites</b> (Facebook → Feeds → Favorites → Manage, up to 30). Then “Fetch Favorites
+        feed” reads them all as one real feed — which returns profile pictures, reaction counts and
+        more posts than a page-by-page check. Posts are matched back to the pages above.
       </div>
     </div>
   );

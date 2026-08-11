@@ -114,6 +114,15 @@ endpoint. The streamed-browser IG login is dead; cookie/password paths work.
   content signature (page + normalized caption) was — so the same post can't
   slip in twice just because a different path handed it to us under a different
   id scheme.
+- **A page profile fires no feed calls; a real FEED does.** Visiting
+  `facebook.com/<page>` server-renders only the newest few posts and triggers no
+  graphql — so per-page collection is DOM-only and shallow. The account's
+  **Favorites feed** (`FB_MODE=favorites`) is a genuine infinite-scroll feed:
+  it fires the graphql, returns many posts with the rich fields, and each post
+  is attributed back to its own author page (mapped to whichever project tracks
+  that page). This is the Facebook analogue of an X List, and it works only
+  because we hold the account. It needs the pages added to the account's
+  Favorites once (max 30).
 - **Use a DESKTOP user-agent. Never switch it to mobile.** A mobile UA makes
   Facebook serve the "WebLite/Bloks" shell — post text and images render, but
   there is no post JSON and no `role="article"`, so BOTH extraction paths get

@@ -72,6 +72,8 @@ export const api = {
     request("/api/fb/source", { method: "POST", body: { label, action: "enable", enabled } }),
   fbFetch: (project) =>
     request("/api/fb/fetch", { method: "POST", body: { project } }),
+  fbFavorites: () =>
+    request("/api/fb/favorites", { method: "POST", body: {} }),
 
   projects: () => request("/api/projects"),
   createProject: (name) => request("/api/projects", { method: "POST", body: { name } }),

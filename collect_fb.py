@@ -126,6 +126,45 @@ async def run_due(store_path="fb_results.db", *, default_interval=21600,
         st.close()
 
 
+async def run_favorites(store_path="fb_results.db", *, max_scroll=12, log=print) -> int:
+    """
+    Collect from the account's FAVORITES feed in ONE pass, then attribute each
+    post to whichever tracked page (across all projects) it came from. Pages the
+    account has favorited but that no project tracks are ignored; a post whose
+    page two projects both track is stored once under the first match. This is
+    the efficient, rich-data path — one feed read instead of N page visits.
+    """
+    from engine_fb import FacebookEngine
+
+    st = store_fb.Store(store_path).open()
+    try:
+        srcs = st.sources(enabled_only=True)
+        if not srcs:
+            log("[fb] no enabled pages to attribute favorites to — add pages first")
+            return 0
+        if not _can_log_in():
+            log("[fb] no Facebook login available — set FB_EMAIL/FB_PASSWORD in .env")
+            return 0
+        by_handle = {s["label"].lower(): s for s in srcs}
+        total = matched = 0
+        async with FacebookEngine(log=log) as eng:
+            posts = await eng.fetch_favorites(max_scroll=max_scroll)
+        for p in posts:
+            s = by_handle.get(str(p.get("page") or "").lower())
+            if not s:
+                continue                       # a favorited page no project tracks
+            matched += 1
+            p["project_id"] = s["project_id"]
+            p["source_label"] = s["label"]
+            if st.upsert(p):
+                total += 1
+        st.db.commit()
+        log(f"[fb] favorites: {matched} posts matched tracked pages, +{total} new")
+        return total
+    finally:
+        st.close()
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description="Collect Facebook page posts")
     ap.add_argument("--store", default="fb_results.db")
@@ -149,6 +188,8 @@ def main() -> int:
     i = sub.add_parser("interval")
     i.add_argument("label")
     i.add_argument("seconds", type=int, help="0 clears the per-page override")
+
+    sub.add_parser("favorites")   # one pass over the account's Favorites feed
 
     args = ap.parse_args()
 
@@ -174,20 +215,33 @@ def main() -> int:
         print(f"{args.label}: check every "
               f"{args.seconds}s" if args.seconds else f"{args.label}: interval cleared")
         return 0
+    if args.cmd == "favorites":
+        n = asyncio.run(run_favorites(args.store))
+        print(f"[fb] favorites pass complete: {n} new")
+        return 0
     if args.cmd == "run":
+        # FB_MODE=favorites → read the account's one Favorites feed each cycle
+        # instead of visiting each page (efficient + richer data).
+        favorites_mode = os.getenv("FB_MODE", "pages").lower() == "favorites"
         if not args.loop:
-            # One-shot: collect everything enabled, right now (ignores per-page
-            # cadence) — this is what the dashboard "Fetch now" button wants too.
-            n = asyncio.run(run_once(args.store, max_scroll=args.scroll))
+            if favorites_mode:
+                n = asyncio.run(run_favorites(args.store))
+            else:
+                # One-shot: collect everything enabled now (ignores per-page
+                # cadence) — what the dashboard "Fetch now" button wants too.
+                n = asyncio.run(run_once(args.store, max_scroll=args.scroll))
             print(f"[fb] pass complete: {n} new")
             return 0
 
         async def loop():
-            # Per-page scheduler: wake on a short tick, collect only pages whose
-            # own interval has elapsed. Each page keeps its own cadence.
             while True:
-                await run_due(args.store, default_interval=args.every,
-                              max_scroll=args.scroll)
+                if favorites_mode:
+                    await run_favorites(args.store)
+                else:
+                    # Per-page scheduler: collect only pages whose own interval
+                    # has elapsed. Each page keeps its own cadence.
+                    await run_due(args.store, default_interval=args.every,
+                                  max_scroll=args.scroll)
                 await asyncio.sleep(max(60, args.tick))
         asyncio.run(loop())
         return 0
