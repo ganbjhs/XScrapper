@@ -26,6 +26,7 @@ small tune after the first real run; everything else is stable.
 
 import json
 import os
+import random
 import re
 import sqlite3
 import time
@@ -451,14 +452,18 @@ class FacebookEngine:
                      "password": os.getenv("WEBSHARE_PASS", "")}
         self._browser = await self._pw.chromium.launch(
             headless=True, proxy=proxy,
-            args=["--no-sandbox", "--disable-dev-shm-usage"])
+            args=["--no-sandbox", "--disable-dev-shm-usage",
+                  # Strip the biggest "I'm automated" tell — the Automation
+                  # Controlled blink feature that sets navigator.webdriver.
+                  "--disable-blink-features=AutomationControlled"])
 
         # Prefer a saved session (it carries the browser's own datr, so Facebook
         # keeps it logged in). Fall back to the raw cookies from .env on first
         # run; the login-with-password path below rebuilds the session if both
         # are stale.
         ctx_kw = dict(user_agent=DESKTOP_UA,
-                      viewport={"width": 1366, "height": 2600}, locale="en-US")
+                      viewport={"width": 1366, "height": 2600}, locale="en-US",
+                      timezone_id=os.getenv("FB_TIMEZONE", "Asia/Kolkata"))
         if os.path.exists(self.state_path):
             ctx_kw["storage_state"] = self.state_path
             self._ctx = await self._browser.new_context(**ctx_kw)
@@ -479,6 +484,15 @@ class FacebookEngine:
                                         "domain": ".facebook.com", "path": "/"})
             if cookies:
                 await self._ctx.add_cookies(cookies)
+
+        # Stealth: erase the leftover automation fingerprints a headless Chrome
+        # still carries, so the browser reads as an ordinary logged-in Chrome.
+        await self._ctx.add_init_script("""
+            Object.defineProperty(navigator, 'webdriver', {get: () => undefined});
+            Object.defineProperty(navigator, 'languages', {get: () => ['en-US', 'en']});
+            Object.defineProperty(navigator, 'plugins', {get: () => [1, 2, 3, 4, 5]});
+            window.chrome = window.chrome || { runtime: {} };
+        """)
 
         async def route(r):
             await (r.abort() if r.request.resource_type in BLOCK else r.continue_())
@@ -517,6 +531,31 @@ class FacebookEngine:
         finally:
             if self._pw:
                 await self._pw.stop()
+
+    async def _human_scroll(self, rounds):
+        """
+        Scroll like a person, not a robot: real wheel events at the cursor
+        (which scroll Facebook's inner feed container — window.scrollBy does
+        not), varied distances, uneven pauses, and the occasional scroll back
+        up. This both looks human (fewer logouts) and actually drives the feed's
+        "load more" that fires the graphql we capture.
+        """
+        try:
+            await self._page.mouse.move(683, 500)
+        except Exception:
+            pass
+        for _ in range(max(0, rounds)):
+            try:
+                await self._page.mouse.wheel(0, random.randint(500, 1500))
+            except Exception:
+                await self._page.evaluate("window.scrollBy(0, 900)")
+            await self._page.wait_for_timeout(random.randint(1300, 3800))
+            if random.random() < 0.18:      # glance back up, like a human
+                try:
+                    await self._page.mouse.wheel(0, -random.randint(150, 450))
+                except Exception:
+                    pass
+                await self._page.wait_for_timeout(random.randint(500, 1400))
 
     async def _save_state(self):
         """Persist the whole logged-in session so the next run reuses it."""
@@ -668,14 +707,8 @@ class FacebookEngine:
             await self._page.wait_for_selector('[role="article"]', timeout=20000)
         except Exception:
             pass
-        await self._page.wait_for_timeout(2000)
-        # Scroll to the bottom repeatedly: the first few posts are server-
-        # rendered, but "load more" (which fires the graphql feed request we
-        # capture) only triggers once you reach the end of what's loaded.
-        for _ in range(max(0, max_scroll)):
-            await self._page.evaluate(
-                "window.scrollTo(0, document.body.scrollHeight)")
-            await self._page.wait_for_timeout(3000)
+        await self._page.wait_for_timeout(random.randint(1500, 3000))
+        await self._human_scroll(max_scroll)
         res = await self._page.evaluate(_EXTRACT_JS)
         if not isinstance(res, dict):
             res = {}
@@ -799,11 +832,8 @@ class FacebookEngine:
                 await self._page.wait_for_selector('[role="article"]', timeout=20000)
             except Exception:
                 pass
-            await self._page.wait_for_timeout(2000)
-            for _ in range(max(0, max_scroll)):
-                await self._page.evaluate(
-                    "window.scrollTo(0, document.body.scrollHeight)")
-                await self._page.wait_for_timeout(3000)
+            await self._page.wait_for_timeout(random.randint(1500, 3000))
+            await self._human_scroll(max_scroll)
             res = await self._page.evaluate(_EXTRACT_JS)
             if isinstance(res, dict):
                 diag = res.get("diag") or {}

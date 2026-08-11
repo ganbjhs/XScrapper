@@ -96,6 +96,14 @@ project(s) that track it; favorited pages no project tracks are ignored. To make
 the always-on service use this feed instead of per-page checks, set
 `FB_MODE=favorites` in `.env` and restart `xscraper-fb`.
 
+Because ONE Favorites read covers ALL your pages, a single account can check it
+often and safely — one feed read looks like a person opening Facebook. Default
+cadence is hourly with jitter; tune with `FB_FAV_INTERVAL_S` (seconds) in
+`.env`. The browser also scrolls like a human (varied speed, pauses, occasional
+scroll-up) and hides the headless automation fingerprints, so the session
+survives far longer than a robotic scrape. Keep it to ONE steady account + IP;
+don't spam manual fetches.
+
 ## 4. Run it continuously
 
 Simplest — a loop:

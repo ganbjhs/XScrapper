@@ -18,6 +18,7 @@ Runs on the SERVER. CLI mirrors collect_ig:
 import argparse
 import asyncio
 import os
+import random
 import time
 
 import store_fb
@@ -233,16 +234,21 @@ def main() -> int:
             print(f"[fb] pass complete: {n} new")
             return 0
 
+        # Favorites mode reads the one feed on its own interval (default hourly);
+        # per-page mode wakes on the short tick and collects only what's due.
+        fav_every = int(os.getenv("FB_FAV_INTERVAL_S", "3600"))
+
         async def loop():
             while True:
                 if favorites_mode:
                     await run_favorites(args.store)
+                    base = fav_every
                 else:
-                    # Per-page scheduler: collect only pages whose own interval
-                    # has elapsed. Each page keeps its own cadence.
                     await run_due(args.store, default_interval=args.every,
                                   max_scroll=args.scroll)
-                await asyncio.sleep(max(60, args.tick))
+                    base = max(60, args.tick)
+                # Jitter the wait ±25% so the rhythm isn't a robotic fixed clock.
+                await asyncio.sleep(int(base * random.uniform(0.75, 1.25)))
         asyncio.run(loop())
         return 0
     return 1
