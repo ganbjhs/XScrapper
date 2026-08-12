@@ -433,7 +433,7 @@ function FacebookSources({ pid }) {
   const fetchFavorites = async () => {
     setFetching(true); setResult(null); setMsg("");
     try {
-      const r = await api.fbFavorites();
+      const r = await api.fbFavorites(pid);
       if (r.error) setMsg(r.error);
       else setResult({ ...r, favorites: true });
       reload();

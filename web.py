@@ -2196,17 +2196,10 @@ def _fb_favorites(body):
     favorites list — so it is not project-scoped.
     """
     rp = _CFG.root / "fb_results.db"
-    import store_fb
-    srcs = []
-    if rp.exists():
-        try:
-            with store_fb.Store(rp) as st:
-                srcs = st.sources(enabled_only=True)
-        except Exception as e:
-            return {"error": f"{type(e).__name__}: {e}"}
-    if not srcs:
-        return {"error": "Add the Facebook pages you track (in any project) first — "
-                         "the Favorites feed is attributed to them."}
+    try:
+        pid = int(body.get("project") or 0)
+    except (TypeError, ValueError):
+        pid = 0
     from collect_fb import _can_log_in, run_favorites
     if not _can_log_in():
         return {"error": "Facebook login isn't set up on the server yet — add "
@@ -2215,8 +2208,10 @@ def _fb_favorites(body):
         return {"error": "A Facebook fetch is already running — give it a moment."}
     try:
         logs: list = []
-        n = _run(run_favorites(str(rp), log=lambda m: logs.append(str(m))),
-                 timeout=300)
+        # pid lets favorited pages auto-register under THIS project, so the feed
+        # just flows in without hand-adding each page.
+        n = _run(run_favorites(str(rp), project_id=pid or None,
+                               log=lambda m: logs.append(str(m))), timeout=300)
         return {"ok": True, "new": n, "log": logs}
     except Exception as e:
         return {"error": f"{type(e).__name__}: {e}"}

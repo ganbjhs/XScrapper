@@ -127,40 +127,47 @@ async def run_due(store_path="fb_results.db", *, default_interval=21600,
         st.close()
 
 
-async def run_favorites(store_path="fb_results.db", *, max_scroll=6, log=print) -> int:
+async def run_favorites(store_path="fb_results.db", *, project_id=None,
+                        max_scroll=6, log=print) -> int:
     """
-    Collect from the account's FAVORITES feed in ONE pass, then attribute each
-    post to whichever tracked page (across all projects) it came from. Pages the
-    account has favorited but that no project tracks are ignored; a post whose
-    page two projects both track is stored once under the first match. This is
-    the efficient, rich-data path — one feed read instead of N page visits.
+    Collect the account's FAVORITES feed in ONE pass. Each post is attributed to
+    its own author page. If that page is already tracked, its project is used;
+    otherwise, when a project_id is given (the dashboard button passes the one
+    you clicked from), the page is auto-registered under that project and the
+    post is saved. So whatever you favorite just flows in — no hand-matching. A
+    page you don't want is a Pause/Remove away in the dashboard.
     """
     from engine_fb import FacebookEngine
 
     st = store_fb.Store(store_path).open()
     try:
-        srcs = st.sources(enabled_only=True)
-        if not srcs:
-            log("[fb] no enabled pages to attribute favorites to — add pages first")
-            return 0
         if not _can_log_in():
             log("[fb] no Facebook login available — set FB_EMAIL/FB_PASSWORD in .env")
             return 0
-        by_handle = {s["label"].lower(): s for s in srcs}
-        total = matched = 0
+        by_handle = {s["label"].lower(): s for s in st.sources()}
+        total = matched = added = 0
         async with FacebookEngine(log=log) as eng:
             posts = await eng.fetch_favorites(max_scroll=max_scroll)
         for p in posts:
-            s = by_handle.get(str(p.get("page") or "").lower())
-            if not s:
-                continue                       # a favorited page no project tracks
+            handle = str(p.get("page") or "")
+            s = by_handle.get(handle.lower())
+            if s:
+                pid = s["project_id"]
+            elif project_id:
+                st.add_source(handle, project_id=project_id)   # auto-register
+                by_handle[handle.lower()] = {"label": handle, "project_id": project_id}
+                pid = project_id
+                added += 1
+            else:
+                continue          # nothing to attribute to (service, no project)
             matched += 1
-            p["project_id"] = s["project_id"]
-            p["source_label"] = s["label"]
+            p["project_id"] = pid
+            p["source_label"] = handle
             if st.upsert(p):
                 total += 1
         st.db.commit()
-        log(f"[fb] favorites: {matched} posts matched tracked pages, +{total} new")
+        log(f"[fb] favorites: {matched} posts attributed "
+            f"({added} new page(s) auto-added), +{total} new")
         return total
     finally:
         st.close()
@@ -216,8 +223,12 @@ def main() -> int:
         print(f"{args.label}: check every "
               f"{args.seconds}s" if args.seconds else f"{args.label}: interval cleared")
         return 0
+    # FB_FAV_PROJECT lets the CLI/service auto-register favorited pages under a
+    # project (the dashboard button passes this per-click).
+    fav_project = int(os.getenv("FB_FAV_PROJECT", "0")) or None
+
     if args.cmd == "favorites":
-        n = asyncio.run(run_favorites(args.store))
+        n = asyncio.run(run_favorites(args.store, project_id=fav_project))
         print(f"[fb] favorites pass complete: {n} new")
         return 0
     if args.cmd == "run":
@@ -226,7 +237,7 @@ def main() -> int:
         favorites_mode = os.getenv("FB_MODE", "pages").lower() == "favorites"
         if not args.loop:
             if favorites_mode:
-                n = asyncio.run(run_favorites(args.store))
+                n = asyncio.run(run_favorites(args.store, project_id=fav_project))
             else:
                 # One-shot: collect everything enabled now (ignores per-page
                 # cadence) — what the dashboard "Fetch now" button wants too.
@@ -241,7 +252,7 @@ def main() -> int:
         async def loop():
             while True:
                 if favorites_mode:
-                    await run_favorites(args.store)
+                    await run_favorites(args.store, project_id=fav_project)
                     base = fav_every
                 else:
                     await run_due(args.store, default_interval=args.every,

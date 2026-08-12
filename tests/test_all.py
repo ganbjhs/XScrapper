@@ -2178,15 +2178,22 @@ def test_facebook(tmp):
     _efb.FacebookEngine = lambda *a, **k: _FakeFav()
     collect_fb._can_log_in = lambda: True     # no real FB creds in the test env
     try:
+        # No project → only the already-tracked page is saved.
         got = asyncio.run(collect_fb.run_favorites(str(db)))
+        ok(got == 1, "with no project, only the tracked page's post is saved")
+        # With a project → the untracked favorited page auto-registers + saves.
+        got2 = asyncio.run(collect_fb.run_favorites(str(db), project_id=7))
     finally:
         _efb.FacebookEngine = _orig
         collect_fb._can_log_in = _orig_login
-    ok(got == 1, "only the post from a tracked page is saved (untracked page ignored)")
+    ok(got2 == 1, "an untracked favorited page auto-registers and its post saves")
     with store_fb.Store(db) as st2:
         rows = [r for r in st2.recent(project_id=7) if r["post_id"] == "narendramodi:20"]
         ok(len(rows) == 1 and rows[0]["project_id"] == 7,
            "the favorites post is attributed to the project that tracks its page")
+        labels = {s["label"] for s in st2.sources()}
+        ok("randompage" in labels,
+           "the new favorited page was auto-added as a source under the project")
 
 
 # ==========================================================================
