@@ -892,6 +892,14 @@ class FacebookEngine:
                  f"gql_responses={diag.get('gql_responses')} "
                  f"gql_posts={diag.get('gql_posts')} "
                  f"articles={diag.get('articles')} authors={authors[:20]}")
+        # Whether we are actually logged in tells us if this is a session
+        # problem (the usual cause) vs. a page-structure problem.
+        head = (diag.get("body_head") or "").lower()
+        logged_out = any(w in head for w in
+                         ("log in", "log into", "create new account",
+                          "forgot password", "sign up"))
+        self.log(f"[fb] favorites: logged_in={not logged_out} "
+                 f"body_head={diag.get('body_head')!r}")
         return posts
 
 
