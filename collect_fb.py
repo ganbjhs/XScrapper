@@ -148,25 +148,33 @@ async def run_favorites(store_path="fb_results.db", *, project_id=None,
         total = matched = added = 0
         async with FacebookEngine(log=log) as eng:
             posts = await eng.fetch_favorites(max_scroll=max_scroll)
+            on_fav = getattr(eng, "on_favorites", False)
+        # Auto-register a page ONLY when we confirmed we're on the real Favorites
+        # feed. If we fell back to the home feed, we must not treat everyone the
+        # account follows as a favorite — store only already-tracked pages.
+        if not on_fav:
+            log("[fb] favorites: could NOT open the Favorites feed — reading the "
+                "home feed instead; saving only pages you already track (no "
+                "auto-add, to avoid pulling in non-favorites)")
         for p in posts:
             handle = str(p.get("page") or "")
             s = by_handle.get(handle.lower())
             if s:
                 pid = s["project_id"]
-            elif project_id:
+            elif project_id and on_fav:
                 st.add_source(handle, project_id=project_id)   # auto-register
                 by_handle[handle.lower()] = {"label": handle, "project_id": project_id}
                 pid = project_id
                 added += 1
             else:
-                continue          # nothing to attribute to (service, no project)
+                continue
             matched += 1
             p["project_id"] = pid
             p["source_label"] = handle
             if st.upsert(p):
                 total += 1
         st.db.commit()
-        log(f"[fb] favorites: {matched} posts attributed "
+        log(f"[fb] favorites: on_favorites={on_fav}, {matched} posts attributed "
             f"({added} new page(s) auto-added), +{total} new")
         return total
     finally:

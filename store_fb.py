@@ -61,19 +61,26 @@ _MIGRATIONS = [
 ]
 
 
-def _signature(page, text):
+def _signature(page, text, created_ms=None):
     """
     A content signature that is the SAME for one real post no matter which path
     (GraphQL / DOM / mbasic) or id scheme found it — so a post cannot appear
     twice just because Facebook handed it to us with a different id. Built from
-    the page + its (normalized) caption; None for captionless posts, which fall
-    back to id-only dedup.
+    the page + POSTED DAY + (normalized) caption; None for captionless posts,
+    which fall back to id-only dedup.
+
+    The posted-day component matters: a page that reuses a caption ("Breaking:",
+    "Good morning") on different days makes genuinely different posts — without
+    the day they would collide on signature and the second would be dropped as a
+    false duplicate. Same page + same day + same caption is a real duplicate.
     """
     import hashlib
     norm = " ".join(str(text or "").split())[:160].lower()
     if len(norm) < 8:
         return None
-    return hashlib.sha1(f"{page}\n{norm}".encode("utf-8", "ignore")).hexdigest()
+    day = int(created_ms // 86_400_000) if created_ms else "na"
+    return hashlib.sha1(
+        f"{str(page).lower()}\n{day}\n{norm}".encode("utf-8", "ignore")).hexdigest()
 
 
 @dataclass
@@ -117,28 +124,34 @@ class Store:
     # ---- sources ----
 
     def add_source(self, label, project_id=0, enabled=True):
+        # Canonicalize to lowercase — FB handles are case-insensitive, and this
+        # keeps source labels in step with the lowercased page on each post.
+        label = str(label).lower()
         now = int(time.time())
+        # On re-add, update the project but KEEP the existing enabled flag — a
+        # page deliberately paused must not silently resume when it is re-added
+        # (or auto-registered from the favorites feed).
         self.db.execute(
             "INSERT INTO sources(label, project_id, enabled, created_at) "
             "VALUES(?,?,?,?) ON CONFLICT(label) DO UPDATE SET "
-            "  project_id = excluded.project_id, enabled = excluded.enabled",
+            "  project_id = excluded.project_id",
             (label, int(project_id), int(bool(enabled)), now))
         self.db.commit()
 
     def remove_source(self, label):
-        self.db.execute("DELETE FROM sources WHERE label = ?", (label,))
+        self.db.execute("DELETE FROM sources WHERE label = ?", (str(label).lower(),))
         self.db.commit()
 
     def set_interval(self, label, seconds):
         """Per-page check cadence in seconds; None clears it (use the default)."""
         self.db.execute("UPDATE sources SET interval_s = ? WHERE label = ?",
-                        (int(seconds) if seconds else None, label))
+                        (int(seconds) if seconds else None, str(label).lower()))
         self.db.commit()
 
     def set_enabled(self, label, enabled):
         """Pause (0) or resume (1) a page without losing what it collected."""
         self.db.execute("UPDATE sources SET enabled = ? WHERE label = ?",
-                        (int(bool(enabled)), label))
+                        (int(bool(enabled)), str(label).lower()))
         self.db.commit()
 
     def sources(self, project_id=None, enabled_only=False):
@@ -148,7 +161,8 @@ class Store:
         if enabled_only:
             where.append("enabled = 1")
         rows = self.db.execute(
-            "SELECT s.*, (SELECT COUNT(*) FROM posts p WHERE p.page = s.label) AS posts "
+            "SELECT s.*, (SELECT COUNT(*) FROM posts p "
+            "             WHERE LOWER(p.page) = LOWER(s.label)) AS posts "
             "FROM sources s "
             + (f"WHERE {' AND '.join(where)} " if where else "")
             + "ORDER BY s.label", params).fetchall()
@@ -173,7 +187,7 @@ class Store:
         post_id (exact), and a content signature (so the same caption on the
         same page can't slip in twice under a different id scheme).
         """
-        sig = _signature(post.get("page"), post.get("text"))
+        sig = _signature(post.get("page"), post.get("text"), post.get("created_ms"))
         if sig:
             exists = self.db.execute(
                 "SELECT 1 FROM posts WHERE post_id = ? OR sig = ?",

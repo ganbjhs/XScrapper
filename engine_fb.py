@@ -253,7 +253,7 @@ def _handle_from_url(u):
     """The page handle from a profile URL — 'narendramodi' from
     facebook.com/narendramodi, or the numeric id from a profile.php?id= link.
     This is how a post in a mixed feed is attributed back to its page."""
-    if not u:
+    if not u or not isinstance(u, str):
         return None
     m = re.search(r"facebook\.com/([^/?#]+)", u)
     if not m:
@@ -438,6 +438,7 @@ class FacebookEngine:
         self.state_path = os.getenv("FB_STATE_PATH", "fb_state.json")
         self.email = os.getenv("FB_EMAIL", "").strip()
         self.password = os.getenv("FB_PASSWORD", "")
+        self.on_favorites = False   # set by fetch_favorites: did we reach the feed
         self._pw = self._browser = self._ctx = self._page = None
 
     async def __aenter__(self):
@@ -514,6 +515,11 @@ class FacebookEngine:
             try:
                 if "/graphql" in resp.url and self._gql_bytes < 14_000_000:
                     body = await resp.text()
+                    # Count graphql payloads toward the bandwidth meter — they
+                    # are usually chunked (no content-length), so the header
+                    # counter above misses them, and they are the big spend.
+                    if not resp.headers.get("content-length"):
+                        self._bytes += len(body)
                     if ("post_id" in body or "Story" in body
                             or "creation_time" in body):
                         self._gql.append(body)
@@ -531,6 +537,57 @@ class FacebookEngine:
         finally:
             if self._pw:
                 await self._pw.stop()
+
+    async def _open_favorites(self) -> bool:
+        """
+        Navigate from home to the FAVORITES feed the way a person does, trying
+        several routes, and confirm success by the URL carrying filter=favorites.
+        Returns True only when we are actually on the Favorites feed — the caller
+        uses that to avoid mistaking the home feed for favorites.
+        """
+        p = self._page
+
+        def _there():
+            return "filter=favorites" in (p.url or "").lower()
+
+        async def _try_click(fn):
+            try:
+                await fn()
+                await p.wait_for_timeout(4000)
+                return _there()
+            except Exception:
+                return False
+
+        # 1) the sidebar link by href / aria-label
+        for sel in ('a[href*="filter=favorites"]',
+                    'a[aria-label*="Favourite" i]', 'a[aria-label*="Favorite" i]'):
+            el = None
+            try:
+                el = await p.query_selector(sel)
+            except Exception:
+                el = None
+            if el and await _try_click(el.click):
+                return True
+        # 2) role=link by visible name (UK + US spelling)
+        for name in ("Favourites", "Favorites"):
+            if await _try_click(
+                    p.get_by_role("link", name=name, exact=False).first.click):
+                return True
+        # 3) open the Feeds section first, then Favourites
+        try:
+            await p.get_by_role("link", name="Feeds", exact=False).first.click(timeout=4000)
+            await p.wait_for_timeout(3000)
+        except Exception:
+            pass
+        for name in ("Favourites", "Favorites"):
+            if await _try_click(
+                    p.get_by_role("link", name=name, exact=False).first.click):
+                return True
+        # 4) last resort — plain text
+        for name in ("Favourites", "Favorites"):
+            if await _try_click(p.get_by_text(name, exact=True).first.click):
+                return True
+        return _there()
 
     async def _human_scroll(self, rounds):
         """
@@ -610,15 +667,19 @@ class FacebookEngine:
     def _build_from_json(self, handle, items):
         """Records from the JSON path — a real post_id is enough (no permalink
         needed); synthesize a URL if Facebook didn't give one."""
+        # Canonicalize the handle to lowercase so the SAME post gets the SAME
+        # post_id whether it came in via the per-page path or the mixed feed
+        # path (Facebook handles are case-insensitive).
+        hl = (handle or "").lower()
         posts = []
         for r in items:
             pid = r.get("id") or (r.get("permalink") and _fallback_id(r["permalink"]))
             if not pid:
                 continue
-            url = r.get("permalink") or f"https://www.facebook.com/{handle}/posts/{pid}"
+            url = r.get("permalink") or f"https://www.facebook.com/{hl}/posts/{pid}"
             posts.append({
-                "post_id": f"{handle}:{pid}",
-                "page": handle,
+                "post_id": f"{hl}:{pid}",
+                "page": hl,
                 "url": url,
                 "created_ms": r.get("created_ms"),
                 "author_name": r.get("author"),
@@ -640,6 +701,7 @@ class FacebookEngine:
             h = r.get("author_handle") or _handle_from_url(r.get("author_url"))
             if not h:
                 continue
+            h = h.lower()      # canonical, case-insensitive (matches _build_from_json)
             pid = r.get("id") or (r.get("permalink") and _fallback_id(r["permalink"]))
             if not pid:
                 continue
@@ -830,30 +892,14 @@ class FacebookEngine:
                     self.log(f"[fb] favorites: NOT LOGGED IN. url={self._page.url}")
                     _record_bytes(self.meter_db, self._bytes)
                     return []
-            # Click "Favourites" (UK spelling) / "Favorites" — the sidebar link's
-            # href carries filter=favorites regardless of the displayed spelling.
-            clicked = False
-            for sel in ('a[href*="filter=favorites"]',
-                        'a[aria-label="Favourites"]', 'a[aria-label="Favorites"]'):
-                try:
-                    el = await self._page.query_selector(sel)
-                    if el:
-                        await el.click()
-                        clicked = True
-                        break
-                except Exception:
-                    pass
-            if not clicked:
-                for name in ("Favourites", "Favorites"):
-                    try:
-                        await self._page.get_by_role(
-                            "link", name=name, exact=True).first.click(timeout=4000)
-                        clicked = True
-                        break
-                    except Exception:
-                        pass
-            self.log(f"[fb] favorites: clicked Favourites link = {clicked}")
-            await self._page.wait_for_timeout(random.randint(3000, 5000))
+            # Reach the actual Favorites feed by in-app navigation (a cold URL
+            # load renders an empty page). We only trust the result if the URL
+            # ends up carrying filter=favorites — otherwise we're on the home
+            # feed and must NOT treat everyone-you-follow as a favorite.
+            self.on_favorites = await self._open_favorites()
+            self.log(f"[fb] favorites: reached favorites feed = {self.on_favorites} "
+                     f"(url={self._page.url})")
+            await self._page.wait_for_timeout(random.randint(2000, 4000))
             try:
                 await self._page.wait_for_selector('[role="article"]', timeout=20000)
             except Exception:

@@ -173,8 +173,14 @@ export default function LiveFeed({ onMenu }) {
     // collected post must never vanish from a recent-window view.
     const inWindow = (t) => {
       if (!cutoff) return true;
-      const v = Date.parse(t.created_at || t.collected_at || "");
-      return Number.isNaN(v) ? true : v >= cutoff;
+      // Show if the post OR its collection falls in the window. Facebook posts
+      // can carry an older original time but were just collected — those must
+      // not vanish from a recent view. If neither timestamp parses, keep it.
+      const c = Date.parse(t.created_at || "");
+      const g = Date.parse(t.collected_at || "");
+      if (!Number.isNaN(c) && c >= cutoff) return true;
+      if (!Number.isNaN(g) && g >= cutoff) return true;
+      return Number.isNaN(c) && Number.isNaN(g);
     };
     const out = latest.filter((t) =>
       (flt.source === "all" || t.platform === flt.source) && inWindow(t));

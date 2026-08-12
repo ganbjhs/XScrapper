@@ -2139,6 +2139,28 @@ def test_facebook(tmp):
     st.db.commit()
 
     print()
+    print("== bug-fix regressions ==")
+    # case-insensitive handle: per-page (label) and feed (actor) paths agree
+    j = eng._build_from_json("NatGeo", [{"id": "77", "text": "wild"}])
+    f = eng._build_feed([{"id": "77", "author_handle": "natgeo", "text": "wild"}])
+    ok(j[0]["post_id"] == f[0]["post_id"] == "natgeo:77",
+       "the same post keys identically whichever path found it (case-folded)")
+    # re-adding a paused page does NOT silently un-pause it
+    st.add_source("pausetest", project_id=7)
+    st.set_enabled("pausetest", False)
+    st.add_source("PauseTest", project_id=7)      # re-add, different case
+    row = [s for s in st.sources() if s["label"] == "pausetest"][0]
+    ok(row["enabled"] == 0, "re-adding a paused page keeps it paused")
+    # same caption on DIFFERENT days = two real posts, both kept
+    d1 = {"post_id": "somepage:a", "page": "somepage", "text": "Breaking news today",
+          "created_ms": 1785000000000, "project_id": 7, "media": []}
+    d2 = {"post_id": "somepage:b", "page": "somepage", "text": "Breaking news today",
+          "created_ms": 1785000000000 + 2 * 86_400_000, "project_id": 7, "media": []}
+    ok(st.upsert(d1) is True and st.upsert(d2) is True,
+       "same caption on different days is NOT dropped as a duplicate")
+    st.db.commit()
+
+    print()
     print("== favorites feed: per-author attribution ==")
     feed_items = [
         {"id": "10", "author": "Narendra Modi", "author_handle": "narendramodi",
@@ -2164,9 +2186,10 @@ def test_facebook(tmp):
     import engine_fb as _efb
 
     class _FakeFav:
+        on_favorites = True       # pretend we reached the real Favorites feed
         async def __aenter__(self): return self
         async def __aexit__(self, *a): return False
-        async def fetch_favorites(self, max_scroll=12):
+        async def fetch_favorites(self, max_scroll=6):
             return [
                 {"post_id": "narendramodi:20", "page": "narendramodi", "url": "u",
                  "text": "tracked page post", "media": [], "project_id": None},

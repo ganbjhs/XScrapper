@@ -2074,8 +2074,14 @@ def _fb_posts(q):
         pid = 0
     since_ms = None
     if q.get("since"):
-        since_ms = store_mod.parse_window(q["since"])
-    limit = min(int(q.get("limit") or 50), 200)
+        try:
+            since_ms = store_mod.parse_window(q["since"])
+        except Exception:
+            since_ms = None
+    try:
+        limit = min(int(q.get("limit") or 50), 200)
+    except (TypeError, ValueError):
+        limit = 50
     with store_fb.Store(rp) as st:
         rows = st.recent(project_id=pid or None, limit=limit, since_ms=since_ms)
     return {"count": len(rows), "posts": [store_fb.to_feed(r) for r in rows]}
@@ -2137,6 +2143,33 @@ def _fb_source_post(body):
 _FB_FETCH_LOCK = threading.Lock()
 
 
+def _fb_locked_run(coro, timeout=300):
+    """
+    Run a Facebook coroutine single-flight. The lock is released when the
+    coroutine ACTUALLY finishes (a done-callback on the loop), NOT when this
+    function returns. That matters: if the HTTP request times out, the browser
+    is still driving Facebook — releasing the lock here would let a second click
+    launch a second headless browser on the same session. Returns (result, err).
+    """
+    import concurrent.futures as _cf
+    if _LOOP is None:
+        return None, {"error": "server not ready"}
+    if not _FB_FETCH_LOCK.acquire(blocking=False):
+        return None, {"error": "A Facebook fetch is already running — give it a moment."}
+    fut = asyncio.run_coroutine_threadsafe(coro, _LOOP)
+    fut.add_done_callback(lambda f: _FB_FETCH_LOCK.release())
+    try:
+        return fut.result(timeout), None
+    except _cf.TimeoutError:
+        # The coroutine keeps running; the callback releases the lock when it
+        # finishes, so no second browser can start meanwhile.
+        return None, {"error": "Facebook fetch is taking a while — it's still "
+                               "running in the background; check the Live Feed "
+                               "in a minute."}
+    except Exception as e:
+        return None, {"error": f"{type(e).__name__}: {e}"}
+
+
 def _fb_fetch(body):
     """
     The Facebook "Fetch now" button: run ONE collection pass immediately, from
@@ -2168,25 +2201,19 @@ def _fb_fetch(body):
                          "FB_EMAIL/FB_PASSWORD (or FB_C_USER/FB_XS) to .env and "
                          "restart the dashboard, then try again."}
 
-    if not _FB_FETCH_LOCK.acquire(blocking=False):
-        return {"error": "A Facebook fetch is already running — give it a moment."}
+    logs: list = []
+    n, err = _fb_locked_run(run_once(str(rp), project_id=pid or None,
+                                     log=lambda m: logs.append(str(m))), timeout=300)
+    if err:
+        return {**err, "log": logs}
+    diag = None
     try:
-        logs: list = []
-        n = _run(run_once(str(rp), project_id=pid or None,
-                          log=lambda m: logs.append(str(m))), timeout=300)
+        dp = _CFG.root / os.getenv("FB_DIAG_PATH", "fb_diag.json")
+        if dp.exists():
+            diag = json.loads(dp.read_text())
+    except Exception:
         diag = None
-        try:
-            dp = _CFG.root / os.getenv("FB_DIAG_PATH", "fb_diag.json")
-            if dp.exists():
-                diag = json.loads(dp.read_text())
-        except Exception:
-            diag = None
-        return {"ok": True, "new": n, "sources": len(srcs), "log": logs,
-                "diag": diag}
-    except Exception as e:
-        return {"error": f"{type(e).__name__}: {e}"}
-    finally:
-        _FB_FETCH_LOCK.release()
+    return {"ok": True, "new": n, "sources": len(srcs), "log": logs, "diag": diag}
 
 
 def _fb_favorites(body):
@@ -2204,19 +2231,14 @@ def _fb_favorites(body):
     if not _can_log_in():
         return {"error": "Facebook login isn't set up on the server yet — add "
                          "FB_EMAIL/FB_PASSWORD to .env and restart the dashboard."}
-    if not _FB_FETCH_LOCK.acquire(blocking=False):
-        return {"error": "A Facebook fetch is already running — give it a moment."}
-    try:
-        logs: list = []
-        # pid lets favorited pages auto-register under THIS project, so the feed
-        # just flows in without hand-adding each page.
-        n = _run(run_favorites(str(rp), project_id=pid or None,
-                               log=lambda m: logs.append(str(m))), timeout=300)
-        return {"ok": True, "new": n, "log": logs}
-    except Exception as e:
-        return {"error": f"{type(e).__name__}: {e}"}
-    finally:
-        _FB_FETCH_LOCK.release()
+    logs: list = []
+    # pid lets favorited pages auto-register under THIS project, so the feed
+    # just flows in without hand-adding each page.
+    n, err = _fb_locked_run(run_favorites(str(rp), project_id=pid or None,
+                                          log=lambda m: logs.append(str(m))), timeout=300)
+    if err:
+        return {**err, "log": logs}
+    return {"ok": True, "new": n, "log": logs}
 
 
 def _ig_status():
