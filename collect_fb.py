@@ -127,7 +127,7 @@ async def run_due(store_path="fb_results.db", *, default_interval=21600,
         st.close()
 
 
-async def run_favorites(store_path="fb_results.db", *, max_scroll=12, log=print) -> int:
+async def run_favorites(store_path="fb_results.db", *, max_scroll=6, log=print) -> int:
     """
     Collect from the account's FAVORITES feed in ONE pass, then attribute each
     post to whichever tracked page (across all projects) it came from. Pages the

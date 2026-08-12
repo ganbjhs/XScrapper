@@ -793,7 +793,7 @@ class FacebookEngine:
                          json.dumps(diag.get("containers"))[:1800])
         return posts
 
-    async def fetch_favorites(self, max_scroll: int = 12) -> list:
+    async def fetch_favorites(self, max_scroll: int = 6) -> list:
         """
         Read the account's FAVORITES feed — a single real news feed of every
         page the account has favorited. Because it is a genuine feed (not a page
