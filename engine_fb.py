@@ -811,23 +811,49 @@ class FacebookEngine:
         self._bytes = 0
         self._gql = []
         self._gql_bytes = 0
-        url = os.getenv("FB_FAVORITES_URL",
-                        "https://www.facebook.com/?filter=favorites")
+        # Facebook only builds the Favorites feed through in-app navigation — a
+        # direct URL load renders an empty page. So open home, then CLICK the
+        # Favourites entry in the Feeds sidebar, exactly like a person does.
+        home = os.getenv("FB_HOME_URL", "https://www.facebook.com/")
         diag = {}
         posts = []
         source = "none"
         try:
-            await self._page.goto(url, wait_until="domcontentloaded", timeout=60000)
+            await self._page.goto(home, wait_until="domcontentloaded", timeout=60000)
             await self._page.wait_for_timeout(3000)
             if self._is_login_wall(self._page.url):
                 self.log("[fb] favorites: session logged out — attempting re-login")
                 if await self._login():
-                    await self._page.goto(url, wait_until="domcontentloaded", timeout=60000)
+                    await self._page.goto(home, wait_until="domcontentloaded", timeout=60000)
                     await self._page.wait_for_timeout(3000)
                 if self._is_login_wall(self._page.url):
                     self.log(f"[fb] favorites: NOT LOGGED IN. url={self._page.url}")
                     _record_bytes(self.meter_db, self._bytes)
                     return []
+            # Click "Favourites" (UK spelling) / "Favorites" — the sidebar link's
+            # href carries filter=favorites regardless of the displayed spelling.
+            clicked = False
+            for sel in ('a[href*="filter=favorites"]',
+                        'a[aria-label="Favourites"]', 'a[aria-label="Favorites"]'):
+                try:
+                    el = await self._page.query_selector(sel)
+                    if el:
+                        await el.click()
+                        clicked = True
+                        break
+                except Exception:
+                    pass
+            if not clicked:
+                for name in ("Favourites", "Favorites"):
+                    try:
+                        await self._page.get_by_role(
+                            "link", name=name, exact=True).first.click(timeout=4000)
+                        clicked = True
+                        break
+                    except Exception:
+                        pass
+            self.log(f"[fb] favorites: clicked Favourites link = {clicked}")
+            await self._page.wait_for_timeout(random.randint(3000, 5000))
             try:
                 await self._page.wait_for_selector('[role="article"]', timeout=20000)
             except Exception:
