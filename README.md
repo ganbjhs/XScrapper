@@ -20,7 +20,9 @@ cursor.
 | `BLUEPRINT.md` | The whole map: architecture, every file's job, data flow, deploy runbook, invariants, roadmap |
 | `RULEBOOK.md` | The design rules every change must respect (the invariants, and why each was paid for) |
 
-`FACEBOOK_RUNBOOK.md` is the one operational side-doc: how to turn Facebook on.
+Facebook has two side-docs: `FACEBOOK_RUNBOOK.md` (how to turn it on) and
+`FACEBOOK_LESSONS.md` (**everything already tried and why it failed** — read it
+before touching the Facebook engine, it will save you days).
 
 ## Run it
 

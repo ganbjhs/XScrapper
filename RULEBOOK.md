@@ -97,7 +97,8 @@ drift (pin the device file), `PleaseWaitFewMinutes` punishes retries — back of
 hours. `user_medias` wants the numeric pk; validate sessions against the *feed*
 endpoint. The streamed-browser IG login is dead; cookie/password paths work.
 
-**Facebook.**
+**Facebook.** (Full history of dead ends in `FACEBOOK_LESSONS.md` — read it
+before changing the engine; nearly every "obvious" idea has been tried.)
 - **Read the data, not the layout. Three paths, best-first.** (1) Captured
   **GraphQL** responses — when logged in, Facebook fetches the feed over
   background `/graphql` requests rather than embedding it, so the engine
