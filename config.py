@@ -55,6 +55,24 @@ class Defaults:
     # sortIndex for ordering forensics.
     keep_entry_json: bool = False
 
+    # Retention. Both default to 0 = keep everything forever (invariant #10);
+    # they only ever delete when the operator sets them here explicitly.
+    #
+    #   raw_retention_days  Drop the raw JSON payloads (tweet_raw) for tweets
+    #                       older than N days. The searchable row — text,
+    #                       author, engagement, media — is untouched, so the
+    #                       dashboard and exports keep working; only the
+    #                       ability to REPARSE those old tweets is given up.
+    #                       This is the payload that dominates database size,
+    #                       so it is the knob to reach for first.
+    #   retention_days      Drop whole tweet rows older than N days (posting
+    #                       time), with their hit edges, payloads and
+    #                       poll/gap audit rows. Pinned posts are always
+    #                       kept. X's index only reaches back ~a week, so
+    #                       pruned tweets cannot be re-collected.
+    retention_days: int = 0
+    raw_retention_days: int = 0
+
 
 # Which network an account belongs to. Accounts are per-platform: an X session
 # and an Instagram session share nothing but the shape of the config block.

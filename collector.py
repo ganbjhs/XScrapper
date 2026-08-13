@@ -53,6 +53,12 @@ ALPHA = 0.35           # EWMA weight on the newest observation
 JITTER = 0.15          # +/- fraction, to decorrelate streams from each other
 MAX_EMPTY_BACKOFF = 4  # cap on consecutive-empty exponential backoff
 
+# How often the long-running watcher does database housekeeping (WAL
+# checkpoint + retention, see Store.maintain). Five minutes: frequent enough
+# that the WAL never accumulates more than a few minutes of writes, rare
+# enough to be invisible next to the polling itself.
+MAINTAIN_EVERY_S = 300
+
 
 @dataclass
 class PollResult:
@@ -459,6 +465,8 @@ class Collector:
         deadline = (time.time() + duration) if duration else None
         tasks: dict[str, asyncio.Task] = {}
         last_discover = 0.0
+        last_maintain = time.time()   # not at boot — opening the DB just ran
+                                      # the migration; let polls start first
         try:
             while True:
                 if deadline and time.time() >= deadline:
@@ -474,6 +482,23 @@ class Collector:
                         await self.discover_new_streams()
                     except Exception as e:
                         self.log(f"[watch] stream discovery error: {e!r}")
+
+                # Housekeeping: checkpoint the WAL, apply retention if the
+                # operator turned it on. A failure here must never stop
+                # collection — log it and try again next cycle.
+                if time.time() - last_maintain >= MAINTAIN_EVERY_S:
+                    last_maintain = time.time()
+                    try:
+                        stats = await self.store.maintain()
+                        pruned = (stats.get("tweets_pruned", 0)
+                                  + stats.get("raw_pruned", 0))
+                        if pruned:
+                            self.log(f"[maintain] pruned: "
+                                     f"{stats.get('tweets_pruned', 0)} tweets, "
+                                     f"{stats.get('raw_pruned', 0)} raw payloads, "
+                                     f"{stats.get('polls_pruned', 0)} poll records")
+                    except Exception as e:
+                        self.log(f"[maintain] error: {e!r}")
 
                 # Global pause: let in-flight polls finish and clean up, but
                 # launch no new ones while collection is switched off.

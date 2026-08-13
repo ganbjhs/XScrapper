@@ -21,6 +21,15 @@ overlap_ms         = 60000        # re-read this far back, to catch late posts
 # and nothing reads it. Leave this off unless you specifically need it.
 keep_entry_json    = false
 
+# Retention. 0 = keep forever (the default). raw_retention_days drops only the
+# heavy raw JSON payloads for tweets older than N days — the searchable row,
+# the dashboard and exports are untouched; this is the knob that controls
+# database size. retention_days drops WHOLE tweet rows older than N days
+# (pinned posts are always kept). Pruned tweets older than ~a week cannot be
+# re-collected from X, so start with raw_retention_days if in doubt.
+retention_days     = 0
+raw_retention_days = 0
+
 
 # ---------------------------------------------------------------------------
 # Accounts

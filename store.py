@@ -384,12 +384,27 @@ CREATE TABLE IF NOT EXISTS tweets (
   source              TEXT NOT NULL DEFAULT 'result',  -- result | embedded
   media_json          TEXT,                  -- [{type,url,thumb}] so a video
                                              -- can be shown without fetching it
-  raw_json            TEXT,                  -- Tweet.json(): nothing is lost
-  raw_entry_json      TEXT
+  raw_json            TEXT,                  -- LEGACY: lives in tweet_raw now.
+                                             -- Kept (always NULL) so old rows,
+                                             -- old queries and old DBs coexist.
+  raw_entry_json      TEXT                   -- LEGACY: see tweet_raw.
 );
 CREATE INDEX IF NOT EXISTS ix_tweets_created   ON tweets(created_ms DESC);
 CREATE INDEX IF NOT EXISTS ix_tweets_collected ON tweets(collected_ms DESC);
 CREATE INDEX IF NOT EXISTS ix_tweets_author    ON tweets(author_username, created_ms DESC);
+
+-- The complete Tweet.json() payload, one row per tweet, OUT of the hot row.
+-- raw_json is ~10x the size of everything else in a tweet row combined, and
+-- the feed/search/export queries that scan `tweets` almost never need it.
+-- Keeping it here means those scans move 10x fewer bytes per page, and a
+-- retention policy can drop old payloads without touching the searchable row.
+-- "Nothing is lost" (R9) still holds: the payload is still written on every
+-- collect, just in its own table, joined by primary key when actually needed.
+CREATE TABLE IF NOT EXISTS tweet_raw (
+  tweet_id       INTEGER PRIMARY KEY,
+  raw_json       TEXT,
+  raw_entry_json TEXT
+);
 
 -- A tweet can match several streams; this is the many-to-many edge.
 CREATE TABLE IF NOT EXISTS tweet_hits (
@@ -732,12 +747,19 @@ class Store:
     magnitude. WAL keeps `export` and `doctor` readable while a watcher writes.
     """
 
-    def __init__(self, path, keep_entry_json: bool = False):
+    def __init__(self, path, keep_entry_json: bool = False,
+                 retention_days: int = 0, raw_retention_days: int = 0):
         # See config.Defaults.keep_entry_json: off by default because the
         # entry wrapper is ~60% of the database and nothing reads it.
         self.keep_entry_json = keep_entry_json
+        # Retention (0 = keep forever, the default — invariant #10 stands
+        # unless the operator opts in). See maintain() for exactly what each
+        # knob deletes; config.toml [defaults] is where they are set.
+        self.retention_days = max(0, int(retention_days or 0))
+        self.raw_retention_days = max(0, int(raw_retention_days or 0))
         self.path = str(path)
         self.db: sqlite3.Connection | None = None
+        self.fts_enabled = False
 
     async def open(self):
         self.db = sqlite3.connect(self.path, isolation_level=None)
@@ -745,8 +767,14 @@ class Store:
         self.db.execute("PRAGMA journal_mode = WAL")
         self.db.execute("PRAGMA synchronous = NORMAL")
         self.db.execute("PRAGMA busy_timeout = 5000")
+        # Cap the WAL file: without this a checkpoint recycles the WAL but
+        # never shrinks it, so one burst of writes leaves a big -wal file on
+        # disk forever. With the limit, any checkpoint that completes truncates
+        # it back under 4MB.
+        self.db.execute("PRAGMA journal_size_limit = 4194304")
         self.db.executescript(SCHEMA)
         self._migrate()
+        self.fts_enabled = self._ensure_fts()
         self.db.execute(
             "INSERT INTO meta(key, value) VALUES('schema_version', ?) "
             "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
@@ -841,6 +869,106 @@ class Store:
                 "  (SELECT 1 FROM project_streams ps WHERE ps.stream_id = s.stream_id)",
                 (oldest["project_id"],))
 
+        self._externalize_raw()
+
+    def _externalize_raw(self):
+        """
+        One-time move of raw payloads out of the tweets table into tweet_raw.
+
+        Gated on a meta flag rather than a table scan, because this runs on
+        EVERY open — the dashboard opens a Store per write request, and a
+        "did we migrate yet?" check must cost one indexed row, not a walk of
+        the whole tweets table.
+
+        The move itself is one transaction (a crash mid-way leaves the old
+        state, and the flag unset, so it simply reruns), followed by a VACUUM
+        so the freed pages actually leave the file instead of sitting in the
+        freelist looking like bloat.
+        """
+        done = self.db.execute(
+            "SELECT 1 FROM meta WHERE key = 'raw_externalized'").fetchone()
+        if done:
+            return
+        moved = 0
+        self.db.execute("BEGIN IMMEDIATE")
+        try:
+            cur = self.db.execute(
+                "INSERT INTO tweet_raw(tweet_id, raw_json, raw_entry_json) "
+                "SELECT tweet_id, raw_json, raw_entry_json FROM tweets "
+                "WHERE raw_json IS NOT NULL OR raw_entry_json IS NOT NULL "
+                "ON CONFLICT(tweet_id) DO UPDATE SET "
+                "  raw_json = COALESCE(excluded.raw_json, tweet_raw.raw_json), "
+                "  raw_entry_json = COALESCE(excluded.raw_entry_json, "
+                "                            tweet_raw.raw_entry_json)")
+            moved = cur.rowcount
+            self.db.execute(
+                "UPDATE tweets SET raw_json = NULL, raw_entry_json = NULL "
+                "WHERE raw_json IS NOT NULL OR raw_entry_json IS NOT NULL")
+            self.db.execute(
+                "INSERT INTO meta(key, value) VALUES('raw_externalized', '1') "
+                "ON CONFLICT(key) DO UPDATE SET value = '1'")
+            self.db.execute("COMMIT")
+        except BaseException:
+            self.db.execute("ROLLBACK")
+            raise
+        if moved:
+            self.db.execute("VACUUM")
+
+    # FTS5 over the tweet text and author, kept in sync by triggers.
+    #
+    # External-content mode (content='tweets'): the index stores tokens only,
+    # never a second copy of the text. tweet_id doubles as the FTS rowid, so a
+    # MATCH result joins back to the tweets row by primary key. The dashboard's
+    # search was `text LIKE '%q%'` — a full-table scan with a leading wildcard
+    # that no index can help; a MATCH here is an index lookup at any size.
+    #
+    # Triggers rather than in-band writes so EVERY path that inserts or
+    # deletes a tweet row — upsert_tweets, forget_stream, retention — keeps
+    # the index correct without having to remember to. The engagement-counter
+    # updates the upsert makes don't touch indexed columns, so polls that
+    # merely re-see a tweet cost the index nothing.
+    _FTS_TRIGGERS = """
+    CREATE TRIGGER IF NOT EXISTS tweets_fts_ai AFTER INSERT ON tweets BEGIN
+      INSERT INTO tweets_fts(rowid, text, author_username, author_display_name)
+      VALUES (new.tweet_id, new.text, new.author_username, new.author_display_name);
+    END;
+    CREATE TRIGGER IF NOT EXISTS tweets_fts_ad AFTER DELETE ON tweets BEGIN
+      INSERT INTO tweets_fts(tweets_fts, rowid, text, author_username, author_display_name)
+      VALUES ('delete', old.tweet_id, old.text, old.author_username, old.author_display_name);
+    END;
+    CREATE TRIGGER IF NOT EXISTS tweets_fts_au AFTER UPDATE OF
+        text, author_username, author_display_name ON tweets BEGIN
+      INSERT INTO tweets_fts(tweets_fts, rowid, text, author_username, author_display_name)
+      VALUES ('delete', old.tweet_id, old.text, old.author_username, old.author_display_name);
+      INSERT INTO tweets_fts(rowid, text, author_username, author_display_name)
+      VALUES (new.tweet_id, new.text, new.author_username, new.author_display_name);
+    END;
+    """
+
+    def _ensure_fts(self) -> bool:
+        """
+        Create the search index if this build of sqlite can. Returns whether
+        FTS is usable; a build without the FTS5 module just keeps the old
+        LIKE search, it does not break the store.
+        """
+        try:
+            existed = self.db.execute(
+                "SELECT 1 FROM sqlite_master WHERE type = 'table' "
+                "AND name = 'tweets_fts'").fetchone() is not None
+            if not existed:
+                self.db.execute(
+                    "CREATE VIRTUAL TABLE tweets_fts USING fts5("
+                    "  text, author_username, author_display_name,"
+                    "  content='tweets', content_rowid='tweet_id')")
+            self.db.executescript(self._FTS_TRIGGERS)
+            if not existed:
+                # Index everything already collected, in one statement.
+                self.db.execute(
+                    "INSERT INTO tweets_fts(tweets_fts) VALUES('rebuild')")
+            return True
+        except sqlite3.OperationalError:
+            return False
+
     def _backfill_media(self) -> int:
         """
         Fill media_json for tweets collected before the column existed.
@@ -855,8 +983,10 @@ class Store:
         Runs once, inside the same migration that adds the column.
         """
         rows = self.db.execute(
-            "SELECT tweet_id, raw_json FROM tweets "
-            "WHERE media_json IS NULL AND raw_json IS NOT NULL").fetchall()
+            "SELECT t.tweet_id, COALESCE(r.raw_json, t.raw_json) AS raw_json "
+            "FROM tweets t LEFT JOIN tweet_raw r USING(tweet_id) "
+            "WHERE t.media_json IS NULL "
+            "AND COALESCE(r.raw_json, t.raw_json) IS NOT NULL").fetchall()
         n = 0
         for r in rows:
             try:
@@ -873,6 +1003,14 @@ class Store:
 
     async def close(self):
         if self.db is not None:
+            # PASSIVE: copy what can be copied into the main file and never
+            # block on other connections. The TRUNCATE variant lives in
+            # maintain(), on the collector's cadence — a per-request dashboard
+            # close must not sit behind someone else's read.
+            try:
+                self.db.execute("PRAGMA wal_checkpoint(PASSIVE)")
+            except sqlite3.Error:
+                pass
             self.db.close()
             self.db = None
 
@@ -1314,8 +1452,13 @@ class Store:
     async def collection_rows(self, collection_id: int) -> list:
         """The board's posts, newest pin first, as full tweet rows."""
         return [dict(r) for r in self.db.execute(
-            "SELECT t.*, i.added_ms FROM collection_items i "
-            "JOIN tweets t USING(tweet_id) WHERE i.collection_id = ? "
+            "SELECT t.*, i.added_ms, "
+            "  json_extract(COALESCE(r.raw_json, t.raw_json), "
+            "               '$.user.profileImageUrl') AS author_avatar "
+            "FROM collection_items i "
+            "JOIN tweets t USING(tweet_id) "
+            "LEFT JOIN tweet_raw r USING(tweet_id) "
+            "WHERE i.collection_id = ? "
             "ORDER BY i.added_ms DESC, t.tweet_id DESC", (int(collection_id),))]
 
     # ----------------------------------------------------------------------
@@ -1677,6 +1820,19 @@ class Store:
 
     # ---------------- tweets ----------------
 
+    def _existing_ids(self, table: str, key: str, ids, extra_sql: str = "",
+                      extra_params: tuple = ()) -> set:
+        """Which of `ids` already have a row. Chunked to stay under sqlite's
+        bound-parameter limit."""
+        out, ids = set(), list(ids)
+        for i in range(0, len(ids), 500):
+            chunk = ids[i:i + 500]
+            marks = ",".join("?" * len(chunk))
+            out.update(r[0] for r in self.db.execute(
+                f"SELECT {key} FROM {table} WHERE {key} IN ({marks}){extra_sql}",
+                (*chunk, *extra_params)))
+        return out
+
     async def upsert_tweets(self, rows, stream_id: int | None, poll_id: int | None) -> UpsertCounts:
         """
         rows: iterable of (tweet, page, source, entry).
@@ -1684,8 +1840,23 @@ class Store:
         collected_at / collected_ms / lag_ms are written once and never
         updated — a tweet re-seen on a later poll must not look fresher than it
         was. Engagement counters and raw_json DO update, because those change.
+
+        One poll = ONE transaction. The old shape was three autocommit
+        statements per tweet, so a 100-tweet poll paid ~300 fsync'd
+        transactions and held the write lock in 300 slices; now the whole
+        batch is two executemany calls plus one for the hit edges, under a
+        single BEGIN IMMEDIATE. Newness is established up front with a couple
+        of chunked SELECTs instead of one probe per tweet — same answers
+        (a tweet appearing twice in a batch counts dup on its second
+        appearance, exactly as the per-row probe reported it), a small
+        fraction of the round-trips.
         """
         counts = UpsertCounts()
+        rows = list(rows)
+        if not rows:
+            return counts
+
+        tweet_rows, raw_rows, meta = [], [], []
         for tweet, page, source, entry in rows:
             tid = int(tweet.id)
             rec = normalize_tweet(tweet)
@@ -1698,7 +1869,7 @@ class Store:
             except Exception:
                 raw_json = None
 
-            payload = {
+            tweet_rows.append({
                 "tweet_id": tid,
                 "created_at": rec["created_at"],
                 "created_ms": created_ms,
@@ -1725,23 +1896,30 @@ class Store:
                 "in_reply_to": rec["in_reply_to"],
                 "conversation_id": rec["conversation_id"],
                 "source": source,
-                "raw_json": raw_json,
-                "raw_entry_json": (json.dumps(entry) if (entry and self.keep_entry_json) else None),
                 "media_json": json.dumps(rec.get("media") or []),
                 **{k: json.dumps(rec[k] or []) for k in LIST_FIELDS},
-            }
+            })
 
+            entry_json = json.dumps(entry) if (entry and self.keep_entry_json) else None
+            if raw_json is not None or entry_json is not None:
+                raw_rows.append({"tweet_id": tid, "raw_json": raw_json,
+                                 "raw_entry_json": entry_json})
+            meta.append((tid, source, collected_ms))
+
+        ids = {m[0] for m in meta}
+        self.db.execute("BEGIN IMMEDIATE")
+        try:
             # ON CONFLICT DO UPDATE reports rowcount 1 for both branches, so
             # newness has to be established before the write.
-            existed = (
-                self.db.execute(
-                    "SELECT 1 FROM tweets WHERE tweet_id = ?", (tid,)
-                ).fetchone()
-                is not None
+            existing = self._existing_ids("tweets", "tweet_id", ids)
+            existing_hits = (
+                self._existing_ids("tweet_hits", "tweet_id", ids,
+                                   " AND stream_id = ?", (stream_id,))
+                if stream_id is not None else set()
             )
 
-            cols = list(payload)
-            self.db.execute(
+            cols = list(tweet_rows[0])
+            self.db.executemany(
                 f"INSERT INTO tweets ({','.join(cols)}) "
                 f"VALUES ({','.join(':' + c for c in cols)}) "
                 "ON CONFLICT(tweet_id) DO UPDATE SET "
@@ -1752,36 +1930,63 @@ class Store:
                 "  quote_count    = excluded.quote_count,"
                 "  view_count     = excluded.view_count,"
                 "  bookmark_count = excluded.bookmark_count,"
-                "  raw_json       = COALESCE(excluded.raw_json, tweets.raw_json),"
                 # A tweet first seen as quoted context can later turn up as a
                 # real search hit. Promote it; never demote.
                 "  source = CASE WHEN tweets.source = 'embedded' AND excluded.source = 'result' "
                 "                THEN 'result' ELSE tweets.source END",
-                payload,
+                tweet_rows,
             )
 
-            if source == "embedded":
-                counts.embedded += 1
-                continue
+            # The heavy payload goes to its own table; a re-seen tweet keeps
+            # the freshest non-NULL payload it has ever had.
+            if raw_rows:
+                self.db.executemany(
+                    "INSERT INTO tweet_raw(tweet_id, raw_json, raw_entry_json) "
+                    "VALUES(:tweet_id, :raw_json, :raw_entry_json) "
+                    "ON CONFLICT(tweet_id) DO UPDATE SET "
+                    "  raw_json       = COALESCE(excluded.raw_json, tweet_raw.raw_json),"
+                    "  raw_entry_json = COALESCE(excluded.raw_entry_json, tweet_raw.raw_entry_json)",
+                    raw_rows,
+                )
 
-            if stream_id is None:
-                # One-shot search: newness is global.
-                counts.new += 0 if existed else 1
-                counts.dup += 1 if existed else 0
-                continue
+            hit_rows, seen, seen_hits = [], set(), set()
+            for tid, source, collected_ms in meta:
+                if source == "embedded":
+                    counts.embedded += 1
+                    seen.add(tid)
+                    continue
 
-            # Normal path: "new" means new TO THIS STREAM. A tweet already
-            # collected by another stream is still new here, and the hit edge
-            # is what the watermark and the lag report key off.
-            hit = self.db.execute(
-                "INSERT OR IGNORE INTO tweet_hits(stream_id, tweet_id, poll_id, first_seen_ms) "
-                "VALUES(?,?,?,?)",
-                (stream_id, tid, poll_id, collected_ms),
-            )
-            if hit.rowcount == 1:
-                counts.new += 1
-            else:
-                counts.dup += 1
+                if stream_id is None:
+                    # One-shot search: newness is global.
+                    if tid in existing or tid in seen:
+                        counts.dup += 1
+                    else:
+                        counts.new += 1
+                    seen.add(tid)
+                    continue
+
+                # Normal path: "new" means new TO THIS STREAM. A tweet already
+                # collected by another stream is still new here, and the hit
+                # edge is what the watermark and the lag report key off.
+                seen.add(tid)
+                if tid in existing_hits or tid in seen_hits:
+                    counts.dup += 1
+                else:
+                    counts.new += 1
+                    seen_hits.add(tid)
+                    hit_rows.append({"stream_id": stream_id, "tweet_id": tid,
+                                     "poll_id": poll_id, "first_seen_ms": collected_ms})
+
+            if hit_rows:
+                self.db.executemany(
+                    "INSERT OR IGNORE INTO tweet_hits(stream_id, tweet_id, poll_id, first_seen_ms) "
+                    "VALUES(:stream_id, :tweet_id, :poll_id, :first_seen_ms)",
+                    hit_rows,
+                )
+            self.db.execute("COMMIT")
+        except BaseException:
+            self.db.execute("ROLLBACK")
+            raise
         return counts
 
     async def has_tweet(self, tweet_id: int) -> bool:
@@ -1798,6 +2003,82 @@ class Store:
                 "SELECT COUNT(*) c FROM tweet_hits WHERE stream_id = ?", (stream_id,)
             ).fetchone()
         return row["c"]
+
+    # ---------------- maintenance: checkpoint + retention ----------------
+
+    async def maintain(self) -> dict:
+        """
+        Periodic housekeeping. Called by the collector on a slow cadence
+        (see collector.MAINTAIN_EVERY_S); safe to call any time.
+
+        Two jobs:
+
+        1. Retention, if the operator opted in (both default to OFF):
+             raw_retention_days  — drop raw payloads older than N days. The
+                                   searchable row stays; only the ~10x JSON
+                                   blob goes. This is the cheap 90% of the
+                                   bloat fix, and the one to reach for first.
+             retention_days      — drop WHOLE tweet rows older than N days
+                                   (by posting time), plus their hit edges,
+                                   payloads and poll/gap audit rows. Pinned
+                                   posts (collection_items) are always kept —
+                                   a curation board must never grow holes.
+        2. wal_checkpoint(TRUNCATE): fold the WAL into the main file and cut
+           the -wal file back to zero. Under constant collector writes the
+           passive autocheckpoint rarely gets to truncate, which is exactly
+           how a 4MB WAL ends up glued to a 6MB database.
+
+        Deletions and the checkpoint are separate steps on purpose: a
+        checkpoint cannot run inside a transaction.
+        """
+        out = {"tweets_pruned": 0, "raw_pruned": 0, "polls_pruned": 0}
+        now_ms = int(time.time() * 1000)
+
+        if self.retention_days:
+            cutoff = now_ms - self.retention_days * 86_400_000
+            self.db.execute("BEGIN IMMEDIATE")
+            try:
+                # Collect the doomed ids once, then hit each table once —
+                # tweet_hits has no index on tweet_id alone, so per-id deletes
+                # would scan it per chunk.
+                self.db.execute("CREATE TEMP TABLE IF NOT EXISTS _prune "
+                                "(tweet_id INTEGER PRIMARY KEY)")
+                self.db.execute("DELETE FROM _prune")
+                self.db.execute(
+                    "INSERT INTO _prune SELECT tweet_id FROM tweets "
+                    "WHERE created_ms < ? AND tweet_id NOT IN "
+                    "  (SELECT tweet_id FROM collection_items)", (cutoff,))
+                out["tweets_pruned"] = self.db.execute(
+                    "DELETE FROM tweets WHERE tweet_id IN "
+                    "  (SELECT tweet_id FROM _prune)").rowcount
+                self.db.execute("DELETE FROM tweet_hits WHERE tweet_id IN "
+                                "  (SELECT tweet_id FROM _prune)")
+                self.db.execute("DELETE FROM tweet_raw WHERE tweet_id IN "
+                                "  (SELECT tweet_id FROM _prune)")
+                self.db.execute("DELETE FROM _prune")
+                out["polls_pruned"] = self.db.execute(
+                    "DELETE FROM polls WHERE started_ms < ?", (cutoff,)).rowcount
+                self.db.execute("DELETE FROM gaps WHERE hi_ms < ?", (cutoff,))
+                self.db.execute("COMMIT")
+            except BaseException:
+                self.db.execute("ROLLBACK")
+                raise
+
+        if self.raw_retention_days:
+            # Snowflake ids are time-ordered, so "older than N days" is a
+            # primary-key range — no date column, no scan.
+            cutoff_id = ms_to_id(now_ms - self.raw_retention_days * 86_400_000)
+            out["raw_pruned"] = self.db.execute(
+                "DELETE FROM tweet_raw WHERE tweet_id < ?", (cutoff_id,)).rowcount
+
+        try:
+            row = self.db.execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchone()
+            # (busy, log_pages, checkpointed_pages); busy=1 means readers kept
+            # the truncate from finishing — normal, it will land next time.
+            out["wal"] = tuple(row) if row else None
+        except sqlite3.Error:
+            out["wal"] = None
+        return out
 
     # ---------------- watermarks ----------------
 
@@ -1989,10 +2270,13 @@ class Store:
         # column — and nothing ever filled it, so every export carried a header
         # with nothing beneath it. A tweet can match several streams, so this is
         # a comma-joined list rather than a single label.
+        # raw_json moved to tweet_raw; COALESCE keeps `export --format raw`
+        # working on a database from before the move.
         sql = ("SELECT t.*, (SELECT GROUP_CONCAT(s2.label, ',') "
                "             FROM tweet_hits h2 JOIN streams s2 USING(stream_id) "
-               "             WHERE h2.tweet_id = t.tweet_id) AS stream_label "
-               f"FROM tweets t {joins}")
+               "             WHERE h2.tweet_id = t.tweet_id) AS stream_label, "
+               "       COALESCE(tr.raw_json, t.raw_json) AS raw_json_ext "
+               f"FROM tweets t LEFT JOIN tweet_raw tr USING(tweet_id) {joins}")
         if where:
             sql += " WHERE " + " AND ".join(where)
         sql += f" ORDER BY t.tweet_id {'ASC' if order == 'asc' else 'DESC'}"
@@ -2064,7 +2348,12 @@ def write_raw(rows, path):
     n = 0
     with open(path, "w", encoding="utf-8") as f:
         for row in rows:
-            raw = row["raw_json"] if "raw_json" in row.keys() else None
+            keys = row.keys()
+            # raw_json_ext is iter_export's view over tweet_raw (with a
+            # legacy-column fallback); plain raw_json still works for any
+            # caller handing in old-shape rows.
+            raw = (row["raw_json_ext"] if "raw_json_ext" in keys
+                   else row["raw_json"] if "raw_json" in keys else None)
             if raw:
                 f.write(raw + "\n")
                 n += 1

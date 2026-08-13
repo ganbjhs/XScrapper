@@ -1234,7 +1234,9 @@ async def cmd_watch(args) -> int:
     active = await auth.active_usernames(api)
     concurrency = args.max_concurrency or max(1, len(active))
 
-    st = store_mod.Store(cfg.db_results, cfg.defaults.keep_entry_json)
+    st = store_mod.Store(cfg.db_results, cfg.defaults.keep_entry_json,
+                         retention_days=cfg.defaults.retention_days,
+                         raw_retention_days=cfg.defaults.raw_retention_days)
     await st.open()
     lock = cfg.root / auth.WATCHER_LOCKFILE
     lock.write_text(json.dumps({"pid": os.getpid(), "started": time.time()}))
