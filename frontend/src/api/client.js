@@ -75,6 +75,24 @@ export const api = {
   fbFavorites: (project) =>
     request("/api/fb/favorites", { method: "POST", body: { project } }),
 
+  // --- Account Control Panel: the managed account pool (store_accounts) ---
+  pool: () => request("/api/pool"),
+  poolAdd: (body) => request("/api/pool/add", { method: "POST", body }),
+  poolUpdate: (body) => request("/api/pool/update", { method: "POST", body }),
+  poolRemove: (account_id) =>
+    request("/api/pool/remove", { method: "POST", body: { account_id } }),
+  poolStatus: (account_id, status, health) =>
+    request("/api/pool/status", { method: "POST", body: { account_id, status, health } }),
+  poolPromote: (account_id) =>
+    request("/api/pool/promote", { method: "POST", body: { account_id } }),
+  poolFailover: (platform, rotate_proxy) =>
+    request("/api/pool/failover", { method: "POST", body: { platform, rotate_proxy } }),
+  poolBackupCodes: (account_id, codes) =>
+    request("/api/pool/backup_codes", { method: "POST", body: { account_id, codes } }),
+  poolLogin: (account_id) =>
+    request("/api/pool/login", { method: "POST", body: { account_id } }),
+  poolTotp: (account_id) => request(`/api/pool/totp${qs({ account_id })}`),
+
   projects: () => request("/api/projects"),
   createProject: (name) => request("/api/projects", { method: "POST", body: { name } }),
   archiveProject: (project_id, archived) =>
