@@ -19,11 +19,11 @@ const BADGE = { x: "platform-x", ig: "platform-ig", fb: "platform-fb" };
 const BADGE_TXT = { x: "X", ig: "IG", fb: "FB" };
 
 const STATUS = {
-  active: { dot: "", text: "Active", cls: "st-good" },
-  backup: { dot: " off", text: "Backup", cls: "" },
-  needs_login: { dot: " warn", text: "Needs login", cls: "st-warn" },
-  quarantined: { dot: " warn", text: "Quarantined", cls: "st-warn" },
-  dead: { dot: " bad", text: "Dead", cls: "st-crit" },
+  active: { dot: "", text: "Active", cls: "st-good", chip: "good" },
+  backup: { dot: " off", text: "Backup", cls: "", chip: "" },
+  needs_login: { dot: " warn", text: "Needs login", cls: "st-warn", chip: "warn" },
+  quarantined: { dot: " warn", text: "Quarantined", cls: "st-warn", chip: "warn" },
+  dead: { dot: " bad", text: "Dead", cls: "st-crit", chip: "crit" },
 };
 
 // ---------------------------------------------------------------------------
@@ -208,19 +208,20 @@ function AccountCard({ a, live, onChanged }) {
 
   return (
     <div className="panel">
-      <div className="phead">
+      <div className="phead" style={{ alignItems: "center", flexWrap: "wrap", rowGap: 6 }}>
         <h3>
           <span className={`dot${s.dot}`} style={{ display: "inline-block", marginRight: 9 }} />
           {a.label}
         </h3>
-        <span className={`badge ${BADGE[a.platform]}`} style={{ marginLeft: 4 }}>{BADGE_TXT[a.platform]}</span>
-        <b className={s.cls} style={{ marginLeft: 8, fontSize: 12.5 }}>{s.text}</b>
+        <span className={`badge ${BADGE[a.platform]}`}>{BADGE_TXT[a.platform]}</span>
+        <span className={`chip ${s.chip}`}>{s.text}</span>
         <span className="right">
-          {a.proxy_id ? `IP: ${a.proxy_id}` : "no proxy"} · {a.has_totp ? "TOTP" : "no 2FA"} · {a.backup_codes_left} codes
+          {a.has_totp ? "TOTP" : "no 2FA"} · {a.backup_codes_left} codes
         </span>
       </div>
 
       <div className="kv"><span>login</span><b>{a.login}</b></div>
+      <div className="kv"><span>proxy / IP</span><b>{a.proxy_id || "none (server IP)"}</b></div>
       {live && (
         <div className="kv"><span>live session</span>
           <b className={live.active ? "st-good" : "st-crit"}>
@@ -328,18 +329,25 @@ function PlatformSection({ platform, title, summary, accounts, orphans, liveFor,
         <Empty title={`No ${title} accounts yet`}>Use “Add account” to put one in the pool.</Empty>
       )}
 
-      {accounts.map((a) => (
-        <AccountCard key={a.account_id} a={a} live={liveFor(a)} onChanged={onChanged} />
-      ))}
+      {accounts.length > 0 && (
+        <div className="cards-grid">
+          {accounts.map((a) => (
+            <AccountCard key={a.account_id} a={a} live={liveFor(a)} onChanged={onChanged} />
+          ))}
+        </div>
+      )}
 
       {orphans.length > 0 && (
         <>
-          <div className="kv" style={{ borderTop: 0, color: "var(--ink-3)", marginTop: 4 }}>
-            <span>Already running — not managed here yet. “Add to pool” to bring them under failover &amp; 2FA.</span>
+          <div style={{ color: "var(--ink-3)", fontSize: 12.5, margin: "2px 0 8px" }}>
+            Already running — not managed here yet. “Add to pool” brings them under
+            failover &amp; 2FA.
           </div>
-          {orphans.map((r, i) => (
-            <OrphanCard key={r.label || r.username || i} r={r} platform={platform} onAdopt={onAdopt} />
-          ))}
+          <div className="cards-grid">
+            {orphans.map((r, i) => (
+              <OrphanCard key={r.label || r.username || i} r={r} platform={platform} onAdopt={onAdopt} />
+            ))}
+          </div>
         </>
       )}
     </>
@@ -437,6 +445,41 @@ export default function Accounts({ onMenu }) {
           2FA secrets can’t be stored — the panel refuses to keep them in plaintext.
         </div>
       )}
+
+      {(() => {
+        // One glance across all three platforms before the per-platform detail.
+        const actives = accounts.filter((a) => a.status === "active").length;
+        const backups = accounts.filter((a) => a.status === "backup").length;
+        const attention = accounts.filter(
+          (a) => a.status === "needs_login" || a.status === "quarantined"
+            || a.status === "dead").length;
+        const liveOn = PLATS.reduce(
+          (n, [p]) => n + liveList(p).filter((r) => r.active).length, 0);
+        return (
+          <div className="stats">
+            <div className="stat">
+              <div className="k">In the pool</div>
+              <div className="v">{accounts.length}</div>
+              <div className="d">managed accounts, all platforms</div>
+            </div>
+            <div className="stat">
+              <div className="k">Active</div>
+              <div className="v">{actives} <small>/ {PLATS.length} platforms</small></div>
+              <div className="d">one active per platform is the target</div>
+            </div>
+            <div className="stat">
+              <div className="k">Warm backups</div>
+              <div className="v">{backups}</div>
+              <div className="d">take over on ban or checkpoint</div>
+            </div>
+            <div className="stat">
+              <div className="k">{attention ? "Needs attention" : "Signed-in sessions"}</div>
+              <div className={`v ${attention ? "st-crit" : ""}`}>{attention || liveOn}</div>
+              <div className="d">{attention ? "needs login / quarantined / dead" : "live right now"}</div>
+            </div>
+          </div>
+        );
+      })()}
 
       {PLATS.map(([p, title]) => (
         <PlatformSection

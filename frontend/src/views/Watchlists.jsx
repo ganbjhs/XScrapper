@@ -199,33 +199,39 @@ function WatchlistCard({ w, onChanged }) {
   // Current interval as a preset value ("" = default).
   const curInterval = w.interval_s ? String(w.interval_s) : "";
 
+  const kindChip = w.kind === "xlist" ? "X List"
+    : w.kind === "keywords" ? "keywords" : "handles";
+
   return (
     <div className="panel">
-      <div className="phead">
+      <div className="phead" style={{ alignItems: "center", flexWrap: "wrap", rowGap: 8 }}>
         <h3>{w.name}</h3>
-        <span className="right">
-          {w.kind === "xlist"
-            ? `X List ${w.list_id}`
-            : w.kind === "keywords"
-              ? `${w.members.length} keywords → ${live.length} stream${live.length === 1 ? "" : "s"}`
-              : `${w.members.length} handles → ${live.length} stream${live.length === 1 ? "" : "s"}`}
-          {" · "}{fmtN(collected)} collected
-        </span>
-      </div>
-      <div className="filters" style={{ marginBottom: 4, marginTop: 2 }}>
-        <label className="fpill" style={{ padding: "7px 8px 7px 12px" }}>
-          <span>Check every</span>
-          <select value={curInterval} onChange={(e) => setInterval(e.target.value)}>
-            <option value="">default (~5–15 min, auto)</option>
-            <option value="300">5 minutes</option>
-            <option value="600">10 minutes</option>
-            <option value="900">15 minutes</option>
-            <option value="1800">30 minutes</option>
-            <option value="3600">1 hour</option>
-          </select>
-        </label>
-        <span style={{ color: "var(--ink-3)", fontSize: 12, alignSelf: "center" }}>
-          how often the collector re-checks this watchlist
+        <span className="badge platform-x">{kindChip}</span>
+        <span className="chip">{fmtN(collected)} collected</span>
+        {live.length === 0 && w.kind !== "xlist" && w.members.length > 0 && (
+          <span className="chip warn">no live stream</span>
+        )}
+        <span className="right" style={{ display: "flex", gap: 8, alignItems: "center" }}>
+          <span>
+            {w.kind === "xlist"
+              ? `List ${w.list_id}`
+              : `${w.members.length} ${w.kind === "keywords" ? "keyword" : "handle"}${w.members.length === 1 ? "" : "s"} → ${live.length} stream${live.length === 1 ? "" : "s"}`}
+          </span>
+          <label className="fpill" style={{ padding: "5px 6px 5px 11px" }}
+                 title="how often the collector re-checks this watchlist">
+            <span>every</span>
+            <select value={curInterval} onChange={(e) => setInterval(e.target.value)}>
+              <option value="">auto</option>
+              <option value="300">5 min</option>
+              <option value="600">10 min</option>
+              <option value="900">15 min</option>
+              <option value="1800">30 min</option>
+              <option value="3600">1 hour</option>
+            </select>
+          </label>
+          <button className="btn btn-danger btn-sm" onClick={() => setConfirming(true)}>
+            Delete
+          </button>
         </span>
       </div>
 
@@ -263,21 +269,12 @@ function WatchlistCard({ w, onChanged }) {
                     onClick={() => change(splitAdd(w.kind, adding), [])}>
               Add
             </button>
-            <button className="btn btn-danger btn-sm" onClick={() => setConfirming(true)}>
-              Delete watchlist
-            </button>
           </div>
         </>
       )}
       {w.kind === "xlist" && (
-        <div className="filters" style={{ marginTop: 8, marginBottom: 0 }}>
-          <span style={{ color: "var(--ink-3)", fontSize: 13 }}>
-            Collected through the X List — members are managed on x.com.
-          </span>
-          <span style={{ flex: 1 }} />
-          <button className="btn btn-danger btn-sm" onClick={() => setConfirming(true)}>
-            Delete watchlist
-          </button>
+        <div style={{ color: "var(--ink-3)", fontSize: 13, marginTop: 8 }}>
+          Collected through the X List — members are managed on x.com.
         </div>
       )}
       {err && <div className="err" style={{ color: "var(--critical)", fontSize: 13, marginTop: 8 }}>{err}</div>}
@@ -587,35 +584,56 @@ function FacebookSources({ pid }) {
     finally { setFetching(false); }
   };
 
+  const health = data?.health || {};
+  const loginChip = !data?.enabled
+    ? ["crit", "login not set up"]
+    : health.blocked
+      ? ["crit", "login needs a human"]
+      : ["good", "login ok"];
+
   return (
     <div className="panel" style={{ marginTop: 16 }}>
-      <div className="phead">
+      <div className="phead" style={{ alignItems: "center", flexWrap: "wrap", rowGap: 8 }}>
         <h3><span className="badge platform-fb" style={{ marginRight: 8 }}>f</span>Facebook pages</h3>
-        <span className="right" style={{ display: "flex", gap: 8, alignItems: "center" }}>
-          <span>{data?.totals?.posts ?? 0} collected{paused ? " · PAUSED" : ""}</span>
-          <button className={`btn btn-sm ${paused ? "btn-brand" : "btn-ghost"}`}
-                  disabled={busy} onClick={togglePause}
-                  title="Master switch — the background service honors it within a minute, no restart">
-            {paused ? "Resume collection" : "Pause collection"}
-          </button>
-          <button className="btn btn-ghost btn-sm"
-                  disabled={fetching || paused || sources.length === 0}
-                  onClick={fetchFavorites}
-                  title="Read the account's Favorites feed once and attribute posts to your pages — richer data, one pass">
-            {fetching ? "…" : "Fetch Favorites feed"}
-          </button>
-          <button className="btn btn-brand btn-sm"
-                  disabled={fetching || paused || sources.length === 0}
-                  onClick={fetchNow}>
-            {fetching ? "Fetching…" : "Fetch now"}
-          </button>
+        <span className="chip">{fmtN(data?.totals?.posts ?? 0)} collected</span>
+        <span className={`chip ${paused ? "warn" : "good"}`}>
+          {paused ? "paused" : "collecting"}
+        </span>
+        <span className={`chip ${loginChip[0]}`}>{loginChip[1]}</span>
+        {data?.config?.mode === "favorites" && <span className="chip">favorites mode</span>}
+        <span className="right">
+          {sources.length} page{sources.length === 1 ? "" : "s"}
         </span>
       </div>
+
       {!data?.enabled && (
-        <div className="kv"><span>Not set up</span>
-          <b className="st-warn">add FB_EMAIL / FB_PASSWORD (or FB_C_USER / FB_XS) to .env on the server</b></div>
+        <div className="banner-crit" style={{ marginTop: 8, marginBottom: 8 }}>
+          <b>Not set up.</b> Add <code>FB_EMAIL / FB_PASSWORD</code> (or
+          <code> FB_C_USER / FB_XS</code>) to .env on the server, then restart the dashboard.
+        </div>
       )}
       <FbHealthBanner health={data?.health} onAction={healthAction} busy={busy} />
+
+      <div className="toolbar">
+        <button className="btn btn-brand btn-sm"
+                disabled={fetching || paused || sources.length === 0}
+                onClick={fetchNow}>
+          {fetching ? "Fetching…" : "Fetch now"}
+        </button>
+        <button className="btn btn-ghost btn-sm"
+                disabled={fetching || paused || sources.length === 0}
+                onClick={fetchFavorites}
+                title="Read the account's Favorites feed once and attribute posts to your pages — richer data, one pass">
+          {fetching ? "…" : "Fetch Favorites feed"}
+        </button>
+        <span className="grow" />
+        <button className={`btn btn-sm ${paused ? "btn-brand" : "btn-ghost"}`}
+                disabled={busy} onClick={togglePause}
+                title="Master switch — the background service honors it within a minute, no restart">
+          {paused ? "Resume collection" : "Pause collection"}
+        </button>
+      </div>
+
       {paused && (
         <div style={{ color: "var(--ink-3)", fontSize: 12.5, margin: "6px 0" }}>
           Collection is paused — the background service idles without opening a
@@ -691,16 +709,19 @@ function FacebookSources({ pid }) {
       </div>
       {msg && <div style={{ color: "var(--critical)", fontSize: 12.5, marginTop: 8 }}>{msg}</div>}
       <FbConfigPanel data={data} reload={reload} />
-      <div style={{ color: "var(--ink-3)", fontSize: 12, marginTop: 8 }}>
-        Facebook runs on the server’s own bandwidth with a monthly cap — it checks each page a few
-        times a day, newest posts only.
-      </div>
-      <div style={{ color: "var(--ink-3)", fontSize: 12, marginTop: 6 }}>
-        <b>Favorites feed (richer):</b> in the collector’s Facebook account, add these pages to
-        <b> Favorites</b> (Facebook → Feeds → Favorites → Manage, up to 30). Then “Fetch Favorites
-        feed” reads them all as one real feed — which returns profile pictures, reaction counts and
-        more posts than a page-by-page check. Posts are matched back to the pages above.
-      </div>
+      <details className="help">
+        <summary>How Facebook collection works</summary>
+        <p>
+          Facebook runs on the server’s own bandwidth with a monthly cap — it checks each page a
+          few times a day, newest posts only.
+        </p>
+        <p>
+          <b>Favorites feed (richer):</b> in the collector’s Facebook account, add these pages to
+          <b> Favorites</b> (Facebook → Feeds → Favorites → Manage, up to 30). Then “Fetch Favorites
+          feed” reads them all as one real feed — more posts and reaction counts in a single pass.
+          Posts are matched back to the pages above.
+        </p>
+      </details>
     </div>
   );
 }
