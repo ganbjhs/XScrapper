@@ -148,12 +148,17 @@ before changing the engine; nearly every "obvious" idea has been tried.)
   a task for a human, and both the account log and the Facebook panel say so
   in plain words.
 - **Profile pictures: X is the canonical source; never make a request just
-  for a picture.** A public figure uses the same photo on every platform, and
-  X avatars arrive free inside every collected tweet — so the dashboard shows
-  a Facebook/Instagram post's avatar by handle-matching it to the X data at
-  READ time (`web.py _x_avatars_for`). Facebook may still cache an avatar
-  when a fetch happens to carry one (posts, or the page render it already
-  did), but it never navigates anywhere only to capture a picture.
+  for a picture, and NEVER scrape one off a rendered page.** A public figure
+  uses the same photo on every platform, and X avatars arrive free inside
+  every collected tweet — so the dashboard shows a Facebook/Instagram post's
+  avatar by handle-matching it to the X data at READ time
+  (`web.py _x_avatars_for`). On the Facebook side the only avatar ever stored
+  is one embedded in a post's own GraphQL Story (`actor.profile_picture`) —
+  structured data, not screen contents. Render-harvesting was tried and
+  REMOVED (2026-08-14): it ran against a login-walled render once and cached
+  Facebook's login-page artwork as the "profile picture" of real pages. A
+  heuristic that reads pixels off whatever page happens to be showing will
+  eventually cache garbage forever; structured data or nothing.
 - **The collector only READS the account. It never changes account settings** —
   no enabling 2FA, no answering verification flows, no profile edits, nothing
   under Settings. Anything Facebook asks that is not "show me the feed" is a

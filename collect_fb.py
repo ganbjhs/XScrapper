@@ -40,17 +40,16 @@ def _persist_log(log=None):
 
 def _cache_avatar(engine, store, handle, posts, log=print):
     """
-    Keep the page's profile picture in the page_profiles cache. FREE sources
-    only — never a dedicated visit just for a picture (RULEBOOK §6; X is the
-    canonical avatar source and the dashboard backfills from it at read time):
-      1. a collected post that carried the avatar (also refreshes the cache),
-      2. the avatar harvested from the page render we already did.
-    Returns the avatar URL (cached or fresh) so posts can be backfilled.
+    Keep the page's profile picture in the page_profiles cache. The ONLY
+    accepted source is a collected post that carried the avatar — real page
+    data embedded in the GraphQL Story. Render-harvesting was REMOVED
+    (RULEBOOK §6): it once ran against a login-walled render and cached
+    Facebook's login-page artwork as "profile pictures". X is the canonical
+    avatar source anyway; the dashboard backfills from it at read time.
     """
     handle = str(handle).lower()
     fresh = next((p.get("author_avatar") for p in posts
                   if p.get("author_avatar")), None)
-    fresh = fresh or getattr(engine, "page_avatars", {}).get(handle)
     if fresh:
         store.set_profile(handle, avatar_url=fresh)
         return fresh

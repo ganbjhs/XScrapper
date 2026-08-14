@@ -231,29 +231,6 @@ _EXTRACT_JS = r"""
 }
 """
 
-# The page's OWN profile picture, read out of an already-rendered profile page.
-# Three sources, best-first: the Relay JSON blobs (profilePicLarge/Medium — the
-# real square avatar), the profile-photo <image> in the header SVG, and the
-# og:image meta as a last resort. Image BYTES are blocked by the engine, but
-# the URLs still sit in the DOM/JSON, which is all we need.
-_AVATAR_JS = r"""
-() => {
-  const good = (u) => u && /fbcdn|scontent/.test(u);
-  const re = /"profilePic(?:Large|Medium|Small|160)?"\s*:\s*\{\s*"uri"\s*:\s*"((?:[^"\\]|\\.)+)"/;
-  for (const s of document.querySelectorAll('script[type="application/json"]')) {
-    const m = (s.textContent || '').match(re);
-    if (m) { try { const u = JSON.parse('"' + m[1] + '"'); if (good(u)) return u; } catch (e) {} }
-  }
-  for (const im of document.querySelectorAll('svg image')) {
-    const u = im.getAttribute('xlink:href') || im.getAttribute('href');
-    if (good(u)) return u;
-  }
-  const og = document.querySelector('meta[property="og:image"]');
-  if (og && og.content) return og.content;
-  const img = document.querySelector('img[src*="fbcdn"], img[src*="scontent"]');
-  return img ? img.src : null;
-}
-"""
 
 
 # --------------------------------------------------------------------------
@@ -665,7 +642,6 @@ class FacebookEngine:
         self.email = os.getenv("FB_EMAIL", "").strip()
         self.password = os.getenv("FB_PASSWORD", "")
         self.on_favorites = False   # set by fetch_favorites: did we reach the feed
-        self.page_avatars = {}      # handle → avatar URL harvested this run
         self._pw = self._browser = self._ctx = self._page = None
 
     async def __aenter__(self):
@@ -1060,16 +1036,6 @@ class FacebookEngine:
         except Exception as e:
             self.log(f"[fb] fetch {handle} failed: {type(e).__name__}: {e}")
 
-        # Harvest the page's profile picture from the SAME render — zero extra
-        # navigation. The collector caches it in page_profiles, so this is a
-        # free refresh whenever the page is visited anyway.
-        try:
-            av = await self._page.evaluate(_AVATAR_JS)
-            if av:
-                self.page_avatars[handle.lower()] = av
-        except Exception:
-            pass
-
         _record_bytes(self.meter_db, self._bytes)
         await self._save_state()
 
@@ -1098,35 +1064,6 @@ class FacebookEngine:
                          json.dumps(diag.get("containers"))[:1800])
         return posts
 
-    async def fetch_avatar(self, handle: str):
-        """
-        ONE profile visit purely to capture the page's profile picture — used
-        only when the avatar cache is empty AND no collected post carried it
-        (the favorites path never visits pages, so first-seen pages land here).
-        The caller stores the result in page_profiles, so per page this runs
-        at most once, ever.
-        """
-        ok, used = _bandwidth_ok(self.meter_db, self.cap_bytes)
-        if not ok:
-            self.log(f"[fb] monthly bandwidth cap reached ({used/1e9:.1f} GB) — "
-                     f"skipping avatar fetch for {handle}")
-            return None
-        self._bytes = 0
-        url = None
-        try:
-            await self._page.goto(f"https://www.facebook.com/{handle}",
-                                  wait_until="domcontentloaded", timeout=60000)
-            await self._page.wait_for_timeout(random.randint(2000, 3500))
-            if not self._is_login_wall(self._page.url):
-                url = await self._page.evaluate(_AVATAR_JS)
-        except Exception as e:
-            self.log(f"[fb] avatar fetch {handle} failed: {type(e).__name__}: {e}")
-        _record_bytes(self.meter_db, self._bytes)
-        if url:
-            self.page_avatars[handle.lower()] = url
-        self.log(f"[fb] {handle}: avatar "
-                 f"{'captured' if url else 'not found'} ({self._bytes//1024} KB)")
-        return url
 
     async def fetch_favorites(self, max_scroll: int = 6) -> list:
         """
