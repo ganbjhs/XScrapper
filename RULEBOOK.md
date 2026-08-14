@@ -103,7 +103,14 @@ precision past 2^53; snowflake ids are well past it).
 50 requests / 15 min) — big permanent watchlists belong on real X Lists. One
 long-lived asyncio loop for the whole process (twscrape's module lock binds to
 the first loop that awaits it). Verification/category come from the stored raw
-tweet JSON at read time, not columns.
+tweet JSON at read time, not columns. **The raw payload lives in `tweet_raw`,
+not in the `tweets` row** (8c416bf moved it; `tweets.raw_json` is NULL on
+every new row). Any reader that needs a payload field — the avatar, `user.blue`,
+`blueType` — must `LEFT JOIN tweet_raw` and read
+`COALESCE(r.raw_json, t.raw_json)`, extracting ONLY the needed field in SQL so
+feed pages stay slim. This rule was paid for: `web.py` kept reading
+`t.raw_json` after the move and every X profile picture silently vanished from
+the Live Feed (2026-08-14).
 
 **Instagram.** Fights automation hard: checkpoints only a human clears (then
 import a fresh `sessionid` from that browser), `LoginRequired` on fingerprint
@@ -140,6 +147,13 @@ before changing the engine; nearly every "obvious" idea has been tried.)
   a loop is how the burner account gets locked permanently; a blocked login is
   a task for a human, and both the account log and the Facebook panel say so
   in plain words.
+- **Profile pictures: X is the canonical source; never make a request just
+  for a picture.** A public figure uses the same photo on every platform, and
+  X avatars arrive free inside every collected tweet — so the dashboard shows
+  a Facebook/Instagram post's avatar by handle-matching it to the X data at
+  READ time (`web.py _x_avatars_for`). Facebook may still cache an avatar
+  when a fetch happens to carry one (posts, or the page render it already
+  did), but it never navigates anywhere only to capture a picture.
 - **The collector only READS the account. It never changes account settings** —
   no enabling 2FA, no answering verification flows, no profile edits, nothing
   under Settings. Anything Facebook asks that is not "show me the feed" is a

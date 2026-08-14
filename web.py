@@ -345,10 +345,12 @@ def _query_tweets(p):
     # legacy flag and is False on essentially every modern account — `blue` is
     # the checkmark people actually mean, so that is what this filters on.
     if p.get("verified"):
-        where.append("json_extract(t.raw_json, '$.user.blue') = 1")
+        where.append(
+            "json_extract(COALESCE(r.raw_json, t.raw_json), '$.user.blue') = 1")
 
     if p.get("category"):
-        where.append("json_extract(t.raw_json, '$.user.blueType') = ?")
+        where.append(
+            "json_extract(COALESCE(r.raw_json, t.raw_json), '$.user.blueType') = ?")
         params.append(p["category"])
 
     if p.get("since"):
@@ -388,7 +390,14 @@ def _query_tweets(p):
         params.append(int(p["since_collected_ms"]))
         cursoring = True
 
-    sql = f"SELECT t.* FROM tweets t {joins} WHERE {' AND '.join(where)}"
+    # raw_json lives in tweet_raw (8c416bf) — LEFT JOIN it and extract ONLY
+    # the avatar field in SQL, so the feed keeps its slim rows but the
+    # profile picture still arrives (RULEBOOK §6 X).
+    sql = (f"SELECT t.*, "
+           f"  json_extract(COALESCE(r.raw_json, t.raw_json), "
+           f"               '$.user.profileImageUrl') AS author_avatar "
+           f"FROM tweets t LEFT JOIN tweet_raw r USING(tweet_id) "
+           f"{joins} WHERE {' AND '.join(where)}")
     # A cursor walk has to run oldest-first, or "the last row I got" is not a
     # position you can resume from.
     order = "ASC" if (p.get("order") == "asc" or cursoring) else "DESC"
@@ -404,7 +413,9 @@ def _query_tweets(p):
 
     with _connect() as con:
         total = con.execute(
-            f"SELECT COUNT(*) c FROM tweets t {joins} WHERE {' AND '.join(where)}", params
+            f"SELECT COUNT(*) c FROM tweets t "
+            f"LEFT JOIN tweet_raw r USING(tweet_id) "
+            f"{joins} WHERE {' AND '.join(where)}", params
         ).fetchone()["c"]
         rows = con.execute(
             f"{sql} ORDER BY {order_by} {order} LIMIT ? OFFSET ?",
@@ -433,19 +444,51 @@ def _row_to_json(r):
         d["media"] = json.loads(d.pop("media_json", None) or "[]")
     except (TypeError, ValueError):
         d["media"] = []
-    # The author's profile picture. Never extracted into a column, but the
-    # full payload was kept (R9 again) — so it is right there in raw_json,
-    # at read time, for every tweet ever collected.
-    try:
-        d["author_avatar"] = (json.loads(d.get("raw_json") or "{}")
-                              .get("user", {}).get("profileImageUrl"))
-    except (TypeError, ValueError, AttributeError):
-        d["author_avatar"] = None
+    # The author's profile picture. The payload lives in tweet_raw since
+    # 8c416bf, so queries feeding this function extract it in SQL
+    # (json_extract over the LEFT JOIN — see _query_tweets / _live_rows /
+    # store.collection_rows). Only FALL BACK to parsing an inline raw_json
+    # here, and never clobber an avatar the query already provided.
+    if not d.get("author_avatar"):
+        try:
+            d["author_avatar"] = (json.loads(d.get("raw_json") or "{}")
+                                  .get("user", {}).get("profileImageUrl"))
+        except (TypeError, ValueError, AttributeError):
+            d["author_avatar"] = None
     # JS loses integer precision above 2^53, and tweet ids are well past it.
     d["tweet_id"] = str(d["tweet_id"])
     d.pop("raw_json", None)
     d.pop("raw_entry_json", None)
     return d
+
+
+def _x_avatars_for(handles):
+    """
+    The latest known X profile picture per handle (case-insensitive map:
+    handle → URL). Public figures use the SAME photo on every platform, and X
+    avatars arrive free with every collected tweet — so X is the canonical
+    avatar source, and a Facebook/Instagram post whose handle matches an X
+    account we collect is shown with that picture. No extra fetching anywhere:
+    this reads only what the X collector already stored.
+    """
+    out = {}
+    wanted = {str(h).lower() for h in handles if h}
+    if not wanted or not _CFG.db_results.exists():
+        return out
+    try:
+        with _connect() as con:
+            for h in wanted:
+                row = con.execute(
+                    "SELECT json_extract(COALESCE(r.raw_json, t.raw_json), "
+                    "       '$.user.profileImageUrl') AS av "
+                    "FROM tweets t LEFT JOIN tweet_raw r USING(tweet_id) "
+                    "WHERE t.author_username = ? COLLATE NOCASE "
+                    "ORDER BY t.created_ms DESC LIMIT 1", (h,)).fetchone()
+                if row and row["av"]:
+                    out[h] = row["av"]
+    except Exception:
+        pass
+    return out
 
 
 def _status():
@@ -1068,7 +1111,11 @@ def _live_rows(con, last_ms: int, last_tweet_id: int, project: int = 0,
             "        WHERE ph.tweet_id = t.tweet_id AND ps.project_id = ?)")
         params.append(project)
     rows = con.execute(
-        f"SELECT t.* FROM tweets t WHERE {' AND '.join(where)} "
+        f"SELECT t.*, "
+        f"  json_extract(COALESCE(r.raw_json, t.raw_json), "
+        f"               '$.user.profileImageUrl') AS author_avatar "
+        f"FROM tweets t LEFT JOIN tweet_raw r USING(tweet_id) "
+        f"WHERE {' AND '.join(where)} "
         "ORDER BY t.collected_ms, t.tweet_id LIMIT ?", [*params, limit]).fetchall()
     return [_row_to_json(r) for r in rows]
 
@@ -2139,7 +2186,17 @@ def _fb_posts(q):
         limit = 50
     with store_fb.Store(rp) as st:
         rows = st.recent(project_id=pid or None, limit=limit, since_ms=since_ms)
-    return {"count": len(rows), "posts": [store_fb.to_feed(r) for r in rows]}
+    posts = [store_fb.to_feed(r) for r in rows]
+    # A post still without a picture gets the X avatar for the same handle —
+    # public figures use one photo everywhere, and X is the canonical source.
+    missing = {p["author_username"] for p in posts if not p.get("author_avatar")}
+    if missing:
+        xmap = _x_avatars_for(missing)
+        for p in posts:
+            if not p.get("author_avatar"):
+                p["author_avatar"] = xmap.get(
+                    str(p.get("author_username") or "").lower())
+    return {"count": len(rows), "posts": posts}
 
 
 # The named check-cadences a Facebook page can be set to, seconds. Hours, not
@@ -2446,6 +2503,17 @@ def _ig_posts(q):
                         username=q.get("username") or None,
                         before_pk=int(q["cursor"]) if q.get("cursor") else None)
         posts = [store_ig.to_api(r) for r in rows]
+    # Same rule as Facebook: the X avatar for the same handle is the profile
+    # picture (one photo everywhere; X is the canonical source).
+    missing = {(p.get("author") or {}).get("username") for p in posts
+               if not p.get("author_avatar")}
+    missing.discard(None)
+    if missing:
+        xmap = _x_avatars_for(missing)
+        for p in posts:
+            if not p.get("author_avatar"):
+                p["author_avatar"] = xmap.get(
+                    str((p.get("author") or {}).get("username") or "").lower())
     return {"count": len(posts), "posts": posts,
             "next_cursor": posts[-1]["id"] if posts else None}
 

@@ -18,6 +18,9 @@ const normIg = (p) => ({
   collected_at: p.collected_at || p.created_at,
   author_username: p.author?.username,
   author_display_name: p.author?.username,
+  // Server-side backfill: the X avatar for the same handle (one photo
+  // everywhere — X is the canonical avatar source).
+  author_avatar: p.author_avatar || p.author?.avatar,
   like_count: p.metrics?.likes,
   reply_count: p.metrics?.comments,
   view_count: p.metrics?.views,

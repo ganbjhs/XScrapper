@@ -40,11 +40,11 @@ def _persist_log(log=None):
 
 def _cache_avatar(engine, store, handle, posts, log=print):
     """
-    Keep the page's profile picture in the page_profiles cache — fetched once,
-    reused forever after. Cheapest source first:
-      1. a collected post that carried the avatar (free — also refreshes it),
-      2. the avatar harvested from the page render we already did (free),
-      3. only if the cache is EMPTY: one dedicated profile visit.
+    Keep the page's profile picture in the page_profiles cache. FREE sources
+    only — never a dedicated visit just for a picture (RULEBOOK §6; X is the
+    canonical avatar source and the dashboard backfills from it at read time):
+      1. a collected post that carried the avatar (also refreshes the cache),
+      2. the avatar harvested from the page render we already did.
     Returns the avatar URL (cached or fresh) so posts can be backfilled.
     """
     handle = str(handle).lower()
@@ -219,32 +219,15 @@ async def run_favorites(store_path="fb_results.db", *, project_id=None,
         async with FacebookEngine(log=log) as eng:
             posts = await eng.fetch_favorites(max_scroll=max_scroll)
             on_fav = getattr(eng, "on_favorites", False)
-            # Avatar cache upkeep, while the browser is still warm. Free when a
-            # post carried the avatar; a page with NOTHING cached gets one
-            # dedicated profile visit — at most 3 per pass to stay gentle (the
-            # rest catch up on later passes), and never again once cached.
-            page_av = {}
+            # Avatar cache upkeep — FREE sources only: posts that carried the
+            # avatar. NO dedicated profile visits for pictures (RULEBOOK §6):
+            # X is the canonical avatar source — a public figure uses one
+            # photo everywhere — and the dashboard backfills FB/IG posts from
+            # the X avatar of the same handle at read time (web.py).
             for p in posts:
                 h = str(p.get("page") or "").lower()
-                if h:
-                    page_av.setdefault(h, None)
-                    page_av[h] = page_av[h] or p.get("author_avatar")
-            visits = 0
-            for h, av in page_av.items():
-                relevant = h in by_handle or (project_id and on_fav)
-                if av:
-                    st.set_profile(h, avatar_url=av)
-                elif relevant and st.profile_avatar(h) is None and visits < 3:
-                    visits += 1
-                    got = await eng.fetch_avatar(h)
-                    if got:
-                        st.set_profile(h, avatar_url=got)
-            missing = [h for h, av in page_av.items()
-                       if not av and st.profile_avatar(h) is None
-                       and (h in by_handle or (project_id and on_fav))]
-            if missing:
-                log(f"[fb] favorites: {len(missing)} page(s) still without a "
-                    f"cached avatar (picked up on later passes): {missing[:10]}")
+                if h and p.get("author_avatar"):
+                    st.set_profile(h, avatar_url=p["author_avatar"])
         avatars = st.profiles()   # handle → cached avatar, for backfill
         # Auto-register a page ONLY when we confirmed we're on the real Favorites
         # feed. If we fell back to the home feed, we must not treat everyone the
