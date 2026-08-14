@@ -237,3 +237,54 @@ before changing the engine; nearly every "obvious" idea has been tried.)
 - **Keep the pinned scraper versions and the `doctor`/`guard` asserts.** They
   turn "the platform changed under us" into a loud failure instead of silent
   data loss.
+
+## 8. Protected features (removal requires the operator's explicit permission)
+
+This registry is STRICT: nothing on it may be removed, disabled by default, or
+quietly degraded without the operator saying so, in their own words, first. A
+refactor that "simplifies away" a listed feature is a rule violation even if
+every test stays green. Adding to this list is normal work; removing from it
+is an operator decision recorded in the commit message. The two documents
+`RULEBOOK.md` and `BLUEPRINT.md` are themselves protected: they may be
+updated, never deleted (the pre-commit hook blocks the deletion).
+
+**Collection**
+- X watchlists: handles / keywords (AND, quoted phrases) / X Lists, with
+  per-watchlist check intervals and collection-time filters.
+- Instagram sources: user / hashtag / home-feed, managed from the dashboard
+  (`/api/ig/source`), collected by the IG service.
+- Facebook pages with per-page cadence, pause/resume per page and globally,
+  plus favorites mode (one richer feed pass, posts attributed per page).
+- Watermark polling everywhere (one cheap request per quiet poll), FB two-key
+  dedup (post id + content signature), removal tombstones beating favorites
+  auto-register.
+- FB monthly byte cap + meter (`fb_meter.db`) — collection refuses past cap.
+
+**Reliability & safety**
+- FB login circuit breaker: ONE automatic attempt, cause recorded
+  (checkpoint vs credentials), human clears it from the dashboard. Never loop.
+- Account activity log (`activity.db`): every collector/engine line,
+  timestamped, browsable per platform in the dashboard.
+- Guard (advisory only), `doctor`, pinned scraper versions with startup
+  asserts, additive self-applying migrations.
+- Login walls / bans surface in the UI in plain words — never silent.
+
+**Dashboard**
+- Live Feed: X + IG + FB in one stream, SSE real-time, keyword highlighting,
+  profile pictures with X as the canonical avatar source.
+- Watchlists page: master-detail with tabs ("Watchlists" /
+  "Network & settings"), unified platform-first add flow.
+- Accounts & Sessions: account pool (add / edit / promote / failover /
+  quarantine / TOTP preview / backup codes), live sessions incl. orphans.
+- Activity Log page: structured X poll history + raw account log with
+  platform/level filters.
+- Collections (pins, CSV export), Alerts (velocity → Telegram), Delivery
+  (targets, backfill, behind-count), Search, Guard views.
+- Every operational switch editable in the dashboard; service loops re-read
+  settings each cycle (no restart to apply).
+
+**Delivery & interfaces**
+- HMAC-signed webhook push to Watch-Tower (cursor-based, at-least-once,
+  media as URLs), Telegram sends, velocity alerts.
+- API-key read-only pull on a fixed allowlist; IG/FB pull endpoints in the
+  shared post shape.

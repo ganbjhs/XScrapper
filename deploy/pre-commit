@@ -59,6 +59,19 @@ fi
 # Opt-out for genuinely behavior-neutral edits:  RULE_OK=1 git commit …
 # (or git commit --no-verify, which skips every hook).
 
+# ---------------------------------------------------------------------------
+# Protected documents (RULEBOOK.md §8): may be UPDATED, may never be DELETED.
+# The rulebook is the law and the blueprint is the rebuild map — a commit that
+# removes either one erases the project's memory. No override except --no-verify.
+
+DELETED=$(git diff --cached --name-only --diff-filter=D)
+for f in RULEBOOK.md BLUEPRINT.md; do
+  if printf '%s\n' "$DELETED" | grep -qx "$f"; then
+    echo "BLOCKED: $f is a protected document — update it, never delete it." >&2
+    exit 1
+  fi
+done
+
 if [ "${RULE_OK:-0}" != "1" ]; then
   CHANGED=$(git diff --cached --name-only --diff-filter=ACMR)
   behavior=0
