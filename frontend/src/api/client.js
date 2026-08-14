@@ -39,6 +39,7 @@ export const api = {
   metrics: (project) => request(`/api/metrics${qs({ project })}`),
   guard: () => request("/api/guard"),
   activity: (p) => request(`/api/activity${qs(p)}`),
+  activityLogs: (p) => request(`/api/activity/logs${qs(p)}`),
   delivery: (project) => request(`/api/delivery${qs({ project })}`),
   streamAssignments: () => request("/api/streams/assignments"),
   attachStream: (project, stream_id) =>

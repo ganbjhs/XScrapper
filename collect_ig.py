@@ -37,11 +37,20 @@ import argparse
 import asyncio
 import time
 
+import activity_log
 import ig
 import ig_session
 import store_ig
 from engine_ig import IGEngine
 from instagrapi.exceptions import LoginRequired
+
+
+def _persist_log(log=None):
+    """Default logger: print AND persist to the account-activity log, so the
+    dashboard's Account Log shows what the Instagram accounts are doing."""
+    if log is not None and log is not print:
+        return log
+    return activity_log.logger("instagram")
 
 
 def _active_account() -> str:
@@ -91,6 +100,7 @@ async def collect_source(engine, store, source, *, page_size=12, max_pages=2, lo
 
 async def run_once(store_path="ig_results.db", account_override="", *,
                    page_size=12, max_pages=2, log=print) -> int:
+    log = _persist_log(log)
     with store_ig.Store(store_path) as store:
         sources = store.sources(only_enabled=True)
         if not sources:

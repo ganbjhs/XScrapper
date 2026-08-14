@@ -1211,6 +1211,26 @@ def _activity_json(q):
     return {"polls": [dict(r) for r in rows]}
 
 
+def _activity_logs_json(q):
+    """
+    The raw account-activity log: every line the collectors and engines write
+    while acting as the burner accounts — session reuse, login attempts,
+    logged-out walls, fetches, avatar captures, errors. This is the "what are
+    the accounts actually doing" view; filters: ?platform=facebook|instagram,
+    ?level=info|warn|error, ?limit=N.
+    """
+    import activity_log
+    try:
+        limit = min(int(q.get("limit") or 300), 1000)
+    except (TypeError, ValueError):
+        limit = 300
+    platform = (q.get("platform") or "").strip().lower() or None
+    level = (q.get("level") or "").strip().lower() or None
+    events = activity_log.recent(limit=limit, platform=platform, level=level,
+                                 db=str(_CFG.root / "activity.db"))
+    return {"count": len(events), "events": events}
+
+
 def _metrics_json(q=None):
     """
     The stat strip and the 7-day chart, from what is actually stored. Days are
@@ -2215,8 +2235,14 @@ def _fb_fetch(body):
                          "restart the dashboard, then try again."}
 
     logs: list = []
+    # Echo into the response (the button shows it) AND persist to the account
+    # activity log, so button-triggered runs appear in the Log section too.
+    import activity_log
+    _lg = activity_log.logger(
+        "facebook", account=os.getenv("FB_EMAIL", "").strip() or None,
+        echo=lambda m: logs.append(str(m)), db=str(_CFG.root / "activity.db"))
     n, err = _fb_locked_run(run_once(str(rp), project_id=pid or None,
-                                     log=lambda m: logs.append(str(m))), timeout=300)
+                                     log=_lg), timeout=300)
     if err:
         return {**err, "log": logs}
     diag = None
@@ -2245,10 +2271,14 @@ def _fb_favorites(body):
         return {"error": "Facebook login isn't set up on the server yet — add "
                          "FB_EMAIL/FB_PASSWORD to .env and restart the dashboard."}
     logs: list = []
+    import activity_log
+    _lg = activity_log.logger(
+        "facebook", account=os.getenv("FB_EMAIL", "").strip() or None,
+        echo=lambda m: logs.append(str(m)), db=str(_CFG.root / "activity.db"))
     # pid lets favorited pages auto-register under THIS project, so the feed
     # just flows in without hand-adding each page.
     n, err = _fb_locked_run(run_favorites(str(rp), project_id=pid or None,
-                                          log=lambda m: logs.append(str(m))), timeout=300)
+                                          log=_lg), timeout=300)
     if err:
         return {**err, "log": logs}
     return {"ok": True, "new": n, "log": logs}
@@ -2615,6 +2645,8 @@ class Handler(BaseHTTPRequestHandler):
                                    f'attachment; filename="{safe}.csv"'})
             if u.path == "/api/activity":
                 return self._send(200, _activity_json(q))
+            if u.path == "/api/activity/logs":
+                return self._send(200, _activity_logs_json(q))
             if u.path == "/api/metrics":
                 return self._send(200, _metrics_json(q))
             if u.path == "/api/login/frame":

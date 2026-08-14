@@ -21,7 +21,21 @@ import os
 import random
 import time
 
+import activity_log
 import store_fb
+
+
+def _persist_log(log=None):
+    """
+    The collectors' default logger: still prints (so journalctl keeps working)
+    AND persists every line to the account-activity log, which is what the
+    dashboard's Account Log section reads. A caller that passes its own log
+    keeps it untouched.
+    """
+    if log is not None and log is not print:
+        return log
+    return activity_log.logger(
+        "facebook", account=(os.getenv("FB_EMAIL", "").strip() or None))
 
 
 def _cache_avatar(engine, store, handle, posts, log=print):
@@ -95,6 +109,8 @@ async def run_once(store_path="fb_results.db", *, max_scroll=4,
                    project_id=None, log=print) -> int:
     from engine_fb import FacebookEngine
 
+    log = _persist_log(log)
+
     st = store_fb.Store(store_path).open()
     try:
         sources = st.sources(enabled_only=True)
@@ -130,6 +146,7 @@ async def run_due(store_path="fb_results.db", *, default_interval=21600,
     """
     from engine_fb import FacebookEngine
 
+    log = _persist_log(log)
     st = store_fb.Store(store_path).open()
     try:
         now = int(time.time())
@@ -166,6 +183,7 @@ async def run_favorites(store_path="fb_results.db", *, project_id=None,
     """
     from engine_fb import FacebookEngine
 
+    log = _persist_log(log)
     st = store_fb.Store(store_path).open()
     try:
         if not _can_log_in():
