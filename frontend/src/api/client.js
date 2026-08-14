@@ -61,6 +61,7 @@ export const api = {
   tweets: (p) => request(`/api/tweets${qs(p)}`),
   igPosts: (p) => request(`/api/ig/posts${qs(p)}`),
   igStatus: () => request("/api/ig/status"),
+  igSource: (body) => request("/api/ig/source", { method: "POST", body }),
   fbPosts: (p) => request(`/api/fb/posts${qs(p)}`),
   fbStatus: (project) => request(`/api/fb/status${qs({ project })}`),
   fbAddSource: (project, label) =>

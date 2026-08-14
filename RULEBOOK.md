@@ -212,6 +212,15 @@ before changing the engine; nearly every "obvious" idea has been tried.)
 - **`python3 tests/test_all.py` stays green, offline, and grows a test for the
   new behavior.** The suite is the contract; it needs no accounts and spends no
   budget. Run it as a script, not under pytest.
+- **Watchlists are ONE structure across platforms.** The Watchlists page is
+  master-detail (compact list left, one detail panel right — long member lists
+  scroll inside their own box, never the page) with two tabs: "Watchlists"
+  for daily use and "Network & settings" for configuration, login health and
+  streams wiring. Adding is one platform-first flow (X: handles/keywords/
+  X List; FB: pages/favorites; IG: user/hashtag/following). A new platform
+  adds one entry to PLATFORM_KINDS, one detail component, and a `/api/<p>/source`
+  endpoint — it must NOT invent its own page structure or scatter controls
+  back onto the main surface.
 - **The dashboard ships built.** The VPS runs no Node — `frontend/dist/` is
   committed on purpose. After any UI change: `cd frontend && npm run build` and
   commit `dist/`. New capability = store method → thin `web.py` validator →

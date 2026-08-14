@@ -2472,12 +2472,48 @@ def _ig_status():
         try:
             import store_ig
             with store_ig.Store(rp) as st:
-                out["sources"] = [{"label": x.label, "type": x.type, "value": x.value}
-                                  for x in st.sources(only_enabled=False)]
+                # Read enabled straight off the table — store_ig.sources() drops
+                # it, and the dashboard's pause toggle needs the real value.
+                out["sources"] = [dict(r) for r in st.db.execute(
+                    "SELECT label, type, value, account, enabled "
+                    "FROM sources ORDER BY label")]
                 out["totals"] = st.stats()
         except Exception as e:
             out["sources_error"] = f"{type(e).__name__}: {e}"
     return out
+
+
+def _ig_source_post(body):
+    """
+    Add, remove, or pause/resume an Instagram source from the dashboard —
+    the same unified watchlist flow X and Facebook already have, so all three
+    platforms are managed in ONE place instead of the IG CLI.
+    """
+    import store_ig
+    action = (body.get("action") or "add").lower()
+    label = str(body.get("label") or "").strip()
+    if not label:
+        return {"error": "a source label is required"}
+    rp = _CFG.root / "ig_results.db"
+    with store_ig.Store(rp) as st:
+        if action == "add":
+            typ = (body.get("type") or "user").lower()
+            value = str(body.get("value") or "").strip()
+            if typ in ("user", "hashtag") and not value:
+                return {"error": f"a {typ} source needs a value "
+                                 f"({'numeric id or username' if typ == 'user' else 'the hashtag'})"}
+            try:
+                st.add_source(label, typ, value, str(body.get("account") or ""))
+            except ValueError as e:
+                return {"error": str(e)}
+        elif action == "remove":
+            st.db.execute("DELETE FROM sources WHERE label = ?", (label,))
+            st.db.commit()
+        elif action == "enable":
+            st.set_enabled(label, bool(body.get("enabled")))
+        else:
+            return {"error": "action must be add, remove, or enable"}
+    return {"ok": True}
 
 
 def _ig_posts(q):
@@ -2950,6 +2986,8 @@ class Handler(BaseHTTPRequestHandler):
                 return self._send(200, _fb_health_post(body))
             if u.path == "/api/fb/settings":
                 return self._send(200, _fb_settings_post(body))
+            if u.path == "/api/ig/source":
+                return self._send(200, _ig_source_post(body))
             if u.path == "/api/project/fetch":
                 return self._send(200, _project_fetch(body))
             if u.path == "/api/fetch":
