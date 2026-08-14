@@ -37,12 +37,19 @@ import argparse
 import asyncio
 import time
 
+import asyncio as _asyncio
+
 import activity_log
 import ig
+import ig_human
 import ig_session
 import store_ig
 from engine_ig import IGEngine
 from instagrapi.exceptions import LoginRequired
+
+# One process-lifetime day counter, shared across passes, so the per-account
+# daily request budget is honored by the long-lived --loop service.
+_DAY = ig_human.DayCounter()
 
 
 def _persist_log(log=None):
@@ -77,7 +84,14 @@ async def collect_source(engine, store, source, *, page_size=12, max_pages=2, lo
     wm = store.watermark(source.label)
     collected, newest, stop = [], None, False
 
+    first_page = True
     async for page in engine.pages_for(source, page_size=page_size, max_pages=max_pages):
+        # Human rhythm BETWEEN pages of the same source: a person scrolls, then
+        # pauses, before loading more — not a steady machine tick. The first
+        # page of a source loads immediately (you just opened it).
+        if not first_page:
+            await _asyncio.sleep(ig_human.request_gap())
+        first_page = False
         if newest is None and page.result_ids:
             newest = max(page.result_ids)
         for pk in page.result_ids:
@@ -127,12 +141,36 @@ async def run_once(store_path="ig_results.db", account_override="", *,
                 log(f"  could not load @{acct}: {e}")
                 continue
 
+            # Daily budget per account (warm-up ramp for young sessions). Once
+            # spent, this account rests until tomorrow — a person doesn't open
+            # the app 500 times a day, and a burner that does gets flagged.
+            budget = ig_human.daily_budget()
+            if _DAY.remaining(acct, budget) <= 0:
+                log(f"  @{acct}: daily budget spent ({budget}) — resting until "
+                    f"tomorrow")
+                continue
+
             engine = IGEngine(cl, account=acct)
             refreshed = False       # relogin is attempted at most ONCE per pass
-            for s in group:
+            for i, s in enumerate(group):
+                # Human rhythm BETWEEN sources: a person doesn't machine-gun
+                # profile after profile. First source in a pass starts right
+                # away; each subsequent one waits a human "switch" gap, with an
+                # occasional longer "put the phone down" break.
+                if i > 0:
+                    gap = ig_human.source_gap()
+                    brk = ig_human.maybe_long_break()
+                    if brk:
+                        log(f"  …taking a {int(brk)}s break (human pause)")
+                        gap += brk
+                    await _asyncio.sleep(gap)
+                _DAY.spend(acct)
                 try:
                     total += await collect_source(engine, store, s, page_size=page_size,
                                               max_pages=max_pages, log=log)
+                    if _DAY.remaining(acct, budget) <= 0:
+                        log(f"  @{acct}: daily budget reached mid-pass — stopping")
+                        break
                     continue
                 except LoginRequired as e:
                     log(f"  [{s.label}] session rejected: {type(e).__name__}")
@@ -225,6 +263,10 @@ def main() -> int:
             asyncio.run(run_once(store_path, args.account, **paging))
             return 0
 
+        # Account-local timezone for the active-hours window (IST by default,
+        # the media house's clock). Env IG_TZ_OFFSET_S overrides.
+        tz_off = int(os.getenv("IG_TZ_OFFSET_S", str(int(5.5 * 3600))))
+
         async def loop():
             while True:
                 started = time.time()
@@ -237,11 +279,20 @@ def main() -> int:
                 if paused:
                     await asyncio.sleep(60)     # cheap idle tick, no log spam
                     continue
+                # Human active-hours: overnight the collector mostly sleeps,
+                # with only a rare "checked my phone" poll — a feed that never
+                # goes quiet is not a person's.
+                if not ig_human.active_now(started, tz_offset_s=tz_off):
+                    await asyncio.sleep(ig_human.next_interval(max(600, every)))
+                    continue
                 try:
                     await run_once(store_path, args.account, **paging)
                 except Exception as e:
                     print(f"pass error: {type(e).__name__}: {e}")
-                await asyncio.sleep(max(5, every - (time.time() - started)))
+                # Jitter the wait so the between-cycle rhythm is never a fixed
+                # clock (±35%).
+                wait = ig_human.next_interval(every) - (time.time() - started)
+                await asyncio.sleep(max(5, wait))
         try:
             asyncio.run(loop())
         except KeyboardInterrupt:

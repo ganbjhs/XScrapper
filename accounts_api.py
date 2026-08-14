@@ -43,6 +43,7 @@ def _acct_json(a) -> dict:
         "health": a.health,
         "last_success_at": a.last_success_at,
         "has_totp": a.has_totp,
+        "has_proxy": a.has_proxy,
         "backup_codes_left": a.backup_codes_left,
         "created_at": a.created_at,
         "updated_at": a.updated_at,
@@ -125,6 +126,7 @@ def handle(method: str, subpath: str, body: dict | None, query: dict | None) -> 
                     totp_secret=body.get("totp_secret") or "",
                     backup_codes=_as_codes(body.get("backup_codes")),
                     proxy_id=(body.get("proxy_id") or None),
+                    proxy_url=body.get("proxy_url") or "",
                     notes=body.get("notes") or "",
                 )
             except SecretError as e:
@@ -135,7 +137,8 @@ def handle(method: str, subpath: str, body: dict | None, query: dict | None) -> 
             aid = _need_int(body, "account_id")
             # Only pass fields that were actually supplied (None = leave alone).
             kw = {}
-            for k in ("label", "login", "password", "totp_secret", "proxy_id", "notes"):
+            for k in ("label", "login", "password", "totp_secret", "proxy_id",
+                      "proxy_url", "notes"):
                 if k in body and body[k] is not None:
                     kw[k] = body[k]
             try:

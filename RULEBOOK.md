@@ -128,8 +128,34 @@ endpoint. The streamed-browser IG login is dead; cookie/password paths work.
   60s, refused not clamped.
 - **The live smoke test is the gate.** `engine_ig.py` was verified by
   introspection, not against a live account — before trusting collection, run
-  `python3 engine_ig.py` once on the server with a real session (the built-in
-  smoke test), and after any instagrapi bump run it again.
+  `python3 engine_ig.py <username>` once on the server with a real session (the
+  built-in smoke test), and after any instagrapi bump run it again.
+
+### Instagram is the STRICT platform — treat every rule here as non-negotiable
+
+Instagram's bot detection watches rhythm, volume, IP and device as much as any
+single request. These are hard rules, not tuning:
+
+- **Human rhythm is mandatory, via `ig_human.py`.** The collector must move
+  like a person: humanized per-page and per-source gaps, an active-hours
+  window (mostly quiet overnight), an occasional long break, a per-account
+  daily request budget, and a warm-up ramp for young accounts. The loop may
+  never fire at a fixed machine tick. Removing or bypassing `ig_human` pacing
+  is a rule violation (it is on the §8 protected list).
+- **One account : one steady residential IP, forever.** IG runs through the
+  account's own residential proxy (`http://user:pass@host:port`, stored
+  encrypted in the pool), never the datacenter server IP, never a
+  rapidly-rotating exit. Prefer sticky sessions; hopping IPs is itself a flag.
+- **Cold starts stay small.** `max_pages` default 2; raise only once an
+  account is warm. A fresh session opening with five back-to-back requests
+  earns a `PleaseWaitFewMinutes`.
+- **One relogin attempt per pass, never into a checkpoint.** The `checkpoint_at`
+  breaker is absolute — retrying a locked account is the fastest way to kill
+  it permanently.
+- **The numeric pk beats the @name** for user sources; validate sessions
+  against the feed endpoint, not `account_info`.
+- **Test on throwaways first.** A hot account stays hot; never debug against
+  the account you depend on.
 
 **Facebook.** (Full history of dead ends in `FACEBOOK_LESSONS.md` — read it
 before changing the engine; nearly every "obvious" idea has been tried.)
@@ -274,8 +300,15 @@ updated, never deleted (the pre-commit hook blocks the deletion).
 - FB monthly byte cap + meter (`fb_meter.db`) — collection refuses past cap.
 
 **Reliability & safety**
+- Instagram human-behavior pacing (`ig_human.py`): active-hours window,
+  humanized request/source gaps, long breaks, per-account daily budget,
+  new-account warm-up. Mandatory whenever IG collects.
+- Per-account residential proxy, stored encrypted in the pool, applied at
+  login; the datacenter server IP is never used for IG.
 - FB login circuit breaker: ONE automatic attempt, cause recorded
   (checkpoint vs credentials), human clears it from the dashboard. Never loop.
+- IG checkpoint breaker (`checkpoint_at`): no auto-relogin into a locked
+  account; human imports a fresh sessionid to clear it.
 - Account activity log (`activity.db`): every collector/engine line,
   timestamped, browsable per platform in the dashboard.
 - Guard (advisory only), `doctor`, pinned scraper versions with startup

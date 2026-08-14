@@ -169,6 +169,7 @@ class Account:
     session_ref: str | None
     notes: str
     has_totp: bool
+    has_proxy: bool
     backup_codes_left: int
     created_at: str
     updated_at: str
@@ -212,7 +213,10 @@ class AccountStore:
         store.py). Nothing here yet — the table is v1 — but the hook exists so a
         future field is a one-line ALTER, never a wipe."""
         wanted: dict[str, dict[str, str]] = {
-            # "managed_accounts": {"new_col": "TEXT"},
+            # The full residential proxy URL (http://user:pass@host:port) —
+            # ENCRYPTED, because it carries the proxy password. proxy_id stays
+            # the human label; this is the working credential.
+            "managed_accounts": {"enc_proxy": "TEXT NOT NULL DEFAULT ''"},
         }
         for table, cols in wanted.items():
             have = {r["name"] for r in self.db.execute(f"PRAGMA table_info({table})")}
@@ -259,12 +263,14 @@ class AccountStore:
         if r["enc_backup_codes"]:
             codes = json.loads(self._cipher.decrypt(r["enc_backup_codes"]))
             codes_left = sum(1 for c in codes if not c["used"])
+        has_proxy = bool(r["enc_proxy"]) if "enc_proxy" in r.keys() else False
         return Account(
             account_id=r["account_id"], platform=r["platform"], label=r["label"],
             login=r["login"], proxy_id=r["proxy_id"], status=r["status"],
             health=r["health"], last_success_at=r["last_success_at"],
             session_ref=r["session_ref"], notes=r["notes"],
-            has_totp=bool(r["enc_totp"]), backup_codes_left=codes_left,
+            has_totp=bool(r["enc_totp"]), has_proxy=has_proxy,
+            backup_codes_left=codes_left,
             created_at=r["created_at"], updated_at=r["updated_at"],
         )
 
@@ -278,9 +284,11 @@ class AccountStore:
 
     def add(self, platform: str, label: str, login: str, *, password: str = "",
             totp_secret: str = "", backup_codes: list[str] | None = None,
-            proxy_id: str | None = None, notes: str = "") -> int:
+            proxy_id: str | None = None, proxy_url: str = "", notes: str = "") -> int:
         """Onboard an account into the pool. Enters as BACKUP; promote() makes it
-        active. Secrets are encrypted here — a non-empty one with no key raises."""
+        active. Secrets are encrypted here — a non-empty one with no key raises.
+        proxy_url is the full residential URL (http://user:pass@host:port),
+        stored encrypted; proxy_id is just the human label for it."""
         platform = self._check_platform(platform)
         label = (label or "").strip()
         if not label:
@@ -289,11 +297,12 @@ class AccountStore:
         enc_codes = self._encode_codes(backup_codes) if backup_codes else ""
         cur = self.db.execute(
             "INSERT INTO managed_accounts(platform, label, login, enc_password, "
-            "enc_totp, enc_backup_codes, proxy_id, status, created_at, updated_at) "
-            "VALUES(?,?,?,?,?,?,?,?,?,?)",
+            "enc_totp, enc_backup_codes, proxy_id, enc_proxy, status, "
+            "created_at, updated_at) "
+            "VALUES(?,?,?,?,?,?,?,?,?,?,?)",
             (platform, label, login, self._cipher.encrypt(password),
              self._cipher.encrypt(_norm_totp(totp_secret)), enc_codes,
-             proxy_id, BACKUP, now, now),
+             proxy_id, self._cipher.encrypt(proxy_url), BACKUP, now, now),
         )
         return int(cur.lastrowid)
 
@@ -315,7 +324,7 @@ class AccountStore:
     def update(self, account_id: int, *, label: str | None = None,
                login: str | None = None, password: str | None = None,
                totp_secret: str | None = None, proxy_id: str | None = None,
-               notes: str | None = None) -> None:
+               proxy_url: str | None = None, notes: str | None = None) -> None:
         """Edit an account. Only the fields passed are changed; a None leaves the
         column alone (so you can rotate a proxy without re-typing the password)."""
         self._row(account_id)  # existence check
@@ -330,6 +339,8 @@ class AccountStore:
             sets.append("enc_totp = ?"); args.append(self._cipher.encrypt(_norm_totp(totp_secret)))
         if proxy_id is not None:
             sets.append("proxy_id = ?"); args.append(proxy_id)
+        if proxy_url is not None:
+            sets.append("enc_proxy = ?"); args.append(self._cipher.encrypt(proxy_url))
         if notes is not None:
             sets.append("notes = ?"); args.append(notes)
         if not sets:
@@ -435,6 +446,13 @@ class AccountStore:
 
     def get_password(self, account_id: int) -> str:
         return self._cipher.decrypt(self._row(account_id)["enc_password"])
+
+    def get_proxy(self, account_id: int) -> str:
+        """The full working proxy URL (with credentials) — used at login time,
+        never sent to the dashboard. '' when no proxy is set."""
+        r = self._row(account_id)
+        enc = r["enc_proxy"] if "enc_proxy" in r.keys() else ""
+        return self._cipher.decrypt(enc) if enc else ""
 
     def totp_now(self, account_id: int) -> str | None:
         """Tier 1 of the 2FA ladder: generate the current authenticator code from

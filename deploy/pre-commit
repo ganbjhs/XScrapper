@@ -78,7 +78,8 @@ if [ "${RULE_OK:-0}" != "1" ]; then
   for f in $CHANGED; do
     case "$f" in
       engine_*.py|collect_*.py|collector.py|store_*.py|web.py|main.py|\
-      guard.py|alerts.py|webhook.py|activity_log.py|api.py|auth.py)
+      guard.py|alerts.py|webhook.py|activity_log.py|api.py|auth.py|\
+      ig_*.py|accounts_api.py)
         behavior=1 ;;
     esac
   done

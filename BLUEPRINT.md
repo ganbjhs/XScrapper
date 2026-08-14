@@ -95,7 +95,8 @@ The organizing layer (in `store.py` + `web.py`):
 | `web.py` | THE server: JSON API, SSE live stream, auth, serves `frontend/dist` at `/app` |
 | `api.py` | API-key service (hash-stored keys) serving Instagram posts to Watch-Tower |
 | `ig.py`, `ig_import.py`, `ig_login.py`, `ig_session.py` | Instagram session acquisition/persistence (cookie or password; device pinned) |
-| `engine_ig.py`, `collect_ig.py`, `store_ig.py` | Instagram engine / poll loop / store (`ig_results.db`) |
+| `engine_ig.py`, `collect_ig.py`, `store_ig.py` | Instagram engine / poll loop (+ human pacing) / store (`ig_results.db`, settings) |
+| `ig_human.py` | Human-behavior pacing: active-hours, humanized gaps, long breaks, daily budget, warm-up — makes IG move like a person (pure, testable) |
 | `engine_fb.py` | FB engine: desktop-UA headless render, GraphQL capture (primary), on-page JSON, DOM fallback; login circuit breaker; byte meter |
 | `collect_fb.py` | FB scheduler: per-page cadence or favorites mode; honors pause/block; avatar cache from post data only |
 | `store_fb.py` | `fb_results.db`: posts (two-key dedup), sources (lowercase labels), settings, page_profiles, removed_pages tombstones |

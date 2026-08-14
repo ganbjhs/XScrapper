@@ -33,7 +33,7 @@ const STATUS = {
 function AddModal({ initial, onDone, onClose }) {
   const [f, setF] = useState({
     platform: "x", label: "", login: "", password: "",
-    totp_secret: "", backup_codes: "", proxy_id: "", notes: "",
+    totp_secret: "", backup_codes: "", proxy_id: "", proxy_url: "", notes: "",
     ...(initial || {}),
   });
   const [err, setErr] = useState("");
@@ -83,8 +83,20 @@ function AddModal({ initial, onDone, onClose }) {
                   placeholder={"11112222\n33334444"} />
       </div>
       <div className="field">
-        <label>Proxy / IP id (optional)</label>
+        <label>Proxy / IP id (a label, optional)</label>
         <input value={f.proxy_id} onChange={set("proxy_id")} placeholder="e.g. resi-in-01" />
+      </div>
+      <div className="field">
+        <label>Residential proxy URL — username &amp; password go INLINE</label>
+        <input value={f.proxy_url} onChange={set("proxy_url")}
+               placeholder="http://user:pass@gateway.host:port" />
+        <div style={{ color: "var(--ink-3)", fontSize: 12, marginTop: 5, lineHeight: 1.5 }}>
+          The whole credential is one URL — both username and password sit
+          inside it. Stored encrypted, never shown again. For a sticky IP,
+          use your provider's session-suffixed username (e.g.
+          <code>user-session-ig1</code>). Instagram must run through this, not
+          the server IP.
+        </div>
       </div>
       {err && <div className="err">{err}</div>}
       <div className="row">
@@ -216,7 +228,7 @@ function AccountCard({ a, live, onChanged }) {
         <span className={`badge ${BADGE[a.platform]}`}>{BADGE_TXT[a.platform]}</span>
         <span className={`chip ${s.chip}`}>{s.text}</span>
         <span className="right">
-          {a.has_totp ? "TOTP" : "no 2FA"} · {a.backup_codes_left} codes
+          {a.has_proxy ? "proxied" : "no proxy"} · {a.has_totp ? "TOTP" : "no 2FA"} · {a.backup_codes_left} codes
         </span>
       </div>
 
