@@ -117,6 +117,19 @@ import a fresh `sessionid` from that browser), `LoginRequired` on fingerprint
 drift (pin the device file), `PleaseWaitFewMinutes` punishes retries — back off
 hours. `user_medias` wants the numeric pk; validate sessions against the *feed*
 endpoint. The streamed-browser IG login is dead; cookie/password paths work.
+- **The IG circuit breaker is the sidecar's `checkpoint_at`** — once recorded,
+  `ig_session.refresh()` refuses every automatic relogin until a human imports
+  a fresh sessionid (which clears it). Relogin is attempted at most ONCE per
+  collection pass, and only after a real call returned login_required. The
+  dashboard surfaces the checkpoint (Network & settings) with the human steps.
+- **Dashboard switches, same contract as Facebook:** global pause
+  (`ig_paused`) and cadence (`ig_interval_s`) live in the settings table; the
+  service loop re-reads them every cycle — no restart to apply. Cadence floor
+  60s, refused not clamped.
+- **The live smoke test is the gate.** `engine_ig.py` was verified by
+  introspection, not against a live account — before trusting collection, run
+  `python3 engine_ig.py` once on the server with a real session (the built-in
+  smoke test), and after any instagrapi bump run it again.
 
 **Facebook.** (Full history of dead ends in `FACEBOOK_LESSONS.md` — read it
 before changing the engine; nearly every "obvious" idea has been tried.)

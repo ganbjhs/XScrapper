@@ -785,16 +785,72 @@ function FbSettings({ data, reload }) {
   );
 }
 
-function IgSettings({ data }) {
+const IG_INTERVALS = [
+  ["120", "2 minutes"], ["300", "5 minutes"], ["600", "10 minutes"],
+  ["1800", "30 minutes"], ["3600", "1 hour"],
+];
+
+function IgSettings({ data, reload }) {
+  const [busy, setBusy] = useState(false);
+  const [note, setNote] = useState("");
   const accounts = data?.accounts || [];
+  const paused = !!data?.paused;
+  const checkpointed = accounts.filter((a) => a.checkpoint_at);
+  const interval = String(data?.config?.interval_s || 120);
+
+  const togglePause = async () => {
+    setBusy(true); setNote("");
+    try { await api.igControl(paused ? "resume" : "pause"); reload(); }
+    catch (e) { setNote(`✗ ${String(e.message || e)}`); }
+    finally { setBusy(false); }
+  };
+  const setInterval = async (v) => {
+    setBusy(true); setNote("");
+    try {
+      await api.igSettings({ interval_s: v });
+      setNote("✓ Saved — applies from the service's next cycle (no restart)");
+      reload();
+    } catch (e) { setNote(`✗ ${String(e.message || e)}`); }
+    finally { setBusy(false); }
+  };
+
   return (
     <div className="panel">
       <div className="phead" style={{ alignItems: "center", flexWrap: "wrap", rowGap: 8 }}>
         <h3><span className="badge platform-ig" style={{ marginRight: 8 }}>IG</span>Instagram network</h3>
-        <span className={`chip ${accounts.some((a) => a.active) ? "good" : "warn"}`}>
-          {accounts.some((a) => a.active) ? "session active" : "no active session"}
+        <span className={`chip ${paused ? "warn" : "good"}`}>{paused ? "paused" : "collecting"}</span>
+        <span className={`chip ${checkpointed.length ? "crit"
+          : accounts.some((a) => a.active) ? "good" : "warn"}`}>
+          {checkpointed.length ? "checkpoint — needs a human"
+            : accounts.some((a) => a.active) ? "session active" : "no active session"}
+        </span>
+        <span className="right">
+          <button className={`btn btn-sm ${paused ? "btn-brand" : "btn-ghost"}`}
+                  disabled={busy} onClick={togglePause}
+                  title="Master switch — the background service honors it within a minute">
+            {paused ? "Resume collection" : "Pause collection"}
+          </button>
         </span>
       </div>
+
+      {checkpointed.map((a) => (
+        <div key={a.username}
+             style={{ border: "1px solid var(--critical)", borderRadius: 10,
+                      padding: "10px 12px", margin: "8px 0",
+                      background: "color-mix(in srgb, var(--critical) 8%, transparent)" }}>
+          <b className="st-crit">@{a.username} is checkpoint-locked — automatic
+            relogins are stopped (since {a.checkpoint_at})</b>
+          <div style={{ fontSize: 12.5, marginTop: 4, lineHeight: 1.5 }}>
+            No code can clear this; retrying makes the lock stickier. A human
+            must: log in as @{a.username} on instagram.com or the app, complete
+            the “confirm it's you” check, copy a fresh <code>sessionid</code>
+            cookie from that same browser, then on the server run{" "}
+            <code>python3 ig_import.py "&lt;sessionid&gt;"</code>. A successful
+            import clears this banner by itself.
+          </div>
+        </div>
+      ))}
+
       {accounts.map((a) => (
         <div className="kv" key={a.username}>
           <span>@{a.username}</span>
@@ -810,6 +866,22 @@ function IgSettings({ data }) {
           Accounts &amp; Sessions page.
         </div>
       )}
+
+      <div className="filters" style={{ marginTop: 12, marginBottom: 0 }}>
+        <label className="fpill">
+          <span>Check every</span>
+          <select value={interval} disabled={busy}
+                  onChange={(e) => setInterval(e.target.value)}>
+            {IG_INTERVALS.map(([v, t]) => (
+              <option key={v} value={v}>{t}</option>
+            ))}
+          </select>
+        </label>
+        {note && (
+          <span className={note.startsWith("✓") ? "st-good" : "st-crit"}
+                style={{ fontSize: 12.5, fontWeight: 600 }}>{note}</span>
+        )}
+      </div>
     </div>
   );
 }
@@ -993,7 +1065,7 @@ export default function Watchlists({ onMenu }) {
       {tab === "settings" && (
         <>
           <FbSettings data={fb.data} reload={fb.reload} />
-          <IgSettings data={ig.data} />
+          <IgSettings data={ig.data} reload={ig.reload} />
           {pid && <StreamsManager pid={pid} />}
         </>
       )}

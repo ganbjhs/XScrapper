@@ -2462,12 +2462,24 @@ def _ig_status():
             con = sqlite3.connect(f"file:{ap}?mode=ro", uri=True, timeout=5)
             con.row_factory = sqlite3.Row
             for r in con.execute("SELECT username, active, proxy, error_msg FROM accounts"):
-                out["accounts"].append({"username": r["username"], "active": bool(r["active"]),
-                                        "proxy": bool(r["proxy"]), "error": r["error_msg"]})
+                acct = {"username": r["username"], "active": bool(r["active"]),
+                        "proxy": bool(r["proxy"]), "error": r["error_msg"]}
+                # The checkpoint tombstone lives in the account's session
+                # sidecar — surface it so the dashboard can say "a human must
+                # act" instead of the collector failing quietly (RULEBOOK §6).
+                try:
+                    sc = root / "profiles" / f"ig_{r['username']}.json"
+                    if sc.exists():
+                        meta = (json.loads(sc.read_text()) or {}).get("meta", {})
+                        acct["checkpoint_at"] = meta.get("checkpoint_at") or None
+                except Exception:
+                    pass
+                out["accounts"].append(acct)
             con.close()
         except Exception as e:
             out["accounts_error"] = f"{type(e).__name__}: {e}"
     rp = root / "ig_results.db"
+    settings = {}
     if rp.exists():
         try:
             import store_ig
@@ -2478,9 +2490,58 @@ def _ig_status():
                     "SELECT label, type, value, account, enabled "
                     "FROM sources ORDER BY label")]
                 out["totals"] = st.stats()
+                settings = {r["key"]: r["value"] for r in st.db.execute(
+                    "SELECT key, value FROM settings")}
         except Exception as e:
             out["sources_error"] = f"{type(e).__name__}: {e}"
+    out["paused"] = settings.get("ig_paused") == "1"
+    out["config"] = {
+        "interval_s": int(settings.get("ig_interval_s")
+                          or os.getenv("IG_INTERVAL_S", "120")),
+    }
     return out
+
+
+def _ig_control(body):
+    """Pause / resume Instagram collection globally. The service loop re-reads
+    the flag every cycle, so it applies without a restart."""
+    action = (body.get("action") or "").lower()
+    if action not in ("pause", "resume"):
+        return {"error": "action must be pause or resume"}
+    import activity_log
+    import store_ig
+    with store_ig.Store(_CFG.root / "ig_results.db") as st:
+        st.set_setting("ig_paused", "1" if action == "pause" else "")
+    activity_log.log_event(
+        "instagram", f"collection {action.upper()}D by operator from the "
+        f"dashboard", db=str(_CFG.root / "activity.db"))
+    return {"ok": True, "paused": action == "pause"}
+
+
+def _ig_settings_post(body):
+    """Edit the Instagram cadence from the dashboard (seconds between passes).
+    Gentle floor: Instagram punishes tight polling with rate limits."""
+    import activity_log
+    import store_ig
+    v = body.get("interval_s")
+    if v in (None, ""):
+        val = ""
+    else:
+        try:
+            iv = int(v)
+        except (TypeError, ValueError):
+            return {"error": "interval_s must be seconds (a number)"}
+        if iv < 60:
+            # Refuse, don't clamp (RULEBOOK §3).
+            return {"error": "interval_s: minimum is 60 seconds — tighter "
+                             "polling is how Instagram sessions get limited"}
+        val = str(iv)
+    with store_ig.Store(_CFG.root / "ig_results.db") as st:
+        st.set_setting("ig_interval_s", val)
+    activity_log.log_event(
+        "instagram", f"cadence changed from the dashboard: "
+        f"{val or '(default)'}s", db=str(_CFG.root / "activity.db"))
+    return {"ok": True}
 
 
 def _ig_source_post(body):
@@ -2988,6 +3049,10 @@ class Handler(BaseHTTPRequestHandler):
                 return self._send(200, _fb_settings_post(body))
             if u.path == "/api/ig/source":
                 return self._send(200, _ig_source_post(body))
+            if u.path == "/api/ig/control":
+                return self._send(200, _ig_control(body))
+            if u.path == "/api/ig/settings":
+                return self._send(200, _ig_settings_post(body))
             if u.path == "/api/project/fetch":
                 return self._send(200, _project_fetch(body))
             if u.path == "/api/fetch":

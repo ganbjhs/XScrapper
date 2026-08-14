@@ -102,6 +102,10 @@ async def run_once(store_path="ig_results.db", account_override="", *,
                    page_size=12, max_pages=2, log=print) -> int:
     log = _persist_log(log)
     with store_ig.Store(store_path) as store:
+        if store.setting("ig_paused") == "1":
+            log("collection is PAUSED from the dashboard — pass skipped "
+                "(resume it in Watchlists → Network & settings)")
+            return 0
         sources = store.sources(only_enabled=True)
         if not sources:
             log("no enabled sources — add one with `collect_ig.py add-source`")
@@ -224,11 +228,20 @@ def main() -> int:
         async def loop():
             while True:
                 started = time.time()
+                # Dashboard settings win over the CLI flag, re-read EVERY
+                # cycle so a change applies without restarting the service
+                # (RULEBOOK §6 — same contract as the Facebook loop).
+                with store_ig.Store(store_path) as st:
+                    paused = st.setting("ig_paused") == "1"
+                    every = int(st.setting("ig_interval_s") or args.every)
+                if paused:
+                    await asyncio.sleep(60)     # cheap idle tick, no log spam
+                    continue
                 try:
                     await run_once(store_path, args.account, **paging)
                 except Exception as e:
                     print(f"pass error: {type(e).__name__}: {e}")
-                await asyncio.sleep(max(5, args.every - (time.time() - started)))
+                await asyncio.sleep(max(5, every - (time.time() - started)))
         try:
             asyncio.run(loop())
         except KeyboardInterrupt:

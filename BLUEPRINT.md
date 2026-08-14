@@ -230,7 +230,10 @@ human-handoff; dashboard-editable FB settings (mode/cadence/pause, applied
 without restart); X-canonical profile pictures across platforms; watchlists
 master-detail UI with unified platform-first add (X/FB/IG); IG sources
 manageable from the dashboard; label canonicalization + removal tombstones;
-living rulebook + protected documents enforced by pre-commit.
+living rulebook + protected documents enforced by pre-commit; IG structural
+parity — dashboard pause/cadence re-read per cycle, checkpoint state surfaced
+in the UI with the human recovery steps (the sidecar `checkpoint_at` breaker
+predates FB's and stays).
 
 **Parked roadmap** (build when asked): media archiving (local copies so
 deleted posts keep evidence); DOCX rundown export; promote-to-X-List

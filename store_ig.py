@@ -56,6 +56,11 @@ CREATE TABLE IF NOT EXISTS sources (
   last_run     INTEGER,
   created_at   INTEGER NOT NULL
 );
+
+CREATE TABLE IF NOT EXISTS settings (
+  key    TEXT PRIMARY KEY,                -- e.g. 'ig_paused', 'ig_interval_s'
+  value  TEXT
+);
 """
 
 
@@ -99,6 +104,24 @@ class Store:
 
     def __enter__(self):
         return self.open()
+
+    # ---- settings (the dashboard's control surface) ----
+    #
+    # Same contract as store_fb: operational switches live HERE so the
+    # dashboard can show and change them, and the service loop re-reads them
+    # every cycle (RULEBOOK §6). Empty value = fall back to the env/CLI default.
+
+    def setting(self, key, default=None):
+        row = self.db.execute(
+            "SELECT value FROM settings WHERE key = ?", (key,)).fetchone()
+        return row["value"] if row and row["value"] not in (None, "") else default
+
+    def set_setting(self, key, value):
+        self.db.execute(
+            "INSERT INTO settings(key, value) VALUES(?,?) "
+            "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            (key, "" if value is None else str(value)))
+        self.db.commit()
 
     def __exit__(self, *a):
         self.close()
