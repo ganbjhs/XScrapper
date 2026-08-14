@@ -1,9 +1,14 @@
 // Account Control Panel — manage the scraper accounts of all three platforms
 // from one place: add / edit / remove, see status, promote a backup, force
 // failover, refresh backup codes, preview the current TOTP, and (next step)
-// sign in on the server IP. The managed pool lives in store_accounts; the live
-// session health (is it actually collecting?) is enriched in from the existing
-// X / Instagram status endpoints so nothing you already run disappears.
+// sign in on the server IP.
+//
+// TWO things show per platform, on purpose:
+//   1. The managed POOL (store_accounts) — full controls.
+//   2. LIVE sessions already running that aren't in the pool yet — read from
+//      the existing X / Instagram status endpoints so nothing you already run
+//      ever disappears from this page. Each has an "Add to pool" button to
+//      bring it under management.
 import React, { useState } from "react";
 import { api, fmtAgo, useApi } from "../api/client.js";
 import { PageHead } from "../App.jsx";
@@ -25,10 +30,11 @@ const STATUS = {
 // Add / edit / backup-code modals
 // ---------------------------------------------------------------------------
 
-function AddModal({ onDone, onClose }) {
+function AddModal({ initial, onDone, onClose }) {
   const [f, setF] = useState({
     platform: "x", label: "", login: "", password: "",
     totp_secret: "", backup_codes: "", proxy_id: "", notes: "",
+    ...(initial || {}),
   });
   const [err, setErr] = useState("");
   const [busy, setBusy] = useState(false);
@@ -43,7 +49,7 @@ function AddModal({ onDone, onClose }) {
   };
 
   return (
-    <Modal title="Add account" onClose={onClose}
+    <Modal title={initial?.label ? `Add “${initial.label}” to the pool` : "Add account"} onClose={onClose}
            sub="Enters the pool as a warm backup. Secrets are encrypted at rest.">
       <div className="field">
         <label>Platform</label>
@@ -104,7 +110,7 @@ function EditModal({ a, onDone, onClose }) {
     try {
       const body = { account_id: a.account_id, label: f.label, login: f.login,
                      proxy_id: f.proxy_id || null };
-      if (f.password) body.password = f.password;         // blank = keep
+      if (f.password) body.password = f.password;          // blank = keep
       if (f.totp_secret) body.totp_secret = f.totp_secret; // blank = keep
       await api.poolUpdate(body);
       onDone(); onClose();
@@ -168,7 +174,7 @@ function CodesModal({ a, onDone, onClose }) {
 }
 
 // ---------------------------------------------------------------------------
-// One account card
+// A managed (pool) account card — full controls
 // ---------------------------------------------------------------------------
 
 function AccountCard({ a, live, onChanged }) {
@@ -246,10 +252,44 @@ function AccountCard({ a, live, onChanged }) {
 }
 
 // ---------------------------------------------------------------------------
-// One platform section
+// A live session that isn't in the pool yet — read-only + "Add to pool"
 // ---------------------------------------------------------------------------
 
-function PlatformSection({ platform, title, summary, accounts, liveFor, onChanged }) {
+function OrphanCard({ r, platform, onAdopt }) {
+  const name = r.username || r.label || "(unknown)";
+  const active = !!r.active;
+  return (
+    <div className="panel" style={{ borderStyle: "dashed" }}>
+      <div className="phead">
+        <h3>
+          <span className={`dot${active ? "" : " bad"}`} style={{ display: "inline-block", marginRight: 9 }} />
+          {name}
+        </h3>
+        <span className={`badge ${BADGE[platform]}`} style={{ marginLeft: 4 }}>{BADGE_TXT[platform]}</span>
+        <b style={{ marginLeft: 8, fontSize: 12.5, color: "var(--ink-3)" }}>Live · not in pool</b>
+        <span className="right">
+          {r.proxy ? "proxied" : "no proxy"}{r.requests != null ? ` · ${r.requests} requests` : ""}
+        </span>
+      </div>
+      <div className="kv"><span>session</span>
+        <b className={active ? "st-good" : "st-crit"}>{active ? "signed in · collecting" : "not signed in"}</b>
+      </div>
+      {(r.reasons || []).map((x, i) => (<div className="kv" key={i}><span>note</span><b>{x}</b></div>))}
+      {r.error && <div className="kv"><span>error</span><b className="st-crit">{r.error}</b></div>}
+      <div className="cactions">
+        <button onClick={() => onAdopt({ platform, label: r.label || name, login: r.username || r.label || "" })}>
+          Add to pool
+        </button>
+      </div>
+    </div>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// One platform section: pool accounts, then live-not-in-pool sessions
+// ---------------------------------------------------------------------------
+
+function PlatformSection({ platform, title, summary, accounts, orphans, liveFor, onAdopt, onChanged }) {
   const failover = async () => {
     if (!confirm(`Force failover on ${title}? The active account is quarantined and the next backup takes over.`)) return;
     const proxy = prompt("Fresh proxy/IP id for the promoted account (recommended — leave blank to keep its own):", "");
@@ -259,6 +299,8 @@ function PlatformSection({ platform, title, summary, accounts, liveFor, onChange
       onChanged();
     } catch (e) { alert(String(e.message || e)); }
   };
+
+  const nothing = accounts.length === 0 && orphans.length === 0;
 
   return (
     <>
@@ -282,11 +324,24 @@ function PlatformSection({ platform, title, summary, accounts, liveFor, onChange
         </div>
       )}
 
-      {accounts.length === 0
-        ? <Empty title={`No ${title} accounts yet`}>Use “Add account” to put one in the pool.</Empty>
-        : accounts.map((a) => (
-            <AccountCard key={a.account_id} a={a} live={liveFor(a)} onChanged={onChanged} />
+      {nothing && (
+        <Empty title={`No ${title} accounts yet`}>Use “Add account” to put one in the pool.</Empty>
+      )}
+
+      {accounts.map((a) => (
+        <AccountCard key={a.account_id} a={a} live={liveFor(a)} onChanged={onChanged} />
+      ))}
+
+      {orphans.length > 0 && (
+        <>
+          <div className="kv" style={{ borderTop: 0, color: "var(--ink-3)", marginTop: 4 }}>
+            <span>Already running — not managed here yet. “Add to pool” to bring them under failover &amp; 2FA.</span>
+          </div>
+          {orphans.map((r, i) => (
+            <OrphanCard key={r.label || r.username || i} r={r} platform={platform} onAdopt={onAdopt} />
           ))}
+        </>
+      )}
     </>
   );
 }
@@ -299,37 +354,53 @@ export default function Accounts({ onMenu }) {
   const pool = useApi(() => api.pool(), [], { every: 30_000 });
   const liveX = useApi(() => api.status(), [], { every: 30_000 });
   const liveIg = useApi(() => api.igStatus(), []);
-  const [adding, setAdding] = useState(false);
+  const [adding, setAdding] = useState(null);   // null | {} | {platform,label,login}
 
   const reload = () => { pool.reload(); liveX.reload(); liveIg.reload(); };
 
+  const liveList = (p) =>
+    p === "x" ? (liveX.data?.accounts || []) : p === "ig" ? (liveIg.data?.accounts || []) : [];
+
   // Match a managed account to its live session (best-effort, by label/username).
   const liveFor = (a) => {
-    if (a.platform === "x") {
-      const hit = (liveX.data?.accounts || []).find(
-        (r) => r.label === a.label || r.username === a.login || r.username === a.label);
-      return hit ? { active: hit.active, requests: hit.requests } : null;
-    }
-    if (a.platform === "ig") {
-      const hit = (liveIg.data?.accounts || []).find(
-        (r) => r.username === a.login || r.label === a.label || r.username === a.label);
-      return hit ? { active: hit.active, requests: hit.requests } : null;
-    }
-    return null;
+    const hit = liveList(a.platform).find(
+      (r) => r.label === a.label || r.username === a.login || r.username === a.label);
+    return hit ? { active: hit.active, requests: hit.requests } : null;
   };
 
   const plats = pool.data?.platforms || {};
   const accounts = pool.data?.accounts || [];
 
+  // Live sessions with no matching pool account = "orphans" to surface + adopt.
+  const orphansFor = (p) => {
+    const pooled = new Set();
+    accounts.filter((a) => a.platform === p).forEach((a) => {
+      pooled.add((a.label || "").toLowerCase());
+      pooled.add((a.login || "").toLowerCase());
+    });
+    return liveList(p).filter((r) => {
+      const lbl = (r.label || "").toLowerCase(), un = (r.username || "").toLowerCase();
+      return !(pooled.has(lbl) || (un && pooled.has(un)));
+    });
+  };
+
   return (
     <>
       <PageHead title="Accounts & Sessions" onMenu={onMenu}
                 sub="One pool per platform · one active, the rest warm backups · failover on ban">
-        <button className="btn btn-brand" onClick={() => setAdding(true)}>+ Add account</button>
+        <button className="btn btn-brand" onClick={() => setAdding({})}>+ Add account</button>
       </PageHead>
 
-      {pool.loading && !pool.data && <Loading />}
-      {pool.error && !pool.data && <ErrorState error={pool.error} retry={pool.reload} />}
+      {pool.loading && liveX.loading && !pool.data && !liveX.data && <Loading />}
+
+      {pool.error && (
+        // The pool backend being down must NOT hide the live sessions below —
+        // that is exactly how existing accounts "vanished". Warn, don't blank.
+        <div className="banner-crit">
+          <b>Account pool not reachable.</b> Adding / promoting / failover is unavailable
+          ({String(pool.error)}). Your live sessions are still shown below.
+        </div>
+      )}
 
       {pool.data && !pool.data.cipher_ready && (
         <div className="banner-crit">
@@ -338,19 +409,23 @@ export default function Accounts({ onMenu }) {
         </div>
       )}
 
-      {pool.data && PLATS.map(([p, title]) => (
+      {PLATS.map(([p, title]) => (
         <PlatformSection
           key={p}
           platform={p}
           title={title}
           summary={plats[p] || { active: null, backups: 0, low: false }}
           accounts={accounts.filter((a) => a.platform === p)}
+          orphans={orphansFor(p)}
           liveFor={liveFor}
+          onAdopt={(initial) => setAdding(initial)}
           onChanged={reload}
         />
       ))}
 
-      {adding && <AddModal onDone={reload} onClose={() => setAdding(false)} />}
+      {adding !== null && (
+        <AddModal initial={adding} onDone={reload} onClose={() => setAdding(null)} />
+      )}
     </>
   );
 }

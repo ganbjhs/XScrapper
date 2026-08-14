@@ -262,53 +262,6 @@ def _connect():
     return con
 
 
-def _db_has(con, name: str) -> bool:
-    """Does this database have table `name` yet? The store's migration creates
-    tweet_raw / tweets_fts the first time a WRITER opens it; a read-only
-    dashboard pointed at a not-yet-migrated file must degrade, not 500."""
-    return con.execute(
-        "SELECT 1 FROM sqlite_master WHERE name = ?", (name,)).fetchone() is not None
-
-
-def _avatar_sql(con) -> str:
-    """The author-avatar column expression, matched to this database's shape.
-
-    Pulling ONE json_extract'd URL out of tweet_raw by primary key replaces
-    what used to happen: shipping the entire multi-KB raw_json blob into
-    Python for every row on every page, just to read one field from it."""
-    if _db_has(con, "tweet_raw"):
-        return ("json_extract(COALESCE((SELECT r.raw_json FROM tweet_raw r "
-                "WHERE r.tweet_id = t.tweet_id), t.raw_json), "
-                "'$.user.profileImageUrl') AS author_avatar")
-    return "json_extract(t.raw_json, '$.user.profileImageUrl') AS author_avatar"
-
-
-def _raw_sql(con) -> str:
-    """Where the raw payload lives for json_extract filters (verified/category),
-    old and new databases alike."""
-    if _db_has(con, "tweet_raw"):
-        return ("COALESCE((SELECT r.raw_json FROM tweet_raw r "
-                "WHERE r.tweet_id = t.tweet_id), t.raw_json)")
-    return "t.raw_json"
-
-
-def _fts_match(q: str) -> str | None:
-    """A user's search box text -> an FTS5 MATCH expression, or None to fall
-    back to LIKE.
-
-    Word characters only (unicode-aware, so Hindi and Arabic terms work),
-    each token quoted and prefix-starred: 'modi flood' becomes
-    '"modi"* "flood"*' — tweets containing both, as word prefixes, in any
-    order. Quoting neutralises every piece of FTS query syntax (AND, NEAR,
-    ^, *, unbalanced quotes), so nothing a user types can produce a syntax
-    error — anything with no word characters at all (an emoji search) simply
-    uses the old LIKE path instead."""
-    tokens = re.findall(r"\w+", q or "", re.UNICODE)
-    if not tokens:
-        return None
-    return " ".join(f'"{t}"*' for t in tokens)
-
-
 def _day_ms(value: str):
     """Midnight UTC for a yyyy-mm-dd date input, or None if it is not one.
 
@@ -324,10 +277,6 @@ def _day_ms(value: str):
 
 def _query_tweets(p):
     """Filter the collected tweets. All of this is local; nothing touches X."""
-    con = _connect()
-    fts = _db_has(con, "tweets_fts")
-    raw_src = _raw_sql(con)
-    avatar = _avatar_sql(con)
     where, params = ["t.source = 'result'"], []
     joins = ""
 
@@ -352,21 +301,9 @@ def _query_tweets(p):
             params.append(pid)
 
     if p.get("q"):
-        # Free text across the tweet and its author. FTS5 when the index
-        # exists: a MATCH is an index lookup where the old
-        # `LIKE '%q%'` was a scan of every row's text — the difference between
-        # instant and unusable at 100x today's data. Semantics shift slightly
-        # (word-prefix match rather than raw substring); the LIKE path remains
-        # for databases without the index and for queries with no indexable
-        # word (pure emoji/punctuation).
-        match = _fts_match(p["q"]) if fts else None
-        if match:
-            where.append("t.tweet_id IN "
-                         "(SELECT rowid FROM tweets_fts WHERE tweets_fts MATCH ?)")
-            params.append(match)
-        else:
-            where.append("(t.text LIKE ? OR t.author_username LIKE ? OR t.author_display_name LIKE ?)")
-            params += [f"%{p['q']}%"] * 3
+        # Free text across the tweet and its author.
+        where.append("(t.text LIKE ? OR t.author_username LIKE ? OR t.author_display_name LIKE ?)")
+        params += [f"%{p['q']}%"] * 3
 
     if p.get("author"):
         where.append("t.author_username LIKE ?")
@@ -408,10 +345,10 @@ def _query_tweets(p):
     # legacy flag and is False on essentially every modern account — `blue` is
     # the checkmark people actually mean, so that is what this filters on.
     if p.get("verified"):
-        where.append(f"json_extract({raw_src}, '$.user.blue') = 1")
+        where.append("json_extract(t.raw_json, '$.user.blue') = 1")
 
     if p.get("category"):
-        where.append(f"json_extract({raw_src}, '$.user.blueType') = ?")
+        where.append("json_extract(t.raw_json, '$.user.blueType') = ?")
         params.append(p["category"])
 
     if p.get("since"):
@@ -451,7 +388,7 @@ def _query_tweets(p):
         params.append(int(p["since_collected_ms"]))
         cursoring = True
 
-    sql = f"SELECT t.*, {avatar} FROM tweets t {joins} WHERE {' AND '.join(where)}"
+    sql = f"SELECT t.* FROM tweets t {joins} WHERE {' AND '.join(where)}"
     # A cursor walk has to run oldest-first, or "the last row I got" is not a
     # position you can resume from.
     order = "ASC" if (p.get("order") == "asc" or cursoring) else "DESC"
@@ -465,7 +402,7 @@ def _query_tweets(p):
     limit = min(int(p.get("limit") or 50), 500)
     offset = int(p.get("offset") or 0)
 
-    try:
+    with _connect() as con:
         total = con.execute(
             f"SELECT COUNT(*) c FROM tweets t {joins} WHERE {' AND '.join(where)}", params
         ).fetchone()["c"]
@@ -473,8 +410,6 @@ def _query_tweets(p):
             f"{sql} ORDER BY {order_by} {order} LIMIT ? OFFSET ?",
             [*params, limit, offset]
         ).fetchall()
-    finally:
-        con.close()
 
     out = {"total": total, "rows": [_row_to_json(r) for r in rows]}
     if rows:
@@ -498,16 +433,14 @@ def _row_to_json(r):
         d["media"] = json.loads(d.pop("media_json", None) or "[]")
     except (TypeError, ValueError):
         d["media"] = []
-    # The author's profile picture. Queries that come through _avatar_sql have
-    # already extracted it in SQL (one field by primary key, not the whole
-    # payload); the raw_json parse remains only for callers handing in
-    # old-shape rows.
-    if "author_avatar" not in d:
-        try:
-            d["author_avatar"] = (json.loads(d.get("raw_json") or "{}")
-                                  .get("user", {}).get("profileImageUrl"))
-        except (TypeError, ValueError, AttributeError):
-            d["author_avatar"] = None
+    # The author's profile picture. Never extracted into a column, but the
+    # full payload was kept (R9 again) — so it is right there in raw_json,
+    # at read time, for every tweet ever collected.
+    try:
+        d["author_avatar"] = (json.loads(d.get("raw_json") or "{}")
+                              .get("user", {}).get("profileImageUrl"))
+    except (TypeError, ValueError, AttributeError):
+        d["author_avatar"] = None
     # JS loses integer precision above 2^53, and tweet ids are well past it.
     d["tweet_id"] = str(d["tweet_id"])
     d.pop("raw_json", None)
@@ -1135,7 +1068,7 @@ def _live_rows(con, last_ms: int, last_tweet_id: int, project: int = 0,
             "        WHERE ph.tweet_id = t.tweet_id AND ps.project_id = ?)")
         params.append(project)
     rows = con.execute(
-        f"SELECT t.*, {_avatar_sql(con)} FROM tweets t WHERE {' AND '.join(where)} "
+        f"SELECT t.* FROM tweets t WHERE {' AND '.join(where)} "
         "ORDER BY t.collected_ms, t.tweet_id LIMIT ?", [*params, limit]).fetchall()
     return [_row_to_json(r) for r in rows]
 
@@ -2704,6 +2637,14 @@ class Handler(BaseHTTPRequestHandler):
                 return self._send(200, _fb_status(q))
             if u.path == "/api/fb/posts":
                 return self._send(200, _fb_posts(q))
+            if u.path == "/api/pool" or u.path.startswith("/api/pool/"):
+                # Account Control Panel (store_accounts). Dashboard-only: it is
+                # behind _require_auth above, and /api/pool* is NOT in
+                # API_KEY_PATHS, so a machine key gets 403 — managing accounts is
+                # never a "read". See accounts_api.py / ACCOUNTS.md.
+                import accounts_api
+                return self._send(200, accounts_api.handle(
+                    "GET", u.path[len("/api/pool"):], None, q))
             return self._send(404, {"error": "not found"})
         except Exception as e:
             import traceback
@@ -2813,6 +2754,10 @@ class Handler(BaseHTTPRequestHandler):
                     query, body.get("tab") or "Latest",
                     body.get("pages") or 1, bool(body.get("ack")),
                     str(body.get("list_id") or "")))
+            if u.path == "/api/pool" or u.path.startswith("/api/pool/"):
+                import accounts_api
+                return self._send(200, accounts_api.handle(
+                    "POST", u.path[len("/api/pool"):], body, {}))
             return self._send(404, {"error": "not found"})
         except Exception as e:
             import traceback

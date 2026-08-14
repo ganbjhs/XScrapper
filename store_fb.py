@@ -49,6 +49,13 @@ CREATE TABLE IF NOT EXISTS sources (
   interval_s     INTEGER,                   -- per-page check cadence; NULL = default
   created_at     INTEGER NOT NULL
 );
+
+CREATE TABLE IF NOT EXISTS page_profiles (
+  handle        TEXT PRIMARY KEY,           -- lowercase page handle
+  avatar_url    TEXT,                       -- the page's profile picture URL
+  display_name  TEXT,
+  updated_ms    INTEGER NOT NULL            -- when the avatar was last confirmed
+);
 """
 
 # Columns added after the first release. Applied on open() so an existing
@@ -179,6 +186,45 @@ class Store:
             (int(ms), int(time.time()), label))
         self.db.commit()
 
+    # ---- page profiles (avatar cache) ----
+    #
+    # The profile picture of a page changes rarely, so it is fetched ONCE and
+    # cached here — the collector checks this table before ever visiting a
+    # page's profile just for its picture. Rows are refreshed for free whenever
+    # a collected post happens to carry the avatar URL anyway.
+
+    def profile(self, handle):
+        """The cached profile row for a handle, or None."""
+        row = self.db.execute(
+            "SELECT * FROM page_profiles WHERE handle = ?",
+            (str(handle).lower(),)).fetchone()
+        return dict(row) if row else None
+
+    def profile_avatar(self, handle):
+        """Just the cached avatar URL (None when never captured)."""
+        p = self.profile(handle)
+        return p["avatar_url"] if p else None
+
+    def set_profile(self, handle, avatar_url=None, display_name=None):
+        """
+        Upsert the cached profile. A None field never clobbers a stored value —
+        so a run that only learned the display name can't erase the avatar.
+        """
+        self.db.execute(
+            "INSERT INTO page_profiles(handle, avatar_url, display_name, updated_ms) "
+            "VALUES(?,?,?,?) ON CONFLICT(handle) DO UPDATE SET "
+            "  avatar_url   = COALESCE(excluded.avatar_url, page_profiles.avatar_url), "
+            "  display_name = COALESCE(excluded.display_name, page_profiles.display_name), "
+            "  updated_ms   = excluded.updated_ms",
+            (str(handle).lower(), avatar_url, display_name, int(time.time() * 1000)))
+        self.db.commit()
+
+    def profiles(self):
+        """{handle: avatar_url} for every cached page (used for backfill)."""
+        return {r["handle"]: r["avatar_url"] for r in self.db.execute(
+            "SELECT handle, avatar_url FROM page_profiles "
+            "WHERE avatar_url IS NOT NULL")}
+
     # ---- posts ----
 
     def upsert(self, post: dict) -> bool:
@@ -216,15 +262,25 @@ class Store:
     def recent(self, project_id=None, limit=50, since_ms=None):
         where, params = [], []
         if project_id is not None:
-            where.append("project_id = ?"); params.append(int(project_id))
+            where.append("p.project_id = ?"); params.append(int(project_id))
         if since_ms:
-            where.append("collected_ms >= ?"); params.append(int(since_ms))
+            where.append("p.collected_ms >= ?"); params.append(int(since_ms))
+        # LEFT JOIN the avatar cache so every post shows its page's profile
+        # picture — including posts collected before the avatar was known.
         rows = self.db.execute(
-            "SELECT * FROM posts "
+            "SELECT p.*, "
+            "  COALESCE(p.author_avatar, pp.avatar_url) AS _avatar_resolved "
+            "FROM posts p "
+            "LEFT JOIN page_profiles pp ON pp.handle = LOWER(p.page) "
             + (f"WHERE {' AND '.join(where)} " if where else "")
-            + "ORDER BY collected_ms DESC, post_id DESC LIMIT ?",
+            + "ORDER BY p.collected_ms DESC, p.post_id DESC LIMIT ?",
             [*params, int(limit)]).fetchall()
-        return [dict(r) for r in rows]
+        out = []
+        for r in rows:
+            d = dict(r)
+            d["author_avatar"] = d.pop("_avatar_resolved")
+            out.append(d)
+        return out
 
     def total(self, project_id=None) -> int:
         if project_id is None:

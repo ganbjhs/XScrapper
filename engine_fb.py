@@ -147,7 +147,9 @@ _EXTRACT_JS = r"""
     const fbk = deepFind(st, (o) => o && (o.reaction_count || o.i18n_reaction_count || o.comment_rendering_instance || o.share_count));
     const likes = fbk && fbk.reaction_count ? fbk.reaction_count.count : null;
     const comments = fbk
-      ? ((fbk.comment_rendering_instance && fbk.comment_rendering_instance.comments && fbk.comment_rendering_instance.comments.total_count) || fbk.total_comment_count || null)
+      ? ((fbk.comment_rendering_instance && fbk.comment_rendering_instance.comments && fbk.comment_rendering_instance.comments.total_count)
+         || (fbk.comment_count && (fbk.comment_count.total_count || (typeof fbk.comment_count === 'number' ? fbk.comment_count : null)))
+         || fbk.total_comment_count || null)
       : null;
     const shares = fbk && fbk.share_count ? fbk.share_count.count : null;
     if (!id && !perma) continue;
@@ -226,6 +228,30 @@ _EXTRACT_JS = r"""
       .replace(/\s+/g, " ").trim().slice(0, 240),
   };
   return { json_posts: jsonPosts, dom_posts: out, diag };
+}
+"""
+
+# The page's OWN profile picture, read out of an already-rendered profile page.
+# Three sources, best-first: the Relay JSON blobs (profilePicLarge/Medium — the
+# real square avatar), the profile-photo <image> in the header SVG, and the
+# og:image meta as a last resort. Image BYTES are blocked by the engine, but
+# the URLs still sit in the DOM/JSON, which is all we need.
+_AVATAR_JS = r"""
+() => {
+  const good = (u) => u && /fbcdn|scontent/.test(u);
+  const re = /"profilePic(?:Large|Medium|Small|160)?"\s*:\s*\{\s*"uri"\s*:\s*"((?:[^"\\]|\\.)+)"/;
+  for (const s of document.querySelectorAll('script[type="application/json"]')) {
+    const m = (s.textContent || '').match(re);
+    if (m) { try { const u = JSON.parse('"' + m[1] + '"'); if (good(u)) return u; } catch (e) {} }
+  }
+  for (const im of document.querySelectorAll('svg image')) {
+    const u = im.getAttribute('xlink:href') || im.getAttribute('href');
+    if (good(u)) return u;
+  }
+  const og = document.querySelector('meta[property="og:image"]');
+  if (og && og.content) return og.content;
+  const img = document.querySelector('img[src*="fbcdn"], img[src*="scontent"]');
+  return img ? img.src : null;
 }
 """
 
@@ -322,6 +348,106 @@ def _deep_all(o, pred, acc=None, depth=0):
     return acc
 
 
+_ABBREV_RE = re.compile(r"^\s*([\d.]+)\s*([KkMmBb]?)\s*$")
+
+# Any of these keys on a node marks it as feedback-ish (carrying engagement
+# counts). Facebook ships the counts under several names depending on which
+# GraphQL query produced the payload — read them all.
+_COUNT_KEYS = ("reaction_count", "i18n_reaction_count", "reactors",
+               "comment_rendering_instance", "comment_count",
+               "total_comment_count", "share_count", "reshares")
+
+
+def _num(v):
+    """A count that may arrive as int, digit string, or '1.2K' / '3,4 mn' style
+    abbreviation. None when it can't be read as a number."""
+    if isinstance(v, bool):
+        return None
+    if isinstance(v, (int, float)):
+        return int(v)
+    if isinstance(v, str):
+        s = v.replace(",", "").replace(" ", "")
+        m = _ABBREV_RE.match(s)
+        if m:
+            try:
+                return int(float(m.group(1)) *
+                           {"k": 1e3, "m": 1e6, "b": 1e9}.get(m.group(2).lower(), 1))
+            except ValueError:
+                return None
+    return None
+
+
+def _counts_from(o):
+    """(likes, comments, shares) out of one feedback-ish node."""
+    if not isinstance(o, dict):
+        return None, None, None
+    rc = o.get("reaction_count")
+    likes = _num(rc.get("count")) if isinstance(rc, dict) else _num(rc)
+    if likes is None and isinstance(o.get("reactors"), dict):
+        likes = _num(o["reactors"].get("count"))
+    if likes is None:
+        likes = _num(o.get("i18n_reaction_count"))
+    cri = o.get("comment_rendering_instance") or {}
+    comments = _num(((cri.get("comments") or {}).get("total_count"))) \
+        if isinstance(cri, dict) else None
+    if comments is None:
+        cc = o.get("comment_count")
+        comments = _num(cc.get("total_count")) if isinstance(cc, dict) else _num(cc)
+    if comments is None:
+        comments = _num(o.get("total_comment_count"))
+    sc = o.get("share_count")
+    shares = _num(sc.get("count")) if isinstance(sc, dict) else _num(sc)
+    if shares is None and isinstance(o.get("reshares"), dict):
+        shares = _num(o["reshares"].get("count"))
+    return likes, comments, shares
+
+
+def _merge_counts(base, node):
+    """Fill the None slots of (likes, comments, shares) from one more node."""
+    l, c, s = _counts_from(node)
+    return (base[0] if base[0] is not None else l,
+            base[1] if base[1] is not None else c,
+            base[2] if base[2] is not None else s)
+
+
+def _feedback_map(blobs):
+    """
+    Engagement counts often arrive in SEPARATE graphql payloads from the Story
+    itself (the CometUFI queries). Walk every blob for feedback-ish nodes and
+    map them by every id they carry — the Feedback id and, crucially,
+    subscription_target_id, which IS the numeric post id — so counts can be
+    stitched back onto the right post afterwards.
+    """
+    fmap = {}
+
+    def walk(o, depth=0):
+        if depth > 18 or not isinstance(o, (dict, list)):
+            return
+        if isinstance(o, list):
+            for x in o:
+                walk(x, depth + 1)
+            return
+        if any(k in o for k in _COUNT_KEYS):
+            counts = _counts_from(o)
+            if any(v is not None for v in counts):
+                for key in (o.get("subscription_target_id"), o.get("id"),
+                            o.get("legacy_fbid")):
+                    if key:
+                        prev = fmap.get(str(key), (None, None, None))
+                        fmap[str(key)] = (
+                            prev[0] if prev[0] is not None else counts[0],
+                            prev[1] if prev[1] is not None else counts[1],
+                            prev[2] if prev[2] is not None else counts[2])
+        for v in o.values():
+            if isinstance(v, (dict, list)):
+                walk(v, depth + 1)
+
+    for b in blobs or []:
+        for obj in _iter_json_objects(b):
+            walk(obj)
+    return fmap
+
+
 def _walk_stories(o, out, seen, depth=0):
     if depth > 18 or not isinstance(o, (dict, list)):
         return
@@ -377,19 +503,30 @@ def _story_to_post(st: dict):
                 media.append({"type": "photo", "url": uri, "thumb": uri})
         if len(media) >= 6:
             break
-    fbk = _deep_find(st, lambda o: o.get("reaction_count") or o.get("i18n_reaction_count")
-                     or o.get("comment_rendering_instance") or o.get("share_count"))
-    likes = (fbk.get("reaction_count") or {}).get("count") if fbk else None
-    comments = None
-    if fbk:
-        cri = fbk.get("comment_rendering_instance") or {}
-        comments = (cri.get("comments") or {}).get("total_count") or fbk.get("total_comment_count")
-    shares = (fbk.get("share_count") or {}).get("count") if fbk else None
+    # Counts: merge every feedback-ish node inside the story (Facebook splits
+    # reactions / comments / shares across nested nodes), starting with the
+    # story's own feedback object.
+    counts = (None, None, None)
+    counts = _merge_counts(counts, st.get("feedback"))
+    for node in _deep_all(st, lambda o: any(k in o for k in _COUNT_KEYS)):
+        counts = _merge_counts(counts, node)
+        if all(v is not None for v in counts):
+            break
+    likes, comments, shares = counts
+    # Every id the story's feedback carries, so counts that arrived in a
+    # SEPARATE graphql payload can be stitched on afterwards (_feedback_map).
+    fb_ids = []
+    fbnode = st.get("feedback")
+    if isinstance(fbnode, dict):
+        for k in ("id", "subscription_target_id", "legacy_fbid"):
+            if fbnode.get(k):
+                fb_ids.append(str(fbnode[k]))
     return {"id": str(pid) if pid else _fallback_id(perma), "author": author,
             "author_handle": author_handle, "author_avatar": avatar,
             "permalink": perma, "text": text[:2000],
             "created_ms": created_ms, "media": media,
-            "like_count": likes, "comment_count": comments, "share_count": shares}
+            "like_count": likes, "comment_count": comments, "share_count": shares,
+            "feedback_ids": fb_ids}
 
 
 def _stories_from_graphql(blobs) -> list:
@@ -402,6 +539,25 @@ def _stories_from_graphql(blobs) -> list:
         p = _story_to_post(s)
         if p:
             posts.append(p)
+    # Second pass: counts that came in SEPARATE payloads (the UFI queries) are
+    # matched back by post id / feedback id and fill any still-empty slots.
+    if posts:
+        fmap = _feedback_map(blobs)
+        if fmap:
+            for p in posts:
+                keys = [str(p.get("id") or "")] + list(p.get("feedback_ids") or [])
+                for k in keys:
+                    hit = fmap.get(k)
+                    if not hit:
+                        continue
+                    if p.get("like_count") is None:
+                        p["like_count"] = hit[0]
+                    if p.get("comment_count") is None:
+                        p["comment_count"] = hit[1]
+                    if p.get("share_count") is None:
+                        p["share_count"] = hit[2]
+    for p in posts:
+        p.pop("feedback_ids", None)
     return posts
 
 
@@ -439,6 +595,7 @@ class FacebookEngine:
         self.email = os.getenv("FB_EMAIL", "").strip()
         self.password = os.getenv("FB_PASSWORD", "")
         self.on_favorites = False   # set by fetch_favorites: did we reach the feed
+        self.page_avatars = {}      # handle → avatar URL harvested this run
         self._pw = self._browser = self._ctx = self._page = None
 
     async def __aenter__(self):
@@ -814,6 +971,16 @@ class FacebookEngine:
         except Exception as e:
             self.log(f"[fb] fetch {handle} (www) failed: {type(e).__name__}: {e}")
 
+        # Harvest the page's profile picture from the SAME render — zero extra
+        # navigation. The collector caches it in page_profiles, so this is a
+        # free refresh whenever the page is visited anyway.
+        try:
+            av = await self._page.evaluate(_AVATAR_JS)
+            if av:
+                self.page_avatars[handle.lower()] = av
+        except Exception:
+            pass
+
         if not posts:
             # mbasic: no JavaScript, posts are plain <article> with story links.
             try:
@@ -854,6 +1021,36 @@ class FacebookEngine:
                 self.log("[fb] containers=" +
                          json.dumps(diag.get("containers"))[:1800])
         return posts
+
+    async def fetch_avatar(self, handle: str):
+        """
+        ONE profile visit purely to capture the page's profile picture — used
+        only when the avatar cache is empty AND no collected post carried it
+        (the favorites path never visits pages, so first-seen pages land here).
+        The caller stores the result in page_profiles, so per page this runs
+        at most once, ever.
+        """
+        ok, used = _bandwidth_ok(self.meter_db, self.cap_bytes)
+        if not ok:
+            self.log(f"[fb] monthly bandwidth cap reached ({used/1e9:.1f} GB) — "
+                     f"skipping avatar fetch for {handle}")
+            return None
+        self._bytes = 0
+        url = None
+        try:
+            await self._page.goto(f"https://www.facebook.com/{handle}",
+                                  wait_until="domcontentloaded", timeout=60000)
+            await self._page.wait_for_timeout(random.randint(2000, 3500))
+            if not self._is_login_wall(self._page.url):
+                url = await self._page.evaluate(_AVATAR_JS)
+        except Exception as e:
+            self.log(f"[fb] avatar fetch {handle} failed: {type(e).__name__}: {e}")
+        _record_bytes(self.meter_db, self._bytes)
+        if url:
+            self.page_avatars[handle.lower()] = url
+        self.log(f"[fb] {handle}: avatar "
+                 f"{'captured' if url else 'not found'} ({self._bytes//1024} KB)")
+        return url
 
     async def fetch_favorites(self, max_scroll: int = 6) -> list:
         """

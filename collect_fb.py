@@ -24,9 +24,34 @@ import time
 import store_fb
 
 
+def _cache_avatar(engine, store, handle, posts, log=print):
+    """
+    Keep the page's profile picture in the page_profiles cache — fetched once,
+    reused forever after. Cheapest source first:
+      1. a collected post that carried the avatar (free — also refreshes it),
+      2. the avatar harvested from the page render we already did (free),
+      3. only if the cache is EMPTY: one dedicated profile visit.
+    Returns the avatar URL (cached or fresh) so posts can be backfilled.
+    """
+    handle = str(handle).lower()
+    fresh = next((p.get("author_avatar") for p in posts
+                  if p.get("author_avatar")), None)
+    fresh = fresh or getattr(engine, "page_avatars", {}).get(handle)
+    if fresh:
+        store.set_profile(handle, avatar_url=fresh)
+        return fresh
+    cached = store.profile_avatar(handle)
+    if cached:
+        return cached
+    return None
+
+
 async def collect_source(engine, store, source, *, max_scroll=4, log=print) -> int:
     """One pass over a source. Returns how many new posts were saved."""
     posts = await engine.fetch_page(source["label"], max_scroll=max_scroll)
+    # Avatar cache: posts / this render / DB — and because fetch_page just
+    # rendered the profile itself, a dedicated visit is never needed here.
+    avatar = _cache_avatar(engine, store, source["label"], posts, log=log)
     if not posts:
         return 0
     wm = store.watermark(source["label"])
@@ -35,6 +60,8 @@ async def collect_source(engine, store, source, *, max_scroll=4, log=print) -> i
     for p in posts:
         p["project_id"] = source.get("project_id")
         p["source_label"] = source["label"]
+        if avatar and not p.get("author_avatar"):
+            p["author_avatar"] = avatar
         # Watermark is best-effort on FB (created_ms often unknown from mobile):
         # id-dedup in store.upsert is the real guarantee that nothing doubles.
         if store.upsert(p):
@@ -149,6 +176,33 @@ async def run_favorites(store_path="fb_results.db", *, project_id=None,
         async with FacebookEngine(log=log) as eng:
             posts = await eng.fetch_favorites(max_scroll=max_scroll)
             on_fav = getattr(eng, "on_favorites", False)
+            # Avatar cache upkeep, while the browser is still warm. Free when a
+            # post carried the avatar; a page with NOTHING cached gets one
+            # dedicated profile visit — at most 3 per pass to stay gentle (the
+            # rest catch up on later passes), and never again once cached.
+            page_av = {}
+            for p in posts:
+                h = str(p.get("page") or "").lower()
+                if h:
+                    page_av.setdefault(h, None)
+                    page_av[h] = page_av[h] or p.get("author_avatar")
+            visits = 0
+            for h, av in page_av.items():
+                relevant = h in by_handle or (project_id and on_fav)
+                if av:
+                    st.set_profile(h, avatar_url=av)
+                elif relevant and st.profile_avatar(h) is None and visits < 3:
+                    visits += 1
+                    got = await eng.fetch_avatar(h)
+                    if got:
+                        st.set_profile(h, avatar_url=got)
+            missing = [h for h, av in page_av.items()
+                       if not av and st.profile_avatar(h) is None
+                       and (h in by_handle or (project_id and on_fav))]
+            if missing:
+                log(f"[fb] favorites: {len(missing)} page(s) still without a "
+                    f"cached avatar (picked up on later passes): {missing[:10]}")
+        avatars = st.profiles()   # handle → cached avatar, for backfill
         # Auto-register a page ONLY when we confirmed we're on the real Favorites
         # feed. If we fell back to the home feed, we must not treat everyone the
         # account follows as a favorite — store only already-tracked pages.
@@ -171,6 +225,8 @@ async def run_favorites(store_path="fb_results.db", *, project_id=None,
             matched += 1
             p["project_id"] = pid
             p["source_label"] = handle
+            if not p.get("author_avatar"):
+                p["author_avatar"] = avatars.get(handle.lower())
             if st.upsert(p):
                 total += 1
         st.db.commit()
