@@ -235,12 +235,19 @@ async def run_favorites(store_path="fb_results.db", *, project_id=None,
             log("[fb] favorites: could NOT open the Favorites feed — reading the "
                 "home feed instead; saving only pages you already track (no "
                 "auto-add, to avoid pulling in non-favorites)")
+        skipped_removed = 0
         for p in posts:
             handle = str(p.get("page") or "")
             s = by_handle.get(handle.lower())
             if s:
                 pid = s["project_id"]
             elif project_id and on_fav:
+                # Never resurrect a page an operator deliberately removed —
+                # Facebook injects "Suggested for you" posts into the
+                # Favorites feed, so presence in the feed is NOT consent.
+                if st.is_removed(handle):
+                    skipped_removed += 1
+                    continue
                 st.add_source(handle, project_id=project_id)   # auto-register
                 by_handle[handle.lower()] = {"label": handle, "project_id": project_id}
                 pid = project_id
@@ -256,7 +263,10 @@ async def run_favorites(store_path="fb_results.db", *, project_id=None,
                 total += 1
         st.db.commit()
         log(f"[fb] favorites: on_favorites={on_fav}, {matched} posts attributed "
-            f"({added} new page(s) auto-added), +{total} new")
+            f"({added} new page(s) auto-added"
+            + (f", {skipped_removed} post(s) from operator-removed pages ignored"
+               if skipped_removed else "")
+            + f"), +{total} new")
         return total
     finally:
         st.close()

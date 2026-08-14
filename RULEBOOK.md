@@ -174,6 +174,14 @@ before changing the engine; nearly every "obvious" idea has been tried.)
   content signature (page + normalized caption) was — so the same post can't
   slip in twice just because a different path handed it to us under a different
   id scheme.
+- **Removing a page is FINAL against auto-register, and label matching is
+  case-insensitive.** Facebook injects "Suggested for you" posts into the
+  Favorites feed, so a page appearing there is NOT consent to track it —
+  `remove_source` writes a tombstone (`removed_pages`) that the favorites
+  auto-register must honor; only a deliberate re-add lifts it. Labels are
+  canonical lowercase; every WHERE on a label goes through `LOWER(label)`
+  (paid for: pre-canonicalization mixed-case rows like `MohitBeniwalBJP`
+  could not be removed from the dashboard at all, 2026-08-14).
 - **A page profile fires no feed calls; a real FEED does.** Visiting
   `facebook.com/<page>` server-renders only the newest few posts and triggers no
   graphql — so per-page collection is DOM-only and shallow. The account's

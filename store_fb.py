@@ -55,6 +55,11 @@ CREATE TABLE IF NOT EXISTS settings (
   value  TEXT
 );
 
+CREATE TABLE IF NOT EXISTS removed_pages (
+  handle      TEXT PRIMARY KEY,             -- lowercase; an operator removed it
+  removed_at  INTEGER NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS page_profiles (
   handle        TEXT PRIMARY KEY,           -- lowercase page handle
   avatar_url    TEXT,                       -- the page's profile picture URL
@@ -119,6 +124,23 @@ class Store:
         # Index on the signature column — created after the migration so it
         # exists whether the DB is new or upgraded.
         self.db.execute("CREATE INDEX IF NOT EXISTS ix_fb_sig ON posts(sig)")
+        # Canonicalize LEGACY mixed-case labels in place. Labels created before
+        # lowercasing was introduced (e.g. 'MohitBeniwalBJP') never matched the
+        # lowercased WHERE of remove/pause/interval — the row was unkillable
+        # from the dashboard. Lowercase them; if both cases exist, keep the
+        # lowercase row and drop the duplicate (posts key on page, which was
+        # already lowercased at write time).
+        for r in self.db.execute("SELECT label FROM sources").fetchall():
+            lbl, low = r["label"], r["label"].lower()
+            if lbl == low:
+                continue
+            dup = self.db.execute(
+                "SELECT 1 FROM sources WHERE label = ?", (low,)).fetchone()
+            if dup:
+                self.db.execute("DELETE FROM sources WHERE label = ?", (lbl,))
+            else:
+                self.db.execute("UPDATE sources SET label = ? WHERE label = ?",
+                                (low, lbl))
         self.db.commit()
         return self
 
@@ -140,6 +162,9 @@ class Store:
         # keeps source labels in step with the lowercased page on each post.
         label = str(label).lower()
         now = int(time.time())
+        # A deliberate (re-)add lifts the removal tombstone: the operator wants
+        # this page again, so favorites auto-register may touch it once more.
+        self.db.execute("DELETE FROM removed_pages WHERE handle = ?", (label,))
         # On re-add, update the project but KEEP the existing enabled flag — a
         # page deliberately paused must not silently resume when it is re-added
         # (or auto-registered from the favorites feed).
@@ -151,18 +176,36 @@ class Store:
         self.db.commit()
 
     def remove_source(self, label):
-        self.db.execute("DELETE FROM sources WHERE label = ?", (str(label).lower(),))
+        """
+        Remove a page AND remember the removal (tombstone), so the favorites
+        pass can never silently re-register it — Facebook injects "Suggested
+        for you" posts into the Favorites feed, and auto-register must not
+        resurrect a page an operator deliberately removed. Case-insensitive:
+        legacy rows may still carry mixed case.
+        """
+        low = str(label).lower()
+        self.db.execute("DELETE FROM sources WHERE LOWER(label) = ?", (low,))
+        self.db.execute(
+            "INSERT INTO removed_pages(handle, removed_at) VALUES(?,?) "
+            "ON CONFLICT(handle) DO UPDATE SET removed_at = excluded.removed_at",
+            (low, int(time.time())))
         self.db.commit()
+
+    def is_removed(self, handle) -> bool:
+        """Was this page deliberately removed by an operator?"""
+        return self.db.execute(
+            "SELECT 1 FROM removed_pages WHERE handle = ?",
+            (str(handle).lower(),)).fetchone() is not None
 
     def set_interval(self, label, seconds):
         """Per-page check cadence in seconds; None clears it (use the default)."""
-        self.db.execute("UPDATE sources SET interval_s = ? WHERE label = ?",
+        self.db.execute("UPDATE sources SET interval_s = ? WHERE LOWER(label) = ?",
                         (int(seconds) if seconds else None, str(label).lower()))
         self.db.commit()
 
     def set_enabled(self, label, enabled):
         """Pause (0) or resume (1) a page without losing what it collected."""
-        self.db.execute("UPDATE sources SET enabled = ? WHERE label = ?",
+        self.db.execute("UPDATE sources SET enabled = ? WHERE LOWER(label) = ?",
                         (int(bool(enabled)), str(label).lower()))
         self.db.commit()
 
