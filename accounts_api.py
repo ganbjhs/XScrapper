@@ -183,14 +183,28 @@ def handle(method: str, subpath: str, body: dict | None, query: dict | None) -> 
             return {"ok": True, "remaining": st.backup_codes_remaining(aid)}
 
         if method == "POST" and sub == "/login":
-            # The live server-IP browser login (InteractiveLogin + the 2FA
-            # ladder) is the NEXT integration step — see ACCOUNTS.md §5/§6. The
-            # panel button is wired; this endpoint returns a clear "not yet"
-            # rather than pretending to log in.
-            _need_int(body, "account_id")
-            return {"ok": False,
-                    "todo": "Server-IP browser login is the next step to wire "
-                            "(reuses the existing streamed-browser sign-in)."}
+            # Signing an account in FROM the dashboard is not wired yet. Rather
+            # than pretend, return the ACCURATE per-platform way to sign this
+            # account in on the server — Instagram never used a streamed
+            # browser (that path is dead; cookie/password is the way), so the
+            # old X-centric text was wrong on IG/FB cards.
+            aid = _need_int(body, "account_id")
+            plat = st.get(aid).platform
+            todo = {
+                "ig": "Instagram signs in on the SERVER, not from here. As the "
+                      "xscraper user run: `.venv/bin/python3 ig_login.py "
+                      "<username>` (password in .env) — or import a fresh "
+                      "cookie with `ig_import.py \"<sessionid>\"`. The account's "
+                      "residential proxy is used automatically.",
+                "fb": "Facebook signs in on the SERVER via FB_EMAIL/FB_PASSWORD "
+                      "in .env (it persists fb_state.json on first run). There "
+                      "is no dashboard login button for Facebook.",
+                "x": "X sign-in uses the streamed-browser flow on the server "
+                     "(see ACCOUNTS.md §5). Dashboard-triggered login is not "
+                     "wired yet.",
+            }.get(plat, "Dashboard-triggered login is not wired for this "
+                        "platform yet.")
+            return {"ok": False, "todo": todo}
 
         return {"error": f"unknown pool route: {method} {subpath}"}
 
