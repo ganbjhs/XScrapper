@@ -50,6 +50,11 @@ CREATE TABLE IF NOT EXISTS sources (
   created_at     INTEGER NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS settings (
+  key    TEXT PRIMARY KEY,                  -- e.g. 'fb_mode', 'fb_paused'
+  value  TEXT
+);
+
 CREATE TABLE IF NOT EXISTS page_profiles (
   handle        TEXT PRIMARY KEY,           -- lowercase page handle
   avatar_url    TEXT,                       -- the page's profile picture URL
@@ -185,6 +190,29 @@ class Store:
             "UPDATE sources SET watermark_ms = ?, last_run = ? WHERE label = ?",
             (int(ms), int(time.time()), label))
         self.db.commit()
+
+    # ---- settings (the dashboard's control surface) ----
+    #
+    # Operational switches live HERE, not only in .env — so the dashboard can
+    # show and change them, and the service loop re-reads them every cycle
+    # (RULEBOOK §6: no SSH needed to steer collection; a setting's empty value
+    # means "fall back to the environment default").
+
+    def setting(self, key, default=None):
+        row = self.db.execute(
+            "SELECT value FROM settings WHERE key = ?", (key,)).fetchone()
+        return row["value"] if row and row["value"] not in (None, "") else default
+
+    def set_setting(self, key, value):
+        self.db.execute(
+            "INSERT INTO settings(key, value) VALUES(?,?) "
+            "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            (key, "" if value is None else str(value)))
+        self.db.commit()
+
+    def settings_all(self):
+        return {r["key"]: r["value"]
+                for r in self.db.execute("SELECT key, value FROM settings")}
 
     # ---- page profiles (avatar cache) ----
     #

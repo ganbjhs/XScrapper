@@ -398,8 +398,139 @@ function StreamsManager({ pid }) {
 const FB_SPEEDS = { "1h": "1 hour", "3h": "3 hours", "6h": "6 hours",
                     "12h": "12 hours", "24h": "24 hours" };
 
+const INTERVAL_OPTS = [
+  ["900", "15 minutes"], ["1800", "30 minutes"], ["3600", "1 hour"],
+  ["10800", "3 hours"], ["21600", "6 hours"], ["43200", "12 hours"],
+  ["86400", "24 hours"],
+];
+
+// The login circuit breaker's state, with the human actions. When the engine
+// hits a wall it can't pass (a checkpoint, a bad password), it stops ALL
+// automatic retries, records the cause, and waits here for an operator.
+function FbHealthBanner({ health, onAction, busy }) {
+  if (!health?.blocked) return null;
+  return (
+    <div style={{ border: "1px solid var(--critical)", borderRadius: 10,
+                  padding: "10px 12px", margin: "8px 0",
+                  background: "color-mix(in srgb, var(--critical) 8%, transparent)" }}>
+      <b className="st-crit">
+        Login needs a human — automatic retries are stopped
+        ({health.reason === "checkpoint" ? "verification checkpoint" : "login failed"})
+      </b>
+      <div style={{ fontSize: 12.5, marginTop: 4 }}>{health.detail}</div>
+      <div style={{ fontSize: 12, color: "var(--ink-3)", marginTop: 4 }}>
+        since {health.ts ? fmtAgo(health.ts * 1000) : "—"}
+        {health.email ? ` · account ${health.email}` : ""}
+      </div>
+      <div className="filters" style={{ marginTop: 8, marginBottom: 0 }}>
+        <button className="btn btn-brand btn-sm" disabled={busy}
+                onClick={() => onAction("clear")}>
+          I fixed it — clear &amp; retry
+        </button>
+        <button className="btn btn-ghost btn-sm" disabled={busy}
+                onClick={() => onAction("reset_session")}
+                title="Also deletes fb_state.json so the next run logs in completely fresh">
+          Reset session (fresh login next run)
+        </button>
+      </div>
+    </div>
+  );
+}
+
+// Every operating switch, visible and editable — the service loop re-reads
+// these each cycle, so changes apply WITHOUT restarting anything.
+function FbConfigPanel({ data, reload }) {
+  const [open, setOpen] = useState(false);
+  const [form, setForm] = useState(null);
+  const [busy, setBusy] = useState(false);
+  const [note, setNote] = useState("");
+  const cfg = data?.config || {};
+  const ses = data?.session || {};
+
+  const openPanel = () => {
+    setForm({
+      mode: cfg.mode || "pages",
+      default_interval_s: String(cfg.default_interval_s || 21600),
+      fav_interval_s: String(cfg.fav_interval_s || 3600),
+    });
+    setNote("");
+    setOpen(true);
+  };
+
+  const save = async () => {
+    setBusy(true); setNote("");
+    try {
+      await api.fbSettings(form);
+      setNote("✓ Saved — the collector uses this from its next cycle (no restart)");
+      reload();
+    } catch (e) { setNote(`✗ ${String(e.message || e)}`); }
+    finally { setBusy(false); }
+  };
+
+  return (
+    <div style={{ marginTop: 10, borderTop: "1px solid var(--ring)", paddingTop: 8 }}>
+      <button className="btn btn-ghost btn-sm" onClick={() => (open ? setOpen(false) : openPanel())}>
+        Configuration {open ? "▴" : "▾"}
+      </button>
+      {open && form && (
+        <div style={{ marginTop: 8 }}>
+          <div className="kv"><span>Login account</span>
+            <b>{ses.identity || "not set"} {ses.method ? `(${ses.method})` : ""}</b></div>
+          <div className="kv"><span>Saved session (fb_state.json)</span>
+            <b className={ses.state_saved ? "st-good" : "st-warn"}>
+              {ses.state_saved ? "present" : "none — will log in fresh"}</b></div>
+          <div className="kv"><span>Login health</span>
+            <b className={data?.health?.blocked ? "st-crit" : "st-good"}>
+              {data?.health?.blocked ? `BLOCKED — ${data.health.reason}` : "ok"}</b></div>
+          <div className="kv"><span>Bandwidth</span>
+            <b>server IP{cfg.use_proxy ? " + proxy" : ""}, cap {cfg.monthly_cap_gb} GB/month</b></div>
+          <div className="filters" style={{ marginTop: 10, marginBottom: 6 }}>
+            <label className="fpill">
+              <span>Collection mode</span>
+              <select value={form.mode}
+                      onChange={(e) => setForm((s) => ({ ...s, mode: e.target.value }))}>
+                <option value="pages">Pages (visit each page on its cadence)</option>
+                <option value="favorites">Favorites feed (one richer pass)</option>
+              </select>
+            </label>
+            <label className="fpill">
+              <span>Default page cadence</span>
+              <select value={form.default_interval_s}
+                      onChange={(e) => setForm((s) => ({ ...s, default_interval_s: e.target.value }))}>
+                {INTERVAL_OPTS.filter(([v]) => Number(v) >= 3600).map(([v, t]) => (
+                  <option key={v} value={v}>{t}</option>
+                ))}
+              </select>
+            </label>
+            <label className="fpill">
+              <span>Favorites cadence</span>
+              <select value={form.fav_interval_s}
+                      onChange={(e) => setForm((s) => ({ ...s, fav_interval_s: e.target.value }))}>
+                {INTERVAL_OPTS.map(([v, t]) => (
+                  <option key={v} value={v}>{t}</option>
+                ))}
+              </select>
+            </label>
+            <button className="btn btn-brand btn-sm" disabled={busy} onClick={save}>
+              Save configuration
+            </button>
+          </div>
+          {note && (
+            <div className={note.startsWith("✓") ? "st-good" : "st-crit"}
+                 style={{ fontSize: 12.5, fontWeight: 600 }}>{note}</div>
+          )}
+          <div style={{ color: "var(--ink-3)", fontSize: 12, marginTop: 6 }}>
+            Credentials themselves stay in .env on the server — never shown or
+            edited here. Everything operational is on this panel.
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
 function FacebookSources({ pid }) {
-  const { data, error, reload } = useApi(() => api.fbStatus(pid), [pid]);
+  const { data, error, reload } = useApi(() => api.fbStatus(pid), [pid], { every: 20_000 });
   const [adding, setAdding] = useState("");
   const [busy, setBusy] = useState(false);
   const [msg, setMsg] = useState("");
@@ -407,6 +538,21 @@ function FacebookSources({ pid }) {
   const [result, setResult] = useState(null);
   if (error) return null;
   const sources = data?.sources || [];
+  const paused = !!data?.paused;
+
+  const healthAction = async (action) => {
+    setBusy(true); setMsg("");
+    try { await api.fbHealthAction(action); reload(); }
+    catch (e) { setMsg(String(e.message || e)); }
+    finally { setBusy(false); }
+  };
+
+  const togglePause = async () => {
+    setBusy(true); setMsg("");
+    try { await api.fbControl(paused ? "resume" : "pause"); reload(); }
+    catch (e) { setMsg(String(e.message || e)); }
+    finally { setBusy(false); }
+  };
 
   const add = async () => {
     setBusy(true); setMsg("");
@@ -446,13 +592,20 @@ function FacebookSources({ pid }) {
       <div className="phead">
         <h3><span className="badge platform-fb" style={{ marginRight: 8 }}>f</span>Facebook pages</h3>
         <span className="right" style={{ display: "flex", gap: 8, alignItems: "center" }}>
-          <span>{data?.totals?.posts ?? 0} collected</span>
-          <button className="btn btn-ghost btn-sm" disabled={fetching || sources.length === 0}
+          <span>{data?.totals?.posts ?? 0} collected{paused ? " · PAUSED" : ""}</span>
+          <button className={`btn btn-sm ${paused ? "btn-brand" : "btn-ghost"}`}
+                  disabled={busy} onClick={togglePause}
+                  title="Master switch — the background service honors it within a minute, no restart">
+            {paused ? "Resume collection" : "Pause collection"}
+          </button>
+          <button className="btn btn-ghost btn-sm"
+                  disabled={fetching || paused || sources.length === 0}
                   onClick={fetchFavorites}
                   title="Read the account's Favorites feed once and attribute posts to your pages — richer data, one pass">
             {fetching ? "…" : "Fetch Favorites feed"}
           </button>
-          <button className="btn btn-brand btn-sm" disabled={fetching || sources.length === 0}
+          <button className="btn btn-brand btn-sm"
+                  disabled={fetching || paused || sources.length === 0}
                   onClick={fetchNow}>
             {fetching ? "Fetching…" : "Fetch now"}
           </button>
@@ -461,6 +614,13 @@ function FacebookSources({ pid }) {
       {!data?.enabled && (
         <div className="kv"><span>Not set up</span>
           <b className="st-warn">add FB_EMAIL / FB_PASSWORD (or FB_C_USER / FB_XS) to .env on the server</b></div>
+      )}
+      <FbHealthBanner health={data?.health} onAction={healthAction} busy={busy} />
+      {paused && (
+        <div style={{ color: "var(--ink-3)", fontSize: 12.5, margin: "6px 0" }}>
+          Collection is paused — the background service idles without opening a
+          browser until you resume.
+        </div>
       )}
       {fetching && (
         <div style={{ color: "var(--ink-3)", fontSize: 12.5, margin: "6px 0" }}>
@@ -530,6 +690,7 @@ function FacebookSources({ pid }) {
         <button className="btn btn-brand btn-sm" disabled={busy || !adding.trim()} onClick={add}>Add page</button>
       </div>
       {msg && <div style={{ color: "var(--critical)", fontSize: 12.5, marginTop: 8 }}>{msg}</div>}
+      <FbConfigPanel data={data} reload={reload} />
       <div style={{ color: "var(--ink-3)", fontSize: 12, marginTop: 8 }}>
         Facebook runs on the server’s own bandwidth with a monthly cap — it checks each page a few
         times a day, newest posts only.

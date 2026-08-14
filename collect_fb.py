@@ -107,12 +107,22 @@ def _can_log_in() -> bool:
 
 async def run_once(store_path="fb_results.db", *, max_scroll=4,
                    project_id=None, log=print) -> int:
-    from engine_fb import FacebookEngine
+    from engine_fb import FacebookEngine, login_blocked
 
     log = _persist_log(log)
 
     st = store_fb.Store(store_path).open()
     try:
+        if st.setting("fb_paused") == "1":
+            log("[fb] collection is PAUSED from the dashboard — run skipped "
+                "(resume it in Watchlists → Facebook pages)")
+            return 0
+        blk = login_blocked()
+        if blk:
+            log(f"[fb] run skipped — login blocked ({blk.get('reason')}), "
+                f"waiting for a human. Fix it, then press \"Clear & retry\" "
+                f"in the dashboard.")
+            return 0
         sources = st.sources(enabled_only=True)
         if project_id:
             sources = [s for s in sources if s.get("project_id") == project_id]
@@ -144,14 +154,21 @@ async def run_due(store_path="fb_results.db", *, default_interval=21600,
     per-watchlist "check every" on the X side. Opens the browser only when at
     least one page is actually due, so idle ticks cost nothing.
     """
-    from engine_fb import FacebookEngine
+    from engine_fb import FacebookEngine, login_blocked
 
     log = _persist_log(log)
     st = store_fb.Store(store_path).open()
     try:
+        # Paused or login-blocked: skip WITHOUT logging on every tick — a
+        # 5-minute heartbeat of "still skipped" is noise, and the state that
+        # explains the silence is on the dashboard already.
+        if st.setting("fb_paused") == "1":
+            return 0
         now = int(time.time())
         due = [s for s in st.sources(enabled_only=True)
                if now - (s.get("last_run") or 0) >= (s.get("interval_s") or default_interval)]
+        if due and login_blocked():
+            return 0
         if not due:
             return 0
         if not _can_log_in():
@@ -181,11 +198,19 @@ async def run_favorites(store_path="fb_results.db", *, project_id=None,
     post is saved. So whatever you favorite just flows in — no hand-matching. A
     page you don't want is a Pause/Remove away in the dashboard.
     """
-    from engine_fb import FacebookEngine
+    from engine_fb import FacebookEngine, login_blocked
 
     log = _persist_log(log)
     st = store_fb.Store(store_path).open()
     try:
+        if st.setting("fb_paused") == "1":
+            log("[fb] collection is PAUSED from the dashboard — favorites "
+                "pass skipped")
+            return 0
+        if login_blocked():
+            log("[fb] favorites pass skipped — login blocked, waiting for a "
+                "human (see the dashboard's Facebook panel)")
+            return 0
         if not _can_log_in():
             log("[fb] no Facebook login available — set FB_EMAIL/FB_PASSWORD in .env")
             return 0
@@ -314,11 +339,24 @@ def main() -> int:
         print(f"[fb] favorites pass complete: {n} new")
         return 0
     if args.cmd == "run":
-        # FB_MODE=favorites → read the account's one Favorites feed each cycle
-        # instead of visiting each page (efficient + richer data).
-        favorites_mode = os.getenv("FB_MODE", "pages").lower() == "favorites"
+        # Mode and cadence come from the DASHBOARD settings first (the settings
+        # table in fb_results.db), falling back to the environment. The loop
+        # re-reads them EVERY cycle, so flipping a switch on the dashboard
+        # takes effect without restarting the service (RULEBOOK §6).
+        def _live_settings():
+            with store_fb.Store(args.store) as st:
+                return {
+                    "paused": st.setting("fb_paused") == "1",
+                    "mode": (st.setting("fb_mode")
+                             or os.getenv("FB_MODE", "pages")).lower(),
+                    "every": int(st.setting("fb_interval_s") or args.every),
+                    "fav_every": int(st.setting("fb_fav_interval_s")
+                                     or os.getenv("FB_FAV_INTERVAL_S", "3600")),
+                }
+
         if not args.loop:
-            if favorites_mode:
+            cfg = _live_settings()
+            if cfg["mode"] == "favorites":
                 n = asyncio.run(run_favorites(args.store, project_id=fav_project))
             else:
                 # One-shot: collect everything enabled now (ignores per-page
@@ -327,17 +365,18 @@ def main() -> int:
             print(f"[fb] pass complete: {n} new")
             return 0
 
-        # Favorites mode reads the one feed on its own interval (default hourly);
-        # per-page mode wakes on the short tick and collects only what's due.
-        fav_every = int(os.getenv("FB_FAV_INTERVAL_S", "3600"))
-
         async def loop():
             while True:
-                if favorites_mode:
+                cfg = _live_settings()
+                if cfg["paused"]:
+                    # Cheap idle tick: no browser, no log spam — the pause
+                    # state is visible on the dashboard.
+                    base = max(60, args.tick)
+                elif cfg["mode"] == "favorites":
                     await run_favorites(args.store, project_id=fav_project)
-                    base = fav_every
+                    base = cfg["fav_every"]
                 else:
-                    await run_due(args.store, default_interval=args.every,
+                    await run_due(args.store, default_interval=cfg["every"],
                                   max_scroll=args.scroll)
                     base = max(60, args.tick)
                 # Jitter the wait ±25% so the rhythm isn't a robotic fixed clock.

@@ -4,6 +4,20 @@ The rules every change must respect. Each one was paid for in a bug, a ban, or
 a confused operator — breaking one re-buys that lesson. `BLUEPRINT.md` is the
 map (what each file does); this is the law (what you may not do).
 
+## 0. The rulebook is part of every change (the living-rulebook rule)
+
+**A change that alters behavior updates THIS FILE in the same commit.** New
+rule learned → written here; old rule invalidated → corrected here, with the
+reason. A rulebook that lags the code is worse than none — it tells the next
+person (or the next AI session) to rebuild a dead end with confidence. The
+pre-commit hook enforces it: a commit touching engine/collector/server code
+without touching `RULEBOOK.md` is refused (`RULE_OK=1 git commit …` is the
+explicit opt-out for a change that truly alters no behavior, e.g. a typo).
+When a rule here and the code disagree, STOP and reconcile — do not pick one
+silently. (This section exists because mbasic survived in the engine after
+testing had already killed it: the code and the book disagreed, and the stale
+rule won.)
+
 ## 1. Three prime directives
 
 1. **The browser is only for logging in and for rendering.** Collection is
@@ -104,13 +118,39 @@ before changing the engine; nearly every "obvious" idea has been tried.)
   background `/graphql` requests rather than embedding it, so the engine
   captures those response bodies and pulls posts out of them. (2) On-page
   `<script type="application/json">` blobs (the logged-out case). (3) The old
-  `role="article"` **DOM** scrape, then `mbasic.facebook.com`. All the JSON
-  paths key on objects whose `__typename === "Story"` — a stable discriminator
-  that survives Facebook's CSS/DOM reshuffles (visible-card class names rotate
-  every few weeks; the story schema does not), and they carry the profile
-  picture, exact time, and reaction/comment/share counts the DOM can't give.
-  A Facebook change degrades us down the ladder, never to zero. The Fetch-now
-  log's `via www:gql|json|dom` says which path fed a run.
+  `role="article"` **DOM** scrape. All the JSON paths key on objects whose
+  `__typename === "Story"` — a stable discriminator that survives Facebook's
+  CSS/DOM reshuffles (visible-card class names rotate every few weeks; the
+  story schema does not), and they carry the profile picture, exact time, and
+  reaction/comment/share counts the DOM can't give. A Facebook change degrades
+  us down the ladder, never to zero. The Fetch-now log's `via www:gql|json|dom`
+  says which path fed a run.
+- **mbasic.facebook.com is DEAD. Never re-add it.** Tested and removed
+  (2026-08): it serves the WebLite/Bloks shell — no post JSON, no
+  `role="article"`, no permalinks — so it can never meet the requirements, and
+  as a "fallback" it only spent a request and polluted the diagnostics. Zero
+  posts from the desktop site means *diagnose with the diag log*, not degrade
+  to a surface that is known to return nothing.
+- **Login gets ONE automatic attempt, then a human. Never loop.** A login
+  wall triggers at most one scripted re-login. If that fails, the engine
+  writes the ACTUAL cause to `fb_health.json` (a verification **checkpoint** —
+  which Facebook throws even with 2FA off, and which no script may answer — vs
+  **bad credentials / IP block**) and every further attempt is refused until an
+  operator presses "Clear & retry" on the dashboard. Retrying a checkpoint in
+  a loop is how the burner account gets locked permanently; a blocked login is
+  a task for a human, and both the account log and the Facebook panel say so
+  in plain words.
+- **The collector only READS the account. It never changes account settings** —
+  no enabling 2FA, no answering verification flows, no profile edits, nothing
+  under Settings. Anything Facebook asks that is not "show me the feed" is a
+  human's job, by definition.
+- **Every operational switch lives on the dashboard, not in SSH.** Pause /
+  resume, collection mode (pages vs favorites), cadences, login retry and
+  session reset are all in the Facebook panel; the background service re-reads
+  them EVERY cycle, so no change requires a restart, and a background loop
+  must always honor them (a paused or login-blocked collector idles for
+  pennies instead of spinning). Secrets are the one exception: credentials
+  stay in `.env` and are never shown or edited in the UI.
 - **Dedup on TWO keys.** A post is refused if its `post_id` was seen OR its
   content signature (page + normalized caption) was — so the same post can't
   slip in twice just because a different path handed it to us under a different
@@ -142,6 +182,10 @@ before changing the engine; nearly every "obvious" idea has been tried.)
 
 ## 7. Change rules
 
+- **Update this rulebook in the same commit as the change** (§0). The
+  pre-commit hook blocks engine/collector/server commits that don't touch
+  `RULEBOOK.md`; `RULE_OK=1 git commit …` is the explicit opt-out for
+  behavior-neutral edits.
 - **Migrations are additive and self-applying.** Add a column via a guarded
   `ALTER TABLE` on `open()` so an existing DB upgrades in place; never require a
   wipe. (See `store_fb._MIGRATIONS` and the X store's `watched`/interval

@@ -50,3 +50,34 @@ if [ "$fail" = 1 ]; then
 MSG
   exit 1
 fi
+
+# ---------------------------------------------------------------------------
+# The living-rulebook rule (RULEBOOK.md §0): a commit that changes behavior
+# must update RULEBOOK.md in the SAME commit — a rulebook that lags the code
+# teaches the next session to rebuild a dead end (mbasic lived on this way).
+#
+# Opt-out for genuinely behavior-neutral edits:  RULE_OK=1 git commit …
+# (or git commit --no-verify, which skips every hook).
+
+if [ "${RULE_OK:-0}" != "1" ]; then
+  CHANGED=$(git diff --cached --name-only --diff-filter=ACMR)
+  behavior=0
+  for f in $CHANGED; do
+    case "$f" in
+      engine_*.py|collect_*.py|collector.py|store_*.py|web.py|main.py|\
+      guard.py|alerts.py|webhook.py|activity_log.py|api.py|auth.py)
+        behavior=1 ;;
+    esac
+  done
+  if [ "$behavior" = 1 ] && ! printf '%s\n' "$CHANGED" | grep -qx 'RULEBOOK.md'; then
+    cat >&2 <<'MSG'
+BLOCKED: this commit changes engine/collector/server behavior but does not
+touch RULEBOOK.md (the living-rulebook rule, RULEBOOK.md §0).
+
+  Learned a rule?  write it into RULEBOOK.md
+  Killed a rule?   correct it there, with the reason
+  Truly neutral?   RULE_OK=1 git commit …
+MSG
+    exit 1
+  fi
+fi

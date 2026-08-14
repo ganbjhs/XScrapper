@@ -75,6 +75,12 @@ export const api = {
     request("/api/fb/fetch", { method: "POST", body: { project } }),
   fbFavorites: (project) =>
     request("/api/fb/favorites", { method: "POST", body: { project } }),
+  fbControl: (action) =>
+    request("/api/fb/control", { method: "POST", body: { action } }),
+  fbHealthAction: (action) =>
+    request("/api/fb/health", { method: "POST", body: { action } }),
+  fbSettings: (body) =>
+    request("/api/fb/settings", { method: "POST", body }),
 
   // --- Account Control Panel: the managed account pool (store_accounts) ---
   pool: () => request("/api/pool"),

@@ -561,6 +561,76 @@ def _stories_from_graphql(blobs) -> list:
     return posts
 
 
+# --------------------------------------------------------------------------
+# Login health — the circuit breaker (RULEBOOK §6: one attempt, then a human)
+# --------------------------------------------------------------------------
+#
+# Facebook walls that need a HUMAN (a checkpoint / identity verification — it
+# throws these even when 2FA is off, and no script may answer one) must not be
+# hammered: automatic retries in a loop are exactly what gets the burner
+# account locked for good. So the engine keeps a tiny health file: after ONE
+# failed login attempt it records the actual cause and BLOCKS further attempts
+# until an operator clears it from the dashboard (Watchlists → Facebook pages
+# → "Clear & retry"). Collectors check it before even opening a browser, so a
+# blocked login costs nothing per tick.
+
+def _health_path():
+    return os.getenv("FB_HEALTH_PATH", "fb_health.json")
+
+
+def read_health() -> dict:
+    try:
+        with open(_health_path()) as f:
+            return json.load(f) or {}
+    except Exception:
+        return {}
+
+
+def write_health(**kw):
+    h = read_health()
+    h.update(kw)
+    try:
+        with open(_health_path(), "w") as f:
+            json.dump(h, f)
+    except Exception:
+        pass
+
+
+def login_blocked():
+    """The health dict when login is blocked pending a human, else None."""
+    h = read_health()
+    return h if h.get("blocked") else None
+
+
+def clear_login_block():
+    """Operator action: forget the block so the NEXT run may try one login."""
+    try:
+        os.remove(_health_path())
+    except FileNotFoundError:
+        pass
+
+
+def classify_login_wall(url: str, email: str = "") -> tuple:
+    """(reason, detail) for a login that did not complete, from the URL we
+    landed on. The detail is written for the operator, not for a log grepper."""
+    u = (url or "").lower()
+    who = email or "the collector account"
+    if ("checkpoint" in u or "two_step" in u or "two_factor" in u
+            or "auth_platform" in u or "/recover/" in u):
+        return ("checkpoint",
+                f"Facebook is holding {who} at a verification checkpoint. It "
+                f"does this even when 2FA is OFF — it is an identity check, "
+                f"and no script may answer it. Open facebook.com in a normal "
+                f"browser, log in as {who}, complete the check, then press "
+                f"\"Clear & retry\" here. If the session still fails, use "
+                f"\"Reset session\" to force a fresh login.")
+    return ("login_failed",
+            f"Facebook did not accept the login for {who} — wrong password, "
+            f"or it is blocking logins from this server IP. Verify the "
+            f"credentials by logging in once from a normal browser, fix "
+            f".env if needed, then press \"Clear & retry\".")
+
+
 def _bandwidth_ok(meter_db, cap_bytes):
     month = time.strftime("%Y-%m", time.gmtime())
     con = sqlite3.connect(meter_db)
@@ -790,7 +860,19 @@ class FacebookEngine:
         issues a fresh session bound to THIS browser's datr, and save it. This
         is the durable fix for the session getting logged out: instead of
         replaying borrowed cookies, we hold a session the browser itself owns.
+
+        ONE attempt, then the circuit breaker: a failure records its cause in
+        fb_health.json and blocks every further attempt until an operator
+        clears it from the dashboard. Retrying a checkpoint in a loop is how
+        accounts get locked — a blocked login is a task for a human, not for
+        this function.
         """
+        blk = login_blocked()
+        if blk:
+            self.log(f"[fb] login is BLOCKED ({blk.get('reason')}) — not "
+                     f"retrying. Fix it and press \"Clear & retry\" in the "
+                     f"dashboard (Watchlists → Facebook pages).")
+            return False
         if not (self.email and self.password):
             self.log("[fb] logged out and no FB_EMAIL / FB_PASSWORD set — "
                      "cannot re-login")
@@ -814,9 +896,15 @@ class FacebookEngine:
             self.log(f"[fb] login attempt failed: {type(e).__name__}: {e}")
             return False
         if self._is_login_wall(p.url):
-            self.log(f"[fb] login did not complete — wrong password, or Facebook "
-                     f"is asking for a checkpoint/2FA. url={p.url}")
+            reason, detail = classify_login_wall(p.url, self.email)
+            write_health(blocked=True, reason=reason, detail=detail,
+                         url=p.url, ts=int(time.time()), email=self.email)
+            self.log(f"[fb] login did not complete — {reason}. AUTOMATIC "
+                     f"RETRIES STOPPED until an operator clears it in the "
+                     f"dashboard. {detail}")
             return False
+        write_health(blocked=False, reason=None, detail=None,
+                     last_login=int(time.time()), ts=int(time.time()))
         await self._save_state()
         self.log("[fb] logged in with password; session saved")
         return True
@@ -950,10 +1038,11 @@ class FacebookEngine:
         Newest posts of one Facebook page, as normalized records. Refuses if the
         monthly byte cap is spent (returns [] and logs), so it can never overrun.
 
-        Tries the desktop site first (real role="article" posts), then falls
-        back to mbasic (server-rendered HTML, cleanest of all) if the desktop
-        render yields nothing — Facebook A/B tests its layouts, so having two
-        surfaces to try makes collection resilient.
+        Desktop site ONLY. mbasic was tested and REMOVED (RULEBOOK §6): it
+        serves the WebLite shell — no post JSON, no permalinks, nothing our
+        extraction needs — so falling back to it only wasted a request and
+        muddied the diagnostics. Zero posts here means diagnose (the diag log),
+        not degrade.
         """
         ok, used = _bandwidth_ok(self.meter_db, self.cap_bytes)
         if not ok:
@@ -969,7 +1058,7 @@ class FacebookEngine:
                 allow_login=True)
             source = f"www:{method}"
         except Exception as e:
-            self.log(f"[fb] fetch {handle} (www) failed: {type(e).__name__}: {e}")
+            self.log(f"[fb] fetch {handle} failed: {type(e).__name__}: {e}")
 
         # Harvest the page's profile picture from the SAME render — zero extra
         # navigation. The collector caches it in page_profiles, so this is a
@@ -980,19 +1069,6 @@ class FacebookEngine:
                 self.page_avatars[handle.lower()] = av
         except Exception:
             pass
-
-        if not posts:
-            # mbasic: no JavaScript, posts are plain <article> with story links.
-            try:
-                p2, d2, m2 = await self._attempt(
-                    f"https://mbasic.facebook.com/{handle}", handle,
-                    max_scroll=2, allow_login=False)
-                if p2:
-                    posts, diag, source = p2, d2, f"mbasic:{m2}"
-                elif d2 is not None:
-                    diag = d2
-            except Exception as e:
-                self.log(f"[fb] fetch {handle} (mbasic) failed: {type(e).__name__}: {e}")
 
         _record_bytes(self.meter_db, self._bytes)
         await self._save_state()

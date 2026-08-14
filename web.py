@@ -2078,6 +2078,14 @@ def _fb_status(q=None):
         "state_saved": (_CFG.root / os.getenv("FB_STATE_PATH",
                                               "fb_state.json")).exists(),
     }
+    # Login health — the circuit breaker's state, so the dashboard can show
+    # the ACTUAL cause of a dead login and offer the human actions.
+    try:
+        hp = _CFG.root / os.getenv("FB_HEALTH_PATH", "fb_health.json")
+        out["health"] = json.loads(hp.read_text()) if hp.exists() else {}
+    except Exception:
+        out["health"] = {}
+    settings = {}
     if rp.exists():
         try:
             import store_fb
@@ -2090,8 +2098,22 @@ def _fb_status(q=None):
                     s["speed"] = inv.get(s.get("interval_s"), "")
                 out["sources"] = srcs
                 out["totals"] = {"posts": st.total(pid or None)}
+                settings = st.settings_all()
         except Exception as e:
             out["error"] = f"{type(e).__name__}: {e}"
+    # The whole operating configuration, dashboard-settings first, env as the
+    # fallback — what the service loop actually uses (it re-reads per cycle).
+    out["paused"] = settings.get("fb_paused") == "1"
+    out["config"] = {
+        "mode": (settings.get("fb_mode")
+                 or os.getenv("FB_MODE", "pages")).lower(),
+        "default_interval_s": int(settings.get("fb_interval_s")
+                                  or os.getenv("FB_INTERVAL_S", "21600")),
+        "fav_interval_s": int(settings.get("fb_fav_interval_s")
+                              or os.getenv("FB_FAV_INTERVAL_S", "3600")),
+        "monthly_cap_gb": float(os.getenv("FB_MONTHLY_CAP_GB", "200")),
+        "use_proxy": os.getenv("FB_USE_PROXY", "0") == "1",
+    }
     return out
 
 
@@ -2282,6 +2304,94 @@ def _fb_favorites(body):
     if err:
         return {**err, "log": logs}
     return {"ok": True, "new": n, "log": logs}
+
+
+def _fb_control(body):
+    """Pause / resume Facebook collection globally — the dashboard's master
+    switch. The service loop re-reads it every cycle, so no restart needed."""
+    action = (body.get("action") or "").lower()
+    if action not in ("pause", "resume"):
+        return {"error": "action must be pause or resume"}
+    import activity_log
+    import store_fb
+    with store_fb.Store(_CFG.root / "fb_results.db") as st:
+        st.set_setting("fb_paused", "1" if action == "pause" else "")
+    activity_log.log_event(
+        "facebook", f"[fb] collection {action.upper()}D by operator from the "
+        f"dashboard", db=str(_CFG.root / "activity.db"))
+    return {"ok": True, "paused": action == "pause"}
+
+
+def _fb_health_post(body):
+    """
+    The human side of the login circuit breaker.
+      clear          — "I fixed it": forget the block; the NEXT run may attempt
+                       one login again.
+      reset_session  — also delete fb_state.json, forcing a completely fresh
+                       login (use after clearing a checkpoint in a browser).
+    """
+    action = (body.get("action") or "").lower()
+    if action not in ("clear", "reset_session"):
+        return {"error": "action must be clear or reset_session"}
+    import activity_log
+    hp = _CFG.root / os.getenv("FB_HEALTH_PATH", "fb_health.json")
+    sp = _CFG.root / os.getenv("FB_STATE_PATH", "fb_state.json")
+    targets = [hp] if action == "clear" else [hp, sp]
+    for pth in targets:
+        try:
+            pth.unlink()
+        except FileNotFoundError:
+            pass
+        except OSError as e:
+            return {"error": f"could not remove {pth.name}: {e}"}
+    activity_log.log_event(
+        "facebook",
+        "[fb] login block CLEARED by operator — next run may attempt one login"
+        if action == "clear" else
+        "[fb] session RESET by operator — fb_state.json deleted; next run "
+        "logs in fresh", db=str(_CFG.root / "activity.db"))
+    return {"ok": True}
+
+
+def _fb_settings_post(body):
+    """Edit the Facebook operating configuration from the dashboard. Values
+    land in the settings table; empty string clears back to the env default."""
+    import activity_log
+    import store_fb
+    changes = {}
+    if "mode" in body:
+        mode = str(body.get("mode") or "").lower()
+        if mode not in ("", "pages", "favorites"):
+            return {"error": "mode must be pages or favorites"}
+        changes["fb_mode"] = mode
+    for body_key, store_key in (("default_interval_s", "fb_interval_s"),
+                                ("fav_interval_s", "fb_fav_interval_s")):
+        if body_key not in body:
+            continue
+        v = body.get(body_key)
+        if v in (None, ""):
+            changes[store_key] = ""
+            continue
+        try:
+            iv = int(v)
+        except (TypeError, ValueError):
+            return {"error": f"{body_key} must be seconds (a number)"}
+        if iv < 900:
+            # Refuse, don't clamp (RULEBOOK §3): sub-15-minute Facebook
+            # cadence is a ban risk nobody meant to ask for.
+            return {"error": f"{body_key}: minimum is 900 seconds (15 min) — "
+                             f"tighter cadence is how accounts get flagged"}
+        changes[store_key] = str(iv)
+    if not changes:
+        return {"error": "nothing to change"}
+    with store_fb.Store(_CFG.root / "fb_results.db") as st:
+        for k, v in changes.items():
+            st.set_setting(k, v)
+    activity_log.log_event(
+        "facebook", "[fb] settings changed from the dashboard: "
+        + ", ".join(f"{k}={v or '(default)'}" for k, v in changes.items()),
+        db=str(_CFG.root / "activity.db"))
+    return {"ok": True}
 
 
 def _ig_status():
@@ -2766,6 +2876,12 @@ class Handler(BaseHTTPRequestHandler):
                 return self._send(200, _fb_fetch(body))
             if u.path == "/api/fb/favorites":
                 return self._send(200, _fb_favorites(body))
+            if u.path == "/api/fb/control":
+                return self._send(200, _fb_control(body))
+            if u.path == "/api/fb/health":
+                return self._send(200, _fb_health_post(body))
+            if u.path == "/api/fb/settings":
+                return self._send(200, _fb_settings_post(body))
             if u.path == "/api/project/fetch":
                 return self._send(200, _project_fetch(body))
             if u.path == "/api/fetch":
