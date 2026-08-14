@@ -354,12 +354,41 @@ export default function Accounts({ onMenu }) {
   const pool = useApi(() => api.pool(), [], { every: 30_000 });
   const liveX = useApi(() => api.status(), [], { every: 30_000 });
   const liveIg = useApi(() => api.igStatus(), []);
+  const liveFb = useApi(() => api.fbStatus(), [], { every: 30_000 });
   const [adding, setAdding] = useState(null);   // null | {} | {platform,label,login}
 
-  const reload = () => { pool.reload(); liveX.reload(); liveIg.reload(); };
+  const reload = () => { pool.reload(); liveX.reload(); liveIg.reload(); liveFb.reload(); };
+
+  // Facebook runs ONE burner session (cookies / password / saved state), not a
+  // list of accounts — shape it like one live entry so it shows up here too.
+  const fbLive = () => {
+    const d = liveFb.data;
+    if (!d) return [];
+    const srcs = d.sources || [];
+    const last = srcs.reduce((a, s) => Math.max(a, s.last_run || 0), 0);
+    const posts = d.totals?.posts ?? 0;
+    return [{
+      label: "facebook",
+      username: d.session?.identity || "facebook session",
+      active: !!d.enabled,
+      requests: null,
+      proxy: false,
+      reasons: d.enabled
+        ? [
+            `signed in via ${d.session?.method || "saved state"}` +
+              (d.session?.state_saved ? " · session state saved on server" : ""),
+            `${posts.toLocaleString("en-IN")} posts collected from ${srcs.length} page${srcs.length === 1 ? "" : "s"}`,
+            last ? `last page check ${fmtAgo(last * 1000)}` : "no page checked yet",
+          ]
+        : ["no Facebook login configured — set FB_C_USER/FB_XS or FB_EMAIL/FB_PASSWORD in .env"],
+      error: d.error || null,
+    }];
+  };
 
   const liveList = (p) =>
-    p === "x" ? (liveX.data?.accounts || []) : p === "ig" ? (liveIg.data?.accounts || []) : [];
+    p === "x" ? (liveX.data?.accounts || [])
+      : p === "ig" ? (liveIg.data?.accounts || [])
+      : p === "fb" ? fbLive() : [];
 
   // Match a managed account to its live session (best-effort, by label/username).
   const liveFor = (a) => {

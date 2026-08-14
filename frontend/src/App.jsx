@@ -126,7 +126,7 @@ function Nav({ open, close }) {
         <div className="avatar">C</div>
         <div>
           <b>Collector</b>
-          <small><a href="/" style={{ textDecoration: "none" }}>classic dashboard →</a></small>
+          <small><a href="/logout" style={{ textDecoration: "none" }}>sign out →</a></small>
         </div>
       </div>
     </nav>

@@ -45,3 +45,5 @@ pool.db-*
 
 pool.db
 pool.db-*
+_to_delete/
+.claude/

@@ -2045,6 +2045,19 @@ def _fb_status(q=None):
         (os.getenv("FB_C_USER", "").strip() and os.getenv("FB_XS", "").strip())
         or (os.getenv("FB_EMAIL", "").strip() and os.getenv("FB_PASSWORD", ""))
         or (_CFG.root / os.getenv("FB_STATE_PATH", "fb_state.json")).exists())
+    # The session itself, so the Accounts panel can show Facebook next to X
+    # and Instagram. One burner login — not a pool — so this is a single
+    # identity plus how it authenticates; never a password or cookie value.
+    email = os.getenv("FB_EMAIL", "").strip()
+    c_user = os.getenv("FB_C_USER", "").strip()
+    out["session"] = {
+        "identity": email or (f"c_user {c_user}" if c_user else "") or None,
+        "method": ("cookies" if c_user and os.getenv("FB_XS", "").strip()
+                   else "password" if email and os.getenv("FB_PASSWORD", "")
+                   else "saved state" if out["enabled"] else None),
+        "state_saved": (_CFG.root / os.getenv("FB_STATE_PATH",
+                                              "fb_state.json")).exists(),
+    }
     if rp.exists():
         try:
             import store_fb
@@ -2391,7 +2404,7 @@ class Handler(BaseHTTPRequestHandler):
         # produce an unexplainable login loop.
         secure = "; Secure" if getattr(_CFG, "_behind_proxy", False) else ""
         self.send_response(303)
-        self.send_header("Location", "/")
+        self.send_header("Location", "/app/")
         self.send_header(
             "Set-Cookie",
             f"{SESSION_COOKIE}={_issue_token()}; HttpOnly; SameSite=Strict; "
@@ -2408,22 +2421,12 @@ class Handler(BaseHTTPRequestHandler):
 
     _head_only = False
 
-    def _serve_static(self, path: str):
-        """
-        Serve one file from static/, and nothing outside it.
-
-        The traversal check is not decoration: "/static/../.env" and
-        "/static/..%2f.env" both arrive here as ordinary paths, and this
-        directory sits beside .env, config.toml and every .db file. resolve()
-        collapses the traversal and is_relative_to rejects anything that
-        escaped, so the only reachable files are the ones actually in static/.
-        """
-        rel = unquote(path[len("/static/"):])
-        target = (STATIC_DIR / rel).resolve()
-        if not target.is_relative_to(STATIC_DIR.resolve()) or not target.is_file():
-            return self._send(404, {"error": "not found"})
-        ctype = _STATIC_TYPES.get(target.suffix.lower(), "application/octet-stream")
-        return self._send(200, target.read_bytes(), ctype)
+    def _redirect(self, where: str):
+        """303 See Other — used to send the old page URLs into the React app."""
+        self.send_response(303)
+        self.send_header("Location", where)
+        self.send_header("Content-Length", "0")
+        self.end_headers()
 
     def _sse_live(self, q):
         """
@@ -2542,25 +2545,21 @@ class Handler(BaseHTTPRequestHandler):
         try:
             if u.path == "/login":
                 if self._authed():
-                    self.send_response(303); self.send_header("Location", "/")
-                    self.send_header("Content-Length", "0"); self.end_headers()
-                    return
+                    return self._redirect("/app/")
                 return self._send(200, self._login_html(), "text/html; charset=utf-8")
             if u.path == "/logout":
                 return self._do_logout()
             if not self._require_auth():
                 return
+            # The React app (frontend/dist, served under /app) IS the dashboard
+            # now. The old server-rendered pages at / and /accounts are retired;
+            # redirects keep every bookmark and muscle-memory URL working.
             if u.path == "/":
-                return self._send(200, _static_text("index.html"),
-                                  "text/html; charset=utf-8")
-            if u.path.startswith("/static/"):
-                return self._serve_static(u.path)
+                return self._redirect("/app/")
+            if u.path in ("/accounts", "/accounts/"):
+                return self._redirect("/app/accounts")
             if u.path == "/app" or u.path.startswith("/app/"):
                 return self._serve_app(u.path)
-            if u.path in ("/accounts", "/accounts/"):
-                return self._send(200, ACCOUNTS_PAGE, "text/html; charset=utf-8")
-            if u.path == "/signin":
-                return self._send(200, _SIGNIN_PAGE, "text/html; charset=utf-8")
             if u.path == "/api/status":
                 return self._send(200, _status())
             if u.path == "/api/streams":
@@ -2828,306 +2827,6 @@ def serve(cfg, host="127.0.0.1", port=8765, log=print, behind_proxy=False):
     return 0
 
 
-# --------------------------------------------------------------------------
-# the pages
-# --------------------------------------------------------------------------
-#
-# Two pages now — the dashboard and the accounts panel — so the pieces both
-# need live in shared constants rather than being copied. The sign-in window in
-# particular is CSS, markup and about a hundred lines of coordinate-scaling
-# JavaScript; a second copy of that would drift from the first the moment
-# either was touched.
-#
-# Assembled with plain concatenation. A template engine would be a dependency,
-# and str.format would fight every { in the CSS and JS.
-
-# _DOC_HEAD now lives in static/index.html
-
-
-# _CSS_CORE now lives in static/base.css
-
-
-# Modern visual + structural layer, appended AFTER _CSS_CORE so later rules win.
-# Adds the brand, source switcher, KPI strip and the per-source view scoping.
-# Removes no existing id/class, so every JS hook keeps working.
-# _CSS_MODERN now lives in static/app.css
-
-
-# --------------------------------------------------------------------------
-# the sign-in tab
-# --------------------------------------------------------------------------
-#
-# This was a modal inside the dashboard, and it did not survive contact with
-# Instagram. The plumbing was fine — clicks and keys arrived, Instagram
-# answered — but a 1000x820 remote page scaled into a 300px-margin dialog gives
-# you small targets, unreadable labels, and no room for the page to grow. Then
-# Instagram shows an error banner, the whole form REFLOWS downward, and the
-# button you were aiming at is 50px from where you last saw it.
-#
-# So the sign-in gets its own tab and the whole window. It is a browser; it
-# should be the size of a browser. The page also shows the remote URL, because
-# a picture with no address bar is a black box, and "did my click do anything"
-# is the question this whole flow lives or dies on.
-
-# _JS_HELPERS now lives in static/helpers.js
-
-
-_SIGNIN_PAGE = r"""<!doctype html>
-<html lang="en"><head>
-<meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Sign in — X Collector</title>
-<style>
-  :root{--bg:#fff;--panel:#f7f8fa;--line:#e3e6ea;--fg:#14171a;--dim:#5b7083;
-        --accent:#1d9bf0;--warn:#c0392b;--ok:#17a673}
-  @media (prefers-color-scheme:dark){
-    :root{--bg:#15181c;--panel:#1e2126;--line:#2f3336;--fg:#e7e9ea;--dim:#8b98a5}}
-  *{box-sizing:border-box}
-  html,body{height:100%}
-  body{margin:0;display:flex;flex-direction:column;background:#000;color:var(--fg);
-       font:14px/1.5 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif}
-  header{display:flex;align-items:center;gap:12px;padding:8px 14px;background:var(--bg);
-         border-bottom:1px solid var(--line);flex:0 0 auto;flex-wrap:wrap}
-  header b{font-size:14px}
-  #msg{color:var(--dim);flex:1;min-width:180px}
-  #msg.bad{color:var(--warn)} #msg.good{color:var(--ok)}
-  #addr{font:12px/1.4 ui-monospace,SFMono-Regular,Menlo,monospace;color:var(--dim);
-        background:var(--panel);border:1px solid var(--line);border-radius:6px;
-        padding:3px 8px;max-width:46vw;overflow:hidden;text-overflow:ellipsis;
-        white-space:nowrap}
-  button{font:inherit;color:var(--fg);background:var(--panel);border:1px solid var(--line);
-         border-radius:8px;padding:6px 12px;cursor:pointer}
-  button:hover{border-color:var(--accent)}
-  button.primary{background:var(--accent);color:#fff;border-color:var(--accent);font-weight:600}
-  /* The picture fills whatever is left. 1:1 when it fits, scaled down when it
-     does not — and never letterboxed INSIDE the image, because the click
-     mapping reads the element's own box. */
-  #stage{flex:1;min-height:0;display:flex;align-items:center;justify-content:center;
-         overflow:auto;background:#000}
-  #shot{display:block;max-width:100%;max-height:100%;cursor:crosshair}
-  #hint{flex:0 0 auto;padding:6px 14px;font-size:12px;color:var(--dim);
-        background:var(--bg);border-top:1px solid var(--line)}
-  #busy{position:fixed;top:8px;right:14px;background:var(--accent);color:#fff;
-        font-size:11px;padding:2px 9px;border-radius:999px;display:none}
-  #busy.on{display:block}
-</style></head><body>
-
-<header>
-  <b id="what">Signing in</b>
-  <span id="addr">—</span>
-  <span id="msg">Starting a browser…</span>
-  <button id="reload" title="Reload the remote page">Reload</button>
-  <button id="done" class="primary" hidden>Done</button>
-  <button id="close">Close</button>
-</header>
-
-<div id="stage"><img id="shot" alt="The sign-in page"></div>
-<div id="hint">This is a real browser running on the server. Click and type in it
-  as you would anywhere else — solve any captcha or code prompt here. Your
-  password goes straight to the site; this page never sees it.</div>
-<div id="busy">working…</div>
-
-<script>
-const $ = s => document.querySelector(s);
-const esc = s => (s||"").replace(/[&<>"']/g, c =>
-  ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
-const LABEL = new URLSearchParams(location.search).get("label") || "";
-
-let W = 1000, H = 820, done = false, timer = null, busy = 0;
-
-function say(text, kind){ const m = $("#msg"); m.textContent = text; m.className = kind || ""; }
-function mark(n){ busy = Math.max(0, busy + n); $("#busy").classList.toggle("on", busy > 0); }
-
-async function api(url, opts){
-  mark(1);
-  try {
-    const r = await fetch(url, opts);
-    const d = await r.json().catch(() => ({error: `HTTP ${r.status}`}));
-    if (!r.ok && !d.error) throw new Error(`HTTP ${r.status}`);
-    return d;
-  } catch (e) {
-    return {error: "Lost contact with the collector. Is it still running?"};
-  } finally { mark(-1); }
-}
-
-function shot(){
-  if (done) return;
-  $("#shot").src = "/api/login/frame?t=" + Date.now();
-}
-
-function show(d){
-  if (d.url) $("#addr").textContent = d.url.replace(/^https?:\/\//, "");
-  const S = {
-    needs_login: "Type your username and password below.",
-    challenge:   "The site is asking for a code or a puzzle — answer it below.",
-    unknown:     "Signed in, but the account could not be identified yet.",
-  };
-  if (d.state && S[d.state]) say(S[d.state]);
-}
-
-async function start(){
-  if (!LABEL){ return say("No account named in the link.", "bad"); }
-  $("#what").textContent = "Signing in — " + LABEL;
-
-  /* Starting a browser is slow on a small server — tens of seconds, sometimes
-     more on the first run while the binary is paged in. A bare spinner for
-     that long is indistinguishable from a hang, which is exactly what it was
-     mistaken for. Count up, and say what is happening. */
-  const t0 = Date.now();
-  const tick = setInterval(() => {
-    const s = Math.round((Date.now() - t0) / 1000);
-    say(s < 20 ? `Starting a browser on the server… ${s}s`
-      : s < 60 ? `Still starting… ${s}s. The first run is the slow one.`
-      : `Still starting… ${s}s. If this passes about 90s the server is probably `
-        + `short of memory — check with:  python3 main.py doctor --browser`);
-  }, 1000);
-
-  const d = await api("/api/login/start", {
-    method:"POST", headers:{"Content-Type":"application/json"},
-    body: JSON.stringify({label: LABEL})
-  });
-  clearInterval(tick);
-
-  if (d.error){
-    say(d.error, "bad");
-    // The launch trace is the whole explanation for "works on my laptop, not
-    // on the server". Show it rather than making someone read journalctl.
-    if ((d.trace || []).length){
-      const pre = document.createElement("pre");
-      pre.style.cssText = "margin:10px 14px;padding:10px;background:var(--panel);"
-        + "border:1px solid var(--line);border-radius:8px;color:var(--dim);"
-        + "font-size:12px;white-space:pre-wrap";
-      pre.textContent = d.trace.join("\n");
-      $("#stage").replaceChildren(pre);
-    }
-    return;
-  }
-  if (d.took_s > 20) console.log("browser took " + d.took_s + "s to start");
-  // The browser started but the page never showed what it should. Say it —
-  // a blank white rectangle with a cheerful "type your password below" is the
-  // worst possible combination.
-  if (d.warning){ say(d.warning, "bad"); }
-  W = d.width; H = d.height;
-  $("#what").textContent =
-    (d.platform === "instagram" ? "Sign in to Instagram — " : "Sign in to X — ") + LABEL;
-  show(d);
-  shot();
-  // Twice a second. The old modal polled at 900ms and every click felt like it
-  // had been ignored, which is the one thing this page cannot afford.
-  timer = setInterval(shot, 500);
-}
-
-async function act(payload){
-  if (done) return;
-  const d = await api("/api/login/act", {
-    method:"POST", headers:{"Content-Type":"application/json"},
-    body: JSON.stringify(payload)
-  });
-  if (d.error) return say(d.error, "bad");
-  if (d.closed) return finish("The sign-in window was closed.", "bad");
-  show(d);
-  if (d.captured){
-    if (d.active) finish(`Signed in as @${d.username}. You can close this tab.`, "good");
-    else finish(`Signed in as @${d.username}, but saving failed: ${d.detail}`, "bad");
-    return;
-  }
-  shot();   // immediate feedback, rather than waiting for the next tick
-}
-
-function finish(text, kind){
-  done = true;
-  if (timer) { clearInterval(timer); timer = null; }
-  say(text, kind);
-  $("#done").hidden = false;
-  try { if (window.opener) window.opener.postMessage("signed-in", location.origin); } catch {}
-}
-
-/* Clicks are scaled from the displayed picture back to the real one. Both
-   max-* on the image preserve its aspect ratio, so the element's box IS the
-   drawn picture and this stays exact at any window size. */
-$("#shot").onclick = (e) => {
-  const r = e.target.getBoundingClientRect();
-  act({act:"click",
-       x: Math.round((e.clientX - r.left) * (W / r.width)),
-       y: Math.round((e.clientY - r.top)  * (H / r.height))});
-};
-$("#shot").onwheel = (e) => { e.preventDefault(); act({act:"scroll", dy: e.deltaY}); };
-
-document.addEventListener("keydown", (e) => {
-  if (done) return;
-  if (e.key === "Escape") return;
-  if ((e.ctrlKey || e.metaKey) && !["v","V"].includes(e.key)) return;  // let copy/paste/devtools through
-  e.preventDefault();
-  if (e.key.length === 1) act({act:"type", text:e.key});
-  else if (["Enter","Backspace","Tab","ArrowLeft","ArrowRight","ArrowUp","ArrowDown","Delete"].includes(e.key))
-    act({act:"key", key:e.key});
-});
-document.addEventListener("paste", (e) => {
-  if (done) return;
-  const text = (e.clipboardData || window.clipboardData).getData("text");
-  if (text) { e.preventDefault(); act({act:"type", text}); }
-});
-
-$("#reload").onclick = () => { act({act:"reload"}); say("Reloading…"); };
-$("#close").onclick = $("#done").onclick = async () => {
-  if (timer) clearInterval(timer);
-  try { await fetch("/api/login/cancel", {method:"POST",
-        headers:{"Content-Type":"application/json"}, body:"{}"}); } catch {}
-  window.close();
-  // window.close() is refused for tabs the script did not open, so say what
-  // happened rather than leaving a dead-looking page.
-  say("Finished. You can close this tab.", "good");
-};
-// Closing the tab must not leave a browser running against the profile.
-window.addEventListener("pagehide", () => {
-  navigator.sendBeacon?.("/api/login/cancel", new Blob(["{}"], {type:"application/json"}));
-});
-
-start();
-</script>
-</body></html>
-"""
-
-
-# _DASH_BODY now lives in static/index.html
-
-
-
-# _DASH_JS now lives in static/app.js
-
-
-
-# Signing in opens its own tab, so neither page carries the remote browser any
-# more — no modal markup, no coordinate scaling, no keyboard capture fighting
-# the page underneath. Both just open a window.
-# _JS_SIGNIN now lives in static/helpers.js
-
-
-
-# --------------------------------------------------------------------------
-# static assets
-# --------------------------------------------------------------------------
-#
-# THE DASHBOARD IS AN ORDINARY index.html NOW.
-#
-# It used to be assembled from Python string constants — _DOC_HEAD + _CSS_CORE
-# + _CSS_MODERN + _DASH_BODY + _DASH_JS — which meant no editor knew it was
-# HTML, no linter saw the CSS, and there were several unrelated <style> blocks
-# in one file that all looked alike. A rule appended to the wrong one is parsed
-# by the browser for a different document and silently does nothing, which is
-# exactly how the Filters panel shipped broken.
-#
-# Files, not strings, so a stylesheet is a stylesheet:
-#
-#   static/index.html   the page
-#   static/base.css     shared shell (tokens, buttons, cards)
-#   static/app.css      dashboard layer, loaded after base
-#   static/app.js       all dashboard behaviour
-#
-# Served by this process, not nginx: the app is already behind cookie auth here
-# and adding a second server to configure would trade one file for two moving
-# parts. There is no build step and no Node — you edit the file and reload.
-
-STATIC_DIR = Path(__file__).resolve().parent / "static"
 APP_DIST_DIR = Path(__file__).resolve().parent / "frontend" / "dist"
 
 _STATIC_TYPES = {".html": "text/html; charset=utf-8",
@@ -3136,319 +2835,3 @@ _STATIC_TYPES = {".html": "text/html; charset=utf-8",
                  ".svg": "image/svg+xml",
                  ".png": "image/png",
                  ".ico": "image/x-icon"}
-
-
-def _static_text(name: str) -> str:
-    """Read a static file fresh on every request.
-
-    Deliberately not cached in memory: editing app.css and reloading the page
-    should show the change, and these files are a few tens of KB read from the
-    page cache. Caching them would buy nothing and cost the edit-reload loop.
-    """
-    return (STATIC_DIR / name).read_text(encoding="utf-8")
-
-
-def _page(title: str, css: str, body: str, js: str) -> str:
-    """
-    One small page: shared shell from static/, page-specific middle inline.
-
-    The shell is LINKED, not pasted. base.css and helpers.js are the same files
-    the dashboard loads, so a change to a button or to the API client reaches
-    every page instead of only the one whose copy was edited. Only this page's
-    own css/js stays inline, because at a few KB a separate request would cost
-    more than it saves.
-    """
-    return (f'<!doctype html>\n<html lang="en"><head>\n'
-            f'<meta charset="utf-8">\n'
-            f'<meta name="viewport" content="width=device-width,initial-scale=1">\n'
-            f'<title>{title}</title>\n'
-            f'<link rel="stylesheet" href="/static/base.css">\n'
-            f'<style>\n{css}</style>\n'
-            f'</head><body>\n'
-            + body.replace("</style></head><body>", "", 1)
-            + '<script src="/static/helpers.js"></script>\n'
-            + "<script>\n" + js + "</script>\n</body></html>\n")
-
-
-# --------------------------------------------------------------------------
-# /accounts — the control panel
-# --------------------------------------------------------------------------
-#
-# Accounts outgrew the sidebar. Signing one in, reading why it is unhappy and
-# knowing what to do next are not glanceable things, and squeezing them into a
-# 300px column meant every account showed a wall of small grey text.
-#
-# So the dashboard keeps only what you glance at — which accounts are working —
-# and everything else lives here.
-#
-# Built around PLATFORMS rather than a flat list, because X will not be the
-# only one. Instagram and Facebook appear as real sections saying plainly that
-# they are not built yet. An empty list under a heading reads as "broken"; a
-# sentence saying "not supported yet" reads as "not built", which is the truth.
-
-_ACCT_CSS = r"""
-  /* The shared core styles .wrap as the dashboard's two-column grid. Without
-     resetting display, the platform cards flowed into those columns and
-     Instagram sat beside X instead of beneath it. */
-  .wrap{display:block;max-width:820px;margin:0 auto;padding:18px}
-  .plat{border:1px solid var(--line);border-radius:var(--radius);margin-bottom:16px;
-        background:var(--panel);overflow:hidden}
-  .plathead{display:flex;align-items:center;gap:10px;padding:12px 16px;
-            border-bottom:1px solid var(--line)}
-  .plathead h2{margin:0;font-size:15px;font-weight:650;letter-spacing:0}
-  .platmark{width:26px;height:26px;border-radius:7px;display:grid;place-items:center;
-            font-weight:700;font-size:14px;color:#fff;flex:0 0 auto}
-  .platnote{color:var(--dim);font-size:13px;margin-left:auto}
-  .platbody{padding:12px 16px}
-  .soon{color:var(--dim);font-size:13px;padding:14px 16px}
-  .acct{border:1px solid var(--line);border-radius:9px;padding:12px 14px;
-        margin-bottom:10px;background:var(--bg)}
-  .acct .top{display:flex;align-items:center;gap:10px;flex-wrap:wrap}
-  .acct .who{font-weight:650}
-  .facts{display:grid;grid-template-columns:repeat(auto-fit,minmax(140px,1fr));
-         gap:6px 16px;margin-top:10px;font-size:13px}
-  .fact .k{color:var(--dim);font-size:11px;text-transform:uppercase;letter-spacing:.05em;
-           display:block}
-  .why{margin-top:10px;padding:8px 10px;border-radius:7px;background:var(--panel);
-       font-size:13px;color:var(--dim)}
-  .why b{color:var(--fg);font-weight:600}
-  .acctacts{display:flex;gap:6px;margin-top:10px;flex-wrap:wrap}
-  .acctacts button{font-size:13px;padding:5px 12px}
-  /* `display:grid` beats the browser's own [hidden]{display:none}, so the
-     form showed even while marked hidden. Say so explicitly. */
-  .addform{display:grid;gap:6px;max-width:380px;margin-top:10px}
-  .addform[hidden]{display:none}
-"""
-
-_ACCT_BODY = r"""</style></head><body>
-
-<header>
-  <h1>Accounts</h1>
-  <a href="/" class="muted" style="font-size:13px">← Back to tweets</a>
-  <a href="/logout" class="muted" style="font-size:13px;margin-left:auto">Sign out</a>
-</header>
-
-<div id="banner"></div>
-
-<div class="wrap">
-  <div class="plat">
-    <div class="plathead">
-      <span class="platmark" style="background:#000">X</span>
-      <h2>X (Twitter)</h2>
-      <span class="platnote" id="xcount">—</span>
-    </div>
-    <div class="platbody">
-      <div id="accounts"><p class="muted">Loading…</p></div>
-      <button id="acctnew" style="margin-top:4px">+ Add an account</button>
-      <div id="acctform" hidden class="addform">
-        <p class="muted" style="margin:0">
-          Give it a short name, then sign in. A window opens where you type your
-          X password directly into x.com — this page never sees it.
-          Use a throwaway account, never a personal one.</p>
-        <input id="a_label" placeholder="short name, e.g. acct_b">
-        <input id="a_user"  placeholder="X username (optional)">
-        <input id="a_proxy" placeholder="proxy (leave blank)">
-        <div style="display:flex;gap:6px">
-          <button id="a_save" class="primary" style="flex:1">Save and sign in</button>
-          <button id="a_cancel">Cancel</button>
-        </div>
-      </div>
-    </div>
-  </div>
-
-  <div class="plat">
-    <div class="plathead">
-      <span class="platmark" style="background:linear-gradient(45deg,#f09433,#dc2743,#bc1888)">In</span>
-      <h2>Instagram</h2>
-      <span class="platnote" id="igcount">—</span>
-    </div>
-    <div class="platbody">
-      <p class="muted" style="margin:0 0 10px">
-        You can sign an account in here, and it is stored. <b>Nothing collects
-        from Instagram yet</b> — the collector is not written. This is the first
-        half, done first because signing in is the part that needs a human.</p>
-      <div id="igaccounts"><p class="muted">Loading…</p></div>
-      <button id="ignew" style="margin-top:4px">+ Add an Instagram account</button>
-      <div id="igform" hidden class="addform">
-        <p class="muted" style="margin:0">
-          Give it a short name, then sign in. A real Instagram opens in a window
-          — solve the captcha and any code prompt there, exactly as you would on
-          your phone. Your password goes straight to instagram.com.</p>
-        <input id="ig_label" placeholder="short name, e.g. ig_a">
-        <input id="ig_user"  placeholder="Instagram username (optional)">
-        <input id="ig_proxy" placeholder="proxy (leave blank)">
-        <div style="display:flex;gap:6px">
-          <button id="ig_save" class="primary" style="flex:1">Save and sign in</button>
-          <button id="ig_cancel">Cancel</button>
-        </div>
-      </div>
-    </div>
-  </div>
-
-  <div class="plat">
-    <div class="plathead">
-      <span class="platmark" style="background:#1877f2">f</span>
-      <h2>Facebook</h2>
-      <span class="platnote">not built yet</span>
-    </div>
-    <div class="soon">
-      Same as Instagram — a placeholder, not a setting.
-    </div>
-  </div>
-</div>
-
-"""
-
-_ACCT_JS = r"""
-/* What each state means, in words rather than a colour alone. */
-const STATE = {
-  live:    {label:"Working",    note:"Collecting normally."},
-  warning: {label:"Check this", note:"It works, but something below will bite later."},
-  dead:    {label:"Signed out", note:"X is refusing this session. It collects nothing."},
-  unknown: {label:"Not set up", note:"Added, but never signed in to X."},
-};
-
-function when(iso){
-  if (!iso) return "never";
-  return ago(iso);
-}
-
-async function load(){
-  let d;
-  try { d = await api("/api/status"); }
-  catch (e) { return banner(esc(e.message).replace(/\n/g,"<br>"), "err"); }
-
-  const accts = d.accounts || [];
-  // Same rule as the dashboard: collecting is `active`. An amber account is
-  // working; the amber says something will bite later, not that it is down.
-  const live = accts.filter(a => a.active).length;
-  $("#xcount").textContent = accts.length
-    ? `${live} of ${accts.length} collecting` : "none yet";
-
-  if (d.accounts_error)
-    banner("Could not read the account store: " + esc(d.accounts_error), "err");
-
-  $("#accounts").innerHTML = accts.length ? accts.map(a => {
-    const st = a.status || (a.active ? "live" : "dead");
-    const s  = STATE[st] || {label: st, note: ""};
-    const needs = st === "dead" || st === "unknown";
-    const reasons = (a.reasons || []).length
-      ? `<div class="why">${a.reasons.map(r => "• " + esc(r)).join("<br>")}
-           ${a.action ? `<br><b>What to do:</b> ${esc(a.action)}` : ""}</div>`
-      : "";
-    return `<div class="acct">
-      <div class="top">
-        <span class="who">@${esc(a.username)}</span>
-        <span class="flag ${st}">${s.label}</span>
-        <span class="muted">${esc(s.note)}</span>
-      </div>
-      <div class="facts">
-        <div class="fact"><span class="k">name in config</span>${esc(a.label || "—")}</div>
-        <div class="fact"><span class="k">requests made</span>${a.requests ?? 0}</div>
-        <div class="fact"><span class="k">last used</span>${esc(when(a.last_used))}</div>
-        <div class="fact"><span class="k">own proxy</span>${a.proxy ? "yes" : "no — shares this machine's address"}</div>
-        <div class="fact"><span class="k">busy queues</span>${(a.locked||[]).length ? esc((a.locked||[]).join(", ")) : "none"}</div>
-      </div>
-      ${a.error ? `<div class="why"><b>Last error from X:</b> ${esc(a.error)}</div>` : ""}
-      ${reasons}
-      <div class="acctacts">
-        <button data-signin="${esc(a.label || a.username)}" ${needs ? 'class="primary"' : ""}>
-          ${needs ? "Sign in to X" : "Sign in again"}</button>
-      </div>
-    </div>`;
-  }).join("") : '<p class="muted">No X accounts yet. Add one below.</p>';
-
-  renderIG(d.instagram || [], d.instagram_error);
-
-  // Bound in the same pass that draws them — both panels are redrawn on every
-  // refresh, so anything bound earlier belongs to nodes that are gone.
-  document.querySelectorAll("[data-signin]").forEach(b =>
-    b.onclick = () => loginOpen(b.dataset.signin));
-}
-
-function renderIG(list, err){
-  $("#igcount").textContent = list.length
-    ? `${list.filter(a => a.active).length} of ${list.length} signed in` : "none yet";
-  if (err) banner("Could not read the Instagram accounts: " + esc(err), "err");
-
-  $("#igaccounts").innerHTML = list.length ? list.map(a => {
-    const st = a.status || (a.active ? "live" : "dead");
-    const s  = STATE[st] || {label: st, note: ""};
-    return `<div class="acct">
-      <div class="top">
-        <span class="who">@${esc(a.username)}</span>
-        <span class="flag ${st}">${st === "live" ? "Signed in" : s.label}</span>
-        <span class="muted">${esc(st === "live"
-          ? "Session stored. Nothing collects from it yet." : s.note)}</span>
-      </div>
-      <div class="facts">
-        <div class="fact"><span class="k">name in config</span>${esc(a.label || "—")}</div>
-        <div class="fact"><span class="k">last used</span>${esc(when(a.last_used))}</div>
-        <div class="fact"><span class="k">own proxy</span>${a.proxy ? "yes" : "no"}</div>
-      </div>
-      ${(a.reasons||[]).length ? `<div class="why">${a.reasons.map(r=>"• "+esc(r)).join("<br>")}
-         ${a.action ? `<br><b>What to do:</b> ${esc(a.action)}` : ""}</div>` : ""}
-      <div class="acctacts">
-        <button data-signin="${esc(a.label || a.username)}" ${a.active ? "" : 'class="primary"'}>
-          ${a.active ? "Sign in again" : "Sign in to Instagram"}</button>
-      </div>
-    </div>`;
-  }).join("") : '<p class="muted">No Instagram accounts yet.</p>';
-}
-
-$("#ignew").onclick    = () => { $("#igform").hidden = false; $("#ig_label").focus(); };
-$("#ig_cancel").onclick = () => { $("#igform").hidden = true; };
-$("#ig_save").onclick = async () => {
-  const body = {
-    label: $("#ig_label").value.trim(), username: $("#ig_user").value.trim(),
-    proxy: $("#ig_proxy").value.trim(), platform: "instagram",
-  };
-  if (!body.label) return banner("Give the account a short name first.", "err");
-  $("#ig_save").disabled = true;
-  try {
-    const d = await api("/api/account", {
-      method:"POST", headers:{"Content-Type":"application/json"},
-      body: JSON.stringify(body)
-    });
-    if (d.error) return banner(esc(d.error), "err");
-    ["#ig_label","#ig_user","#ig_proxy"].forEach(s => $(s).value = "");
-    $("#igform").hidden = true;
-    banner("");
-    await load();
-    await loginOpen(d.label);
-  } catch (e) { banner(esc(e.message), "err"); }
-  finally { $("#ig_save").disabled = false; }
-};
-
-$("#acctnew").onclick  = () => { $("#acctform").hidden = false; $("#a_label").focus(); };
-$("#a_cancel").onclick = () => { $("#acctform").hidden = true; };
-$("#a_save").onclick = async () => {
-  const body = {
-    label: $("#a_label").value.trim(), username: $("#a_user").value.trim(),
-    proxy: $("#a_proxy").value.trim(),
-  };
-  if (!body.label) return banner("Give the account a short name first.", "err");
-  $("#a_save").disabled = true;
-  try {
-    const d = await api("/api/account", {
-      method:"POST", headers:{"Content-Type":"application/json"},
-      body: JSON.stringify(body)
-    });
-    if (d.error) return banner(esc(d.error), "err");
-    ["#a_label","#a_user","#a_proxy"].forEach(s => $(s).value = "");
-    $("#acctform").hidden = true;
-    banner("");
-    await load();
-    await loginOpen(d.label);        // saved but not signed in collects nothing
-  } catch (e) { banner(esc(e.message), "err"); }
-  finally { $("#a_save").disabled = false; }
-};
-
-// status() is what the shared sign-in code calls when it finishes.
-const status = load;
-
-load();
-setInterval(load, 15000);
-"""
-
-ACCOUNTS_PAGE = _page("Accounts — X Collector", _ACCT_CSS, _ACCT_BODY, _ACCT_JS)
