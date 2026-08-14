@@ -1,0 +1,35 @@
+[Unit]
+Description=Instagram Collector (human-paced poll loop)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=xscraper
+Group=xscraper
+WorkingDirectory=/opt/xscraper/app
+Environment=DO_NOT_TRACK=1
+# The loop re-reads its cadence and pause switch from the dashboard every
+# cycle (ig_results.db settings). ig_human.py adds active-hours, humanized
+# gaps, a daily budget and warm-up on top — so the base interval here is just
+# the intent, not a robotic tick.
+ExecStart=/opt/xscraper/app/.venv/bin/python3 collect_ig.py run --loop --every 300
+
+# Instagram punishes rapid restarts (a fresh session hammered on start earns a
+# PleaseWaitFewMinutes), so back off hard rather than hot-loop on a bad session.
+Restart=always
+RestartSec=120
+StartLimitIntervalSec=900
+StartLimitBurst=4
+
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/opt/xscraper/app
+ProtectKernelTunables=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+
+[Install]
+WantedBy=multi-user.target

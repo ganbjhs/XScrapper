@@ -2544,6 +2544,63 @@ def _ig_settings_post(body):
     return {"ok": True}
 
 
+_IG_FETCH_LOCK = threading.Lock()
+
+
+def _ig_locked_run(coro, timeout=180):
+    """Run an Instagram coroutine single-flight (mirrors _fb_locked_run) — a
+    second click must not launch a second concurrent poll on the same session."""
+    import concurrent.futures as _cf
+    if _LOOP is None:
+        return None, {"error": "server not ready"}
+    if not _IG_FETCH_LOCK.acquire(blocking=False):
+        return None, {"error": "An Instagram fetch is already running — give it a moment."}
+    fut = asyncio.run_coroutine_threadsafe(coro, _LOOP)
+    fut.add_done_callback(lambda f: _IG_FETCH_LOCK.release())
+    try:
+        return fut.result(timeout), None
+    except _cf.TimeoutError:
+        return None, {"error": "Instagram fetch is still running in the "
+                               "background — check the Live Feed in a minute."}
+    except Exception as e:
+        return None, {"error": f"{type(e).__name__}: {e}"}
+
+
+def _ig_fetch(body):
+    """
+    The Instagram "Fetch now" button: run ONE collection pass immediately from
+    the dashboard, so collection doesn't depend only on the background service
+    being up. Reports new-post count + the run log, so a checkpoint or a
+    missing source is visible in the UI instead of silent.
+    """
+    rp = _CFG.root / "ig_results.db"
+    import store_ig
+    srcs = []
+    if rp.exists():
+        try:
+            with store_ig.Store(rp) as st:
+                srcs = [r for r in st.db.execute(
+                    "SELECT label FROM sources WHERE enabled = 1")]
+        except Exception as e:
+            return {"error": f"{type(e).__name__}: {e}"}
+    if not srcs:
+        return {"error": "Add an Instagram source first (Watchlists → + New "
+                         "watchlist → Instagram), then press Fetch."}
+    try:
+        from collect_ig import run_once
+    except Exception as e:
+        return {"error": f"Instagram collector not available: {e}"}
+    logs: list = []
+    import activity_log
+    _lg = activity_log.logger("instagram",
+                              echo=lambda m: logs.append(str(m)),
+                              db=str(_CFG.root / "activity.db"))
+    n, err = _ig_locked_run(run_once(str(rp), log=_lg), timeout=180)
+    if err:
+        return {**err, "log": logs}
+    return {"ok": True, "new": n, "sources": len(srcs), "log": logs}
+
+
 def _ig_source_post(body):
     """
     Add, remove, or pause/resume an Instagram source from the dashboard —
@@ -3049,6 +3106,8 @@ class Handler(BaseHTTPRequestHandler):
                 return self._send(200, _fb_settings_post(body))
             if u.path == "/api/ig/source":
                 return self._send(200, _ig_source_post(body))
+            if u.path == "/api/ig/fetch":
+                return self._send(200, _ig_fetch(body))
             if u.path == "/api/ig/control":
                 return self._send(200, _ig_control(body))
             if u.path == "/api/ig/settings":

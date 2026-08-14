@@ -102,7 +102,7 @@ The organizing layer (in `store.py` + `web.py`):
 | `store_fb.py` | `fb_results.db`: posts (two-key dedup), sources (lowercase labels), settings, page_profiles, removed_pages tombstones |
 | `fb_debug.py` / `fb_probe.py` / `fb_data_probe.py` | FB page-structure diagnostics (standalone) |
 | `frontend/` | Vite + React SPA (source `src/`, built `dist/` committed — the server never runs Node) |
-| `deploy/` | VPS install: systemd units (`xscraper-web`, `xscraper-watch`, `xscraper-fb`), nginx, re-runnable `setup.sh`, pre-commit hook |
+| `deploy/` | VPS install: systemd units (`xscraper-web`, `xscraper-watch` X, `xscraper-fb`, `xscraper-ig`), nginx, re-runnable `setup.sh`, pre-commit hook. FB/IG units are enabled but start STOPPED (need a signed-in session; Fetch-now runs a pass on demand meanwhile) |
 | `tests/` | The offline suite — no network, no budget spent. Run after every change |
 | `tools/ig_probe.py` | Instagram session diagnostic |
 

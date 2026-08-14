@@ -579,13 +579,28 @@ function FbDetail({ pid, data, reload, gotoSettings }) {
 // Instagram detail panel
 // ---------------------------------------------------------------------------
 
-function IgDetail({ data, reload }) {
+function IgDetail({ pid, data, reload, gotoSettings }) {
   const [msg, setMsg] = useState("");
+  const [fetching, setFetching] = useState(false);
+  const [result, setResult] = useState(null);
   const sources = data?.sources || [];
+  const paused = !!data?.paused;
+  const anyCheckpoint = (data?.accounts || []).some((a) => a.checkpoint_at);
+  const anyActive = (data?.accounts || []).some((a) => a.active);
   const act = async (body) => {
     setMsg("");
     try { await api.igSource(body); reload(); }
     catch (e) { setMsg(String(e.message || e)); }
+  };
+  const fetchNow = async () => {
+    setFetching(true); setResult(null); setMsg("");
+    try {
+      const r = await api.igFetch(pid);
+      if (r.error) setMsg(r.error);
+      else setResult(r);
+      reload();
+    } catch (e) { setMsg(String(e.message || e)); }
+    finally { setFetching(false); }
   };
 
   return (
@@ -593,11 +608,55 @@ function IgDetail({ data, reload }) {
       <div className="phead" style={{ alignItems: "center", flexWrap: "wrap", rowGap: 8 }}>
         <h3><span className="badge platform-ig" style={{ marginRight: 8 }}>IG</span>Instagram sources</h3>
         <span className="chip">{fmtN(data?.totals?.posts ?? 0)} collected</span>
+        <span className={`chip ${paused ? "warn" : anyActive ? "good" : "warn"}`}>
+          {paused ? "paused" : anyActive ? "collecting" : "no active session"}
+        </span>
+        {(anyCheckpoint || !anyActive) && (
+          <button className="chip crit" style={{ cursor: "pointer" }} onClick={gotoSettings}
+                  title="Open Network & settings to fix the session">
+            {anyCheckpoint ? "checkpoint — needs a human →" : "not signed in →"}
+          </button>
+        )}
         <span className="right">{sources.length} source{sources.length === 1 ? "" : "s"}</span>
       </div>
+
+      <div className="toolbar">
+        <button className="btn btn-brand btn-sm"
+                disabled={fetching || paused || sources.length === 0}
+                onClick={fetchNow}>
+          {fetching ? "Fetching…" : "Fetch now"}
+        </button>
+        <span className="grow" />
+        <button className="btn btn-ghost btn-sm" onClick={gotoSettings}>Settings →</button>
+      </div>
+
+      {fetching && (
+        <div style={{ color: "var(--ink-3)", fontSize: 12.5, margin: "6px 0" }}>
+          Polling Instagram through the account's session — a few seconds.
+        </div>
+      )}
+      {result && (
+        <div style={{ fontSize: 12.5, margin: "6px 0" }}>
+          <b style={{ color: result.new > 0 ? "var(--brand)" : "var(--ink-2)" }}>
+            {result.new > 0
+              ? `${result.new} new post${result.new === 1 ? "" : "s"} collected`
+              : "No new posts this time"}
+          </b>{" "}— open the Live Feed to see them.
+          {Array.isArray(result.log) && result.log.length > 0 && (
+            <pre style={{ whiteSpace: "pre-wrap", background: "var(--brand-softer)",
+                          padding: "8px 10px", borderRadius: 8, marginTop: 6,
+                          fontSize: 11.5, color: "var(--ink-3)", maxHeight: 160,
+                          overflow: "auto" }}>
+              {result.log.join("\n")}
+            </pre>
+          )}
+        </div>
+      )}
+
       <div style={{ color: "var(--ink-3)", fontSize: 12.5 }}>
-        Collected by the Instagram service on its own cadence. Use “+ New
-        watchlist” above to add a user, hashtag, or the home feed.
+        Collected by the Instagram service on its own cadence — “Fetch now”
+        runs one pass immediately. Use “+ New watchlist” above to add a user,
+        hashtag, or the home feed.
       </div>
       <div className="members-box" style={{ maxHeight: 320, padding: "0 12px" }}>
         {sources.map((s) => (
@@ -1054,7 +1113,8 @@ export default function Watchlists({ onMenu }) {
                             gotoSettings={() => setTab("settings")} />
                 )}
                 {selected?.id === "ig" && (
-                  <IgDetail data={ig.data} reload={ig.reload} />
+                  <IgDetail pid={pid} data={ig.data} reload={ig.reload}
+                            gotoSettings={() => setTab("settings")} />
                 )}
               </div>
             </div>

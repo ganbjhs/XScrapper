@@ -232,8 +232,13 @@ say "systemd"
 # The web unit carries the chosen port, so it is rendered rather than copied.
 sed "s|__PORT__|$PORT|g" deploy/xscraper-web.service > /etc/systemd/system/xscraper-web.service
 cp deploy/xscraper-watch.service /etc/systemd/system/
+# The Facebook and Instagram collector units. Both are enabled so they survive
+# reboot, but left STOPPED here — they need a signed-in session first (FB via
+# .env, IG via ig_login.py / ig_import.py), and the dashboard's Fetch-now can
+# run a pass on demand meanwhile.
+cp deploy/xscraper-fb.service deploy/xscraper-ig.service /etc/systemd/system/
 systemctl daemon-reload
-systemctl enable -q xscraper-web xscraper-watch
+systemctl enable -q xscraper-web xscraper-watch xscraper-fb xscraper-ig
 systemctl restart xscraper-web
 sleep 2
 if systemctl is-active --quiet xscraper-web; then

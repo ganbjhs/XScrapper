@@ -114,6 +114,15 @@ export default function LiveFeed({ onMenu }) {
         }
       })
       .catch(() => { /* FB may be mid-run or unconfigured — never block X */ });
+    // Instagram, same idea: fire in the background so it never blocks X.
+    api.igFetch(pid)
+      .then((ir) => {
+        if (ir && ir.new > 0) {
+          setFetchMsg(`✓ ${ir.new} new from Instagram`);
+          feed.reload(true);
+        }
+      })
+      .catch(() => { /* IG may be paused / not signed in — never block X */ });
     try {
       const r = await api.projectFetch(pid, ack);
       setFetchMsg(`✓ ${r.new} new from X · checking Facebook…`);

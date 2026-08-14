@@ -62,6 +62,7 @@ export const api = {
   igPosts: (p) => request(`/api/ig/posts${qs(p)}`),
   igStatus: () => request("/api/ig/status"),
   igSource: (body) => request("/api/ig/source", { method: "POST", body }),
+  igFetch: (project) => request("/api/ig/fetch", { method: "POST", body: { project } }),
   igControl: (action) => request("/api/ig/control", { method: "POST", body: { action } }),
   igSettings: (body) => request("/api/ig/settings", { method: "POST", body }),
   fbPosts: (p) => request(`/api/fb/posts${qs(p)}`),
