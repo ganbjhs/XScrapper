@@ -375,6 +375,21 @@ function XDetail({ w, onChanged }) {
     ? w.members.filter((m) => m.handle.toLowerCase().includes(search.toLowerCase()))
     : w.members;
 
+  // Pause/resume the whole watchlist by pausing its compiled stream(s). Paused
+  // streams are skipped by the collector; nothing collected is lost.
+  const [busyPause, setBusyPause] = useState(false);
+  const paused = w.streams.length > 0 && w.streams.every((s) => s.paused);
+  const togglePause = async () => {
+    setBusyPause(true); setErr("");
+    try {
+      for (const s of w.streams) {
+        await api.streamSettings({ label: s.label, paused: !paused });
+      }
+      onChanged();
+    } catch (e) { setErr(String(e.message || e)); }
+    finally { setBusyPause(false); }
+  };
+
   return (
     <div className="panel">
       <div className="phead" style={{ alignItems: "center", flexWrap: "wrap", rowGap: 8 }}>
@@ -383,6 +398,7 @@ function XDetail({ w, onChanged }) {
           {w.kind === "xlist" ? "X List" : w.kind === "keywords" ? "keywords" : "handles"}
         </span>
         <span className="chip">{fmtN(collected)} collected</span>
+        {paused && <span className="chip warn">paused</span>}
         <span className="right" style={{ display: "flex", gap: 8, alignItems: "center" }}>
           <label className="fpill" style={{ padding: "5px 6px 5px 11px" }}
                  title="how often the collector re-checks this watchlist">
@@ -396,6 +412,10 @@ function XDetail({ w, onChanged }) {
               <option value="3600">1 hour</option>
             </select>
           </label>
+          <button className="btn btn-ghost btn-sm" disabled={busyPause || w.streams.length === 0}
+                  onClick={togglePause}>
+            {busyPause ? "…" : paused ? "Resume" : "Pause"}
+          </button>
           <button className="btn btn-danger btn-sm" onClick={() => setConfirming(true)}>
             Delete
           </button>
