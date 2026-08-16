@@ -1283,10 +1283,10 @@ def _metrics_json(q=None):
     The stat strip and the 7-day chart, from what is actually stored. Days are
     UTC to match every other timestamp in the store.
 
-    ?project=N scopes every number to that project's streams — a project's
-    dashboard must describe THAT project, never the whole machine. (Instagram
-    sources are not project-mapped yet, so the IG series reads zero in a
-    project-scoped view rather than lying with a global count.)
+    ?project=N scopes the X and Facebook numbers to that project (X via
+    project_streams, Facebook via posts.project_id). Instagram is a GLOBAL pool
+    with no project mapping, so its line is the same global flow in every view
+    rather than reading zero.
     """
     try:
         pid = int((q or {}).get("project") or 0)
@@ -1336,9 +1336,11 @@ def _metrics_json(q=None):
     else:
         by_day = {}
 
+    # Instagram is a GLOBAL pool (no project mapping), so its line is the same
+    # in every project view — show it rather than zeroing it under a project.
     ig_by_day = {}
     rp = _CFG.root / "ig_results.db"
-    if rp.exists() and not pid:
+    if rp.exists():
         try:
             con = sqlite3.connect(f"file:{rp}?mode=ro", uri=True, timeout=5)
             con.row_factory = sqlite3.Row
@@ -1350,13 +1352,33 @@ def _metrics_json(q=None):
         except Exception:
             pass
 
+    # Facebook IS project-scoped (posts carry project_id) — scope the line the
+    # same way X is, so it describes THIS project. Uses collected_ms to match X.
+    fb_by_day = {}
+    fp = _CFG.root / "fb_results.db"
+    if fp.exists():
+        try:
+            con = sqlite3.connect(f"file:{fp}?mode=ro", uri=True, timeout=5)
+            con.row_factory = sqlite3.Row
+            fb_where, fb_params = "collected_ms >= ?", [week_ago]
+            if pid:
+                fb_where += " AND project_id = ?"
+                fb_params.append(pid)
+            fb_by_day = {int(r["d"]): r["c"] for r in con.execute(
+                f"SELECT collected_ms / ? AS d, COUNT(*) c FROM posts "
+                f"WHERE {fb_where} GROUP BY d", (day_ms, *fb_params))}
+            con.close()
+        except Exception:
+            pass
+
     for i in range(7):
         ms = week_ago + i * day_ms
         d = ms // day_ms
         out["per_day"].append({
             "day": datetime.datetime.fromtimestamp(
                 ms / 1000, tz=datetime.timezone.utc).strftime("%d %b"),
-            "x": by_day.get(d, 0), "ig": ig_by_day.get(d, 0)})
+            "x": by_day.get(d, 0), "ig": ig_by_day.get(d, 0),
+            "fb": fb_by_day.get(d, 0)})
     return out
 
 

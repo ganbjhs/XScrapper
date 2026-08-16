@@ -18,6 +18,7 @@ export default function CollectedChart({ perDay }) {
   const days = perDay?.map((d) => d.day) || [];
   const X = perDay?.map((d) => d.x) || [];
   const IG = perDay?.map((d) => d.ig) || [];
+  const FB = perDay?.map((d) => d.fb) || [];
   const n = days.length;
   if (!n) return null;
 
@@ -25,7 +26,7 @@ export default function CollectedChart({ perDay }) {
   const m = { t: 12, r: 20, b: 26, l: 44 };
   const iw = Math.max(10, width - m.l - m.r);
   const ih = H - m.t - m.b;
-  const rawMax = Math.max(4, ...X, ...IG);
+  const rawMax = Math.max(4, ...X, ...IG, ...FB);
   // A tidy top tick at or above the data max.
   const step = Math.pow(10, Math.floor(Math.log10(rawMax)));
   const ymax = Math.ceil(rawMax / step) * step;
@@ -39,6 +40,7 @@ export default function CollectedChart({ perDay }) {
     getComputedStyle(document.documentElement).getPropertyValue(name).trim();
   const c1 = css("--series-1") || "#2a78d6";
   const c2 = css("--series-2") || "#eb6834";
+  const c3 = "#1877f2";   // Facebook blue (matches the platform-fb badge)
 
   const onMove = (e) => {
     const r = e.currentTarget.getBoundingClientRect();
@@ -51,6 +53,7 @@ export default function CollectedChart({ perDay }) {
       <div className="legend">
         <span><span className="sw" style={{ background: c1 }} />X</span>
         <span><span className="sw" style={{ background: c2 }} />Instagram</span>
+        <span><span className="sw" style={{ background: c3 }} />Facebook</span>
       </div>
       <div className="viz-root" ref={wrapRef}>
         <svg width="100%" height={H} role="img"
@@ -83,6 +86,7 @@ export default function CollectedChart({ perDay }) {
                 fill={c1} opacity="0.09" />
           <path d={path(X)} fill="none" stroke={c1} strokeWidth="2" strokeLinejoin="round" />
           <path d={path(IG)} fill="none" stroke={c2} strokeWidth="2" strokeLinejoin="round" />
+          <path d={path(FB)} fill="none" stroke={c3} strokeWidth="2" strokeLinejoin="round" />
           <text x={xs(n - 1) - 4} y={ys(X[n - 1]) - 8} textAnchor="end"
                 fontSize="10.5" fontWeight="600" fill="var(--ink-2)">X</text>
           <text x={xs(n - 1) - 4} y={ys(IG[n - 1]) - 8} textAnchor="end"
@@ -94,6 +98,8 @@ export default function CollectedChart({ perDay }) {
               <circle cx={xs(hover)} cy={ys(X[hover])} r="4.5" fill={c1}
                       stroke="var(--chart-surface)" strokeWidth="2" />
               <circle cx={xs(hover)} cy={ys(IG[hover])} r="4.5" fill={c2}
+                      stroke="var(--chart-surface)" strokeWidth="2" />
+              <circle cx={xs(hover)} cy={ys(FB[hover])} r="4.5" fill={c3}
                       stroke="var(--chart-surface)" strokeWidth="2" />
             </g>
           )}
@@ -107,6 +113,7 @@ export default function CollectedChart({ perDay }) {
             <div style={{ color: "var(--ink-3)", marginBottom: 3 }}>{days[hover]}</div>
             <div><span className="sw" style={{ background: c1, marginRight: 6 }} />X <b>{X[hover].toLocaleString()}</b></div>
             <div><span className="sw" style={{ background: c2, marginRight: 6 }} />Instagram <b>{IG[hover].toLocaleString()}</b></div>
+            <div><span className="sw" style={{ background: c3, marginRight: 6 }} />Facebook <b>{FB[hover].toLocaleString()}</b></div>
           </div>
         )}
       </div>
