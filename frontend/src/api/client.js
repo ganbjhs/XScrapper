@@ -65,6 +65,10 @@ export const api = {
   igFetch: (project) => request("/api/ig/fetch", { method: "POST", body: { project } }),
   igControl: (action) => request("/api/ig/control", { method: "POST", body: { action } }),
   igSettings: (body) => request("/api/ig/settings", { method: "POST", body }),
+  // Shared display-name identity: link handles across X/FB/IG so the picture is shared.
+  identities: (platform) => request(`/api/identities${qs({ platform })}`),
+  setIdentity: (platform, handle, display_name) =>
+    request("/api/identity", { method: "POST", body: { platform, handle, display_name } }),
   fbPosts: (p) => request(`/api/fb/posts${qs(p)}`),
   fbStatus: (project) => request(`/api/fb/status${qs({ project })}`),
   fbAddSource: (project, label) =>

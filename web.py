@@ -491,6 +491,104 @@ def _x_avatars_for(handles):
     return out
 
 
+# ---------------------------------------------------------------------------
+# Shared identity: one editable "display name" per source links handles ACROSS
+# platforms. Two handles with the SAME name are the same person, so a Facebook
+# or Instagram post with no picture borrows the X avatar of the X author who
+# carries that display name. X avatars arrive free with every tweet, so this
+# fixes cross-handle profile pictures with no extra fetching and no migration.
+# ---------------------------------------------------------------------------
+
+def _names_con():
+    """Writable results.db connection that ensures the handle_names table."""
+    con = sqlite3.connect(_CFG.db_results, timeout=5)
+    con.row_factory = sqlite3.Row
+    con.execute("CREATE TABLE IF NOT EXISTS handle_names ("
+                "platform TEXT NOT NULL, handle TEXT NOT NULL, "
+                "display_name TEXT NOT NULL, updated_ms INTEGER NOT NULL, "
+                "PRIMARY KEY (platform, handle))")
+    return con
+
+
+def _set_handle_name(platform, handle, display_name):
+    con = _names_con()
+    try:
+        h = str(handle or "").strip().lower().lstrip("@")
+        nm = str(display_name or "").strip()
+        if not h:
+            return
+        if nm:
+            con.execute(
+                "INSERT INTO handle_names(platform, handle, display_name, updated_ms) "
+                "VALUES(?,?,?,?) ON CONFLICT(platform, handle) DO UPDATE SET "
+                "display_name = excluded.display_name, updated_ms = excluded.updated_ms",
+                (platform, h, nm, int(time.time() * 1000)))
+        else:
+            con.execute("DELETE FROM handle_names WHERE platform=? AND handle=?",
+                        (platform, h))
+        con.commit()
+    finally:
+        con.close()
+
+
+def _handle_names_map(platform):
+    """{handle_lower: display_name} for a platform."""
+    try:
+        con = _names_con()
+        try:
+            return {r["handle"]: r["display_name"] for r in con.execute(
+                "SELECT handle, display_name FROM handle_names WHERE platform = ?",
+                (platform,))}
+        finally:
+            con.close()
+    except Exception:
+        return {}
+
+
+def _x_avatars_by_name(names):
+    """{display_name_lower: X avatar URL} — latest avatar of the X author whose
+    DISPLAY NAME matches. Reads only what the X collector already stored."""
+    out = {}
+    wanted = {str(n).strip().lower() for n in names if n and str(n).strip()}
+    if not wanted or not _CFG.db_results.exists():
+        return out
+    try:
+        with _connect() as con:
+            for nm in wanted:
+                row = con.execute(
+                    "SELECT json_extract(COALESCE(r.raw_json, t.raw_json), "
+                    "       '$.user.profileImageUrl') AS av "
+                    "FROM tweets t LEFT JOIN tweet_raw r USING(tweet_id) "
+                    "WHERE t.author_display_name = ? COLLATE NOCASE "
+                    "ORDER BY t.created_ms DESC LIMIT 1", (nm,)).fetchone()
+                if row and row["av"]:
+                    out[nm] = row["av"]
+    except Exception:
+        pass
+    return out
+
+
+def _fill_avatars_by_name(posts, platform, handle_of):
+    """For posts still missing an avatar, resolve it via the source's display
+    name → the X author with that name. `handle_of(post)` returns the post's
+    source handle, lowercased."""
+    names = _handle_names_map(platform)
+    if not names:
+        return
+    want = {names[h] for h in
+            (handle_of(p) for p in posts if not p.get("author_avatar"))
+            if h in names}
+    if not want:
+        return
+    avby = _x_avatars_by_name(want)
+    for p in posts:
+        if p.get("author_avatar"):
+            continue
+        nm = names.get(handle_of(p))
+        if nm and avby.get(nm.lower()):
+            p["author_avatar"] = avby[nm.lower()]
+
+
 def _status():
     """Accounts, streams, budget, totals — everything the sidebar shows."""
     import auth
@@ -2218,6 +2316,9 @@ def _fb_posts(q):
             if not p.get("author_avatar"):
                 p["author_avatar"] = xmap.get(
                     str(p.get("author_username") or "").lower())
+    # Cross-handle: a display name set on the page links it to the X avatar.
+    _fill_avatars_by_name(posts, "fb",
+                          lambda p: str(p.get("author_username") or "").lower())
     return {"count": len(rows), "posts": posts}
 
 
@@ -2690,8 +2791,29 @@ def _ig_posts(q):
             if not p.get("author_avatar"):
                 p["author_avatar"] = xmap.get(
                     str((p.get("author") or {}).get("username") or "").lower())
+    # Cross-handle: a display name set on the source links it to the X avatar.
+    _fill_avatars_by_name(posts, "ig",
+                          lambda p: str((p.get("author") or {}).get("username") or "").lower())
     return {"count": len(posts), "posts": posts,
             "next_cursor": posts[-1]["id"] if posts else None}
+
+
+def _identities_json(q):
+    platform = (q.get("platform") or "").strip().lower()
+    if platform not in ("x", "ig", "fb"):
+        return {"error": "platform must be x | ig | fb"}
+    return {"names": _handle_names_map(platform)}
+
+
+def _identity_post(body):
+    platform = (body.get("platform") or "").strip().lower()
+    handle = (body.get("handle") or "").strip()
+    if platform not in ("x", "ig", "fb"):
+        return {"error": "platform must be x | ig | fb"}
+    if not handle:
+        return {"error": "handle is required"}
+    _set_handle_name(platform, handle, body.get("display_name") or "")
+    return {"ok": True}
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -3014,6 +3136,8 @@ class Handler(BaseHTTPRequestHandler):
                 return self._send(200, png, "image/jpeg")
             if u.path == "/api/export":
                 return self._export(q)
+            if u.path == "/api/identities":
+                return self._send(200, _identities_json(q))
             if u.path == "/api/ig/status":
                 return self._send(200, _ig_status())
             if u.path == "/api/ig/posts":
@@ -3126,6 +3250,8 @@ class Handler(BaseHTTPRequestHandler):
                 return self._send(200, _fb_health_post(body))
             if u.path == "/api/fb/settings":
                 return self._send(200, _fb_settings_post(body))
+            if u.path == "/api/identity":
+                return self._send(200, _identity_post(body))
             if u.path == "/api/ig/source":
                 return self._send(200, _ig_source_post(body))
             if u.path == "/api/ig/fetch":

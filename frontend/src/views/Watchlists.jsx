@@ -452,6 +452,17 @@ function FbDetail({ pid, data, reload, gotoSettings }) {
   const sources = data?.sources || [];
   const paused = !!data?.paused;
   const health = data?.health || {};
+  const nm = useApi(() => api.identities("fb"), []);
+  const nameOf = (h) => (nm.data?.names || {})[String(h).toLowerCase()] || "";
+  const editName = async (handle) => {
+    const val = prompt(
+      "Common display name for this page — links X / FB / IG by name and fixes the "
+      + "profile picture (use the person's real name, same across platforms):",
+      nameOf(handle));
+    if (val === null) return;
+    try { await api.setIdentity("fb", handle, val); nm.reload(); }
+    catch (e) { alert(String(e.message || e)); }
+  };
 
   const add = async () => {
     setBusy(true); setMsg("");
@@ -559,6 +570,10 @@ function FbDetail({ pid, data, reload, gotoSettings }) {
                       onClick={async () => { await api.fbSetEnabled(s.label, !s.enabled); reload(); }}>
                 {s.enabled ? "Pause" : "Resume"}
               </button>
+              <button className="btn btn-ghost btn-sm" onClick={() => editName(s.label)}
+                      title="Set a common name to link this across X/FB/IG and fix the picture">
+                Name{nameOf(s.label) ? " ✓" : ""}
+              </button>
               <button className="btn btn-ghost btn-sm" aria-label={`remove ${s.label}`}
                       onClick={async () => { await api.fbRemoveSource(s.label); reload(); }}>
                 Remove
@@ -601,6 +616,17 @@ function IgDetail({ pid, data, reload, gotoSettings }) {
   const paused = !!data?.paused;
   const anyCheckpoint = (data?.accounts || []).some((a) => a.checkpoint_at);
   const anyActive = (data?.accounts || []).some((a) => a.active);
+  const nm = useApi(() => api.identities("ig"), []);
+  const nameOf = (h) => (nm.data?.names || {})[String(h).toLowerCase()] || "";
+  const editName = async (handle) => {
+    const val = prompt(
+      "Common display name for this account — links X / FB / IG by name and fixes the "
+      + "profile picture (use the person's real name, same across platforms):",
+      nameOf(handle));
+    if (val === null) return;
+    try { await api.setIdentity("ig", handle, val); nm.reload(); }
+    catch (e) { alert(String(e.message || e)); }
+  };
   const act = async (body) => {
     setMsg("");
     try { await api.igSource(body); reload(); }
@@ -694,6 +720,10 @@ function IgDetail({ pid, data, reload, gotoSettings }) {
               <small>{s.type}{s.value ? ` · ${s.value}` : ""}{s.account ? ` · @${s.account}` : ""}</small>
             </div>
             <div className="right" style={{ display: "flex", gap: 6, alignItems: "center" }}>
+              <button className="btn btn-ghost btn-sm" onClick={() => editName(s.value || s.label)}
+                      title="Set a common name to link this across X/FB/IG and fix the picture">
+                Name{nameOf(s.value || s.label) ? " ✓" : ""}
+              </button>
               <button className="btn btn-ghost btn-sm"
                       onClick={() => act({ action: "enable", label: s.label, enabled: !s.enabled })}>
                 {s.enabled ? "Pause" : "Resume"}
