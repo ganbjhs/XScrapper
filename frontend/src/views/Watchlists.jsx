@@ -287,6 +287,66 @@ function FiltersPanel({ w, onChanged }) {
   );
 }
 
+// The accounts inside an X List — cached; "Refresh members" pulls them from X.
+function XListMembers({ listId }) {
+  const { data, reload } = useApi(() => api.xlistMembers(listId), [listId]);
+  const [busy, setBusy] = useState(false);
+  const [msg, setMsg] = useState("");
+  const members = data?.members || [];
+
+  const refresh = async () => {
+    setBusy(true); setMsg("");
+    try {
+      const r = await api.refreshXlistMembers(listId);
+      if (r && r.error) setMsg(r.error);
+      reload();
+    } catch (e) { setMsg(String(e.message || e)); }
+    finally { setBusy(false); }
+  };
+
+  return (
+    <div style={{ marginTop: 12, borderTop: "1px solid var(--ring)", paddingTop: 10 }}>
+      <div className="toolbar">
+        <span style={{ color: "var(--ink-3)", fontSize: 12.5 }}>
+          {members.length ? `${members.length} accounts in this list` : "Members not fetched yet"}
+          {data?.fetched_ms ? ` · updated ${fmtAgo(data.fetched_ms)}` : ""}
+        </span>
+        <span className="grow" />
+        <button className="btn btn-ghost btn-sm" disabled={busy} onClick={refresh}>
+          {busy ? "Fetching…" : "Refresh members"}
+        </button>
+      </div>
+      <div className="members-box" style={{ maxHeight: 340, padding: "0 12px" }}>
+        {members.map((m) => (
+          <div className="wl-row" key={m.user_id}>
+            <div className="who" style={{ display: "flex", alignItems: "center", gap: 10 }}>
+              {m.avatar
+                ? <img src={m.avatar} alt="" width="34" height="34"
+                       style={{ borderRadius: "50%", flex: "none" }} />
+                : <span className="pfp" style={{ background: "var(--brand)", width: 34, height: 34 }}>
+                    {(m.display_name || m.username || "?").slice(0, 1).toUpperCase()}
+                  </span>}
+              <div style={{ minWidth: 0 }}>
+                <b>{m.display_name || m.username}</b>
+                <small style={{ display: "block", color: "var(--ink-3)" }}>@{m.username}</small>
+              </div>
+            </div>
+            <a className="right" href={`https://x.com/${m.username}`} target="_blank"
+               rel="noreferrer" style={{ color: "var(--ink-3)", fontSize: 12 }}>open ↗</a>
+          </div>
+        ))}
+        {members.length === 0 && (
+          <div style={{ color: "var(--ink-3)", fontSize: 13, padding: "12px 0" }}>
+            This list is collected as one fast stream. Click “Refresh members” to pull the
+            individual accounts inside it (spends a little X budget; cached afterwards).
+          </div>
+        )}
+      </div>
+      {msg && <div style={{ color: "var(--critical)", fontSize: 12.5, marginTop: 6 }}>{msg}</div>}
+    </div>
+  );
+}
+
 function XDetail({ w, onChanged }) {
   const [adding, setAdding] = useState("");
   const [search, setSearch] = useState("");
@@ -394,6 +454,7 @@ function XDetail({ w, onChanged }) {
           </div>
         </>
       )}
+      {w.kind === "xlist" && <XListMembers listId={w.list_id} />}
       {err && <div style={{ color: "var(--critical)", fontSize: 13, marginTop: 8 }}>{err}</div>}
 
       {w.kind !== "xlist" && <FiltersPanel w={w} onChanged={onChanged} />}

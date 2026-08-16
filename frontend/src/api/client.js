@@ -69,6 +69,10 @@ export const api = {
   identities: (platform) => request(`/api/identities${qs({ platform })}`),
   setIdentity: (platform, handle, display_name) =>
     request("/api/identity", { method: "POST", body: { platform, handle, display_name } }),
+  // X List members — the individual accounts inside a list (cached; refresh spends a little budget).
+  xlistMembers: (list_id) => request(`/api/watchlist/xmembers${qs({ list_id })}`),
+  refreshXlistMembers: (list_id) =>
+    request("/api/watchlist/xmembers/refresh", { method: "POST", body: { list_id, ack: true } }),
   fbPosts: (p) => request(`/api/fb/posts${qs(p)}`),
   fbStatus: (project) => request(`/api/fb/status${qs({ project })}`),
   fbAddSource: (project, label) =>

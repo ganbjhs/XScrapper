@@ -2816,6 +2816,98 @@ def _identity_post(body):
     return {"ok": True}
 
 
+# ---------------------------------------------------------------------------
+# X List members. A list collects as ONE stream (fast rate limit), but the
+# accounts inside it live on x.com. This caches those member accounts so the
+# dashboard can show them individually — like Facebook pages / Instagram
+# sources — instead of an opaque "managed on x.com". Fetching spends a little
+# X budget (guard-checked), so it is cached and refreshed on demand.
+# ---------------------------------------------------------------------------
+
+def _xlist_con():
+    con = sqlite3.connect(_CFG.db_results, timeout=5)
+    con.row_factory = sqlite3.Row
+    con.execute("CREATE TABLE IF NOT EXISTS xlist_members ("
+                "list_id TEXT NOT NULL, user_id TEXT NOT NULL, "
+                "username TEXT, display_name TEXT, avatar TEXT, "
+                "fetched_ms INTEGER NOT NULL, "
+                "PRIMARY KEY (list_id, user_id))")
+    return con
+
+
+def _xlist_members_save(list_id, members):
+    con = _xlist_con()
+    try:
+        now = int(time.time() * 1000)
+        con.execute("DELETE FROM xlist_members WHERE list_id = ?", (list_id,))
+        con.executemany(
+            "INSERT OR REPLACE INTO xlist_members(list_id, user_id, username, "
+            "display_name, avatar, fetched_ms) VALUES(?,?,?,?,?,?)",
+            [(list_id, m["user_id"], m.get("username", ""), m.get("display_name", ""),
+              m.get("avatar", ""), now) for m in members if m.get("user_id")])
+        con.commit()
+    finally:
+        con.close()
+
+
+def _xlist_members_json(q):
+    list_id = str(q.get("list_id") or "").strip()
+    if not list_id:
+        return {"error": "list_id is required"}
+    con = _xlist_con()
+    try:
+        rows = [dict(r) for r in con.execute(
+            "SELECT user_id, username, display_name, avatar, fetched_ms "
+            "FROM xlist_members WHERE list_id = ? ORDER BY LOWER(display_name)",
+            (list_id,))]
+    finally:
+        con.close()
+    return {"members": rows, "count": len(rows),
+            "fetched_ms": max((r["fetched_ms"] for r in rows), default=None)}
+
+
+def _xlist_refresh(body):
+    list_id = str(body.get("list_id") or "").strip()
+    if not list_id.isdigit():
+        return {"error": "a numeric X List id is required"}
+    import guard
+    v = guard.assess(_CFG, action="fetch", cost=3, queue="list")
+    if v.blocked:
+        b = v.blocks[0]
+        return {"error": f"{b.title} — {b.remedy}", "blocked": True, "guard": v.to_json()}
+    if v.warnings and not body.get("ack"):
+        return {"error": "Warnings not acknowledged: "
+                + "; ".join(w.title for w in v.warnings),
+                "blocked": True, "needs_ack": True, "guard": v.to_json()}
+
+    async def run():
+        api = auth.open_api(_CFG.db_accounts)
+        names = await auth.active_usernames(api)
+        if not names:
+            return {"error": "No active X account is signed in."}
+        out = []
+        try:
+            async for u in api.list_members(int(list_id),
+                                            limit=int(body.get("limit") or 300)):
+                out.append({
+                    "user_id": str(getattr(u, "id_str", "") or getattr(u, "id", "") or ""),
+                    "username": u.username or "",
+                    "display_name": u.displayname or "",
+                    "avatar": getattr(u, "profileImageUrl", "") or "",
+                })
+        except Exception as e:
+            return {"error": f"{type(e).__name__}: {e}"}
+        return {"members": out}
+
+    with _FETCH_LOCK:
+        res = _run(run())
+    if res.get("error"):
+        return res
+    _xlist_members_save(list_id, res["members"])
+    return {"ok": True, "count": len(res["members"]), "members": res["members"],
+            "fetched_ms": int(time.time() * 1000)}
+
+
 class Handler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
 
@@ -3138,6 +3230,8 @@ class Handler(BaseHTTPRequestHandler):
                 return self._export(q)
             if u.path == "/api/identities":
                 return self._send(200, _identities_json(q))
+            if u.path == "/api/watchlist/xmembers":
+                return self._send(200, _xlist_members_json(q))
             if u.path == "/api/ig/status":
                 return self._send(200, _ig_status())
             if u.path == "/api/ig/posts":
@@ -3252,6 +3346,8 @@ class Handler(BaseHTTPRequestHandler):
                 return self._send(200, _fb_settings_post(body))
             if u.path == "/api/identity":
                 return self._send(200, _identity_post(body))
+            if u.path == "/api/watchlist/xmembers/refresh":
+                return self._send(200, _xlist_refresh(body))
             if u.path == "/api/ig/source":
                 return self._send(200, _ig_source_post(body))
             if u.path == "/api/ig/fetch":
