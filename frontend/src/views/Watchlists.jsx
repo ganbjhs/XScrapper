@@ -82,8 +82,16 @@ function AddModal({ pid, onDone, onClose }) {
         if (kind === "favorites") await api.fbSettings({ mode: "favorites" });
         for (const n of names) await api.fbAddSource(pid, n);
       } else if (platform === "ig") {
-        await api.igSource({ action: "add", label: name.trim(),
-                             type: kind, value: igValue.trim() });
+        if (kind === "following") {
+          await api.igSource({ action: "add", label: "home", type: "following", value: "" });
+        } else {
+          // Bulk: one source per line/word — paste many at once (like Facebook).
+          const items = handles.split(/[\s,]+/).filter(Boolean);
+          for (const it of items) {
+            const v = it.replace(/^[@#]/, "");
+            await api.igSource({ action: "add", label: v, type: kind, value: v });
+          }
+        }
       }
       onDone(platform); onClose();
     } catch (e) { setErr(String(e.message || e)); }
@@ -93,7 +101,7 @@ function AddModal({ pid, onDone, onClose }) {
   const canCreate =
     platform === "x" ? name.trim() && (kind === "xlist" ? listId.trim() : true)
       : platform === "fb" ? (kind === "favorites" || handles.trim())
-      : name.trim() && (kind === "following" || igValue.trim());
+      : (kind === "following" || handles.trim());
 
   return (
     <Modal title="New watchlist" onClose={onClose}
@@ -168,20 +176,24 @@ function AddModal({ pid, onDone, onClose }) {
 
       {platform === "ig" && (
         <>
-          <div className="field">
-            <label>Label (shown in the list)</label>
-            <input value={name} autoFocus onChange={(e) => setName(e.target.value)}
-                   placeholder="e.g. natgeo" />
-          </div>
-          {kind !== "following" && (
+          {kind === "following" ? (
+            <div style={{ color: "var(--ink-3)", fontSize: 12.5, margin: "10px 0 0", lineHeight: 1.5 }}>
+              Collects the account's whole <b>home feed</b> (everything it follows).
+              One source is created.
+            </div>
+          ) : (
             <div className="field">
-              <label>{kind === "user" ? "User — numeric id preferred (or username)" : "Hashtag (without #)"}</label>
-              <input value={igValue} onChange={(e) => setIgValue(e.target.value)}
-                     placeholder={kind === "user" ? "787132" : "wildlife"} />
+              <label>{kind === "user"
+                ? "Usernames or numeric ids — one per line"
+                : "Hashtags (without #) — one per line"}</label>
+              <textarea rows="5" value={handles} autoFocus
+                        onChange={(e) => setHandles(e.target.value)}
+                        placeholder={kind === "user" ? "natgeo\nnasa\n787132" : "wildlife\nnature"} />
               {kind === "user" && (
                 <div style={{ color: "var(--ink-3)", fontSize: 12, marginTop: 6 }}>
-                  The numeric id keeps working even when the session is
-                  restricted — find it in the profile page source as “profile_id”.
+                  Paste one or many. A username works; a numeric id is more robust when the
+                  session is restricted (find it in the profile source as “profile_id”). The
+                  label is the username/id itself.
                 </div>
               )}
             </div>
@@ -583,6 +595,8 @@ function IgDetail({ pid, data, reload, gotoSettings }) {
   const [msg, setMsg] = useState("");
   const [fetching, setFetching] = useState(false);
   const [result, setResult] = useState(null);
+  const [adding, setAdding] = useState("");
+  const [busyAdd, setBusyAdd] = useState(false);
   const sources = data?.sources || [];
   const paused = !!data?.paused;
   const anyCheckpoint = (data?.accounts || []).some((a) => a.checkpoint_at);
@@ -601,6 +615,20 @@ function IgDetail({ pid, data, reload, gotoSettings }) {
       reload();
     } catch (e) { setMsg(String(e.message || e)); }
     finally { setFetching(false); }
+  };
+
+  // Facebook-style inline add: paste one or many usernames, added as user
+  // sources (label = username; the engine resolves it to the pk at collect time).
+  const addBulk = async () => {
+    setBusyAdd(true); setMsg("");
+    try {
+      for (const u of adding.split(/[\s,]+/).filter(Boolean)) {
+        const name = u.replace(/^[@#]/, "");
+        await api.igSource({ action: "add", label: name, type: "user", value: name });
+      }
+      setAdding(""); reload();
+    } catch (e) { setMsg(String(e.message || e)); }
+    finally { setBusyAdd(false); }
   };
 
   return (
@@ -679,9 +707,18 @@ function IgDetail({ pid, data, reload, gotoSettings }) {
         ))}
         {sources.length === 0 && (
           <div style={{ color: "var(--ink-3)", fontSize: 13, padding: "12px 0" }}>
-            No Instagram sources yet — use “+ New watchlist” and pick Instagram.
+            No Instagram sources yet — paste usernames below, or use “+ New watchlist”.
           </div>
         )}
+      </div>
+      <div className="filters" style={{ marginTop: 10, marginBottom: 0 }}>
+        <input value={adding} placeholder="instagram usernames — one or many, e.g. natgeo nasa isro"
+               style={{ flex: 1, minWidth: 200 }}
+               onChange={(e) => setAdding(e.target.value)}
+               onKeyDown={(e) => e.key === "Enter" && adding.trim() && addBulk()} />
+        <button className="btn btn-brand btn-sm" disabled={busyAdd || !adding.trim()} onClick={addBulk}>
+          Add
+        </button>
       </div>
       {msg && <div style={{ color: "var(--critical)", fontSize: 12.5 }}>{msg}</div>}
     </div>
@@ -1126,7 +1163,10 @@ export default function Watchlists({ onMenu }) {
         <>
           <FbSettings data={fb.data} reload={fb.reload} />
           <IgSettings data={ig.data} reload={ig.reload} />
-          {pid && <StreamsManager pid={pid} />}
+          {/* The raw "Streams in this project" panel was removed — streams are
+              plumbing (watchlists compile into them), not something to wire by
+              hand. The StreamsManager component and the /api/streams/* endpoints
+              are left intact; the panel just isn't rendered. */}
         </>
       )}
 
