@@ -2306,6 +2306,18 @@ def _fb_posts(q):
         limit = 50
     with store_fb.Store(rp) as st:
         rows = st.recent(project_id=pid or None, limit=limit, since_ms=since_ms)
+        # TRUE count for the window (project-scoped, since FB carries project_id).
+        fw, fa = [], []
+        if pid:
+            fw.append("project_id = ?"); fa.append(pid)
+        if since_ms:
+            fw.append("collected_ms >= ?"); fa.append(since_ms)
+        try:
+            total = st.db.execute(
+                "SELECT COUNT(*) c FROM posts"
+                + ((" WHERE " + " AND ".join(fw)) if fw else ""), fa).fetchone()["c"]
+        except Exception:
+            total = len(rows)
     posts = [store_fb.to_feed(r) for r in rows]
     # A post still without a picture gets the X avatar for the same handle —
     # public figures use one photo everywhere, and X is the canonical source.
@@ -2319,7 +2331,7 @@ def _fb_posts(q):
     # Cross-handle: a display name set on the page links it to the X avatar.
     _fill_avatars_by_name(posts, "fb",
                           lambda p: str(p.get("author_username") or "").lower())
-    return {"count": len(rows), "posts": posts}
+    return {"count": len(rows), "total": total, "posts": posts}
 
 
 # The named check-cadences a Facebook page can be set to, seconds. Hours, not
@@ -2780,6 +2792,21 @@ def _ig_posts(q):
                         username=q.get("username") or None,
                         before_pk=int(q["cursor"]) if q.get("cursor") else None)
         posts = [store_ig.to_api(r) for r in rows]
+        # TRUE count for the window (not the page) so the UI number is real,
+        # independent of how many rows the load-more has pulled so far.
+        tw, ta = [], []
+        if since is not None:
+            tw.append("taken_at >= ?"); ta.append(since)
+        if q.get("source"):
+            tw.append("source_label = ?"); ta.append(q["source"])
+        if q.get("username"):
+            tw.append("username = ?"); ta.append(str(q["username"]).lstrip("@"))
+        try:
+            total = st.db.execute(
+                "SELECT COUNT(*) c FROM posts"
+                + ((" WHERE " + " AND ".join(tw)) if tw else ""), ta).fetchone()["c"]
+        except Exception:
+            total = len(posts)
     # Same rule as Facebook: the X avatar for the same handle is the profile
     # picture (one photo everywhere; X is the canonical source).
     missing = {(p.get("author") or {}).get("username") for p in posts
@@ -2794,7 +2821,7 @@ def _ig_posts(q):
     # Cross-handle: a display name set on the source links it to the X avatar.
     _fill_avatars_by_name(posts, "ig",
                           lambda p: str((p.get("author") or {}).get("username") or "").lower())
-    return {"count": len(posts), "posts": posts,
+    return {"count": len(posts), "total": total, "posts": posts,
             "next_cursor": posts[-1]["id"] if posts else None}
 
 

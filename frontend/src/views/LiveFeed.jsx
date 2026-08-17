@@ -58,19 +58,26 @@ export default function LiveFeed({ onMenu }) {
   const delivery = useApi(() => api.delivery(pid), [pid], { every: 15_000 });
   const wls = useApi(() => (pid ? api.watchlists(pid) : Promise.resolve({ watchlists: [] })), [pid]);
 
+  // Load-more: every platform is fetched at pageN × PAGE and the duration
+  // filter now applies to ALL three (Instagram/Facebook used to ignore it).
+  const PAGE = 30;
+  const [pageN, setPageN] = useState(1);
+  useEffect(() => { setPageN(1); }, [pid, flt.dur, flt.sort, flt.source]);
+
   const feed = useApi(
     async () => {
+      const lim = pageN * PAGE;
+      const since = flt.dur !== "all" ? flt.dur : undefined;
       const [x, ig, fb] = await Promise.all([
         pid
           ? api.tweets({
-              project: pid, limit: 50,
-              since: flt.dur !== "all" ? flt.dur : undefined,
+              project: pid, limit: lim, since,
               sort: flt.sort === "likes" || flt.sort === "views" ? flt.sort : undefined,
               order: flt.sort === "oldest" ? "asc" : undefined,
             })
           : Promise.resolve({ rows: [] }),
-        api.igPosts({ limit: 10 }).catch(() => ({ posts: [] })),
-        pid ? api.fbPosts({ project: pid, limit: 25 }).catch(() => ({ posts: [] }))
+        api.igPosts({ limit: lim, since }).catch(() => ({ posts: [] })),
+        pid ? api.fbPosts({ project: pid, limit: lim, since }).catch(() => ({ posts: [] }))
             : Promise.resolve({ posts: [] }),
       ]);
       const rows = [
@@ -79,11 +86,16 @@ export default function LiveFeed({ onMenu }) {
         ...(fb.posts || []),   // already in feed shape (store_fb.to_feed)
       ];
       rows.sort((a, b) => Date.parse(b.collected_at || 0) - Date.parse(a.collected_at || 0));
-      // xTotal is the SERVER's count for the window — the true number even
-      // when more matched than the page we fetched.
-      return { rows, xTotal: x.total ?? (x.rows || []).length };
+      // *Total is the SERVER's count for the window — the TRUE number, not the
+      // page size, so the "N posts" figure is real for every platform.
+      return {
+        rows,
+        xTotal: x.total ?? (x.rows || []).length,
+        igTotal: ig.total ?? (ig.posts || []).length,
+        fbTotal: fb.total ?? (fb.posts || []).length,
+      };
     },
-    [pid, flt.dur, flt.sort],
+    [pid, flt.dur, flt.sort, pageN],
     // The stream below is the real-time path; this refetch is the safety net
     // that also picks up Instagram (which the stream does not carry yet).
     { every: 60_000 },
@@ -352,10 +364,12 @@ export default function LiveFeed({ onMenu }) {
               {fmtN(
                 flt.source === "x"
                   ? feed.data?.xTotal ?? 0
-                  : flt.source === "instagram" || flt.source === "facebook"
-                    ? filtered.filter((t) => t.platform === flt.source).length
-                    : (feed.data?.xTotal ?? 0) +
-                      filtered.filter((t) => t.platform !== "x").length,
+                  : flt.source === "instagram"
+                    ? feed.data?.igTotal ?? 0
+                    : flt.source === "facebook"
+                      ? feed.data?.fbTotal ?? 0
+                      : (feed.data?.xTotal ?? 0) + (feed.data?.igTotal ?? 0) +
+                        (feed.data?.fbTotal ?? 0),
               )}{" "}posts
             </span>
             {fresh > 0 && (
@@ -395,6 +409,21 @@ export default function LiveFeed({ onMenu }) {
             <PostCard key={`${t.platform}:${t.tweet_id}`} t={t}
                       onPin={setPinTarget} terms={keywordTerms} />
           ))}
+          {feed.data && visible.length > 0 && (() => {
+            const total = flt.source === "x" ? (feed.data.xTotal ?? 0)
+              : flt.source === "instagram" ? (feed.data.igTotal ?? 0)
+              : flt.source === "facebook" ? (feed.data.fbTotal ?? 0)
+              : (feed.data.xTotal ?? 0) + (feed.data.igTotal ?? 0) + (feed.data.fbTotal ?? 0);
+            return visible.length < total ? (
+              <div style={{ textAlign: "center", margin: "16px 0 4px" }}>
+                <button className="btn btn-ghost" disabled={feed.loading}
+                        onClick={() => setPageN((n) => n + 1)}>
+                  {feed.loading ? "Loading…"
+                    : `Load more — showing ${fmtN(visible.length)} of ${fmtN(total)}`}
+                </button>
+              </div>
+            ) : null;
+          })()}
           {pinTarget && pid && (
             <CollectionPicker t={pinTarget} pid={pid} onClose={() => setPinTarget(null)} />
           )}
