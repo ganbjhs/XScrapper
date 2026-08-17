@@ -69,5 +69,6 @@ export const icons = {
   activity: I("M12 8v4l2.5 2.5", <circle cx="12" cy="12" r="9" />),
   accounts: I("M5 21c.9-3.7 3.6-5.5 7-5.5s6.1 1.8 7 5.5", <circle cx="12" cy="7" r="3.5" />),
   guard: I("M12 3l8 4v5c0 5-3.4 8-8 9-4.6-1-8-4-8-9V7z"),
+  stress: I("M13 2L4 14h7l-1 8 9-12h-7z"),
   menu: I("M4 6h16M4 12h16M4 18h16"),
 };

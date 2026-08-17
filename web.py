@@ -2935,6 +2935,86 @@ def _xlist_refresh(body):
             "fetched_ms": int(time.time() * 1000)}
 
 
+# --------------------------------------------------------------------------
+# Stress test — deliberately push one account to find its hotness ceiling.
+# The probes live in stress.py (one per platform, extensible); this is just the
+# HTTP surface: list the available accounts, and run a bounded stress pass.
+# --------------------------------------------------------------------------
+
+def _stress_accounts(q):
+    """Available accounts per platform, plus the registered platform list, so
+    the UI can offer a picker and works automatically for any future platform."""
+    import stress
+    out = {"platforms": stress.platforms(),
+           "accounts": {"x": [], "ig": [], "fb": []}}
+    try:
+        with ig.Store("ig_accounts.db") as st:
+            out["accounts"]["ig"] = [r["username"] for r in st.all()
+                                     if r.get("username")]
+    except Exception:
+        pass
+    try:
+        async def _xnames():
+            api = auth.open_api(_CFG.db_accounts)
+            return await auth.active_usernames(api)
+        out["accounts"]["x"] = _run(_xnames(), timeout=30) or []
+    except Exception:
+        pass
+    try:
+        fb_email = os.getenv("FB_EMAIL", "").strip()
+        out["accounts"]["fb"] = [fb_email] if fb_email else []
+    except Exception:
+        pass
+    return out
+
+
+def _stress_run(body):
+    import stress
+    platform = str(body.get("platform") or "").strip().lower()
+    target = str(body.get("target") or "").strip()
+    account = str(body.get("account") or "").strip() or None
+    try:
+        n = int(body.get("n") or 10)
+    except (TypeError, ValueError):
+        n = 10
+    n = max(1, min(n, stress.MAX_REQUESTS))
+    if platform not in stress.platforms():
+        return {"error": f"pick a platform: {', '.join(stress.platforms())}"}
+    if not target:
+        return {"error": "a target account/handle (or search query for X) is required"}
+
+    # Advisory guard: a stress run spends REAL budget shared with collection and
+    # is meant to make the account hot, so we surface the assessment and require
+    # an explicit ack rather than silently blocking or silently proceeding.
+    import guard
+    queue = "search"
+    v = guard.assess(_CFG, action="fetch", cost=n, queue=queue)
+    if not body.get("ack"):
+        notes = [b.title for b in v.blocks] + [w.title for w in v.warnings]
+        return {"needs_ack": True, "blocked": True, "guard": v.to_json(),
+                "warning": ("This deliberately pushes %s toward rate-limits — "
+                            "use a THROWAWAY account only." %
+                            (("@" + account) if account else "the active account")),
+                "notes": notes}
+
+    log_lines = []
+    def _log(m):
+        log_lines.append(str(m))
+
+    async def _go():
+        return await stress.run(platform, target, n, account=account,
+                                accounts_db=str(_CFG.db_accounts), log=_log)
+
+    with _FETCH_LOCK:
+        try:
+            res = _run(_go(), timeout=280)
+        except Exception as e:
+            return {"error": f"{type(e).__name__}: {e}", "log": log_lines[-20:]}
+    if isinstance(res, dict):
+        res["log"] = log_lines[-40:]
+    return res
+
+
 class Handler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
 
@@ -3259,6 +3339,8 @@ class Handler(BaseHTTPRequestHandler):
                 return self._send(200, _identities_json(q))
             if u.path == "/api/watchlist/xmembers":
                 return self._send(200, _xlist_members_json(q))
+            if u.path == "/api/stress/accounts":
+                return self._send(200, _stress_accounts(q))
             if u.path == "/api/ig/status":
                 return self._send(200, _ig_status())
             if u.path == "/api/ig/posts":
@@ -3375,6 +3457,8 @@ class Handler(BaseHTTPRequestHandler):
                 return self._send(200, _identity_post(body))
             if u.path == "/api/watchlist/xmembers/refresh":
                 return self._send(200, _xlist_refresh(body))
+            if u.path == "/api/stress/run":
+                return self._send(200, _stress_run(body))
             if u.path == "/api/ig/source":
                 return self._send(200, _ig_source_post(body))
             if u.path == "/api/ig/fetch":

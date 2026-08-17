@@ -73,6 +73,11 @@ export const api = {
   xlistMembers: (list_id) => request(`/api/watchlist/xmembers${qs({ list_id })}`),
   refreshXlistMembers: (list_id) =>
     request("/api/watchlist/xmembers/refresh", { method: "POST", body: { list_id, ack: true } }),
+  // Stress test — find how many requests an account can pull before it's hot.
+  // stressAccounts lists platforms+accounts; the UI works for any future
+  // platform the server registers, no client change needed.
+  stressAccounts: () => request("/api/stress/accounts"),
+  stressRun: (body) => request("/api/stress/run", { method: "POST", body }),
   fbPosts: (p) => request(`/api/fb/posts${qs(p)}`),
   fbStatus: (project) => request(`/api/fb/status${qs({ project })}`),
   fbAddSource: (project, label) =>

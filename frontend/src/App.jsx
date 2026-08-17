@@ -13,6 +13,7 @@ import Delivery from "./views/Delivery.jsx";
 import Activity from "./views/Activity.jsx";
 import Accounts from "./views/Accounts.jsx";
 import Guard from "./views/Guard.jsx";
+import StressTest from "./views/StressTest.jsx";
 
 const ProjectCtx = createContext(null);
 export const useProject = () => useContext(ProjectCtx);
@@ -121,6 +122,7 @@ function Nav({ open, close }) {
       <div className="nav-label">GLOBAL</div>
       {item("/accounts", "accounts", "Accounts & Sessions")}
       {item("/guard", "guard", "Guard")}
+      {item("/stress", "stress", "Stress Test")}
 
       <div className="nav-foot">
         <div className="avatar">C</div>
@@ -174,6 +176,7 @@ export default function App() {
             <Route path="/activity" element={<Activity onMenu={() => setNavOpen(true)} />} />
             <Route path="/accounts" element={<Accounts onMenu={() => setNavOpen(true)} />} />
             <Route path="/guard" element={<Guard onMenu={() => setNavOpen(true)} />} />
+            <Route path="/stress" element={<StressTest onMenu={() => setNavOpen(true)} />} />
             <Route path="*" element={<Navigate to="/feed" replace />} />
           </Routes>
         </main>
