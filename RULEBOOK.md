@@ -358,8 +358,10 @@ updated, never deleted (the pre-commit hook blocks the deletion).
   checkpoint quarantines. This works with no `ACCOUNTS_SECRET_KEY` in the
   collector's environment (the systemd units set no `EnvironmentFile`), so the
   lookup reads raw columns and never decrypts.
-- The streamed sign-in window (`/api/login/*`) takes a pool `account_id`, not
-  just a `config.toml` label: it signs in through that account's own encrypted
+- The streamed sign-in window (`/api/login/*`) is offered for **X only** —
+  the panel must never present it for Instagram (6: the IG streamed-browser
+  login is dead, captcha loop; `ig_login.py` / `ig_import.py` are the paths).
+  It takes a pool `account_id`, not just a `config.toml` label: it signs in through that account's own encrypted
   residential proxy and its own stable profile directory
   (`profiles/pool_<id>`), and writes the outcome back onto the card. The
   profile directory is the trusted-device state — it must stay derived from the

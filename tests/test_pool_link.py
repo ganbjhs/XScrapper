@@ -125,25 +125,34 @@ def test_works_without_the_secret_key():
     print("ok  writes the card with no ACCOUNTS_SECRET_KEY in the environment")
 
 
-def test_login_route_advertises_the_streamed_window():
+def test_login_route_offers_the_streamed_window_to_X_ONLY():
+    """Instagram must NOT be offered the streamed browser. RULEBOOK 6: the
+    streamed-browser IG login is dead — Instagram detects the automated Chrome
+    and re-serves the captcha forever, so solving it cannot succeed. Unifying
+    the two platforms behind one button is how that loop gets rediscovered."""
     _fresh_pool()
-    for plat in ("x", "ig"):
-        aid = A.handle("POST", "/add",
-                       {"platform": plat, "label": f"{plat}_a", "login": "u"}, {})["account_id"]
-        r = A.handle("POST", "/login", {"account_id": aid}, {})
-        assert r["ok"] is False, "the route must not silently open a browser"
-        assert r["signin"]["ready"] is True
-        assert r["signin"]["account_id"] == aid
-        assert r["signin"]["start"] == "/api/login/start"
-        assert r["signin"]["body"] == {"account_id": aid}
-        assert f"profiles/pool_{aid}" in r["todo"]
+    xid = A.handle("POST", "/add",
+                   {"platform": "x", "label": "x_a", "login": "u"}, {})["account_id"]
+    r = A.handle("POST", "/login", {"account_id": xid}, {})
+    assert r["ok"] is False, "the route must not silently open a browser"
+    assert r["signin"]["ready"] is True
+    assert r["signin"]["account_id"] == xid
+    assert r["signin"]["start"] == "/api/login/start"
+    assert r["signin"]["body"] == {"account_id": xid}
+    assert f"profiles/pool_{xid}" in r["todo"]
+
+    iid = A.handle("POST", "/add",
+                   {"platform": "ig", "label": "ig_a", "login": "u"}, {})["account_id"]
+    r = A.handle("POST", "/login", {"account_id": iid}, {})
+    assert "signin" not in r, "the IG streamed window is dead — never offer it"
+    assert "ig_login.py" in r["todo"] and "ig_import.py" in r["todo"]
 
     fid = A.handle("POST", "/add",
                    {"platform": "fb", "label": "fb_a", "login": "u"}, {})["account_id"]
     r = A.handle("POST", "/login", {"account_id": fid}, {})
     assert "signin" not in r, "Facebook has no streamed window — don't claim one"
     assert "FB_EMAIL" in r["todo"]
-    print("ok  /login advertises the streamed window for X + IG, not for FB")
+    print("ok  /login offers the streamed window to X only, never IG or FB")
 
 
 if __name__ == "__main__":

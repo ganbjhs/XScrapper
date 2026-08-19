@@ -183,22 +183,25 @@ def handle(method: str, subpath: str, body: dict | None, query: dict | None) -> 
             return {"ok": True, "remaining": st.backup_codes_remaining(aid)}
 
         if method == "POST" and sub == "/login":
-            # What "Login now" can actually do, per platform. X and Instagram
-            # both have the streamed sign-in window on the server (web.py
-            # /api/login/*), and since the pool wiring landed it accepts an
-            # `account_id` straight from this panel -- no config.toml entry and
-            # no hand-made profile directory. Facebook has no window; it signs
-            # in from .env on the server.
+            # What "Login now" can actually do, per platform.
             #
-            # This route still does NOT open the browser itself, and that is
-            # deliberate: starting a headless Chrome nobody is watching would
-            # burn a login attempt and hold the account's profile directory
-            # open for the idle timeout. The caller opens the window when it
-            # has a UI to show it in. `signin` below is what that UI needs.
+            # ONLY X gets the streamed sign-in window. Instagram does not, and
+            # that is a hard-won rule, not an oversight: the streamed-browser IG
+            # login is DEAD (RULEBOOK.md 6). Instagram detects the
+            # Playwright-driven Chrome and re-serves the captcha forever --
+            # solving it cannot succeed, because the distrust is about the
+            # browser, not the answer. instagrapi's app API (ig_login.py) and a
+            # sessionid minted by a real browser (ig_import.py) both work. Do
+            # not "unify" the two platforms behind one button; that is how the
+            # captcha loop gets rediscovered.
+            #
+            # This route never opens the browser itself either: starting a
+            # headless Chrome nobody is watching would burn a login attempt and
+            # hold the account's profile directory open for the idle timeout.
+            # The caller opens the window when it has a UI to show it in.
             aid = _need_int(body, "account_id")
             plat = st.get(aid).platform
-            if plat in ("x", "ig"):
-                site = "X" if plat == "x" else "Instagram"
+            if plat == "x":
                 return {
                     "ok": False,
                     "signin": {
@@ -211,8 +214,8 @@ def handle(method: str, subpath: str, body: dict | None, query: dict | None) -> 
                         "body": {"account_id": aid},
                     },
                     "todo": (
-                        f"{site} signs in through the streamed browser on the "
-                        f"server, and this account is now wired to it: POST "
+                        f"X signs in through the streamed browser on the server, "
+                        f"and this account is now wired to it: POST "
                         f"/api/login/start with account_id={aid}, drive it with "
                         f"/api/login/act, poll /api/login/frame. It runs through "
                         f"this account's own residential proxy and its own "
@@ -222,6 +225,18 @@ def handle(method: str, subpath: str, body: dict | None, query: dict | None) -> 
                         f"window is the next step."
                     ),
                 }
+            if plat == "ig":
+                return {"ok": False, "todo":
+                        "Instagram signs in on the SERVER, not from here, and "
+                        "NOT through a browser -- the streamed-browser IG login "
+                        "is dead (captcha loop). As the xscraper user run: "
+                        "`.venv/bin/python3 ig_login.py <username> --label "
+                        "<ig_x> --proxy <this account's residential URL>` with "
+                        "the password in .env as IG_PASSWORD_<IG_X> -- or "
+                        "import a fresh cookie from a real browser with "
+                        "`ig_import.py \"<sessionid>\" --label <ig_x> --proxy "
+                        "<url>`. Once it lands in ig_accounts.db this card "
+                        "picks up its session state automatically."}
             if plat == "fb":
                 return {"ok": False, "todo":
                         "Facebook signs in on the SERVER via FB_EMAIL / "
