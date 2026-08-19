@@ -1994,7 +1994,14 @@ def _test_telegram(body):
 #
 # One at a time, deliberately. Each session holds a Chrome process open against
 # an account's profile directory, and two Chromes on one profile corrupt it.
-_LOGIN = {"session": None, "label": None, "platform": "x"}
+_LOGIN = {"session": None, "label": None, "platform": "x",
+          # The AccountCfg the window is driving. It is NOT always a
+          # config.toml account any more: a POOL account (pool.db, the
+          # Account Control Panel) gets one synthesised for it by
+          # _pool_account_cfg. Capture must use THIS, not re-look-up a
+          # label that config.toml has never heard of.
+          "cfg": None,
+          "pool_id": None}
 _LOGIN_LOCK = threading.RLock()
 
 
@@ -2003,6 +2010,7 @@ def _login_drop():
     with _LOGIN_LOCK:
         s = _LOGIN["session"]
         _LOGIN["session"] = _LOGIN["label"] = None
+        _LOGIN["cfg"] = _LOGIN["pool_id"] = None
     if s is not None:
         try:
             _run(s.close(), timeout=30)
@@ -2037,16 +2045,137 @@ def _login_module(platform: str):
     return auth
 
 
-def _login_start(label):
+# The pool's vocabulary is 'x' | 'ig' | 'fb'; config.py's is 'x' | 'instagram'.
+_POOL_TO_CFG_PLATFORM = {"x": "x", "ig": "instagram"}
+
+
+def _pool_store():
+    from store_accounts import AccountStore
+    return AccountStore(os.getenv("ACCOUNTS_DB", "pool.db")).open()
+
+
+def _pool_account_cfg(account_id: int):
+    """
+    Make a POOL account (pool.db) drivable by the streamed sign-in window.
+
+    The window was written against config.toml's AccountCfg — it needs a profile
+    directory, a proxy, a locale and a timezone, none of which the pool stored
+    under those names. Rather than fork the sign-in code or make the operator
+    hand-edit config.toml for every account they add in the panel, synthesise
+    the AccountCfg here from the pool row. Nothing is written back to
+    config.toml: the pool row stays the single source of truth.
+
+    Two things are deliberate:
+      * The profile directory is per-account and STABLE (`profiles/pool_<id>`).
+        That directory is the trusted-device state — the reason the second
+        sign-in for an account does not raise a new-device challenge. It must
+        never be derived from a label the operator can rename.
+      * The proxy is the account's own residential URL, decrypted from the pool.
+        Signing in from the server IP and then collecting through a residential
+        proxy is exactly the mismatch that gets a session flagged.
+
+    Returns (AccountCfg, store_accounts.Account).
+    """
+    import config
+
+    st = _pool_store()
+    try:
+        acct = st.get(int(account_id))
+        try:
+            proxy = st.get_proxy(acct.account_id) or ""
+        except Exception:
+            # A proxy we cannot decrypt is not a reason to refuse the sign-in;
+            # it is a reason to say so. The caller surfaces this as a warning.
+            proxy = ""
+    finally:
+        st.close()
+
+    platform = _POOL_TO_CFG_PLATFORM.get(acct.platform)
+    if platform is None:
+        raise ValueError(
+            f"{acct.platform.upper()} has no streamed sign-in window. Facebook "
+            f"signs in on the server from FB_EMAIL / FB_PASSWORD in .env.")
+
+    cfg = config.AccountCfg(
+        label=acct.label,
+        platform=platform,
+        username=acct.login,
+        # The password stays in pool.db and is typed by the operator into the
+        # real login form. password_env is left blank on purpose: nothing here
+        # should be able to read a password out of the environment for a pool
+        # account that never put one there.
+        password_env="",
+        profile_dir=f"pool_{acct.account_id}",
+        proxy=proxy,
+    )
+    cfg.profile_path = _CFG.profiles_dir / f"pool_{acct.account_id}"
+    return cfg, acct
+
+
+def _pool_after_capture(account_id: int, ok: bool, detail: str) -> None:
+    """Write the outcome of a sign-in back onto the pool row.
+
+    This is the half that was missing: the window could sign an account in
+    perfectly and the panel would still show `last success —` and whatever
+    stale status it had, because nothing ever told the pool it happened.
+    """
+    try:
+        st = _pool_store()
+    except Exception:
+        return
+    try:
+        a = st.get(int(account_id))
+        if ok:
+            st.record_success(a.account_id)
+            # A signed-in account is no longer waiting on a human. Promote out
+            # of needs_login / quarantined back to a warm backup; leave 'active'
+            # and 'dead' alone — who collects is an operator decision, and a
+            # dead account is a record, not a candidate.
+            if a.status in ("needs_login", "quarantined"):
+                st.set_status(a.account_id, "backup", "")
+        else:
+            st.set_status(a.account_id, "needs_login", (detail or "sign-in failed")[:400])
+    except Exception:
+        pass
+    finally:
+        try:
+            st.close()
+        except Exception:
+            pass
+
+
+def _login_start(label="", account_id=None):
+    """
+    Open the streamed sign-in window for ONE account.
+
+    Accepts either a config.toml `label` (how this always worked) or a pool
+    `account_id` (the Account Control Panel). Exactly one is needed.
+    """
     _login_reap()
     with _LOGIN_LOCK:
         if _LOGIN["session"] is not None:
             return {"error": f"A sign-in window is already open for "
                              f"'{_LOGIN['label']}'. Finish or close that one first."}
-        try:
-            acct = _CFG.account(label)
-        except Exception as e:
-            return {"error": str(e)}
+        pool_id = None
+        proxy_warning = ""
+        if account_id not in (None, ""):
+            try:
+                acct, pool_row = _pool_account_cfg(account_id)
+            except Exception as e:
+                return {"error": str(e)}
+            pool_id = pool_row.account_id
+            label = pool_row.label
+            if pool_row.has_proxy and not acct.proxy:
+                proxy_warning = ("This account has a residential proxy on file "
+                                 "but it could not be decrypted — check "
+                                 "ACCOUNTS_SECRET_KEY. Signing in from the "
+                                 "SERVER IP instead, which is a fingerprint "
+                                 "mismatch with how it will collect.")
+        else:
+            try:
+                acct = _CFG.account(label)
+            except Exception as e:
+                return {"error": str(e)}
 
         mod = _login_module(acct.platform)
 
@@ -2081,10 +2210,13 @@ def _login_start(label):
         _LOGIN["session"] = sess
         _LOGIN["label"] = label
         _LOGIN["platform"] = acct.platform
+        _LOGIN["cfg"] = acct
+        _LOGIN["pool_id"] = pool_id
         return {"ok": True, "label": label, "platform": acct.platform,
+                "account_id": pool_id,
                 "state": sess.state, "screen_name": sess.screen_name,
                 "url": sess.url(), "took_s": round(took, 1), "trace": trace,
-                "warning": getattr(sess, "error", "") or "",
+                "warning": (getattr(sess, "error", "") or "") or proxy_warning,
                 "width": mod.LOGIN_VIEWPORT["width"],
                 "height": mod.LOGIN_VIEWPORT["height"]}
 
@@ -2135,8 +2267,20 @@ def _login_capture():
     """
     s, label = _LOGIN["session"], _LOGIN["label"]
     platform = _LOGIN.get("platform", "x")
+    pool_id = _LOGIN.get("pool_id")
     if s is None:
         return {"error": "The sign-in window is closed."}
+
+    # The account this window is driving. For a pool account this is the
+    # synthesised cfg — looking `label` up in config.toml would raise, which is
+    # precisely how a successful sign-in used to end in "Could not save the
+    # session: ConfigError".
+    cfg = _LOGIN.get("cfg")
+    if cfg is None:
+        try:
+            cfg = _CFG.account(label)
+        except Exception as e:
+            return {"error": f"Could not resolve the account: {e}"}
 
     try:
         harvest = _run(s.harvest(), timeout=60)
@@ -2150,25 +2294,33 @@ def _login_capture():
         if platform == "instagram":
             import ig
             with ig.Store(_ig_store_path()) as st:
-                active, detail = ig.capture(st, harvest, _CFG.account(label))
+                active, detail = ig.capture(st, harvest, cfg)
             username = harvest.username
         else:
             import auth
             async def save():
                 api = auth.open_api(_CFG.db_accounts)
-                return await auth.upsert_session(api, harvest, _CFG.account(label))
+                return await auth.upsert_session(api, harvest, cfg)
 
             username, res = _run(save(), timeout=120)
             active, detail = res.ok, ("" if res.ok else res.error)
             if res.ok:
-                auth.write_identity(_CFG.account(label), username)
+                auth.write_identity(cfg, username)
     except Exception as e:
+        if pool_id is not None:
+            _pool_after_capture(pool_id, False, f"{type(e).__name__}: {e}")
         _login_drop()
         return {"error": f"Could not save the session: {type(e).__name__}: {e}"}
 
+    # The pool row is what the Account Control Panel renders. Stamp it here or
+    # the card keeps saying "last success —" after a sign-in that worked.
+    if pool_id is not None:
+        _pool_after_capture(pool_id, bool(active), detail)
+
     _login_drop()
     return {"captured": True, "username": username, "active": active,
-            "platform": platform, "detail": "" if active else detail}
+            "platform": platform, "account_id": pool_id,
+            "detail": "" if active else detail}
 
 
 def _login_cancel():
@@ -2596,9 +2748,20 @@ def _ig_status():
         try:
             con = sqlite3.connect(f"file:{ap}?mode=ro", uri=True, timeout=5)
             con.row_factory = sqlite3.Row
-            for r in con.execute("SELECT username, active, proxy, error_msg FROM accounts"):
-                acct = {"username": r["username"], "active": bool(r["active"]),
-                        "proxy": bool(r["proxy"]), "error": r["error_msg"]}
+            # label / last_used / total_req are selected too, not because the
+            # old view "worked without them" but because it did not: the
+            # Account Control Panel matches a pool account to its live session
+            # by label OR login, and a row with no label could only ever match
+            # on username — which is why a pooled account whose label differs
+            # from its handle showed no session state at all.
+            for r in con.execute(
+                    "SELECT username, label, active, proxy, error_msg, "
+                    "last_used, total_req FROM accounts"):
+                acct = {"username": r["username"], "label": r["label"],
+                        "active": bool(r["active"]),
+                        "proxy": bool(r["proxy"]), "error": r["error_msg"],
+                        "last_used": r["last_used"],
+                        "requests": r["total_req"] or 0}
                 # The checkpoint tombstone lives in the account's session
                 # sidecar — surface it so the dashboard can say "a human must
                 # act" instead of the collector failing quietly (RULEBOOK §6).
@@ -3373,7 +3536,11 @@ class Handler(BaseHTTPRequestHandler):
             n = int(self.headers.get("Content-Length") or 0)
             body = json.loads(self.rfile.read(n) or "{}")
             if u.path == "/api/login/start":
-                return self._send(200, _login_start((body.get("label") or "").strip()))
+                # Either a config.toml label (the original callers) or a pool
+                # account_id (the Account Control Panel). See _login_start.
+                return self._send(200, _login_start(
+                    (body.get("label") or "").strip(),
+                    body.get("account_id")))
             if u.path == "/api/login/act":
                 return self._send(200, _login_act(body))
             if u.path == "/api/login/cancel":

@@ -186,6 +186,73 @@ function CodesModal({ a, onDone, onClose }) {
 }
 
 // ---------------------------------------------------------------------------
+// Session state — ALWAYS rendered, on every card
+// ---------------------------------------------------------------------------
+//
+// This row used to be conditional on `live` (`{live && ...}`), and that single
+// `&&` is why an Instagram card could show no state at all: an account that is
+// in the pool but has never been signed in on the server has no row in
+// ig_accounts.db, so `liveFor` returned null, so the card silently rendered
+// nothing between "proxy / IP" and "last success —". Two very different
+// situations — "signed in and collecting" and "we have never seen this account
+// sign in" — looked identical: blank.
+//
+// A missing session IS a state, and the most important one, because it is the
+// only one an operator has to act on. So the row is unconditional and says
+// which of the two it is.
+function SessionRow({ a, live }) {
+  // No live record at all: the account exists in the pool and nowhere else.
+  if (!live) {
+    return (
+      <div className="kv"><span>session</span>
+        <b className="st-warn">
+          never signed in on this server
+          <span style={{ color: "var(--ink-3)", fontWeight: 400 }}>
+            {" · use Login now"}
+          </span>
+        </b>
+      </div>
+    );
+  }
+
+  // Instagram parks a checkpoint tombstone next to the session. It outranks
+  // active/inactive: the session may still half-work while a human is required.
+  if (live.checkpoint_at) {
+    return (
+      <div className="kv"><span>session</span>
+        <b className="st-crit">
+          checkpoint — Instagram wants a human ({fmtAgo(live.checkpoint_at)})
+        </b>
+      </div>
+    );
+  }
+
+  const bits = [];
+  if (live.requests != null) bits.push(`${live.requests} requests`);
+  if (live.last_used) bits.push(`last used ${fmtAgo(live.last_used)}`);
+
+  return (
+    <>
+      <div className="kv"><span>session</span>
+        <b className={live.active ? "st-good" : "st-crit"}>
+          {live.active ? "signed in · collecting" : "signed in once · not working now"}
+          {bits.length ? (
+            <span style={{ color: "var(--ink-3)", fontWeight: 400 }}>
+              {` · ${bits.join(" · ")}`}
+            </span>
+          ) : null}
+        </b>
+      </div>
+      {live.error && (
+        <div className="kv"><span>session error</span>
+          <b className="st-crit">{live.error}</b></div>
+      )}
+    </>
+  );
+}
+
+
+// ---------------------------------------------------------------------------
 // A managed (pool) account card — full controls
 // ---------------------------------------------------------------------------
 
@@ -234,15 +301,9 @@ function AccountCard({ a, live, onChanged }) {
 
       <div className="kv"><span>login</span><b>{a.login}</b></div>
       <div className="kv"><span>proxy / IP</span><b>{a.proxy_id || "none (server IP)"}</b></div>
-      {live && (
-        <div className="kv"><span>live session</span>
-          <b className={live.active ? "st-good" : "st-crit"}>
-            {live.active ? "signed in · collecting" : "not signed in"}
-            {live.requests != null ? ` · ${live.requests} requests` : ""}
-          </b>
-        </div>
-      )}
-      <div className="kv"><span>last success</span><b>{a.last_success_at ? fmtAgo(a.last_success_at) : "—"}</b></div>
+      <SessionRow a={a} live={live} />
+      <div className="kv"><span>last success</span>
+        <b>{a.last_success_at ? fmtAgo(a.last_success_at) : "never"}</b></div>
       {a.health && <div className="kv"><span>health</span><b className="st-warn">{a.health}</b></div>}
       {msg && <div className="kv"><span>note</span><b>{msg}</b></div>}
 
@@ -410,11 +471,20 @@ export default function Accounts({ onMenu }) {
       : p === "ig" ? (liveIg.data?.accounts || [])
       : p === "fb" ? fbLive() : [];
 
-  // Match a managed account to its live session (best-effort, by label/username).
+  // Match a managed account to its live session.
+  //
+  // Case- and @-insensitive, and it passes the WHOLE live record through rather
+  // than plucking two fields: the error, the checkpoint tombstone and last_used
+  // are exactly the details that explain a card with no green dot, and dropping
+  // them here is what left the panel unable to say why an account was quiet.
+  const norm = (v) => String(v || "").trim().toLowerCase().replace(/^@/, "");
   const liveFor = (a) => {
-    const hit = liveList(a.platform).find(
-      (r) => r.label === a.label || r.username === a.login || r.username === a.label);
-    return hit ? { active: hit.active, requests: hit.requests } : null;
+    const label = norm(a.label), login = norm(a.login);
+    const rows = liveList(a.platform);
+    return rows.find((r) => login && norm(r.username) === login)
+      || rows.find((r) => label && norm(r.label) === label)
+      || rows.find((r) => label && norm(r.username) === label)
+      || null;
   };
 
   const plats = pool.data?.platforms || {};

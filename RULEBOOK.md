@@ -273,6 +273,33 @@ before changing the engine; nearly every "obvious" idea has been tried.)
   commit `dist/`. New capability = store method → thin `web.py` validator →
   small view in `frontend/src/views/`, with honest loading/empty/error states
   and dark mode from the same tokens.
+- **Every state the dashboard renders must have a writer, and a test that
+  proves it writes.** `store_accounts.record_success()` existed from day one
+  and nothing ever called it, so every card in the Account Control Panel read
+  `last success —` forever no matter how much the account was collecting. The
+  store's own tests were green the whole time, because the store was never the
+  broken half. A getter without a caller is a lie the UI tells on your behalf:
+  when you add a status column, wire the writer in the same commit
+  (`pool_link.py` is that path for the pool) and test the wiring, not just the
+  setter.
+- **A missing state IS a state — never render nothing.** The panel's session
+  row was `{live && (…)}`, so an account that had never been signed in showed
+  no row at all: "collecting fine" and "we have never seen this account" were
+  both blank. Blank reads as "nothing to report", which is exactly backwards —
+  the absent case is usually the one needing action. Render every case by name
+  ("never signed in on this server"), never by omission. Same reason
+  `_status()` already lists declared-but-never-signed-in accounts.
+- **Proxy credentials go in Playwright's `username` / `password`, never inline
+  in `server`.** Chromium ignores userinfo in `--proxy-server`, so passing a
+  whole `http://user:pass@host:port` authenticates as nobody and the first
+  request returns 407 — surfacing as an inscrutable browser-launch failure, not
+  as "your proxy password was dropped". `auth._proxy_kwargs()` splits it.
+- **Match accounts across subsystems on the login, case-insensitively.** The
+  pool, `ig_accounts.db`, `accounts.db` and `config.toml` each name the same
+  account differently (label vs handle, typed by different people at different
+  times). Match on the login first and the label second, normalising case, `@`
+  and whitespace — an exact `===` on a display name silently un-matches an
+  account and the UI degrades to blank.
 - **Keep the pinned scraper versions and the `doctor`/`guard` asserts.** They
   turn "the platform changed under us" into a loud failure instead of silent
   data loss.
@@ -322,6 +349,21 @@ updated, never deleted (the pre-commit hook blocks the deletion).
   "Network & settings"), unified platform-first add flow.
 - Accounts & Sessions: account pool (add / edit / promote / failover /
   quarantine / TOTP preview / backup codes), live sessions incl. orphans.
+- Every pool card states its session in words, always — "signed in ·
+  collecting", "never signed in on this server", "checkpoint — Instagram wants
+  a human", or the session error. The row is unconditional; it may never go
+  back to being hidden when there is no live record.
+- Collectors write back to the pool (`pool_link.py`): a clean pass stamps
+  `last_success_at`, a rejected session sets `needs_login` with the reason, a
+  checkpoint quarantines. This works with no `ACCOUNTS_SECRET_KEY` in the
+  collector's environment (the systemd units set no `EnvironmentFile`), so the
+  lookup reads raw columns and never decrypts.
+- The streamed sign-in window (`/api/login/*`) takes a pool `account_id`, not
+  just a `config.toml` label: it signs in through that account's own encrypted
+  residential proxy and its own stable profile directory
+  (`profiles/pool_<id>`), and writes the outcome back onto the card. The
+  profile directory is the trusted-device state — it must stay derived from the
+  immutable account id, never from a renameable label.
 - Activity Log page: structured X poll history + raw account log with
   platform/level filters.
 - Collections (pins, CSV export), Alerts (velocity → Telegram), Delivery

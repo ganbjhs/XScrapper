@@ -183,28 +183,53 @@ def handle(method: str, subpath: str, body: dict | None, query: dict | None) -> 
             return {"ok": True, "remaining": st.backup_codes_remaining(aid)}
 
         if method == "POST" and sub == "/login":
-            # Signing an account in FROM the dashboard is not wired yet. Rather
-            # than pretend, return the ACCURATE per-platform way to sign this
-            # account in on the server — Instagram never used a streamed
-            # browser (that path is dead; cookie/password is the way), so the
-            # old X-centric text was wrong on IG/FB cards.
+            # What "Login now" can actually do, per platform. X and Instagram
+            # both have the streamed sign-in window on the server (web.py
+            # /api/login/*), and since the pool wiring landed it accepts an
+            # `account_id` straight from this panel -- no config.toml entry and
+            # no hand-made profile directory. Facebook has no window; it signs
+            # in from .env on the server.
+            #
+            # This route still does NOT open the browser itself, and that is
+            # deliberate: starting a headless Chrome nobody is watching would
+            # burn a login attempt and hold the account's profile directory
+            # open for the idle timeout. The caller opens the window when it
+            # has a UI to show it in. `signin` below is what that UI needs.
             aid = _need_int(body, "account_id")
             plat = st.get(aid).platform
-            todo = {
-                "ig": "Instagram signs in on the SERVER, not from here. As the "
-                      "xscraper user run: `.venv/bin/python3 ig_login.py "
-                      "<username>` (password in .env) — or import a fresh "
-                      "cookie with `ig_import.py \"<sessionid>\"`. The account's "
-                      "residential proxy is used automatically.",
-                "fb": "Facebook signs in on the SERVER via FB_EMAIL/FB_PASSWORD "
-                      "in .env (it persists fb_state.json on first run). There "
-                      "is no dashboard login button for Facebook.",
-                "x": "X sign-in uses the streamed-browser flow on the server "
-                     "(see ACCOUNTS.md §5). Dashboard-triggered login is not "
-                     "wired yet.",
-            }.get(plat, "Dashboard-triggered login is not wired for this "
-                        "platform yet.")
-            return {"ok": False, "todo": todo}
+            if plat in ("x", "ig"):
+                site = "X" if plat == "x" else "Instagram"
+                return {
+                    "ok": False,
+                    "signin": {
+                        "ready": True,
+                        "account_id": aid,
+                        "start": "/api/login/start",
+                        "act": "/api/login/act",
+                        "frame": "/api/login/frame",
+                        "cancel": "/api/login/cancel",
+                        "body": {"account_id": aid},
+                    },
+                    "todo": (
+                        f"{site} signs in through the streamed browser on the "
+                        f"server, and this account is now wired to it: POST "
+                        f"/api/login/start with account_id={aid}, drive it with "
+                        f"/api/login/act, poll /api/login/frame. It runs through "
+                        f"this account's own residential proxy and its own "
+                        f"profile directory (profiles/pool_{aid}), and on "
+                        f"success the session AND this card's status are "
+                        f"written back automatically. The in-panel sign-in "
+                        f"window is the next step."
+                    ),
+                }
+            if plat == "fb":
+                return {"ok": False, "todo":
+                        "Facebook signs in on the SERVER via FB_EMAIL / "
+                        "FB_PASSWORD in .env (it persists fb_state.json on the "
+                        "first run). There is no streamed sign-in window for "
+                        "Facebook."}
+            return {"ok": False, "todo": "Dashboard-triggered login is not "
+                                         "wired for this platform yet."}
 
         return {"error": f"unknown pool route: {method} {subpath}"}
 

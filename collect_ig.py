@@ -42,6 +42,7 @@ import asyncio as _asyncio
 import activity_log
 import ig
 import ig_human
+import pool_link
 import ig_session
 import store_ig
 from engine_ig import IGEngine
@@ -139,6 +140,10 @@ async def run_once(store_path="ig_results.db", account_override="", *,
                 cl = ig_session.load_client(acct, log=log)
             except Exception as e:
                 log(f"  could not load @{acct}: {e}")
+                # Tell the Account Control Panel WHY this account is quiet.
+                # Without this the card just sits at "last success —" and the 
+                # operator has to read journalctl to learn the session is gone.
+                pool_link.note_needs_login("ig", acct, f"{type(e).__name__}: {e}")
                 continue
 
             # Daily budget per account (warm-up ramp for young sessions). Once
@@ -152,6 +157,10 @@ async def run_once(store_path="ig_results.db", account_override="", *,
 
             engine = IGEngine(cl, account=acct)
             refreshed = False       # relogin is attempted at most ONCE per pass
+            # Did this account manage a single clean source this pass? That is
+            # the honest definition of "the session still works", and it is what
+            # stamps last_success_at in the pool (pool_link.record_success).
+            acct_ok = False
             for i, s in enumerate(group):
                 # Human rhythm BETWEEN sources: a person doesn't machine-gun
                 # profile after profile. First source in a pass starts right
@@ -168,12 +177,15 @@ async def run_once(store_path="ig_results.db", account_override="", *,
                 try:
                     total += await collect_source(engine, store, s, page_size=page_size,
                                               max_pages=max_pages, log=log)
+                    acct_ok = True
                     if _DAY.remaining(acct, budget) <= 0:
                         log(f"  @{acct}: daily budget reached mid-pass — stopping")
                         break
                     continue
                 except LoginRequired as e:
                     log(f"  [{s.label}] session rejected: {type(e).__name__}")
+                    pool_link.note_needs_login(
+                        "ig", acct, f"session rejected on {s.label}: {type(e).__name__}")
                 except Exception as e:
                     log(f"  [{s.label}] error: {type(e).__name__}: {e}")
                     continue
@@ -196,9 +208,15 @@ async def run_once(store_path="ig_results.db", account_override="", *,
                 try:
                     total += await collect_source(engine, store, s, page_size=page_size,
                                               max_pages=max_pages, log=log)
+                    acct_ok = True
                 except Exception as e:
                     log(f"  [{s.label}] still failing after refresh: "
                         f"{type(e).__name__}: {e}")
+
+            # One write per account per pass, not one per post: the column means
+            # "this account was working at this time".
+            if acct_ok:
+                pool_link.record_success("ig", acct)
         log(f"done: {total} new post(s) stored")
         return total
 

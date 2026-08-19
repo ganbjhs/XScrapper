@@ -372,6 +372,37 @@ def clear_stale_locks(profile_dir: Path, log) -> None:
             pass
 
 
+def _proxy_kwargs(url: str) -> dict:
+    """
+    Split a proxy URL into what Playwright actually honours.
+
+    Chromium does NOT read credentials out of `--proxy-server`, so a residential
+    URL of the shape http://user:pass@gateway:port passed whole as `server`
+    authenticates as nobody and the first request comes back 407 — which
+    surfaces as an inscrutable browser-launch or blank-page failure rather than
+    "your proxy password was ignored". Playwright takes them as separate
+    `username` / `password` fields; this hands them over that way.
+
+    A URL with no credentials is passed through untouched.
+    """
+    import urllib.parse as _up
+
+    try:
+        u = _up.urlsplit(url)
+    except Exception:
+        return {"server": url}
+    if not u.username:
+        return {"server": url}
+    hostport = u.hostname or ""
+    if u.port:
+        hostport = f"{hostport}:{u.port}"
+    out = {"server": _up.urlunsplit((u.scheme or "http", hostport, u.path or "", "", "")),
+           "username": _up.unquote(u.username)}
+    if u.password:
+        out["password"] = _up.unquote(u.password)
+    return out
+
+
 async def _launch(pw, acct, headless: bool, log):
     """Launch the persistent context, preferring real Chrome over bundled Chromium."""
     profile_dir = Path(acct.profile_path)
@@ -409,7 +440,7 @@ async def _launch(pw, acct, headless: bool, log):
         kwargs["no_viewport"] = True   # real window size for the human
 
     if acct.proxy_or_none:
-        kwargs["proxy"] = {"server": acct.proxy_or_none}
+        kwargs["proxy"] = _proxy_kwargs(acct.proxy_or_none)
 
     # Tried in order, most faithful first.
     #
