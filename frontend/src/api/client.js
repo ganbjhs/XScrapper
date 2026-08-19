@@ -116,6 +116,15 @@ export const api = {
   poolLogin: (account_id) =>
     request("/api/pool/login", { method: "POST", body: { account_id } }),
   poolTotp: (account_id) => request(`/api/pool/totp${qs({ account_id })}`),
+  // Session import / background sign-in. `user_agent` is the operator's OWN
+  // browser string, sent with a paste on purpose: the cookies were copied from
+  // that browser, and a session that then collects under a different
+  // user-agent is a fingerprint that has never been associated with it.
+  poolSignin: (body) =>
+    request("/api/pool/signin", { method: "POST",
+                                  body: { ...body, user_agent: navigator.userAgent } }),
+  poolSigninStatus: () => request("/api/pool/signin"),
+  poolSigninHelp: () => request("/api/pool/signin/help"),
 
   projects: () => request("/api/projects"),
   createProject: (name) => request("/api/projects", { method: "POST", body: { name } }),

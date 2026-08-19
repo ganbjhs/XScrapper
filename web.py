@@ -2323,6 +2323,181 @@ def _login_capture():
             "detail": "" if active else detail}
 
 
+# ---------------------------------------------------------------------------
+# Session import / background sign-in — the browser-free path (signin.py)
+# ---------------------------------------------------------------------------
+#
+# Runs in its own thread rather than in the request, for one reason: the useful
+# part of a sign-in is not the verdict, it is the running commentary. "Instagram
+# wants a code sent to your email" and "rejected: sessionid expired" are
+# different problems with different fixes, and a request that blocks for thirty
+# seconds and then returns one boolean throws that away. The panel polls
+# /api/pool/signin and shows the lines as they arrive.
+#
+# One at a time, like the browser window above: two concurrent logins for the
+# same account race on the same device sidecar and the same session row.
+
+_SIGNIN = {"thread": None, "account_id": None, "label": "",
+           "started": 0.0, "outcome": None, "lines": []}
+_SIGNIN_LOCK = threading.RLock()
+
+
+def _signin_busy() -> bool:
+    t = _SIGNIN["thread"]
+    return t is not None and t.is_alive()
+
+
+def _ig_label_for(login: str, account_id: int) -> str:
+    """
+    The instagrapi device label for this account.
+
+    REUSE the label an existing ig_accounts.db row already carries. The label
+    is what pins the device fingerprint (ig_session.ensure_device), and
+    Instagram's own checkpoint message asks for "the same saved client
+    settings, device identifiers, and proxy/IP". Minting a new label for an
+    account that already has one would hand it a brand-new handset, which is
+    the exact change that gets a re-login challenged.
+    """
+    try:
+        import ig
+        path = _CFG.root / "ig_accounts.db"
+        if path.exists():
+            with ig.Store(path) as st:
+                for r in st.all():
+                    if (r["username"] or "").lower() == (login or "").lower():
+                        if r["label"]:
+                            return r["label"]
+    except Exception:
+        pass
+    return f"pool_{account_id}"
+
+
+def _signin_start(body):
+    """Kick off one sign-in. Returns immediately; poll _signin_status()."""
+    import signin
+
+    with _SIGNIN_LOCK:
+        if _signin_busy():
+            return {"error": f"A sign-in is already running for "
+                             f"'{_SIGNIN['label']}'. Wait for it to finish."}
+
+        try:
+            aid = int(body.get("account_id"))
+        except (TypeError, ValueError):
+            return {"error": "account_id is required"}
+        mode = (body.get("mode") or "auto").strip()
+        blob = body.get("cookies") or ""
+        user_agent = (body.get("user_agent") or "").strip()
+
+        try:
+            st = _pool_store()
+        except Exception as e:
+            return {"error": f"account pool unavailable: {e}"}
+        try:
+            acct = st.get(aid)
+            proxy = ""
+            password = ""
+            totp = ""
+            try:
+                proxy = st.get_proxy(aid) or ""
+            except Exception:
+                pass
+            if mode == "auto":
+                try:
+                    password = st.get_password(aid) or ""
+                except Exception:
+                    pass
+                try:
+                    totp = st._cipher.decrypt(st._row(aid)["enc_totp"]) if \
+                        st._row(aid)["enc_totp"] else ""
+                except Exception:
+                    totp = ""
+        except KeyError:
+            return {"error": f"no such account: {aid}"}
+        finally:
+            st.close()
+
+        plat, login, label = acct.platform, acct.login, acct.label
+        root = str(_CFG.root)
+
+        # What each platform can actually do without a browser. X and Facebook
+        # have no safe background login at all (see signin.py's docstring), so
+        # 'auto' on those is not a fallback — it is a mistake worth naming.
+        if mode == "auto" and plat != "ig":
+            return {"error": f"{plat.upper()} has no background login. Paste a "
+                             f"session from a browser you are already signed "
+                             f"into — that is both the safest path and the "
+                             f"only one that does not drive a login form from "
+                             f"this server."}
+        if mode not in ("auto", "paste"):
+            return {"error": "mode must be 'auto' or 'paste'"}
+        if mode == "paste" and not str(blob).strip():
+            return {"error": "paste the cookies first"}
+
+        ig_label = _ig_label_for(login, aid) if plat == "ig" else ""
+
+        def work():
+            try:
+                if plat == "ig" and mode == "auto":
+                    o = signin.ig_password(login, password, totp_secret=totp,
+                                           proxy=proxy, label=ig_label, root=root)
+                elif plat == "ig":
+                    o = signin.ig_cookie(blob, proxy=proxy, label=ig_label, root=root)
+                elif plat == "x":
+                    cfg, _row = _pool_account_cfg(aid)
+                    o = signin.x_cookie(blob, screen_name=login,
+                                        user_agent=user_agent, acct_cfg=cfg,
+                                        db_accounts=str(_CFG.db_accounts))
+                elif plat == "fb":
+                    o = signin.fb_cookie(blob, root=root)
+                else:
+                    o = signin.Outcome(detail=f"no sign-in path for {plat}")
+            except Exception as e:
+                import traceback
+                traceback.print_exc()
+                o = signin.Outcome(detail=f"{type(e).__name__}: {e}")
+            _SIGNIN["outcome"] = o
+            _SIGNIN["lines"] = list(o.lines)
+            # The card is the thing the operator reads. Stamp it either way.
+            _pool_after_capture(aid, o.ok, o.detail)
+            try:
+                import activity_log
+                activity_log.log_event(
+                    {"ig": "instagram", "fb": "facebook"}.get(plat, "x"),
+                    f"[signin] {label}: "
+                    + ("signed in as @" + o.identity if o.ok else "FAILED — " + o.detail),
+                    db=str(_CFG.root / "activity.db"))
+            except Exception:
+                pass
+
+        _SIGNIN.update({"account_id": aid, "label": label, "outcome": None,
+                        "lines": [], "started": time.time()})
+        t = threading.Thread(target=work, name=f"signin-{aid}", daemon=True)
+        _SIGNIN["thread"] = t
+        t.start()
+        return {"ok": True, "account_id": aid, "label": label, "mode": mode,
+                "platform": plat}
+
+
+def _signin_status():
+    o = _SIGNIN["outcome"]
+    running = _signin_busy()
+    out = {"running": running, "account_id": _SIGNIN["account_id"],
+           "label": _SIGNIN["label"],
+           "lines": list(o.lines) if o else list(_SIGNIN["lines"]),
+           "elapsed_s": round(time.time() - _SIGNIN["started"], 1)
+                        if _SIGNIN["started"] else 0}
+    if o is not None and not running:
+        out["result"] = o.as_json()
+    return out
+
+
+def _signin_help():
+    """Which cookies each platform needs, and how to copy them."""
+    import signin
+    return {"platforms": signin.PLATFORM_HELP}
+
+
 def _login_cancel():
     _login_drop()
     return {"ok": True}
@@ -3512,6 +3687,10 @@ class Handler(BaseHTTPRequestHandler):
                 return self._send(200, _fb_status(q))
             if u.path == "/api/fb/posts":
                 return self._send(200, _fb_posts(q))
+            if u.path == "/api/pool/signin":
+                return self._send(200, _signin_status())
+            if u.path == "/api/pool/signin/help":
+                return self._send(200, _signin_help())
             if u.path == "/api/pool" or u.path.startswith("/api/pool/"):
                 # Account Control Panel (store_accounts). Dashboard-only: it is
                 # behind _require_auth above, and /api/pool* is NOT in
@@ -3653,6 +3832,10 @@ class Handler(BaseHTTPRequestHandler):
                     query, body.get("tab") or "Latest",
                     body.get("pages") or 1, bool(body.get("ack")),
                     str(body.get("list_id") or "")))
+            if u.path == "/api/pool/signin":
+                # Not accounts_api's job: that module is a thin validator over
+                # the store and must not open sockets or spawn threads.
+                return self._send(200, _signin_start(body))
             if u.path == "/api/pool" or u.path.startswith("/api/pool/"):
                 import accounts_api
                 return self._send(200, accounts_api.handle(

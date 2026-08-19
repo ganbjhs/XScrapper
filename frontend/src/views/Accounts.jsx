@@ -9,7 +9,7 @@
 //      the existing X / Instagram status endpoints so nothing you already run
 //      ever disappears from this page. Each has an "Add to pool" button to
 //      bring it under management.
-import React, { useState } from "react";
+import React, { useEffect, useState } from "react";
 import { api, fmtAgo, useApi } from "../api/client.js";
 import { PageHead } from "../App.jsx";
 import { Empty, ErrorState, Loading, Modal } from "../components/ui.jsx";
@@ -186,6 +186,146 @@ function CodesModal({ a, onDone, onClose }) {
 }
 
 // ---------------------------------------------------------------------------
+// Sign in — one path for all three platforms, and it is not a browser
+// ---------------------------------------------------------------------------
+//
+// Two mechanisms, ranked by how much suspicion they create (signin.py has the
+// full reasoning):
+//
+//   IMPORT     paste the cookies from a browser you are already signed into.
+//              No login event ever reaches the platform from this server — no
+//              form to fingerprint, no captcha to lose. Works on all three.
+//   BACKGROUND Instagram only, via instagrapi's app API. Not a browser, which
+//              is why it works where the streamed window never did. Costs one
+//              real login, but it is the only path that can re-login by itself
+//              when a session dies.
+//
+// The server runs it in a thread and streams its commentary back, because
+// "Instagram wants a code sent to your email" and "that cookie expired" are
+// different problems and a lone red X cannot tell them apart.
+
+const NEEDS_HINT = {
+  proxy: "Add the residential proxy on this card first (Edit → proxy URL).",
+  totp: "Add the account's TOTP secret on this card (Edit → TOTP secret), or paste a session instead.",
+  paste: "Paste a session from a browser you are already signed into.",
+};
+
+function SignInModal({ a, onDone, onClose }) {
+  const [help, setHelp] = useState(null);
+  const [blob, setBlob] = useState("");
+  const [busy, setBusy] = useState(false);
+  const [lines, setLines] = useState([]);
+  const [result, setResult] = useState(null);
+  const [err, setErr] = useState("");
+
+  const canBackground = a.platform === "ig";
+  const h = help?.[a.platform];
+
+  useEffect(() => {
+    api.poolSigninHelp().then((r) => setHelp(r.platforms)).catch(() => {});
+  }, []);
+
+  // Poll while it runs. The server keeps one sign-in at a time, so there is
+  // exactly one job to watch and no id to track.
+  const watch = () => {
+    const tick = async () => {
+      try {
+        const r = await api.poolSigninStatus();
+        setLines(r.lines || []);
+        if (!r.running) {
+          setBusy(false);
+          if (r.result) setResult(r.result);
+          onDone();
+          return;
+        }
+      } catch (e) { setErr(String(e.message || e)); setBusy(false); return; }
+      setTimeout(tick, 1200);
+    };
+    setTimeout(tick, 700);
+  };
+
+  const start = async (mode) => {
+    setBusy(true); setErr(""); setResult(null); setLines([]);
+    try {
+      await api.poolSignin({ account_id: a.account_id, mode, cookies: blob });
+      watch();
+    } catch (e) { setErr(String(e.message || e)); setBusy(false); }
+  };
+
+  return (
+    <Modal title={`Sign in — ${a.label}`} onClose={onClose}
+           sub="Pasting a session from your own browser is the safest path: no login ever happens from this server.">
+      {canBackground && (
+        <div className="field">
+          <label>Background sign-in (no browser)</label>
+          <div style={{ color: "var(--ink-3)", fontSize: 12.5, lineHeight: 1.55, marginBottom: 8 }}>
+            Uses the password and TOTP stored on this card, through this
+            account’s residential proxy, over Instagram’s app API. Costs one
+            real login — but it is the only path that can refresh itself later
+            without you.
+          </div>
+          <button className="btn btn-brand" disabled={busy}
+                  onClick={() => start("auto")}>
+            {busy ? "Signing in…" : "Sign in in the background"}
+          </button>
+        </div>
+      )}
+
+      <div className="field">
+        <label>{canBackground ? "…or paste a session" : "Paste a session"}</label>
+        {h && (
+          <div style={{ color: "var(--ink-3)", fontSize: 12.5, lineHeight: 1.55, marginBottom: 8 }}>
+            {h.how}
+            <div style={{ marginTop: 6 }}>
+              Needs <b>{h.required.join(" + ")}</b>. Paste everything — {" "}
+              <b>{h.valuable.slice(0, 2).join(", ")}</b> and the rest are the
+              device tokens that keep this looking like a machine{" "}
+              {h.where} already knows.
+            </div>
+          </div>
+        )}
+        <textarea rows="5" value={blob} onChange={(e) => setBlob(e.target.value)}
+                  placeholder={'paste the cookies — "Copy all as JSON", the cookie: header line, or name=value lines'} />
+        <button className="btn btn-brand" style={{ marginTop: 8 }}
+                disabled={busy || !blob.trim()} onClick={() => start("paste")}>
+          {busy ? "Checking…" : "Import this session"}
+        </button>
+      </div>
+
+      {lines.length > 0 && (
+        <div className="field">
+          <label>Progress</label>
+          <div style={{ fontFamily: "ui-monospace, monospace", fontSize: 12,
+                        lineHeight: 1.6, color: "var(--ink-2)",
+                        maxHeight: 160, overflowY: "auto",
+                        border: "1px solid var(--line)", borderRadius: 8, padding: "8px 10px" }}>
+            {lines.map((l, i) => <div key={i}>{l}</div>)}
+          </div>
+        </div>
+      )}
+
+      {result && (
+        <div className={result.ok ? "banner-ok" : "banner-crit"}
+             style={{ marginTop: 4 }}>
+          <b>{result.ok ? "Signed in." : "Not signed in."}</b> {result.detail}
+          {!result.ok && NEEDS_HINT[result.needs] && (
+            <div style={{ marginTop: 6 }}>{NEEDS_HINT[result.needs]}</div>
+          )}
+        </div>
+      )}
+      {err && <div className="err">{err}</div>}
+
+      <div className="row">
+        <button className="btn btn-ghost" onClick={onClose}>
+          {result?.ok ? "Done" : "Close"}
+        </button>
+      </div>
+    </Modal>
+  );
+}
+
+
+// ---------------------------------------------------------------------------
 // Session state — ALWAYS rendered, on every card
 // ---------------------------------------------------------------------------
 //
@@ -276,7 +416,6 @@ function AccountCard({ a, live, onChanged }) {
     act(() => api.poolRemove(a.account_id), "removed");
   };
   const promote = () => act(() => api.poolPromote(a.account_id), "promoted to active");
-  const login = () => act(() => api.poolLogin(a.account_id));
   const quarantine = () => act(() => api.poolStatus(a.account_id, "quarantined"), "quarantined");
   const revive = () => act(() => api.poolStatus(a.account_id, "backup"), "returned to pool");
   const showCode = async () => {
@@ -309,7 +448,7 @@ function AccountCard({ a, live, onChanged }) {
 
       <div className="cactions">
         {a.status !== "active" && <button onClick={promote}>Promote</button>}
-        <button onClick={login}>Login now</button>
+        <button onClick={() => setModal("signin")}>Sign in</button>
         <button onClick={showCode}>Show TOTP</button>
         <button onClick={() => setModal("edit")}>Edit</button>
         <button onClick={() => setModal("codes")}>Codes ({a.backup_codes_left})</button>
@@ -319,6 +458,7 @@ function AccountCard({ a, live, onChanged }) {
         <button onClick={remove} style={{ color: "var(--critical)" }}>Remove</button>
       </div>
 
+      {modal === "signin" && <SignInModal a={a} onDone={onChanged} onClose={() => setModal(null)} />}
       {modal === "edit" && <EditModal a={a} onDone={onChanged} onClose={() => setModal(null)} />}
       {modal === "codes" && <CodesModal a={a} onDone={onChanged} onClose={() => setModal(null)} />}
     </div>

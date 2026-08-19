@@ -157,6 +157,21 @@ header.top .grow { flex: 1; }
   line-height: 1.55;
 }
 .banner-crit b { color: var(--critical); }
+
+/* The success twin of .banner-crit. A sign-in that worked deserves the same
+   weight of statement as one that failed — an outcome the operator has to
+   scroll to find reads as "nothing happened". */
+.banner-ok {
+  border: 1px solid color-mix(in srgb, var(--good) 45%, transparent);
+  border-left: 4px solid var(--good);
+  background: color-mix(in srgb, var(--good) 7%, var(--surface));
+  border-radius: 12px;
+  padding: 13px 16px;
+  margin-bottom: 16px;
+  font-size: 13.5px;
+  line-height: 1.55;
+}
+.banner-ok b { color: var(--good-text); }
 .banner-crit code { background: var(--brand-softer); border: 1px solid var(--ring); border-radius: 6px; padding: 1px 7px; }
 
 .stats {

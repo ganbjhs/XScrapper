@@ -99,6 +99,47 @@ precision past 2^53; snowflake ids are well past it).
 
 ## 6. Per-platform hard rules
 
+**Sign-in is IMPORT-FIRST, on every platform, and it is never a browser.**
+Instagram reached this wall first — "the streamed-browser IG login is dead" —
+but the reason generalises: the login form is the most-scrutinised page these
+sites have, and it is where every automation signal is checked at once (the
+WebDriver flag, CDP artefacts, headless quirks, a profile with no history, a
+datacenter IP that has never seen the account). Solving the captcha cannot
+help, because the distrust is about the browser, not the answer. So the server
+does not log in. `signin.py` has exactly two mechanisms, in this order:
+
+1. **Import** (all three platforms). The operator pastes cookies from a
+   browser they are already signed into, on their own IP, on a device the
+   platform has trusted for months. No login event reaches the platform from
+   this server at all — there is nothing to fingerprint and no captcha to
+   lose. `parse_cookies` accepts whatever DevTools produced, because a parser
+   that only takes one shape sends the operator back to the browser login.
+2. **Background login** (Instagram only). instagrapi's app API with a pinned
+   device — not a browser, which is why it works where the window never did.
+   It costs one real login event, so it is second, but it is the only path
+   that can re-login by itself when a session dies. X has none (twscrape's
+   HTTP password login is unusable for the four reasons in `auth.py`'s
+   docstring); Facebook's only non-cookie path is a headless browser at the
+   login form, i.e. the thing this rule forbids.
+
+**Carry the WHOLE cookie jar, and the operator's real user-agent.** `kdt` (X)
+and `datr` (Facebook) are device-trust tokens — the browser saying "this is
+the machine you already know". Importing only the two strictly-required
+cookies throws that away and turns a trusted device into a new one. An empty
+or `@`-prefixed user-agent makes twscrape invent a RANDOM one seeded by the
+username (`http.py:25-33`), a fingerprint never associated with those cookies;
+the panel sends `navigator.userAgent` with every paste for exactly this reason.
+
+**One IP per session, consistently — a wrong IP beats two IPs.** An imported
+cookie was minted on the operator's home IP and is then used from the server:
+a real signal. Instagram's answer is its residential proxy, and both IG paths
+REFUSE to run without one rather than fall back to the server IP. X and
+Facebook run on the stable server IP (proxy bandwidth is the constraint) and
+are mitigated by cookie completeness instead. Do NOT "fix" that by logging in
+through a residential proxy and then collecting from the server IP — hopping
+exits mid-session is worse than a single unfamiliar one.
+
+
 **X (Twitter).** List watchlists poll ~10× faster than query watchlists (500 vs
 50 requests / 15 min) — big permanent watchlists belong on real X Lists. One
 long-lived asyncio loop for the whole process (twscrape's module lock binds to
@@ -358,6 +399,13 @@ updated, never deleted (the pre-commit hook blocks the deletion).
   checkpoint quarantines. This works with no `ACCOUNTS_SECRET_KEY` in the
   collector's environment (the systemd units set no `EnvironmentFile`), so the
   lookup reads raw columns and never decrypts.
+- One sign-in path for all three platforms (`signin.py`, `/api/pool/signin`):
+  paste-a-session on every card, plus background login on Instagram. It runs
+  in a thread and streams its commentary back, because "Instagram wants a code
+  sent to your email" and "that cookie expired" are different problems and one
+  red X cannot tell them apart. The Instagram device label is REUSED from any
+  existing `ig_accounts.db` row — minting a new label hands the account a new
+  handset, which is what gets a re-login challenged.
 - The streamed sign-in window (`/api/login/*`) is offered for **X only** —
   the panel must never present it for Instagram (6: the IG streamed-browser
   login is dead, captcha loop; `ig_login.py` / `ig_import.py` are the paths).
