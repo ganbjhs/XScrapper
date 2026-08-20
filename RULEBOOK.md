@@ -170,6 +170,23 @@ precision past 2^53; snowflake ids are well past it).
   can be re-sent as often as the operator likes. Without this the honest advice
   for a gap would have been "compute the exact untouched window yourself",
   which nobody can do from the dashboard.
+- **"Delivered" and "landed in the sheet" are different claims — surface the
+  script's receipt.** The Apps Script replies with `appended`/`skipped` and the
+  sender used to discard them, so a backfill of 120 duplicates read as
+  "✓ Sent 120" while the sheet visibly did not change — indistinguishable,
+  from the dashboard, from rows landing in the wrong spreadsheet entirely.
+  `sheets.deliver(..., info=)` now carries the reply through and the backfill
+  result states what was written and what was skipped, and to which tab. The
+  general rule: when a transport may decline rows ON PURPOSE (dedup), its
+  receipt must say so, or every deliberate decline reads as data loss.
+- **A project-scoped page fetches nothing until the project id is known.**
+  `/api/delivery` without `?project` answers with EVERY project's targets —
+  the right shape for the nav badge, the wrong one to paint a project page
+  from. The Delivery view used to fire its first request while the projects
+  list was still loading, so every reload flashed other projects' data until
+  the refetch landed. A scoped view holds its request until `pid` exists
+  (`Delivery.jsx`); an unscoped call from a scoped page is a bug even when a
+  later refetch papers over it.
 - **A sheet has two routes in, and the credential-free one is the default.**
   Google requires a credential for every write, so `sheet_mode='script'` puts
   the receiver INSIDE the sheet (an Apps Script web app running as its owner)

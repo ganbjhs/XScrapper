@@ -1932,8 +1932,23 @@ def _delivery_backfill(body):
             if kind == "sheet":
                 # One write for the whole window: all of it lands or none of
                 # it does, so a half-written history is not a state that exists.
-                ok_, err = await _sheets.deliver(client, sheet_target, rows)
-                return {"sent": len(rows)} if ok_ else {"sent": 0, "error": err}
+                # `info` carries what the script DID with the batch — "sent"
+                # alone cannot distinguish "120 new rows" from "120 duplicates
+                # skipped", and that distinction is exactly what an operator
+                # staring at an unchanged sheet needs to see.
+                info: dict = {}
+                ok_, err = await _sheets.deliver(client, sheet_target, rows,
+                                                 info=info)
+                if not ok_:
+                    return {"sent": 0, "error": err}
+                out = {"sent": len(rows)}
+                if "appended" in info:
+                    out["note"] = (
+                        f"the sheet's script wrote {info['appended']} new "
+                        f"row{'s' if info['appended'] != 1 else ''} to tab "
+                        f"“{info.get('tab') or 'Sheet1'}” and skipped "
+                        f"{info.get('skipped') or 0} already there")
+                return out
             for i, msg in enumerate(wh.tg_format(rows)):
                 if i:
                     await asyncio.sleep(wh.TG_GAP_S)

@@ -512,8 +512,11 @@ function TargetPanel({ t, reload }) {
 export default function Delivery({ onMenu }) {
   const { project } = useProject();
   const pid = project?.project_id;
+  // Never fetch before the project is known: /api/delivery WITHOUT ?project
+  // returns every project's targets, so the first paint after a reload would
+  // flash another project's data until the projects list arrives.
   const { data, error, loading, reload } = useApi(
-    () => api.delivery(pid), [pid], { every: 10_000 });
+    () => (pid ? api.delivery(pid) : Promise.resolve(null)), [pid], { every: 10_000 });
   const [adding, setAdding] = useState(false);
 
   const targets = data?.targets || [];

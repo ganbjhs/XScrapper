@@ -620,9 +620,14 @@ def _script_hint(rep, body_text: str) -> str:
 
 
 async def via_script(client, exec_url: str, token: str, tab: str,
-                     rows: list) -> tuple[bool, str]:
+                     rows: list, info: dict | None = None) -> tuple[bool, str]:
     """
     Hand a batch to the sheet's own script. (ok, error). Never raises.
+
+    `info`, when given, receives what the script actually did with the batch —
+    appended / skipped / tab from its reply. "Delivered" and "landed in the
+    sheet" are different claims (the script drops duplicate links on purpose),
+    and without this the difference is invisible from our side.
 
     follow_redirects is forced ON for this ONE call. The delivery loop's
     client is built with follow_redirects=False on purpose — a webhook
@@ -651,6 +656,10 @@ async def via_script(client, exec_url: str, token: str, tab: str,
     if not isinstance(data, dict):
         return False, _script_hint(rep, text)
     if data.get("ok"):
+        if isinstance(info, dict):
+            for k in ("appended", "skipped", "tab"):
+                if k in data:
+                    info[k] = data[k]
         return True, ""
     err = str(data.get("error") or "").strip()
     if err == "bad token":
@@ -694,17 +703,19 @@ def mode_of(value) -> str:
     return MODE_API if str(value or "").strip() == MODE_API else MODE_SCRIPT
 
 
-async def deliver(client, target, rows: list) -> tuple[bool, str]:
+async def deliver(client, target, rows: list,
+                  info: dict | None = None) -> tuple[bool, str]:
     """
     One batch to one sheet target, whichever way it is set up. (ok, error).
 
     `target` is anything carrying sheet_mode / sheet_id / sheet_tab / url /
     token — in practice webhook.DbTarget, which is also what carries the
     cursor. Both branches send rows built by the same sheet_rows(), so the
-    mode is invisible in the result.
+    mode is invisible in the result. `info` (script mode only) receives the
+    script's appended/skipped counts — see via_script.
     """
     tab = getattr(target, "sheet_tab", "") or "Sheet1"
     if mode_of(getattr(target, "sheet_mode", "")) == MODE_API:
         return await via_api(client, getattr(target, "sheet_id", ""), tab, rows)
     return await via_script(client, getattr(target, "url", ""),
-                            getattr(target, "token", ""), tab, rows)
+                            getattr(target, "token", ""), tab, rows, info=info)
