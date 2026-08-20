@@ -149,6 +149,16 @@ export const api = {
     request("/api/watchlists/depth", { method: "POST", body: { watchlist_id, pages } }),
   watchlistBackfill: (watchlist_id, pages) =>
     request("/api/watchlists/backfill", { method: "POST", body: { watchlist_id, pages } }),
+  // The standing backwards sweep: on/off plus its cadence. Separate call from
+  // the one-shot grant above because they are different promises — a quantity
+  // versus a rhythm — and collapsing them into one argument made the caller
+  // guess which it had asked for.
+  watchlistBackfillAuto: (watchlist_id, auto, every_s) =>
+    request("/api/watchlists/backfill",
+            { method: "POST", body: { watchlist_id, auto, every_s } }),
+  watchlistFetchNow: (watchlist_id, ack) =>
+    request("/api/watchlists/fetch-now",
+            { method: "POST", body: { watchlist_id, ack: !!ack } }),
 
   streamSettings: (body) => request("/api/stream/settings", { method: "POST", body }),
 

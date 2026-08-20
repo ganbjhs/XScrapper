@@ -899,7 +899,20 @@ class Store:
                               "backfill_cursor": "TEXT",
                               "backfill_walked": "INTEGER NOT NULL DEFAULT 0",
                               "backfill_got": "INTEGER NOT NULL DEFAULT 0",
-                              "backfill_done": "INTEGER NOT NULL DEFAULT 0"}}
+                              "backfill_done": "INTEGER NOT NULL DEFAULT 0",
+
+                              # A grant is a one-shot: spend N pages, go idle,
+                              # wait to be asked again. That is the wrong shape
+                              # for an archive you simply want emptied -- it
+                              # makes the operator the scheduler, clicking every
+                              # few minutes to keep a background job alive.
+                              # `backfill_auto` is the standing version: dig
+                              # every `backfill_every_s` until X runs out, then
+                              # set backfill_done and stop on its own. It is the
+                              # mirror of the forward poller's interval, and it
+                              # ends by itself, so it needs no minding.
+                              "backfill_auto": "INTEGER NOT NULL DEFAULT 0",
+                              "backfill_every_s": "REAL"}}
         added = []
         for table, cols in wanted.items():
             have = {r["name"] for r in self.db.execute(f"PRAGMA table_info({table})")}
@@ -1214,7 +1227,7 @@ class Store:
                 "SELECT s.stream_id, s.label, s.paused, s.min_interval_s, "
                 "       s.max_interval_s, s.max_pages_per_poll, "
                 "       s.backfill_pages, s.backfill_walked, s.backfill_got, "
-                "       s.backfill_done, "
+                "       s.backfill_done, s.backfill_auto, s.backfill_every_s, "
                 "       COUNT(h.tweet_id) AS tweets "
                 "FROM streams s LEFT JOIN tweet_hits h USING(stream_id) "
                 "WHERE s.label LIKE ? GROUP BY s.stream_id ORDER BY s.label",
@@ -1238,13 +1251,23 @@ class Store:
             # there budget left that has neither been spent nor been declared
             # exhausted? Anything looser ("pages > 0") would keep showing a
             # finished sweep as though it were still working.
+            bf_auto = bool(streams and streams[0]["backfill_auto"])
             d["backfill"] = {
                 "pages": sum(s["backfill_pages"] or 0 for s in streams),
                 "walked": sum(s["backfill_walked"] or 0 for s in streams),
                 "got": sum(s["backfill_got"] or 0 for s in streams),
-                "running": any((s["backfill_pages"] or 0) > (s["backfill_walked"] or 0)
-                               and not s["backfill_done"] for s in streams),
+                # A standing sweep is running whenever it is on and X has not
+                # yet said "no more"; a one-shot grant is running while it has
+                # budget it has not spent. Two different questions, one honest
+                # answer for the panel.
+                "running": any(
+                    (not s["backfill_done"])
+                    and (s["backfill_auto"]
+                         or (s["backfill_pages"] or 0) > (s["backfill_walked"] or 0))
+                    for s in streams),
                 "exhausted": bool(streams) and all(s["backfill_done"] for s in streams),
+                "auto": bf_auto,
+                "every_s": streams[0]["backfill_every_s"] if streams else None,
             }
             try:
                 d["filters"] = json.loads(d.get("filters") or "{}")
@@ -2341,17 +2364,26 @@ class Store:
         """Where a stream's backwards walk has got to. Empty dict if unknown."""
         row = self.db.execute(
             "SELECT backfill_pages, backfill_cursor, backfill_walked, "
-            "       backfill_got, backfill_done "
+            "       backfill_got, backfill_done, backfill_auto, backfill_every_s "
             "FROM streams WHERE stream_id = ?", (int(stream_id),)).fetchone()
         if row is None:
             return {}
+        auto = bool(row["backfill_auto"])
         return {
             "pages": row["backfill_pages"] or 0,
             "cursor": row["backfill_cursor"],
             "walked": row["backfill_walked"] or 0,
             "got": row["backfill_got"] or 0,
             "done": bool(row["backfill_done"]),
-            "remaining": max(0, (row["backfill_pages"] or 0) - (row["backfill_walked"] or 0)),
+            "auto": auto,
+            "every_s": row["backfill_every_s"],
+            # In standing mode the budget is not a number the operator has to
+            # keep topping up -- the sweep runs until X says there is no more.
+            # `remaining` stays meaningful for a one-shot grant so both modes
+            # can share one call site.
+            "remaining": (None if auto else
+                          max(0, (row["backfill_pages"] or 0)
+                              - (row["backfill_walked"] or 0))),
         }
 
     async def save_backfill(self, stream_id: int, *, cursor=None, walked: int = 0,
@@ -2422,6 +2454,70 @@ class Store:
         return {"watchlist_id": int(watchlist_id), "granted_pages": n,
                 "streams": cur.rowcount}
 
+    # The cadences the dashboard offers for a standing sweep. Bounded at both
+    # ends on purpose: faster than 5 minutes and a background dig starts
+    # competing with live polling for the same ~50 requests per 15 minutes,
+    # which is the one thing history must never do (RULEBOOK 3).
+    BACKFILL_EVERY_CHOICES = (300.0, 600.0, 900.0)
+
+    async def set_watchlist_backfill_auto(self, watchlist_id: int, on: bool,
+                                          every_s=None) -> dict:
+        """
+        Switch the standing backwards sweep on or off for a whole watchlist.
+
+        This is the mirror of the forward poller's interval, and the difference
+        from a page grant is the whole point: a grant is a quantity the operator
+        has to keep re-issuing, whereas this is a cadence that runs until the
+        archive is genuinely empty and then stops by itself (`backfill_done`).
+        Nothing to remember, nothing to top up.
+
+        Switching it ON clears `backfill_done` for the same reason a grant does:
+        the flag means "X had no more results the last time we asked", and an
+        operator turning the sweep back on has usually just widened the query
+        and knows better. One request re-establishes the truth.
+
+        The cursor is never cleared -- not on stop, not on start. It is the
+        resume point, so keeping it is what makes pausing free: the sweep picks
+        up exactly where it left off instead of re-walking, and re-paying for,
+        everything it already has.
+        """
+        w = self.db.execute("SELECT 1 FROM watchlists WHERE watchlist_id = ?",
+                            (int(watchlist_id),)).fetchone()
+        if not w:
+            return {"error": f"no watchlist {watchlist_id}"}
+        like = f"wl:{int(watchlist_id)}:%"
+
+        if not on:
+            cur = self.db.execute(
+                "UPDATE streams SET backfill_auto = 0 WHERE label LIKE ?", (like,))
+            return {"watchlist_id": int(watchlist_id), "auto": False,
+                    "streams": cur.rowcount}
+
+        every = None
+        if every_s not in (None, "", 0, "0"):
+            try:
+                every = float(every_s)
+            except (TypeError, ValueError):
+                return {"error": "every_s must be a number of seconds"}
+            if every not in self.BACKFILL_EVERY_CHOICES:
+                allowed = ", ".join(f"{int(c) // 60} min"
+                                    for c in self.BACKFILL_EVERY_CHOICES)
+                # Refuse, never clamp (RULEBOOK 3): a silent trim to 5 minutes
+                # would have the digger running four times more often than the
+                # operator asked, against a shared rate-limit budget.
+                return {"error": f"a standing sweep runs every {allowed} — "
+                                 f"{int(every) // 60} min is not one of them"}
+
+        cur = self.db.execute(
+            "UPDATE streams SET backfill_auto = 1, backfill_done = 0, "
+            "backfill_every_s = COALESCE(?, backfill_every_s) "
+            "WHERE label LIKE ?", (every, like))
+        if not cur.rowcount:
+            return {"error": "this watchlist has no compiled streams yet — "
+                             "add a keyword or handle first"}
+        return {"watchlist_id": int(watchlist_id), "auto": True,
+                "every_s": every, "streams": cur.rowcount}
+
     def streams_with_backfill(self) -> list:
         """
         Labels with unspent, unexhausted backfill budget.
@@ -2433,8 +2529,8 @@ class Store:
         try:
             return [r["label"] for r in self.db.execute(
                 "SELECT label FROM streams "
-                "WHERE backfill_done = 0 AND backfill_pages > backfill_walked "
-                "AND paused = 0")]
+                "WHERE backfill_done = 0 AND paused = 0 "
+                "AND (backfill_auto = 1 OR backfill_pages > backfill_walked)")]
         except Exception:
             return []
 

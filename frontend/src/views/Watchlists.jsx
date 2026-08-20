@@ -363,16 +363,19 @@ function XListMembers({ listId }) {
 //     the watermark — an archival query (`until:2025-02-20`), or an account
 //     that has stopped posting. No cadence and no page count helps here; the
 //     poller is doing its job and its job is the wrong shape. Fix: walk
-//     backwards, which is what "fetch older" grants budget for.
+//     backwards on a standing schedule, which is what "dig older" switches on.
+//
+// "Fetch now" sits here too, because the third thing an operator does when a
+// count looks stuck is check whether it is the SCHEDULE that is broken. Making
+// them leave for the Live Feed to answer that turned a one-second question
+// into a navigation.
 //
 // Both are shown together because from the outside the symptom is identical,
 // and an operator who can see both controls can tell which one they have.
 function DepthRow({ w, onChanged }) {
   const [busy, setBusy] = useState(false);
   const [err, setErr] = useState("");
-  const [want, setWant] = useState("50");
   const bf = w.backfill || {};
-  const remaining = Math.max(0, (bf.pages || 0) - (bf.walked || 0));
 
   const run = async (fn) => {
     setBusy(true); setErr("");
@@ -406,55 +409,70 @@ function DepthRow({ w, onChanged }) {
         </select>
       </label>
 
-      {bf.running ? (
-        <>
-          <span className="chip" title="pages of older history still to walk">
-            fetching older — {fmtN(bf.got || 0)} found, {remaining} page
-            {remaining === 1 ? "" : "s"} to go
-          </span>
-          <button className="btn btn-ghost btn-sm" disabled={busy}
-                  onClick={() => run(() => api.watchlistBackfill(w.watchlist_id, 0))}>
-            Stop
-          </button>
-        </>
-      ) : (
-        <>
-          <label className="fpill" style={{ padding: "5px 6px 5px 11px" }}
-                 title={"Walk BACKWARDS through this watchlist's query and "
-                        + "collect posts older than what it already has.\n\n"
-                        + "This is the control for an archival query, or an "
-                        + "account that has stopped posting — cases where "
-                        + "checking more often finds nothing because there is "
-                        + "nothing new to find. It resumes where it left off, "
-                        + "spends a few pages at a time inside the rate limit, "
-                        + "and never disturbs live collection."}>
-            <span>fetch older</span>
-            <select value={want} disabled={busy}
-                    onChange={(e) => setWant(e.target.value)}>
-              <option value="10">10 pages (~200)</option>
-              <option value="25">25 pages (~500)</option>
-              <option value="50">50 pages (~1,000)</option>
-              <option value="150">150 pages (~3,000)</option>
-              <option value="500">500 pages (~10,000)</option>
-            </select>
-          </label>
-          <button className="btn btn-brand btn-sm" disabled={busy || !w.streams.length}
-                  onClick={() => run(() => api.watchlistBackfill(w.watchlist_id, want))}>
-            {busy ? "…" : bf.got ? "Fetch more" : "Fetch older posts"}
-          </button>
-        </>
+      {/* The forward twin. Fetching current posts used to mean leaving this
+          page and refreshing the Live Feed, which is why "it only fetched
+          once" read as a bug in the schedule rather than as a missing button.
+          One page per stream, same guard as everywhere else. */}
+      <button className="btn btn-ghost btn-sm" disabled={busy || !w.streams.length}
+              title={"Check for NEW posts right now, without waiting for the "
+                     + "next scheduled check. One page per stream."}
+              onClick={() => run(async () => {
+                const r = await api.watchlistFetchNow(w.watchlist_id);
+                if (r && r.needs_ack
+                    && confirm("The rate-limit guard has warnings. Fetch anyway?"))
+                  return api.watchlistFetchNow(w.watchlist_id, true);
+                return r;
+              })}>
+        {busy ? "…" : "Fetch now"}
+      </button>
+
+      {/* The standing backwards sweep.
+          A page grant was the wrong shape: it made the operator the scheduler,
+          returning every few minutes to top it up so a background job stayed
+          alive. This is a cadence instead — the exact mirror of the check
+          interval above it, running the other way — and it retires itself when
+          X runs out, so there is nothing to remember and nothing to stop. */}
+      <label className="fpill" style={{ padding: "5px 6px 5px 11px" }}
+             title={"Keep walking BACKWARDS through this watchlist's query on a "
+                    + "schedule, collecting posts older than what it already "
+                    + "has, until there is no more history to find.\n\n"
+                    + "This is the control for an archival query "
+                    + "(until:2025-02-20) or an account that has stopped "
+                    + "posting — cases where checking more often finds nothing "
+                    + "because there is nothing new to find. It resumes where "
+                    + "it left off across restarts, takes the smaller share of "
+                    + "the rate limit so live collection always wins, and "
+                    + "stops by itself when the archive is empty."}>
+        <span>dig older</span>
+        <select value={bf.auto ? String(Math.round(bf.every_s || 300)) : ""}
+                disabled={busy || !w.streams.length}
+                onChange={(e) => run(() => e.target.value
+                  ? api.watchlistBackfillAuto(w.watchlist_id, true, e.target.value)
+                  : api.watchlistBackfillAuto(w.watchlist_id, false))}>
+          <option value="">off</option>
+          <option value="300">every 5 min</option>
+          <option value="600">every 10 min</option>
+          <option value="900">every 15 min</option>
+        </select>
+      </label>
+
+      {bf.auto && !bf.exhausted && (
+        <span className="chip" title="the backwards sweep is running in the background">
+          digging older — {fmtN(bf.got || 0)} collected so far
+        </span>
       )}
 
       {/* Exhausted is worth saying out loud. Without it, a sweep that finished
           because X genuinely has no more results is indistinguishable from one
-          that quietly failed, and the natural response — grant more budget —
-          spends requests to be told the same thing again. */}
-      {!bf.running && bf.exhausted && bf.walked > 0 && (
+          that quietly failed, and the natural response — switch it on again —
+          spends requests to be told the same thing twice. */}
+      {bf.exhausted && bf.walked > 0 && (
         <span className="chip" title="X returned no further results for this query">
           history complete — {fmtN(bf.got || 0)} older post
           {bf.got === 1 ? "" : "s"} collected
         </span>
       )}
+
       {err && <span style={{ color: "var(--critical)", fontSize: 12.5 }}>{err}</span>}
     </div>
   );

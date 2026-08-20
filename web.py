@@ -1638,6 +1638,27 @@ def _watchlist_backfill(body):
     except (TypeError, ValueError):
         return {"error": "watchlist_id must be a number"}
 
+    # Two modes share this endpoint because they are the same act at different
+    # durations: "walk N pages once" and "keep walking until there is no more".
+    # `auto` present in the body selects the standing sweep.
+    if "auto" in body:
+        on = bool(body.get("auto"))
+        if on:
+            try:
+                import guard
+                import collector as _c
+                v = guard.assess(_CFG, action="fetch",
+                                 cost=_c.BACKFILL_PAGES_PER_PASS, queue="search")
+                if v.blocked:
+                    b = v.blocks[0]
+                    return {"error": f"{b.title} — {b.remedy}", "blocked": True,
+                            "guard": v.to_json()}
+            except Exception:
+                pass
+        return _with_store(
+            lambda st: st.set_watchlist_backfill_auto(
+                wid, on, body.get("every_s")))
+
     pages = body.get("pages")
     stopping = pages in (None, "", 0, "0")
 
@@ -1655,6 +1676,79 @@ def _watchlist_backfill(body):
             pass    # a guard that cannot be consulted must not block collection
 
     return _with_store(lambda st: st.set_watchlist_backfill(wid, pages))
+
+
+def _watchlist_fetch_now(body):
+    """
+    Poll THIS watchlist's streams once, right now — the forward twin of
+    "fetch older".
+
+    /api/project/fetch already did this for a whole project, but it lives on
+    the Live Feed, which is why fetching current posts meant leaving the
+    Watchlists page and refreshing something else. The two directions belong on
+    the same card: one button for "what is new", one for "what is older", both
+    reporting what they cost.
+
+    Same guard, same lock, same one-page-per-stream ceiling as the project
+    Refresh, so putting it here adds a place to click and not a way to spend
+    more than the guard would have allowed.
+    """
+    import auth
+    import guard
+    from collector import poll_once
+    from config import StreamCfg
+    from engine import Engine
+
+    try:
+        wid = int(body.get("watchlist_id") or 0)
+    except (TypeError, ValueError):
+        return {"error": "watchlist_id must be a number"}
+    if not wid:
+        return {"error": "which watchlist?"}
+    if not _CFG.db_results.exists():
+        return {"error": "nothing has been collected yet — create a watchlist first"}
+
+    like = f"wl:{wid}:%"
+    with _connect() as con:
+        rows = con.execute(
+            "SELECT * FROM streams WHERE label LIKE ? AND paused = 0 "
+            "AND (query != '' OR list_id IS NOT NULL) "
+            "ORDER BY stream_id LIMIT 8", (like,)).fetchall()
+    if not rows:
+        return {"error": "this watchlist has no live streams — add a keyword "
+                         "or handle first, or un-pause it"}
+
+    v = guard.assess(_CFG, action="fetch", cost=len(rows), queue="search")
+    if v.blocked:
+        return {"error": v.summary(), "blocked": True, "guard": v.to_json()}
+    if v.warnings and not bool(body.get("ack")):
+        return {"error": "Warnings not acknowledged: "
+                         + "; ".join(w.title for w in v.warnings),
+                "blocked": True, "needs_ack": True, "guard": v.to_json()}
+
+    async def run():
+        api = auth.open_api(_CFG.db_accounts)
+        names = await auth.active_usernames(api)
+        if not names:
+            return {"error": "No active X account is signed in — see Accounts & Sessions."}
+        st = store_mod.Store(_CFG.db_results, _CFG.defaults.keep_entry_json)
+        await st.open()
+        try:
+            eng = Engine(api)
+            total_new = total_pages = 0
+            for r in rows:
+                sc = StreamCfg(label=r["label"], query=r["query"] or "",
+                               list_id=r["list_id"] or "", tab=r["tab"] or "Latest")
+                sc.max_pages_per_poll = 1
+                res = await poll_once(eng, st, sc, r["stream_id"])
+                total_new += res.new
+                total_pages += res.pages
+            return {"new": total_new, "streams": len(rows), "pages": total_pages}
+        finally:
+            await st.close()
+
+    with _FETCH_LOCK:
+        return _run(run())
 
 
 def _watchlist_filters(body):
@@ -4016,6 +4110,8 @@ class Handler(BaseHTTPRequestHandler):
                 return self._send(200, _watchlist_interval(body))
             if u.path == "/api/watchlists/depth":
                 return self._send(200, _watchlist_depth(body))
+            if u.path == "/api/watchlists/fetch-now":
+                return self._send(200, _watchlist_fetch_now(body))
             if u.path == "/api/watchlists/backfill":
                 return self._send(200, _watchlist_backfill(body))
             if u.path == "/api/watchlists/remove":

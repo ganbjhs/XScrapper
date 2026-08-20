@@ -80,8 +80,29 @@ precision past 2^53; snowflake ids are well past it).
   `collector.backfill_once` — a separate pass that resumes from a stored cursor,
   spends an operator-granted page budget a few pages at a time, and NEVER moves
   the watermark (the watermark answers "how far forward are we"; an old post
-  must not be allowed to answer it). It is off until granted: `backfill_pages`
-  defaults to 0, so the forward poller's behaviour is unchanged by its existence.
+  must not be allowed to answer it). It is off until switched on, so the
+  forward poller's behaviour is unchanged by its existence.
+- **History is a CADENCE, not a quantity.** The first version of the backwards
+  sweep was a page grant: spend N pages, go idle, wait to be asked again. That
+  makes the operator the scheduler — returning every few minutes to top up a
+  background job so it stays alive — and it is the wrong shape for the ordinary
+  case, which is "empty this archive". `backfill_auto` + `backfill_every_s` is
+  the standing form: it digs on its own interval, needs no budget, and RETIRES
+  ITSELF by setting `backfill_done` when X stops returning results. Anything
+  that runs in the background must be able to end without being told to.
+- **Exhausted and starved are different, and the sweep must not confuse them.**
+  Fewer pages than asked for means X has no more history (`backfill_done`).
+  ZERO pages means no account was free. Treat starvation as exhaustion and an
+  empty pool permanently retires a sweep with history left; treat exhaustion as
+  starvation and the sweep asks a dry query every cycle forever. The test that
+  pins both directions is `run_backfill`.
+- **Both directions belong on the same card.** "Fetch now" (forward) and "dig
+  older" (backwards) answer the two halves of "why is this number not moving",
+  and for a while only the backwards one was on the Watchlists page while the
+  forward one lived on the Live Feed. That is what made a working schedule read
+  as a broken one: the operator refreshed the Live Feed, saw nothing new, and
+  concluded collection had stopped. Controls that diagnose the same symptom go
+  in the same place.
 - **Starvation spends nothing.** Zero pages means no account was free, not that
   the archive ended. A backfill pass that walks zero pages must not decrement
   the operator's budget, advance the cursor, or mark the sweep exhausted —
@@ -100,6 +121,17 @@ precision past 2^53; snowflake ids are well past it).
 
 ## 4. Delivery rules
 
+- **The delivery cursor keys on `collected_ms`, NEVER on `created_ms`.** This is
+  what lets a backfilled post reach its destination at all: a 2024 tweet stored
+  today is AHEAD of the cursor, because the cursor asks "what have we not sent
+  yet", not "what was posted recently". Switching it to posting time would look
+  like an obvious fix for ordering and would silently strand every post the
+  backwards sweep ever collects behind the cursor, undelivered and unreported.
+  Age is filtered separately, in `_wanted`, on `created_ms` — that is the right
+  place for it, and note that a Telegram target with `tg_max_age_h` set WILL
+  drop backfilled posts while the cursor advances past them. Sheet targets set
+  no age filter, which is why "dig older" and a Google Sheet compose without
+  further wiring. Test: `test_backfilled_posts_reach_delivery`.
 - **Delivery is a durable cursor, at-least-once.** The webhook sender walks the
   same composite cursor the feed does, so the dashboard and the sender can never
   disagree about what "new" or "behind" means. A failed delivery leaves the

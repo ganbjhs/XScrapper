@@ -3154,7 +3154,114 @@ async def run_backfill(tmp):
        "an empty account pool spends none of the operator's pages")
     ok(after["cursor"] == before["cursor"], "and does not disturb the resume point")
 
+    print()
+    print("== the standing sweep needs no grant, and retires itself ==")
+    # The grant model made the OPERATOR the scheduler: spend N pages, go idle,
+    # wait to be clicked again. backfill_auto is the cadence version -- the
+    # mirror of the forward poller's interval -- and the thing to prove is that
+    # it runs with no budget at all and still stops when X runs out.
+    store.db.execute(
+        "UPDATE streams SET backfill_pages = backfill_walked, backfill_auto = 1, "
+        "backfill_done = 0 WHERE stream_id = ?", (sid,))
+    state = await store.backfill_state(sid)
+    ok(state["auto"] is True, "the stream reports itself as a standing sweep")
+    ok(state["remaining"] is None,
+       "which has no page budget to run out of (remaining is not a number)")
+
+    auto_eng = ReplayEngine([ids_at(300, 310), ids_at(320, 330)], cursor_end=False)
+    res = await backfill_once(auto_eng, store, arch, sid, max_pages=2)
+    ok(res.stop_reason != STOP_BACKFILL_IDLE,
+       f"a pass runs with zero granted pages (stop={res.stop_reason})")
+    ok(res.new > 0, f"and actually collects older posts ({res.new})")
+
+    # Exhaustion is the ONLY thing that stops it, and it must stick: an auto
+    # sweep that kept asking a dry query would spend a request every cycle
+    # forever, which is the failure the grant model accidentally prevented.
+    # Exhaustion is "X gave us FEWER pages than we asked for", not "X gave us
+    # nothing" -- zero pages is starvation and is proven above to spend nothing.
+    # Getting this distinction wrong in either direction is a real bug: treat
+    # starvation as exhaustion and an empty account pool permanently retires a
+    # sweep that had history left; treat exhaustion as starvation and the sweep
+    # asks a dry query forever.
+    dry = ReplayEngine([ids_at(400, 410)], cursor_end=True)
+    res = await backfill_once(dry, store, arch, sid, max_pages=3)
+    state = await store.backfill_state(sid)
+    ok(state["done"] is True, "X running out of results marks the sweep done")
+    res = await backfill_once(auto_eng, store, arch, sid, max_pages=2)
+    ok(res.stop_reason == STOP_BACKFILL_IDLE,
+       "and a finished sweep costs nothing thereafter, standing or not")
+
+    print()
+    print("== the scheduler picks a standing sweep up without a grant ==")
+    store.db.execute(
+        "UPDATE streams SET backfill_done = 0 WHERE stream_id = ?", (sid,))
+    ok(arch.label in store.streams_with_backfill(),
+       "an auto stream with no unspent pages is still due for a dig")
+    store.db.execute(
+        "UPDATE streams SET backfill_auto = 0 WHERE stream_id = ?", (sid,))
+    ok(arch.label not in store.streams_with_backfill(),
+       "and switching it off takes it out of the scheduler's list")
+
     await store.close()
+
+
+def test_backfilled_posts_reach_delivery(tmp):
+    """
+    An old post collected today must still reach the sheet.
+
+    This is the question the backwards sweep raises for delivery, and the
+    answer is not obvious: normal delivery deliberately starts from NOW, so
+    "we just collected a post from 2024" sounds exactly like the case delivery
+    is designed to skip. It is not, and the reason is that the delivery cursor
+    keys on collected_ms (WHEN WE GOT IT) and never on created_ms (when it was
+    posted). A tweet the digger stores today is therefore AHEAD of the cursor
+    however old it is, and flows out with everything else.
+
+    Worth a test rather than a comment, because the whole feature rests on it:
+    if the cursor ever moved to created_ms as an "obvious" fix for ordering,
+    every backfilled post would land behind it and silently never deliver.
+    """
+    import store as store_mod
+
+    async def go():
+        st = store_mod.Store(pathlib.Path(tmp) / "results.db", False)
+        await st.open()
+        out = {}
+        sid = await st.ensure_stream("archive", "from:someone until:2025-02-20",
+                                     "Latest", True)
+        info = list(st.db.execute("PRAGMA table_info(tweets)"))
+        required = [x[1] for x in info if x[3] and x[4] is None and not x[5]]
+        text_cols = {x[1] for x in info if "TEXT" in (x[2] or "").upper()}
+
+        # A 2024 post, collected right now by the backwards sweep.
+        old_created = 1_700_000_000_000      # Nov 2023
+        now_collected = 1_780_000_000_000    # far ahead of any cursor below
+        for tid, created, collected in ((900, old_created, now_collected),
+                                        (901, now_collected, now_collected + 1)):
+            row = {c: ("" if c in text_cols else 0) for c in required}
+            row.update(tweet_id=tid, created_ms=created, collected_ms=collected,
+                       source="result")
+            st.db.execute(
+                f"INSERT INTO tweets({','.join(row)}) VALUES({','.join('?' * len(row))})",
+                list(row.values()))
+            st.db.execute("INSERT INTO tweet_hits(stream_id, tweet_id, first_seen_ms) "
+                          "VALUES(?,?,?)", (sid, tid, collected))
+
+        # A delivery cursor sitting where live delivery would have left it,
+        # i.e. well after the old post was WRITTEN and well before it was
+        # COLLECTED.
+        cursor_at = old_created + 1_000_000
+        out["due"] = [r["tweet_id"] for r in await st.tweets_after(cursor_at, 0, 50)]
+        await st.close()
+        return out
+
+    r = asyncio.run(go())
+    ok(900 in r["due"],
+       "a 2024 post collected today is still due for delivery — the cursor "
+       "keys on collection, not on posting")
+    ok(r["due"] == sorted(r["due"]),
+       "and it queues in collection order, so the sheet reads in the order it "
+       "was dug up")
 
 
 def test_watchlist_depth_controls(tmp):
@@ -3188,6 +3295,16 @@ def test_watchlist_depth_controls(tmp):
         out["stopped"] = [dict(r) for r in st.db.execute(
             "SELECT backfill_pages, backfill_walked FROM streams WHERE label LIKE ?",
             (f"wl:{wid}:%",))]
+        out["auto_bad"] = await st.set_watchlist_backfill_auto(wid, True, 60)
+        out["auto_on"] = await st.set_watchlist_backfill_auto(wid, True, 300)
+        out["auto_rows"] = [dict(r) for r in st.db.execute(
+            "SELECT backfill_auto, backfill_every_s, backfill_done FROM streams "
+            "WHERE label LIKE ?", (f"wl:{wid}:%",))]
+        out["view_auto"] = (await st.watchlists(pid))[0]
+        out["auto_off"] = await st.set_watchlist_backfill_auto(wid, False)
+        out["off_rows"] = [dict(r) for r in st.db.execute(
+            "SELECT backfill_auto, backfill_cursor FROM streams WHERE label LIKE ?",
+            (f"wl:{wid}:%",))]
         out["view"] = (await st.watchlists(pid))[0]
         await st.close()
         return out
@@ -3214,6 +3331,23 @@ def test_watchlist_depth_controls(tmp):
     ok(r["stop"].get("stopped") is True, "and it can be stopped")
     ok(all(x["backfill_pages"] == x["backfill_walked"] for x in r["stopped"]),
        "which withdraws the unspent remainder")
+
+    print()
+    print("== the standing sweep is a cadence, not a quantity ==")
+    ok("error" in r["auto_bad"],
+       f"an off-menu cadence is refused, not clamped: {r['auto_bad'].get('error','')[:60]}")
+    ok(r["auto_on"].get("auto") is True, "5 min is accepted")
+    ok(all(x["backfill_auto"] == 1 and x["backfill_every_s"] == 300
+           for x in r["auto_rows"]),
+       "and is written to every compiled stream")
+    ok(all(x["backfill_done"] == 0 for x in r["auto_rows"]),
+       "switching it on clears a previous 'no more history' verdict")
+    ok(r["view_auto"]["backfill"]["running"] is True,
+       "a standing sweep reports as running with no pages granted")
+    ok(r["view_auto"]["backfill"]["every_s"] == 300,
+       "and the panel is told which cadence it is on")
+    ok(all(x["backfill_auto"] == 0 for x in r["off_rows"]), "it can be switched off")
+    ok(r["view"]["backfill"]["running"] is False, "which stops it reporting as running")
 
     print()
     print("== the panel is told all of it ==")
@@ -3260,6 +3394,9 @@ def main():
         asyncio.run(run_collector(fresh("collector")))
         test_interval()
         test_pinned_interval()
+
+        section("backfilled posts still reach delivery")
+        test_backfilled_posts_reach_delivery(fresh("bf_delivery"))
 
         section("backfill (walking a query backwards, on a budget)")
         asyncio.run(run_backfill(fresh("backfill")))

@@ -295,7 +295,15 @@ async def backfill_once(engine, store, stream, stream_id, *,
     """
     res = PollResult(stream_label=stream.label)
     state = await store.backfill_state(stream_id)
-    budget = min(int(max_pages), int(state.get("remaining", 0)))
+    # Two ways to be authorised. A one-shot grant spends a page budget and goes
+    # idle; a standing sweep (backfill_auto) has no budget to exhaust and stops
+    # only when X itself runs out, which is what makes it fire-and-forget. Both
+    # answer to `done`, so neither can keep asking a query that has no more
+    # history to give.
+    if state.get("auto"):
+        budget = int(max_pages)
+    else:
+        budget = min(int(max_pages), int(state.get("remaining") or 0))
     if state.get("done") or budget <= 0:
         res.stop_reason = STOP_BACKFILL_IDLE
         return res
@@ -647,6 +655,24 @@ class Collector:
             st["next_ms"] = int((time.time() + max(stream.min_interval_s, 10)) * 1000)
             return PollResult(stream_label=stream.label, stop_reason="paused")
 
+        # A standing sweep digs on the cadence the operator chose in the
+        # dashboard; a one-shot grant runs at the default pace until spent.
+        # Read every pass, so changing the dropdown takes effect on the next
+        # cycle rather than at the next restart -- the same rule the forward
+        # poller's settings follow.
+        base = BACKFILL_GAP_S
+        try:
+            bs = await self.store.backfill_state(sid)
+            if bs.get("auto") and bs.get("every_s"):
+                base = float(bs["every_s"])
+        except Exception:
+            pass
+        if st.get("base") != base:
+            # The operator just changed the cadence (or this is the first pass).
+            # Reset the adaptive gap to it rather than letting a backed-off
+            # value from the old setting quietly outlive the change.
+            st["base"], st["gap"] = base, base
+
         async with self.sem:
             res = await backfill_once(self.engine, self.store, stream, sid, log=self.log)
 
@@ -656,12 +682,18 @@ class Collector:
         # keep asking. An error backs off too: retrying a failing page every
         # minute is how a transient problem turns into a rate-limit ban.
         gap = st["gap"]
+        base = st.get("base", BACKFILL_GAP_S)
+        ceiling = max(BACKFILL_GAP_MAX_S, base * 4)
         if (res.starved or res.error
                 or (res.rl_remaining is not None
                     and res.rl_remaining < BACKFILL_LOW_HEADROOM)):
-            gap = min(BACKFILL_GAP_MAX_S, gap * 2)
+            gap = min(ceiling, gap * 2)
         else:
-            gap = max(BACKFILL_GAP_S, gap * 0.5)
+            # Recovers TOWARDS the operator's cadence, never below it. A
+            # standing sweep set to 15 minutes must not creep to 1 minute just
+            # because the last few passes went well -- the number on the card
+            # is a promise (RULEBOOK 3).
+            gap = max(base, gap * 0.5)
         st["gap"] = gap
         st["next_ms"] = int((time.time() + jittered(gap)) * 1000)
 
