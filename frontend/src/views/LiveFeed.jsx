@@ -208,9 +208,18 @@ export default function LiveFeed({ onMenu }) {
     };
     const out = latest.filter((t) =>
       (flt.source === "all" || t.platform === flt.source) && inWindow(t));
+    // Latest/Oldest order by the post's OWN time, not collection time — a 2024
+    // post collected five minutes ago must not outrank a 2025 post. Facebook
+    // sometimes has no exact post time, so fall back to collected time there.
+    const postTime = (t) => {
+      const c = Date.parse(t.created_at || "");
+      if (!Number.isNaN(c)) return c;
+      const g = Date.parse(t.collected_at || "");
+      return Number.isNaN(g) ? 0 : g;
+    };
     const by = {
-      latest: (a, b) => Date.parse(b.collected_at || 0) - Date.parse(a.collected_at || 0),
-      oldest: (a, b) => Date.parse(a.collected_at || 0) - Date.parse(b.collected_at || 0),
+      latest: (a, b) => postTime(b) - postTime(a),
+      oldest: (a, b) => postTime(a) - postTime(b),
       likes: (a, b) => (b.like_count || 0) - (a.like_count || 0),
       views: (a, b) => (b.view_count || 0) - (a.view_count || 0),
     }[flt.sort];
@@ -379,8 +388,8 @@ export default function LiveFeed({ onMenu }) {
               </button>
             )}
             <span className="right">
-              {{ latest: "Newest first · by collected time",
-                 oldest: "Oldest first · by collected time",
+              {{ latest: "Newest first · by post time",
+                 oldest: "Oldest first · by post time",
                  likes: "Most liked first",
                  views: "Most viewed first" }[flt.sort]}
               {" · "}{DUR_LABEL[flt.dur].toLowerCase()}
