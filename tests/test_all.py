@@ -2928,6 +2928,73 @@ def test_sheets_script(tmp):
        "sheets.deliver routes a script target to the script")
     ok(len(c3.seen) == 1, "in exactly one request")
 
+    print("== the token the form shows must not drift ==")
+    #
+    # The regression this pins: the setup form used to mint a NEW token every
+    # time it was opened. Deploy the script, close the form, reopen it, and it
+    # now showed a different token — silently killing a deployment that was
+    # already correct and making the operator's own .env look wrong.
+    import web
+
+    os.environ.pop("SHEET_TOKEN_MAIN", None)
+    web._pending_sheet_tokens.clear()
+    first = web._sheet_script({"name": ""})
+    ok(first["secret_env"] == "SHEET_TOKEN_MAIN",
+       "an unnamed target gets the default variable name")
+    ok(web._sheet_script({"secret_env": "SHEET_TOKEN_MAIN"})["token"]
+       == first["token"],
+       "reopening BEFORE .env is edited shows the SAME token, not a new one")
+    ok(first["already_set"] is False, "and says the server does not have it yet")
+
+    os.environ["SHEET_TOKEN_MAIN"] = first["token"]
+    again = web._sheet_script({"secret_env": "SHEET_TOKEN_MAIN"})
+    ok(again["token"] == first["token"] and again["already_set"] is True,
+       "once .env holds it, the server's value is what the form shows, forever")
+    ok(f"var TOKEN = '{first['token']}';" in again["code"],
+       "and the script on screen carries exactly that token")
+
+    rotated = web._sheet_script({"secret_env": "SHEET_TOKEN_MAIN", "rotate": True})
+    ok(rotated["token"] != first["token"] and rotated["rotated"] is True,
+       "rotation is the ONLY way to get a new token, and it is explicit")
+    ok(os.getenv("SHEET_TOKEN_MAIN") == first["token"],
+       "rotating does not touch .env — the operator still has to")
+
+    os.environ["SHEET_TOKEN_MAIN"] = first["token"]
+    checked = {}
+
+    class SpyClient:
+        async def post(s, url, **kw):
+            checked["token"] = kw["json"]["token"]
+
+            class R:
+                status_code = 200
+                text = ""
+
+                def json(s2):
+                    return {"ok": True}
+            return R()
+
+        async def __aenter__(s):
+            return s
+
+        async def __aexit__(s, *a):
+            return False
+
+    import httpx as _httpx
+    real_client, real_run, real_loop = _httpx.AsyncClient, web._run, web._LOOP
+    try:
+        _httpx.AsyncClient = lambda *a, **k: SpyClient()
+        web._run = lambda coro, timeout=300: asyncio.new_event_loop().run_until_complete(coro)
+        web._test_sheet({"sheet_mode": "script", "url": EXEC,
+                         "secret_env": "SHEET_TOKEN_MAIN",
+                         "token": rotated["token"]})
+    finally:
+        _httpx.AsyncClient, web._run, web._LOOP = real_client, real_run, real_loop
+    ok(checked.get("token") == first["token"],
+       "Check access tests the token in .env — the one DELIVERY will use — "
+       "never whichever one happens to be on screen")
+    os.environ.pop("SHEET_TOKEN_MAIN", None)
+
 
 def sqlite3_connect(path):
     import sqlite3

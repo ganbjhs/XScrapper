@@ -44,26 +44,41 @@ function AddTargetModal({ pid, serviceAccount, onDone, onClose }) {
   // the server, which is the difference between "set this up now" and "set
   // this up one day".
   const [sheetMode, setSheetMode] = useState("script");
+  // The sheet token's .env variable is its own state, NOT shared with the
+  // webhook secret above — one form, two unrelated credentials.
+  const [sheetEnv, setSheetEnv] = useState("");
   const [script, setScript] = useState(null);
   const [check, setCheck] = useState(null);
   const [checking, setChecking] = useState(false);
   const [err, setErr] = useState("");
 
-  // Mint the token and build the script as soon as the operator asks for a
-  // sheet. Nothing is stored by this — it is a page of text and a random
-  // string until they paste both somewhere.
+  // Ask the server what token this variable should carry.
+  //
+  // It answers with the value ALREADY in .env when there is one, and mints a
+  // new one only when there is not (or when `rotate` is passed). That matters:
+  // an earlier version generated a token per call, so reopening this form
+  // quietly replaced the token of a deployment that was already working, and
+  // made a correct .env look wrong.
+  const loadScript = async (opts = {}) => {
+    try {
+      const r = await api.sheetScript({
+        name, secret_env: sheetEnv, rotate: !!opts.rotate,
+      });
+      if (r.error) return;
+      setScript(r);
+      setCheck(null);
+      if (!sheetEnv) setSheetEnv(r.secret_env);
+    } catch {
+      /* leave the panel as it was */
+    }
+  };
+
   useEffect(() => {
-    if (kind !== "sheet" || sheetMode !== "script" || script) return;
-    let live = true;
-    api.sheetScript({ name })
-      .then((r) => {
-        if (!live || r.error) return;
-        setScript(r);
-        setSecretEnv((v) => v || r.secret_env);
-      })
-      .catch(() => {});
-    return () => { live = false; };
-  }, [kind, sheetMode]);           // eslint-disable-line react-hooks/exhaustive-deps
+    if (kind !== "sheet" || sheetMode !== "script") return undefined;
+    // Debounced: this refires while the variable name is being typed.
+    const t = setTimeout(() => { loadScript(); }, 350);
+    return () => clearTimeout(t);
+  }, [kind, sheetMode, sheetEnv]);  // eslint-disable-line react-hooks/exhaustive-deps
 
   const testSheet = async () => {
     setChecking(true);
@@ -71,7 +86,8 @@ function AddTargetModal({ pid, serviceAccount, onDone, onClose }) {
     try {
       const r = await api.testSheet({
         sheet_mode: sheetMode, sheet_id: sheetUrl, sheet_tab: sheetTab,
-        url, secret_env: secretEnv, token: script?.token,
+        url, secret_env: sheetMode === "script" ? sheetEnv : secretEnv,
+        token: script?.token,
       });
       setCheck(r.error ? `\u2717 ${r.error}`
                        : "\u2713 Connected — the header row is ready");
@@ -86,7 +102,8 @@ function AddTargetModal({ pid, serviceAccount, onDone, onClose }) {
     setErr("");
     try {
       await api.createDeliveryTarget({
-        project: pid, kind, name, url, secret_env: secretEnv, chat_id: chat,
+        project: pid, kind, name, url, chat_id: chat,
+        secret_env: kind === "sheet" ? sheetEnv : secretEnv,
         sheet_id: sheetUrl, sheet_tab: sheetTab, sheet_mode: sheetMode,
       });
       onDone();
@@ -99,7 +116,7 @@ function AddTargetModal({ pid, serviceAccount, onDone, onClose }) {
   const ready = name.trim() && (
     kind === "webhook" ? url.trim() && secretEnv.trim()
       : kind === "telegram" ? chat.trim()
-        : sheetMode === "script" ? url.trim() && secretEnv.trim()
+        : sheetMode === "script" ? url.trim() && sheetEnv.trim()
           : sheetUrl.trim());
 
   return (
@@ -119,7 +136,8 @@ function AddTargetModal({ pid, serviceAccount, onDone, onClose }) {
                placeholder={kind === "webhook" ? "Watch-Tower"
                  : kind === "sheet" ? "Daily posts sheet" : "War-room group"} />
       </div>
-      {kind === "webhook" ? (
+
+      {kind === "webhook" && (
         <>
           <div className="field">
             <label htmlFor="durl">URL</label>
@@ -138,13 +156,17 @@ function AddTargetModal({ pid, serviceAccount, onDone, onClose }) {
             </div>
           </div>
         </>
-      ) : kind === "telegram" ? (
+      )}
+
+      {kind === "telegram" && (
         <div className="field">
           <label htmlFor="dchat">Chat id</label>
           <input id="dchat" value={chat} onChange={(e) => setChat(e.target.value)}
                  placeholder="-1001234567890 or @channel" />
         </div>
-      ) : (
+      )}
+
+      {kind === "sheet" && (
         <>
           <div className="field">
             <label htmlFor="dmode">How the sheet is reached</label>
@@ -170,109 +192,135 @@ function AddTargetModal({ pid, serviceAccount, onDone, onClose }) {
               empty. Posts are appended underneath, newest at the bottom.
             </div>
           </div>
+        </>
+      )}
 
-          {sheetMode === "script" ? (
+      {kind === "sheet" && sheetMode === "script" && (
+        <>
+          <div className="field">
+            <label htmlFor="dsenv">Token — the NAME of the .env variable</label>
+            <input id="dsenv" value={sheetEnv}
+                   onChange={(e) => setSheetEnv(e.target.value.toUpperCase())}
+                   placeholder="SHEET_TOKEN_MAIN" />
+            <div style={{ color: "var(--ink-3)", fontSize: 12, marginTop: 6 }}>
+              The token itself is never stored in the database — only this
+              name, so the value can be rotated without touching a target.
+            </div>
+          </div>
+
+          {script?.already_set ? (
+            <div className="state" style={{ textAlign: "left", marginTop: 4 }}>
+              <b className="st-good">{script.secret_env} is already set on this server</b>
+              The script below carries that same token, so a deployment you have
+              already made is still valid — skip to the web app URL. Paste the
+              script again only if you changed it.
+            </div>
+          ) : (
+            <div className="state" style={{ textAlign: "left", marginTop: 4 }}>
+              <b>{script?.rotated ? "New token generated" : "Three steps, about two minutes"}</b>
+              {script?.rotated
+                ? "The old one stops working the moment you redeploy. Paste the script again, update .env, and restart."
+                : "The script runs inside your own sheet, as you — so there is no Google Cloud project, no key file, and nothing to share."}
+            </div>
+          )}
+
+          {script ? (
             <>
-              <div className="state" style={{ textAlign: "left", marginTop: 4 }}>
-                <b>Three steps, about two minutes</b>
-                The script runs inside your own sheet, as you — so there is no
-                Google Cloud project, no key file, and nothing to share.
-              </div>
-
-              {script ? (
-                <>
-                  <Copyable rows={12} value={script.code}
-                            label="1. In the sheet: Extensions → Apps Script. Replace everything with this, then Save." />
-                  <div className="field">
-                    <label>2. Deploy → New deployment → Web app</label>
-                    <div style={{ fontSize: 12, marginTop: 2 }}>
-                      Set <b>Execute as: Me</b> and{" "}
-                      <b>Who has access: Anyone</b>. Google will ask you to
-                      authorise it once. Copy the <code>/exec</code> URL it
-                      gives you back and paste it below.
-                      <div style={{ color: "var(--ink-3)", marginTop: 4 }}>
-                        “Anyone” is safe here because the token above is what
-                        the script actually checks.
-                      </div>
-                    </div>
+              <Copyable rows={12} value={script.code}
+                        label="1. In the sheet: Extensions → Apps Script. Replace everything with this, then Save." />
+              <div className="field">
+                <label>2. Deploy → New deployment → Web app</label>
+                <div style={{ fontSize: 12, marginTop: 2 }}>
+                  Set <b>Execute as: Me</b> and <b>Who has access: Anyone</b>.
+                  Google will ask you to authorise it once. Copy the{" "}
+                  <code>/exec</code> URL it gives you back and paste it below.
+                  <div style={{ color: "var(--ink-3)", marginTop: 4 }}>
+                    “Anyone” is safe here because the token above is what the
+                    script actually checks.
                   </div>
-                  <Copyable rows={2} value={script.env_line}
-                            label="3. Add this line to .env on the server, then restart the collector." />
-                </>
-              ) : (
-                <div className="field">
-                  <label>Preparing your script…</label>
                 </div>
-              )}
-
-              <div className="field">
-                <label htmlFor="dexec">Web app URL</label>
-                <input id="dexec" value={url}
-                       onChange={(e) => setUrl(e.target.value)}
-                       placeholder="https://script.google.com/macros/s/…/exec" />
               </div>
-              <div className="field">
-                <label htmlFor="dsenv">Token — the NAME of the .env variable</label>
-                <input id="dsenv" value={secretEnv}
-                       onChange={(e) => setSecretEnv(e.target.value.toUpperCase())}
-                       placeholder="SHEET_TOKEN_MAIN" />
-                <div style={{ color: "var(--ink-3)", fontSize: 12, marginTop: 6 }}>
-                  The token itself is never stored in the database — only this
-                  name, so the value can be rotated without touching a target.
-                </div>
+              <Copyable rows={2} value={script.env_line}
+                        label={script.already_set
+                          ? "3. This is what the server already holds — .env needs no change."
+                          : "3. Add this line to .env on the server, then restart the collector."} />
+              <div className="filters" style={{ marginTop: 0, marginBottom: 6 }}>
+                <button className="btn btn-ghost btn-sm"
+                        onClick={() => loadScript({ rotate: true })}>
+                  Generate a new token
+                </button>
+                <span style={{ color: "var(--ink-3)", fontSize: 12 }}>
+                  Only if the current one leaked or was lost — it invalidates the
+                  deployed script until you paste and redeploy it.
+                </span>
               </div>
             </>
           ) : (
-            <>
-              <div className="field">
-                <label htmlFor="dsheet">Google Sheet link</label>
-                <input id="dsheet" value={sheetUrl}
-                       onChange={(e) => setSheetUrl(e.target.value)}
-                       placeholder="https://docs.google.com/spreadsheets/d/…" />
-                <div style={{ color: "var(--ink-3)", fontSize: 12, marginTop: 6 }}>
-                  Paste the whole address from your browser — the id is picked
-                  out of it.
-                </div>
-              </div>
-              <div className="field">
-                <label>Share the sheet first</label>
-                {serviceAccount ? (
-                  <>
-                    <div style={{ fontSize: 12, marginTop: 2 }}>
-                      In the sheet, click <b>Share</b> and give <b>Editor</b>{" "}
-                      access to
-                    </div>
-                    <code style={{ display: "block", marginTop: 6, wordBreak: "break-all" }}>
-                      {serviceAccount}
-                    </code>
-                  </>
-                ) : (
-                  <div className="err" style={{ marginTop: 2 }}>
-                    No service-account key on the server yet — set{" "}
-                    <code>GOOGLE_SHEETS_CREDENTIALS</code> in <code>.env</code>{" "}
-                    to the path of the downloaded JSON key, then restart. If
-                    you would rather not make a Google Cloud project, switch
-                    the option above to Apps Script.
-                  </div>
-                )}
-              </div>
-            </>
+            <div className="field">
+              <label>Preparing your script…</label>
+            </div>
           )}
 
-          <div className="filters" style={{ marginTop: 0, marginBottom: 6 }}>
-            <button className="btn btn-ghost btn-sm"
-                    disabled={checking
-                      || !(sheetMode === "script" ? url.trim() : sheetUrl.trim())}
-                    onClick={testSheet}>
-              {checking ? "Checking…" : "Check access"}
-            </button>
-            {check && (
-              <span className={check.startsWith("\u2713") ? "st-good" : "st-crit"}
-                    style={{ fontWeight: 600 }}>{check}</span>
+          <div className="field">
+            <label htmlFor="dexec">Web app URL</label>
+            <input id="dexec" value={url}
+                   onChange={(e) => setUrl(e.target.value)}
+                   placeholder="https://script.google.com/macros/s/…/exec" />
+          </div>
+        </>
+      )}
+
+      {kind === "sheet" && sheetMode === "service_account" && (
+        <>
+          <div className="field">
+            <label htmlFor="dsheet">Google Sheet link</label>
+            <input id="dsheet" value={sheetUrl}
+                   onChange={(e) => setSheetUrl(e.target.value)}
+                   placeholder="https://docs.google.com/spreadsheets/d/…" />
+            <div style={{ color: "var(--ink-3)", fontSize: 12, marginTop: 6 }}>
+              Paste the whole address from your browser — the id is picked out
+              of it.
+            </div>
+          </div>
+          <div className="field">
+            <label>Share the sheet first</label>
+            {serviceAccount ? (
+              <>
+                <div style={{ fontSize: 12, marginTop: 2 }}>
+                  In the sheet, click <b>Share</b> and give <b>Editor</b> access to
+                </div>
+                <code style={{ display: "block", marginTop: 6, wordBreak: "break-all" }}>
+                  {serviceAccount}
+                </code>
+              </>
+            ) : (
+              <div className="err" style={{ marginTop: 2 }}>
+                No service-account key on the server yet — set{" "}
+                <code>GOOGLE_SHEETS_CREDENTIALS</code> in <code>.env</code> to
+                the path of the downloaded JSON key, then restart. If you would
+                rather not make a Google Cloud project, switch the option above
+                to Apps Script.
+              </div>
             )}
           </div>
         </>
       )}
+
+      {kind === "sheet" && (
+        <div className="filters" style={{ marginTop: 0, marginBottom: 6 }}>
+          <button className="btn btn-ghost btn-sm"
+                  disabled={checking
+                    || !(sheetMode === "script" ? url.trim() : sheetUrl.trim())}
+                  onClick={testSheet}>
+            {checking ? "Checking…" : "Check access"}
+          </button>
+          {check && (
+            <span className={check.startsWith("\u2713") ? "st-good" : "st-crit"}
+                  style={{ fontWeight: 600 }}>{check}</span>
+          )}
+        </div>
+      )}
+
       {err && <div className="err">{err}</div>}
       <div className="row">
         <button className="btn btn-ghost" onClick={onClose}>Cancel</button>

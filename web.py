@@ -1809,26 +1809,63 @@ def _delivery_backfill(body):
     return _run(go(), timeout=280)
 
 
+# Tokens minted for a variable that is not in .env YET, kept for as long as
+# this process lives.
+#
+# Closes the last window in which the form could contradict itself: mint a
+# token, deploy the script with it, close the form and reopen it BEFORE adding
+# the line to .env — without this the second visit would show a different
+# token and the deployment just made would be dead on arrival. A restart
+# clears the cache, which is exactly when .env has been edited anyway.
+_pending_sheet_tokens: dict = {}
+
+
+def _sheet_env_name(body) -> str:
+    """The .env variable this target's token lives in — given, or from the name."""
+    env = (body.get("secret_env") or "").strip().upper()
+    if re.fullmatch(r"[A-Z][A-Z0-9_]*", env or ""):
+        return env
+    stem = re.sub(r"[^A-Z0-9]+", "_", (body.get("name") or "").upper()).strip("_")[:24]
+    return f"SHEET_TOKEN_{stem}" if stem else "SHEET_TOKEN_MAIN"
+
+
 def _sheet_script(body):
     """
-    The script to paste into the sheet, with a freshly minted token in it.
+    The script to paste into the sheet, with the RIGHT token already in it.
 
-    The token is generated HERE rather than asked for. Apps Script web apps
-    have to be deployed as "Anyone" for a server to reach them at all, so this
-    string is the only thing standing in front of the endpoint — which makes
-    "pick a password" exactly the wrong question to ask a human.
+    "The right one" is the whole of this function's job, and getting it wrong
+    is a trap the first version walked straight into: it minted a fresh token
+    on every call. Open the form, deploy the script, put the token in .env,
+    close the form, open it again — and the page now showed a DIFFERENT token
+    from the one deployed, silently invalidating a setup that was complete.
+    The operator's own .env then looked wrong when it was right.
 
-    Nothing is stored by this call. The operator pastes the code into their
-    sheet and the token into .env; the database only ever learns the NAME of
-    that .env variable, the same way it does for a webhook secret.
+    So the server's existing value wins whenever there is one. A token is
+    minted only when `secret_env` names a variable that is not set yet, or
+    when the operator explicitly asks to rotate.
+
+    Yes, this reads a secret back out to the dashboard. That is deliberate:
+    the dashboard is authenticated, it is where the token was generated in the
+    first place, and the alternative — showing a script the operator cannot
+    match against what they deployed — is how the setup fails. Nothing is
+    stored by this call; the database only ever learns the variable's NAME.
     """
     import sheets as _sheets
 
-    token = (body.get("token") or "").strip() or _sheets.new_token()
-    name = (body.get("name") or "").strip()
-    env = re.sub(r"[^A-Z0-9]+", "_", name.upper()).strip("_")[:24]
-    env = f"SHEET_TOKEN_{env}" if env else "SHEET_TOKEN_MAIN"
+    env = _sheet_env_name(body)
+    existing = os.getenv(env, "").strip()
+    rotate = bool(body.get("rotate"))
+    if existing and not rotate:
+        token = existing
+    elif rotate:
+        token = _sheets.new_token()
+        _pending_sheet_tokens[env] = token
+    else:
+        token = _pending_sheet_tokens.get(env) or _sheets.new_token()
+        _pending_sheet_tokens[env] = token
     return {"token": token, "secret_env": env,
+            "already_set": bool(existing) and not rotate,
+            "rotated": rotate and bool(existing),
             "env_line": f"{env}={token}",
             "code": _sheets.script_source(token)}
 
@@ -1898,17 +1935,18 @@ def _test_sheet(body):
 
     if not url:
         return {"error": "paste the Apps Script web app URL (it ends in /exec)"}
-    # The token may come straight from the setup form — the operator has it on
-    # screen and has not restarted the server yet, so requiring .env first
-    # would mean the check could not be run until after the thing it checks.
-    if not token and secret_env:
-        token = os.getenv(secret_env, "").strip()
-        if not token:
-            return {"error": f"{secret_env} is not set in .env on the server yet "
-                             f"— add it and restart, or run this check from the "
-                             f"setup form where the token is still on screen"}
+
+    # THE SERVER'S VALUE WINS. This check exists to predict what delivery will
+    # do, and delivery reads .env — so checking with the token that happens to
+    # be on screen would happily pass while every real send failed. The form's
+    # token is the fallback for the one moment .env cannot answer: a brand-new
+    # deployment that has not been added to .env and restarted yet.
+    env_token = os.getenv(secret_env, "").strip() if secret_env else ""
+    form_token = token
+    token = env_token or form_token
     if not token:
-        return {"error": "no token to check with"}
+        return {"error": f"{secret_env or 'the token variable'} is not set in "
+                         f".env on the server yet — add it and restart"}
 
     async def go_script():
         import httpx
@@ -1916,6 +1954,11 @@ def _test_sheet(body):
             return await _sheets.check_script_access(client, url, token, tab)
 
     ok, err = _run(go_script(), timeout=90)
+    if not ok and env_token and form_token and env_token != form_token:
+        # The single most likely reason, and one neither end can see alone.
+        err += (f" — note that {secret_env} on the server holds a DIFFERENT "
+                f"token from the script shown here; whichever you keep, the "
+                f"script, .env and a re-deploy all have to agree")
     return {"ok": True, "sheet_tab": tab, "url": url} if ok else {"error": err}
 
 

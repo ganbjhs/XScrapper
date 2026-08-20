@@ -105,6 +105,19 @@ precision past 2^53; snowflake ids are well past it).
   `fmtAgo` is untouched and still measures OUR freshness — last collected,
   last delivered, last polled — where a large number IS the alarm and a date
   would bury it. Do not merge the two.
+- **A setup screen shows the credential the SERVER holds — it never mints one
+  on view.** The sheet form used to generate a fresh token every time it was
+  opened, so deploying a script, closing the form and reopening it silently
+  replaced the token of a working deployment and made a correct `.env` look
+  wrong. `.env` is the source of truth; a new value appears only when the
+  operator asks to rotate. Anything that puts a secret on screen must read it
+  from where it is used, or it becomes a second, competing source of truth.
+- **A connectivity check tests what DELIVERY will use, or it is theatre.** The
+  same bug had "Check access" verifying the token the form had just invented
+  rather than the one in `.env` that the sender reads — a check that could
+  pass while every real send failed. Same rule as the Telegram test sending
+  real tweets through the real formatter: a check that cannot fail the way the
+  system fails is not a check.
 - **A per-deployment secret is NAMED, never stored.** The Apps Script token
   follows the webhook-secret rule (`secret_env` holds the variable's name),
   not the Telegram-token rule (one global value), because there is one token
