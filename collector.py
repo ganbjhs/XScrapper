@@ -53,6 +53,29 @@ ALPHA = 0.35           # EWMA weight on the newest observation
 JITTER = 0.15          # +/- fraction, to decorrelate streams from each other
 MAX_EMPTY_BACKOFF = 4  # cap on consecutive-empty exponential backoff
 
+# Jitter for a stream whose cadence the operator PINNED from the dashboard.
+# Spreading polls out still matters -- streams started together would otherwise
+# stay phase-locked and hit the account pool in a burst -- but +/-15% of a
+# five-minute promise is +/-45 seconds, which is exactly the kind of "it says
+# 5 min and it isn't" that pinning exists to stop. 2% is enough to decorrelate
+# and small enough that the number in the dropdown is still the truth.
+JITTER_PINNED = 0.02
+
+# How many pages one backfill pass may walk. A granted budget is spent a few
+# pages at a time on the stream's normal cadence, so a 500-page grant costs the
+# rate-limit guard the same as ordinary polling spread over a while, instead of
+# arriving as one unbounded burst that trips it.
+BACKFILL_PAGES_PER_PASS = 3
+
+# Gap between backfill passes. Three pages a minute is roughly a third of the
+# ~50-requests-per-15-minutes search budget, which leaves the live poll loop --
+# the thing the whole system is actually for -- the larger share. It backs off
+# from here whenever X says headroom is short, and it is a starting point, not
+# a ceiling.
+BACKFILL_GAP_S = 60.0
+BACKFILL_GAP_MAX_S = 900.0
+BACKFILL_LOW_HEADROOM = 10   # rl_remaining below this = slow down
+
 # How often the long-running watcher does database housekeeping (WAL
 # checkpoint + retention, see Store.maintain). Five minutes: frequent enough
 # that the WAL never accumulates more than a few minutes of writes, rare
@@ -226,6 +249,162 @@ async def poll_once(engine, store, stream, stream_id, *, kind="poll", log=None) 
 
 
 # --------------------------------------------------------------------------
+# backfill — the same walk, in the other direction
+# --------------------------------------------------------------------------
+
+STOP_BACKFILL_IDLE = "backfill_idle"
+STOP_BACKFILL_DONE = "backfill_exhausted"
+STOP_BACKFILL_BUDGET = "backfill_budget"
+
+
+async def backfill_once(engine, store, stream, stream_id, *,
+                        max_pages=BACKFILL_PAGES_PER_PASS, log=None) -> PollResult:
+    """
+    Walk OLDER, resuming from the last stored cursor.
+
+    poll_once is watermark-first: it starts at the top of the timeline and stops
+    the instant it reaches known ground. For a live stream that is the whole
+    design and it is right. For a query with a fixed past — `from:someone
+    until:2025-02-20`, an account that stopped posting, any archival sweep —
+    it is a trap. The first poll takes page_size * max_pages_per_poll tweets and
+    sets the watermark at the newest of them. Every poll after that finds the
+    same newest tweet on page one, stops, and reports nothing new. The stream is
+    capped there permanently: polling on schedule, costing requests, and never
+    reaching tweet number 101. From the dashboard it looks like collection
+    stopped, because in every sense that matters it did.
+
+    This is the way past that. Three things make it safe to run next to the
+    poller rather than instead of it:
+
+      * It NEVER touches the watermark. The watermark answers "how far forward
+        have we got", and an old tweet must not be allowed to answer it —
+        set_watermark's max() guard would ignore a lower value anyway, but not
+        asking is clearer than relying on being refused.
+
+      * It resumes from a stored cursor, so a pass costs only new pages. A walk
+        that restarted at the top would re-pay for everything it already had,
+        and the deeper it got the more it would waste.
+
+      * It spends a granted budget a few pages per pass, on the stream's own
+        cadence. The rate-limit guard sees ordinary polling, not a burst.
+
+    Starvation is the case worth being careful about: when no account is free,
+    twscrape's generator simply yields nothing, and counting that as pages
+    walked would silently eat an operator's budget without collecting a tweet.
+    Zero pages therefore spends nothing.
+    """
+    res = PollResult(stream_label=stream.label)
+    state = await store.backfill_state(stream_id)
+    budget = min(int(max_pages), int(state.get("remaining", 0)))
+    if state.get("done") or budget <= 0:
+        res.stop_reason = STOP_BACKFILL_IDLE
+        return res
+
+    started = time.time()
+    poll_id = await store.begin_poll(stream_id, kind="backfill")
+    committed = []
+    cursor = state.get("cursor")
+    exhausted = False
+
+    try:
+        async with aclosing(
+            engine.pages_for(
+                stream,
+                tab=stream.tab,
+                page_size=stream.page_size,
+                max_pages=budget,
+                cursor=cursor,
+            )
+        ) as pages:
+            async for page in pages:
+                res.pages += 1
+                res.account = page.account or res.account
+                if page.rl_limit is not None:
+                    res.rl_limit = page.rl_limit
+                if page.rl_remaining is not None:
+                    res.rl_remaining = page.rl_remaining
+                if page.rl_reset is not None:
+                    res.rl_reset = page.rl_reset
+                res.orphans += len(page.orphan_ids)
+
+                # Only advance the resume point when X actually gave us one.
+                # Overwriting a good cursor with None would rewind the sweep to
+                # the top of the timeline on the next pass, which is both
+                # expensive and invisible.
+                if page.cursor:
+                    cursor = page.cursor
+
+                for tid in page.embedded_ids:
+                    committed.append((page.tweets[tid], page, "embedded", None))
+
+                if page.result_ids:
+                    res.results += len(page.result_ids)
+                    for tid in page.result_ids:
+                        tweet = page.tweets.get(tid)
+                        if tweet is None:
+                            continue
+                        committed.append((tweet, page, "result", page.entries_by_id.get(tid)))
+                    page_min = page.min_result_id()
+                    page_max = page.max_result_id()
+                    res.min_id = page_min if res.min_id is None else min(res.min_id, page_min)
+                    res.max_id = page_max if res.max_id is None else max(res.max_id, page_max)
+                else:
+                    # A cursored page with no search hits on it is X saying the
+                    # walk is over. Believe it: continuing would spend the rest
+                    # of the budget on empty pages.
+                    exhausted = True
+                    break
+        # Finishing under budget means the generator ran out first, i.e. there
+        # is no more history to have. Finishing AT budget says nothing about
+        # whether more exists, so it must not be recorded as exhausted.
+        if res.pages < budget:
+            exhausted = True
+    except Exception as e:
+        res.stop_reason = STOP_ERROR
+        res.error = f"{type(e).__name__}: {e}"
+        if log:
+            log(f"[{stream.label}] backfill error: {res.error}")
+
+    res.elapsed_s = time.time() - started
+
+    if res.pages == 0 and res.stop_reason != STOP_ERROR:
+        # Pool starvation, not the end of the archive. Spend nothing and try
+        # again on the next cycle.
+        res.stop_reason = STOP_STARVED
+        await store.finish_poll(poll_id, pages=0, stop_reason=res.stop_reason,
+                                account=res.account)
+        return res
+
+    counts = await store.upsert_tweets(committed, stream_id, poll_id)
+    res.new, res.dup, res.embedded = counts.new, counts.dup, counts.embedded
+
+    if res.stop_reason != STOP_ERROR:
+        res.stop_reason = STOP_BACKFILL_DONE if exhausted else STOP_BACKFILL_BUDGET
+
+    await store.save_backfill(
+        stream_id, cursor=cursor, walked=res.pages, got=res.new,
+        done=True if exhausted else None,
+    )
+    await store.finish_poll(
+        poll_id,
+        pages=res.pages,
+        results=res.results,
+        new_tweets=res.new,
+        dup_tweets=res.dup,
+        orphans=res.orphans,
+        max_id=res.max_id,
+        min_id=res.min_id,
+        stop_reason=res.stop_reason,
+        account=res.account,
+        rl_limit=res.rl_limit,
+        rl_remaining=res.rl_remaining,
+        rl_reset=res.rl_reset,
+        error=res.error,
+    )
+    return res
+
+
+# --------------------------------------------------------------------------
 # adaptive interval
 # --------------------------------------------------------------------------
 
@@ -265,15 +444,19 @@ def next_interval(stream, prev_interval: float, elapsed: float, res: PollResult,
     return interval, ewma, consecutive_empty
 
 
-def jittered(interval: float) -> float:
+def jittered(interval: float, frac: float = JITTER) -> float:
     """
     Spread polls out.
 
     Without this, streams started together stay phase-locked and hit the
     account pool in a burst every tick. It also makes the traffic pattern less
     obviously machine-generated, which matters more than the efficiency.
+
+    `frac` is smaller for a pinned stream -- see JITTER_PINNED. The spread is
+    still there; it is just held inside the tolerance of a cadence someone was
+    shown in an interface and is entitled to believe.
     """
-    return interval * (1 + random.uniform(-JITTER, JITTER))
+    return interval * (1 + random.uniform(-frac, frac))
 
 
 # --------------------------------------------------------------------------
@@ -291,6 +474,12 @@ class Collector:
         self.sem = asyncio.Semaphore(max(1, max_concurrency))
         self.stream_ids: dict[str, int] = {}
         self.state: dict[str, dict] = {}
+        # Backfill pacing, per stream label. Kept separate from self.state
+        # because the two schedules are genuinely independent: a stream can be
+        # polling forward every five minutes and walking backwards every
+        # minute, and collapsing them into one clock would make the operator
+        # choose between the two.
+        self.bf_state: dict[str, dict] = {}
 
     async def prepare(self):
         for s in self.streams:
@@ -370,8 +559,8 @@ class Collector:
         """
         try:
             row = self.store.db.execute(
-                "SELECT paused, min_interval_s, max_pages_per_poll FROM streams "
-                "WHERE label = ?", (stream.label,)).fetchone()
+                "SELECT paused, min_interval_s, max_interval_s, max_pages_per_poll "
+                "FROM streams WHERE label = ?", (stream.label,)).fetchone()
         except Exception:
             return True     # settings unreadable is not a reason to stop collecting
         if row is None:
@@ -379,6 +568,22 @@ class Collector:
 
         if row["min_interval_s"] is not None:
             stream.min_interval_s = float(row["min_interval_s"])
+        # The CEILING, and the reason the dashboard's interval control is now
+        # a control rather than a hint. next_interval clamps into
+        # [min_interval_s, max_interval_s]; when the dashboard writes the same
+        # number to both there is nothing left for the adaptive controller to
+        # decide, and the stream polls at exactly the chosen cadence. Left NULL
+        # ("auto") the config value stands and the controller adapts as before.
+        if row["max_interval_s"] is not None:
+            stream.max_interval_s = float(row["max_interval_s"])
+        # A floor above the ceiling is not a configuration, it is a mistake --
+        # from the older per-stream speed control, which writes only the floor.
+        # Raise the ceiling to meet it rather than letting the clamp resolve it
+        # by accident: max(min, min(max, target)) happens to return the floor
+        # here, and relying on the happy accident of an expression is how the
+        # next edit to it breaks something far away.
+        if stream.max_interval_s < stream.min_interval_s:
+            stream.max_interval_s = stream.min_interval_s
         if row["max_pages_per_poll"] is not None:
             stream.max_pages_per_poll = int(row["max_pages_per_poll"])
         return not row["paused"]
@@ -408,7 +613,8 @@ class Collector:
             stream, st["interval"], elapsed, res, st["ewma"], st["empty"]
         )
         st.update(interval=interval, ewma=ewma, empty=empty)
-        delay = jittered(interval)
+        pinned = stream.min_interval_s == stream.max_interval_s
+        delay = jittered(interval, JITTER_PINNED if pinned else JITTER)
         st["next_ms"] = int((time.time() + delay) * 1000)
 
         if res.max_id:
@@ -420,6 +626,66 @@ class Collector:
 
         self.log(self.format_result(res, interval))
         return res
+
+    async def backfill_stream(self, stream) -> PollResult:
+        """
+        One backwards pass for a stream that has been granted budget.
+
+        Runs on the SAME concurrency semaphore as the forward polls, so
+        backfilling can never starve live collection of account slots — it just
+        queues behind it. That is the correct priority: history is not going
+        anywhere, and the next tweet is.
+        """
+        sid = self.stream_ids.get(stream.label)
+        if sid is None:
+            return PollResult(stream_label=stream.label, stop_reason=STOP_BACKFILL_IDLE)
+
+        st = self.bf_state.setdefault(
+            stream.label, {"next_ms": 0, "gap": BACKFILL_GAP_S})
+
+        if not self.apply_settings(stream):
+            st["next_ms"] = int((time.time() + max(stream.min_interval_s, 10)) * 1000)
+            return PollResult(stream_label=stream.label, stop_reason="paused")
+
+        async with self.sem:
+            res = await backfill_once(self.engine, self.store, stream, sid, log=self.log)
+
+        # Pace on what X just told us about headroom rather than on a fixed
+        # clock. Starvation and a short rate-limit window are the same message
+        # -- "not now" -- and the response to both is to wait longer, not to
+        # keep asking. An error backs off too: retrying a failing page every
+        # minute is how a transient problem turns into a rate-limit ban.
+        gap = st["gap"]
+        if (res.starved or res.error
+                or (res.rl_remaining is not None
+                    and res.rl_remaining < BACKFILL_LOW_HEADROOM)):
+            gap = min(BACKFILL_GAP_MAX_S, gap * 2)
+        else:
+            gap = max(BACKFILL_GAP_S, gap * 0.5)
+        st["gap"] = gap
+        st["next_ms"] = int((time.time() + jittered(gap)) * 1000)
+
+        if res.stop_reason != STOP_BACKFILL_IDLE:
+            self.log(self.format_backfill(res, gap))
+        return res
+
+    def format_backfill(self, res: PollResult, gap: float) -> str:
+        bits = [f"[{res.stream_label}]", "backfill",
+                f"older={res.new}", f"dup={res.dup}",
+                f"pages={res.pages}", f"stop={res.stop_reason}"]
+        if res.account:
+            bits.append(f"acct=@{res.account}")
+        if res.rl_remaining is not None:
+            bits.append(f"rl={res.rl_remaining}/{res.rl_limit}")
+        if res.starved:
+            bits.append("<< POOL STARVED (budget not spent)")
+        if res.error:
+            bits.append(f"err={res.error[:80]}")
+        if res.stop_reason == STOP_BACKFILL_DONE:
+            bits.append("-- no more history to fetch")
+        else:
+            bits.append(f"next={gap:.0f}s")
+        return "  ".join(bits)
 
     def format_result(self, res: PollResult, interval: float) -> str:
         bits = [
@@ -464,6 +730,13 @@ class Collector:
         """Poll every stream on its own schedule until stopped."""
         deadline = (time.time() + duration) if duration else None
         tasks: dict[str, asyncio.Task] = {}
+        # Backfill tasks are tracked separately so a slow backwards walk can
+        # never occupy the slot that a stream's forward poll needs. The two
+        # share the concurrency semaphore, which is the resource that actually
+        # needs protecting; they do not share a queue position.
+        bf_tasks: dict[str, asyncio.Task] = {}
+        last_backfill_scan = 0.0
+        backfill_labels: set[str] = set()
         last_discover = 0.0
         last_maintain = time.time()   # not at boot — opening the DB just ran
                                       # the migration; let polls start first
@@ -504,6 +777,18 @@ class Collector:
                 # launch no new ones while collection is switched off.
                 paused = self._paused()
 
+                # Which streams have unspent backfill budget? Re-read on a
+                # slow cadence rather than every tick: a grant arrives from a
+                # dashboard click, so noticing it within a few seconds is
+                # ample, and this way the scheduler's hot path stays free of
+                # database work.
+                if time.time() - last_backfill_scan >= 5:
+                    last_backfill_scan = time.time()
+                    try:
+                        backfill_labels = set(self.store.streams_with_backfill())
+                    except Exception as e:
+                        self.log(f"[backfill] scan error: {e!r}")
+
                 for s in list(self.streams):
                     st = self.state[s.label]
                     running = tasks.get(s.label)
@@ -521,9 +806,27 @@ class Collector:
                     if not paused and now_ms >= st["next_ms"]:
                         tasks[s.label] = asyncio.create_task(self.poll_stream(s))
 
+                    # Backwards walk, on its own clock. Gated by the same
+                    # global pause as forward polling -- "stop collecting"
+                    # has to mean stop, not "stop the half you can see".
+                    bf_running = bf_tasks.get(s.label)
+                    if bf_running and bf_running.done():
+                        exc = bf_running.exception()
+                        if exc:
+                            self.log(f"[{s.label}] backfill task failed: {exc!r}")
+                            self.bf_state.setdefault(s.label, {})["next_ms"] = int(
+                                (time.time() + BACKFILL_GAP_MAX_S) * 1000)
+                        bf_tasks.pop(s.label, None)
+                        bf_running = None
+                    if (not paused and s.label in backfill_labels
+                            and bf_running is None
+                            and now_ms >= self.bf_state.get(s.label, {}).get("next_ms", 0)):
+                        bf_tasks[s.label] = asyncio.create_task(self.backfill_stream(s))
+
                 await asyncio.sleep(0.25)
         finally:
-            for t in tasks.values():
+            for t in list(tasks.values()) + list(bf_tasks.values()):
                 t.cancel()
-            if tasks:
-                await asyncio.gather(*tasks.values(), return_exceptions=True)
+            if tasks or bf_tasks:
+                await asyncio.gather(*tasks.values(), *bf_tasks.values(),
+                                     return_exceptions=True)

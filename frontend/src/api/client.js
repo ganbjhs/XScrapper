@@ -145,6 +145,10 @@ export const api = {
     request("/api/watchlists/filters", { method: "POST", body: { watchlist_id, filters } }),
   watchlistInterval: (watchlist_id, seconds) =>
     request("/api/watchlists/interval", { method: "POST", body: { watchlist_id, seconds } }),
+  watchlistDepth: (watchlist_id, pages) =>
+    request("/api/watchlists/depth", { method: "POST", body: { watchlist_id, pages } }),
+  watchlistBackfill: (watchlist_id, pages) =>
+    request("/api/watchlists/backfill", { method: "POST", body: { watchlist_id, pages } }),
 
   streamSettings: (body) => request("/api/stream/settings", { method: "POST", body }),
 

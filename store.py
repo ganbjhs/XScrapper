@@ -833,6 +833,25 @@ class Store:
                               "watched": "INTEGER NOT NULL DEFAULT 0",
                               "paused": "INTEGER NOT NULL DEFAULT 0",
                               "min_interval_s": "REAL",
+                              # The dropdown in the Watchlists panel promises a
+                              # CADENCE ("every 5 min"). The adaptive controller
+                              # in collector.next_interval only ever read
+                              # min_interval_s as a FLOOR, then inflated the real
+                              # interval towards max_interval_s every time a poll
+                              # came back with nothing new -- which is precisely
+                              # what a quiet or archival watchlist does, every
+                              # time. So the panel said 5 minutes and the
+                              # collector quietly settled on 15, and the setting
+                              # read as broken because it was not the control it
+                              # claimed to be.
+                              #
+                              # Storing the CEILING per stream as well lets an
+                              # explicit choice pin both ends: min == max means
+                              # the number in the dropdown is the number that
+                              # runs. NULL still means "inherit config.toml", so
+                              # the "auto" option keeps the adaptive behaviour
+                              # exactly as it was.
+                              "max_interval_s": "REAL",
                               "max_pages_per_poll": "INTEGER",
                               "tg_enabled": "INTEGER NOT NULL DEFAULT 0",
                               "tg_chat_id": "TEXT",
@@ -851,7 +870,36 @@ class Store:
                               # that starts on an account with a week of
                               # history otherwise pushes all of it into the
                               # channel as if it were new. 0 = no limit.
-                              "tg_max_age_h": "INTEGER NOT NULL DEFAULT 0"}}
+                              "tg_max_age_h": "INTEGER NOT NULL DEFAULT 0",
+
+                              # ---- backfill: walking a query BACKWARDS -------
+                              #
+                              # The poll loop is watermark-first. It walks the
+                              # Latest timeline from the top and stops the moment
+                              # it reaches known ground, which is the right shape
+                              # for a live stream and the wrong shape for an
+                              # archival query ("from:someone until:2025-02-20"),
+                              # where there are no new tweets and never will be.
+                              # The first poll takes max_pages_per_poll pages and
+                              # sets a watermark at the newest of them; every poll
+                              # after that stops on page one. The stream is then
+                              # capped at page_size * max_pages_per_poll for good
+                              # -- collecting on schedule, finding nothing, and
+                              # looking frozen from the dashboard.
+                              #
+                              # These columns are the other direction: a page
+                              # budget the operator grants from the dashboard, the
+                              # cursor to resume from, how far it has walked, how
+                              # much it found, and whether X ran out of results.
+                              # Resuming from a stored cursor is what lets the
+                              # budget be spent a few pages per cycle -- inside
+                              # the rate-limit guard and across restarts --
+                              # instead of in one unbounded sweep.
+                              "backfill_pages": "INTEGER NOT NULL DEFAULT 0",
+                              "backfill_cursor": "TEXT",
+                              "backfill_walked": "INTEGER NOT NULL DEFAULT 0",
+                              "backfill_got": "INTEGER NOT NULL DEFAULT 0",
+                              "backfill_done": "INTEGER NOT NULL DEFAULT 0"}}
         added = []
         for table, cols in wanted.items():
             have = {r["name"] for r in self.db.execute(f"PRAGMA table_info({table})")}
@@ -1164,6 +1212,9 @@ class Store:
                 (w["watchlist_id"],))]
             streams = [dict(s) for s in self.db.execute(
                 "SELECT s.stream_id, s.label, s.paused, s.min_interval_s, "
+                "       s.max_interval_s, s.max_pages_per_poll, "
+                "       s.backfill_pages, s.backfill_walked, s.backfill_got, "
+                "       s.backfill_done, "
                 "       COUNT(h.tweet_id) AS tweets "
                 "FROM streams s LEFT JOIN tweet_hits h USING(stream_id) "
                 "WHERE s.label LIKE ? GROUP BY s.stream_id ORDER BY s.label",
@@ -1173,6 +1224,28 @@ class Store:
             d["streams"] = streams
             # The current check-interval override (seconds), or None = default.
             d["interval_s"] = streams[0]["min_interval_s"] if streams else None
+            # Pinned means min == max: the cadence in the dropdown is the
+            # cadence that runs, with no adaptive drift. Sent to the panel so it
+            # can say so, rather than leaving the operator to infer it from a
+            # number that used to be advisory.
+            d["interval_pinned"] = bool(
+                streams and streams[0]["min_interval_s"] is not None
+                and streams[0]["min_interval_s"] == streams[0]["max_interval_s"])
+            # How deep ONE poll is allowed to go. None = the config default.
+            d["pages"] = streams[0]["max_pages_per_poll"] if streams else None
+            # Backfill progress, summed over the watchlist's compiled streams.
+            # `running` is the honest question the panel needs answered: is
+            # there budget left that has neither been spent nor been declared
+            # exhausted? Anything looser ("pages > 0") would keep showing a
+            # finished sweep as though it were still working.
+            d["backfill"] = {
+                "pages": sum(s["backfill_pages"] or 0 for s in streams),
+                "walked": sum(s["backfill_walked"] or 0 for s in streams),
+                "got": sum(s["backfill_got"] or 0 for s in streams),
+                "running": any((s["backfill_pages"] or 0) > (s["backfill_walked"] or 0)
+                               and not s["backfill_done"] for s in streams),
+                "exhausted": bool(streams) and all(s["backfill_done"] for s in streams),
+            }
             try:
                 d["filters"] = json.loads(d.get("filters") or "{}")
             except (TypeError, ValueError):
@@ -1349,10 +1422,26 @@ class Store:
 
     async def set_watchlist_interval(self, watchlist_id: int, seconds) -> dict:
         """
-        How often to re-check this watchlist — applied to all its compiled
-        streams' min_interval_s. None/0 clears the override (back to the
-        config default). The running collector re-reads this every poll
-        (apply_settings), so a change takes effect on the next cycle.
+        How often to re-check this watchlist. Applied to every compiled stream.
+
+        An explicit choice PINS the cadence: min_interval_s and max_interval_s
+        are both set to the same number, which leaves the adaptive controller in
+        collector.next_interval no room to drift. That is the whole point of the
+        change. Writing only the floor — what this used to do — meant a
+        watchlist that returned nothing new (a quiet account, or an archival
+        `until:` query, where nothing new is the permanent and correct answer)
+        had its interval multiplied by GROW on every empty poll until it sat at
+        max_interval_s, 900s by default. The dropdown said "every 5 min", the
+        collector ran every 15, and the setting looked ignored because in every
+        way that mattered it was.
+
+        None/0 clears BOTH overrides — the "auto" option — and hands the cadence
+        back to config.toml and the adaptive controller, which is the right
+        behaviour for a busy live stream where reacting to volume beats
+        keeping a promise about the clock.
+
+        The running collector re-reads these every poll (apply_settings), so a
+        change takes effect on the next cycle without a restart.
         """
         w = self.db.execute("SELECT 1 FROM watchlists WHERE watchlist_id = ?",
                             (int(watchlist_id),)).fetchone()
@@ -1366,9 +1455,44 @@ class Store:
             except (TypeError, ValueError):
                 return {"error": "interval must be a whole number of seconds"}
         self.db.execute(
-            "UPDATE streams SET min_interval_s = ? WHERE label LIKE ?",
+            "UPDATE streams SET min_interval_s = ?, max_interval_s = ? "
+            "WHERE label LIKE ?",
+            (val, val, f"wl:{int(watchlist_id)}:%"))
+        return {"watchlist_id": int(watchlist_id), "min_interval_s": val,
+                "max_interval_s": val, "pinned": val is not None}
+
+    async def set_watchlist_pages(self, watchlist_id: int, pages) -> dict:
+        """
+        How deep ONE forward poll may go, in pages of ~20 posts.
+
+        This is the ceiling on a single cycle, not on the watchlist. Raising it
+        makes each poll reach further down the timeline before giving up, which
+        is what a busy watchlist needs so it stops opening gaps between cycles.
+        It is NOT the way to collect an archive: a watermarked stream stops at
+        known ground regardless of how many pages it is allowed, so on a quiet
+        or archival query every page past the first is simply never requested.
+        Backfill is the control for that.
+
+        None/0 clears the override and returns to config.toml.
+        """
+        w = self.db.execute("SELECT 1 FROM watchlists WHERE watchlist_id = ?",
+                            (int(watchlist_id),)).fetchone()
+        if not w:
+            return {"error": f"no watchlist {watchlist_id}"}
+        if pages in (None, "", 0, "0"):
+            val = None
+        else:
+            try:
+                val = int(pages)
+            except (TypeError, ValueError):
+                return {"error": "pages must be a whole number"}
+            if not 1 <= val <= 25:
+                return {"error": "pages must be between 1 and 25 "
+                                 "(~20 posts each, per poll)"}
+        self.db.execute(
+            "UPDATE streams SET max_pages_per_poll = ? WHERE label LIKE ?",
             (val, f"wl:{int(watchlist_id)}:%"))
-        return {"watchlist_id": int(watchlist_id), "min_interval_s": val}
+        return {"watchlist_id": int(watchlist_id), "max_pages_per_poll": val}
 
     async def delete_watchlist(self, watchlist_id: int) -> dict:
         """
@@ -2198,6 +2322,121 @@ class Store:
             "SELECT * FROM polls WHERE stream_id = ? ORDER BY started_ms DESC LIMIT ?",
             (stream_id, limit),
         ).fetchall()
+
+    # ---------------- backfill ----------------
+    #
+    # Gaps record where the forward poller did not reach. Backfill is the thing
+    # that goes and gets it. Both live here because they are two halves of one
+    # question: a watermark-first collector is fast and cheap precisely because
+    # it refuses to look backwards, so looking backwards has to be a separate,
+    # explicitly budgeted activity rather than something a poll might decide to
+    # do on its own and spend fifty requests on.
+
+    # A single grant is bounded. Not because 500 pages is a natural limit, but
+    # because a typo in a text box should not be able to authorise ten thousand
+    # requests; the operator can always grant again.
+    MAX_BACKFILL_PAGES = 500
+
+    async def backfill_state(self, stream_id: int) -> dict:
+        """Where a stream's backwards walk has got to. Empty dict if unknown."""
+        row = self.db.execute(
+            "SELECT backfill_pages, backfill_cursor, backfill_walked, "
+            "       backfill_got, backfill_done "
+            "FROM streams WHERE stream_id = ?", (int(stream_id),)).fetchone()
+        if row is None:
+            return {}
+        return {
+            "pages": row["backfill_pages"] or 0,
+            "cursor": row["backfill_cursor"],
+            "walked": row["backfill_walked"] or 0,
+            "got": row["backfill_got"] or 0,
+            "done": bool(row["backfill_done"]),
+            "remaining": max(0, (row["backfill_pages"] or 0) - (row["backfill_walked"] or 0)),
+        }
+
+    async def save_backfill(self, stream_id: int, *, cursor=None, walked: int = 0,
+                            got: int = 0, done: bool | None = None) -> None:
+        """
+        Record one backwards pass.
+
+        walked/got ACCUMULATE and the cursor REPLACES, which is what makes the
+        sweep resumable across restarts: the next pass asks X to continue from
+        the last cursor rather than starting at the top of the timeline again
+        and re-paying for pages it already has.
+
+        The cursor is only written when there is one. A pass that ends without
+        a cursor has reached the end of what X will return, and blanking the
+        stored one would silently rewind the sweep to the beginning.
+        """
+        sets = ["backfill_walked = backfill_walked + :walked",
+                "backfill_got = backfill_got + :got"]
+        vals = {"walked": int(walked), "got": int(got), "sid": int(stream_id)}
+        if cursor:
+            sets.append("backfill_cursor = :cursor")
+            vals["cursor"] = cursor
+        if done is not None:
+            sets.append("backfill_done = :done")
+            vals["done"] = int(bool(done))
+        self.db.execute(
+            f"UPDATE streams SET {','.join(sets)} WHERE stream_id = :sid", vals)
+
+    async def set_watchlist_backfill(self, watchlist_id: int, pages) -> dict:
+        """
+        Grant (or withdraw) backwards-walk budget for a whole watchlist.
+
+        A grant is ADDITIVE against what has already been walked, so pressing
+        "fetch older" twice asks for more history rather than restarting from
+        the top — the same reasoning as the resumable cursor. 0/None withdraws
+        the unspent remainder and stops the sweep, but keeps the cursor, so it
+        can be picked up later exactly where it paused instead of re-walking.
+
+        `backfill_done` is cleared on a grant. If X really has run out of
+        results the very next pass will set it again, at a cost of one request,
+        which is a better trade than refusing an operator who has just widened
+        the query and knows there is more to find.
+        """
+        w = self.db.execute("SELECT 1 FROM watchlists WHERE watchlist_id = ?",
+                            (int(watchlist_id),)).fetchone()
+        if not w:
+            return {"error": f"no watchlist {watchlist_id}"}
+        like = f"wl:{int(watchlist_id)}:%"
+        if pages in (None, "", 0, "0"):
+            self.db.execute(
+                "UPDATE streams SET backfill_pages = backfill_walked "
+                "WHERE label LIKE ?", (like,))
+            return {"watchlist_id": int(watchlist_id), "stopped": True}
+        try:
+            n = int(pages)
+        except (TypeError, ValueError):
+            return {"error": "pages must be a whole number"}
+        if not 1 <= n <= self.MAX_BACKFILL_PAGES:
+            return {"error": f"pages must be between 1 and {self.MAX_BACKFILL_PAGES} "
+                             f"(~{self.MAX_BACKFILL_PAGES * 20} posts per grant); "
+                             f"ask again when it finishes to go deeper"}
+        cur = self.db.execute(
+            "UPDATE streams SET backfill_pages = backfill_walked + ?, "
+            "backfill_done = 0 WHERE label LIKE ?", (n, like))
+        if not cur.rowcount:
+            return {"error": "this watchlist has no compiled streams yet — "
+                             "add a keyword or handle first"}
+        return {"watchlist_id": int(watchlist_id), "granted_pages": n,
+                "streams": cur.rowcount}
+
+    def streams_with_backfill(self) -> list:
+        """
+        Labels with unspent, unexhausted backfill budget.
+
+        Deliberately synchronous and deliberately narrow: the collector calls it
+        on every scheduler tick, so it must be one indexed read answering one
+        question, not a general stream listing the loop then has to filter.
+        """
+        try:
+            return [r["label"] for r in self.db.execute(
+                "SELECT label FROM streams "
+                "WHERE backfill_done = 0 AND backfill_pages > backfill_walked "
+                "AND paused = 0")]
+        except Exception:
+            return []
 
     # ---------------- gaps ----------------
 

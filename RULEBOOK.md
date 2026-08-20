@@ -64,10 +64,39 @@ precision past 2^53; snowflake ids are well past it).
   the watcher's own timer).
 - **Refuse, don't silently clamp.** A request for more pages than the cap is
   rejected with the reason, not quietly shrunk — a silent clamp still spends
-  budget the caller never agreed to.
+  budget the caller never agreed to. This covers backfill grants too: an absurd
+  page count is refused with the ceiling named, never trimmed to fit.
 - **Per-source cadence is the source's own.** X watchlists and FB pages each
   carry their own check interval; a scheduler collects only what is *due*. Idle
   ticks cost nothing (no browser opened when nothing is due).
+- **The watermark walk is FORWARD-ONLY, and history is a separate, budgeted
+  act.** Stopping at the first already-seen post is what makes a poll cost one
+  request — and it also means a poll can never reach further back than
+  `page_size x max_pages_per_poll`. On a live account that ceiling is invisible.
+  On an archival query (`from:someone until:2025-02-20`), a dormant account, or
+  anything whose newest post is already stored, it is permanent: the stream sits
+  at exactly that number forever, polling on schedule, finding nothing, and
+  looking from the dashboard as though collection died. Reaching older posts is
+  `collector.backfill_once` — a separate pass that resumes from a stored cursor,
+  spends an operator-granted page budget a few pages at a time, and NEVER moves
+  the watermark (the watermark answers "how far forward are we"; an old post
+  must not be allowed to answer it). It is off until granted: `backfill_pages`
+  defaults to 0, so the forward poller's behaviour is unchanged by its existence.
+- **Starvation spends nothing.** Zero pages means no account was free, not that
+  the archive ended. A backfill pass that walks zero pages must not decrement
+  the operator's budget, advance the cursor, or mark the sweep exhausted —
+  otherwise an empty pool silently eats a grant and reports success.
+- **A cadence shown in the interface is a promise, and the scheduler keeps it.**
+  The Watchlists dropdown wrote only `min_interval_s`, so it was a floor: the
+  adaptive controller multiplied a quiet stream's interval by `GROW` on every
+  empty poll up to `max_interval_s`, and "empty" is the permanent, correct
+  answer for an archival query. The panel said 5 minutes, the collector ran 15,
+  and nothing anywhere reported the disagreement. An explicit choice now pins
+  BOTH ends (`min_interval_s == max_interval_s`) and jitter drops to
+  `JITTER_PINNED`, so the number displayed is the number that runs. `auto`
+  clears both and hands the cadence back to the adaptive controller, which is
+  still the right default for a busy live stream. General form: if a control
+  states a number, either honour that number or do not state it.
 
 ## 4. Delivery rules
 

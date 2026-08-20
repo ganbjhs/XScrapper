@@ -547,10 +547,12 @@ async def test_lock_release(tmp):
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent))
 
 from collector import (  # noqa: E402
+    JITTER_PINNED,
     STOP_EXHAUSTED,
     STOP_PAGE_BUDGET,
     STOP_STARVED,
     STOP_WATERMARK,
+    jittered,
     next_interval,
     poll_once,
 )
@@ -3001,6 +3003,228 @@ def sqlite3_connect(path):
     return sqlite3.connect(str(path))
 
 
+def test_pinned_interval():
+    """
+    An interval chosen in the dashboard must be the interval that RUNS.
+
+    This is the regression that made the Watchlists panel look broken: the
+    dropdown wrote min_interval_s only, so it was a floor. The adaptive
+    controller multiplied a quiet stream's interval by GROW on every empty
+    poll -- and "empty" is the permanent, correct answer for an archival query
+    or an account that has stopped posting -- until it sat at max_interval_s.
+    The panel said 5 minutes, the collector ran every 15, and nothing anywhere
+    reported the disagreement.
+    """
+    print()
+    print("== a pinned interval does not drift ==")
+    pinned = Stream(min_interval_s=300, max_interval_s=300, page_size=20)
+
+    class R:
+        def __init__(self, new, stop):
+            self.new, self.stop_reason = new, stop
+
+        @property
+        def starved(self):
+            return self.stop_reason == STOP_STARVED
+
+    i, ewma, empty = 300.0, 0.0, 0
+    for _ in range(10):
+        i, ewma, empty = next_interval(pinned, i, i, R(0, STOP_WATERMARK), ewma, empty)
+    ok(i == 300, f"ten empty polls in a row do not inflate it ({i:.0f}s)")
+
+    i, _, _ = next_interval(pinned, 300, 300, R(0, STOP_PAGE_BUDGET), 0.0, 0)
+    ok(i == 300, f"hitting the page budget does not shorten it either ({i:.0f}s)")
+
+    i, _, _ = next_interval(pinned, 300, 300, R(500, STOP_WATERMARK), 0.0, 0)
+    ok(i == 300, f"nor does a burst of new tweets ({i:.0f}s)")
+
+    # And the unpinned case must be untouched -- "auto" still adapts.
+    auto = Stream(min_interval_s=5, max_interval_s=900, page_size=20)
+    i, _, _ = next_interval(auto, 60, 60, R(0, STOP_WATERMARK), 0.0, 0)
+    ok(i > 60, f"'auto' still backs off on a quiet stream (60s -> {i:.0f}s)")
+
+    # Jitter has to stay INSIDE the promise, or pinning is only cosmetic.
+    worst = max(abs(jittered(300, JITTER_PINNED) - 300) for _ in range(2000))
+    ok(worst <= 300 * JITTER_PINNED + 1e-9,
+       f"pinned jitter stays within +/-{JITTER_PINNED:.0%} (worst seen: {worst:.1f}s)")
+    ok(worst < 10, f"...which on a 5-minute cadence is under 10s of slop ({worst:.1f}s)")
+
+
+async def run_backfill(tmp):
+    """
+    Walking BACKWARDS: the fix for a watchlist frozen at exactly
+    page_size * max_pages_per_poll.
+
+    The first half of this test reproduces the freeze, because a fix for a bug
+    nobody can see reproduced is a fix nobody can check.
+    """
+    import store as store_mod
+    from collector import (STOP_BACKFILL_BUDGET, STOP_BACKFILL_DONE,
+                           STOP_BACKFILL_IDLE, backfill_once)
+
+    store = store_mod.Store(tmp / "results.db")
+    await store.open()
+
+    print("== the freeze, reproduced ==")
+    arch = Stream(label="archive", query="from:someone until:2025-02-20",
+                  max_pages_per_poll=2)
+    sid = await store.ensure_stream(arch.label, arch.query, "Latest", True)
+
+    # Two pages of an archive that has plenty more behind it.
+    eng = ReplayEngine([ids_at(100, 110), ids_at(120, 130), ids_at(140, 150)],
+                       cursor_end=False)
+    r1 = await poll_once(eng, store, arch, sid)
+    ok(r1.new == 4 and r1.pages == 2,
+       f"the first poll takes its whole page budget and stops (new={r1.new} pages={r1.pages})")
+    await store.set_watermark(sid, r1.max_id)
+
+    # Every poll from here on sees the same newest tweet on page one.
+    for _ in range(3):
+        eng = ReplayEngine([ids_at(100, 110), ids_at(120, 130), ids_at(140, 150)],
+                           cursor_end=False)
+        rn = await poll_once(eng, store, arch, sid)
+    ok(rn.new == 0 and rn.pages == 1,
+       f"and every poll after it finds nothing, on one page (new={rn.new} pages={rn.pages})")
+    total = await store.count_tweets()
+    ok(total == 4, f"the stream is stuck at its page ceiling ({total} tweets, forever)")
+
+    print()
+    print("== backfill: budget, resume, accumulate ==")
+    st0 = await store.backfill_state(sid)
+    ok(st0["remaining"] == 0, "no budget granted yet, so nothing to spend")
+    res = await backfill_once(eng, store, arch, sid)
+    ok(res.stop_reason == STOP_BACKFILL_IDLE,
+       f"and a pass with no budget costs nothing (stop={res.stop_reason})")
+
+    store.db.execute("UPDATE streams SET backfill_pages = 4 WHERE stream_id = ?", (sid,))
+    older = ReplayEngine([ids_at(200, 210), ids_at(220, 230), ids_at(240, 250)],
+                         cursor_end=False)
+    res = await backfill_once(older, store, arch, sid,
+                              max_pages=2)
+    ok(res.pages == 2, f"one pass spends only its per-pass budget (pages={res.pages})")
+    ok(res.new == 4, f"and collects older posts the poller could never reach (new={res.new})")
+    ok(res.stop_reason == STOP_BACKFILL_BUDGET, f"stop={res.stop_reason}")
+    ok(older.requested[0]["cursor"] is None, "the first pass starts where the poll left off")
+
+    state = await store.backfill_state(sid)
+    ok(state["walked"] == 2 and state["remaining"] == 2,
+       f"progress is recorded against the grant (walked={state['walked']} "
+       f"remaining={state['remaining']})")
+    ok(state["cursor"] == "CUR1", f"and the resume point is stored (cursor={state['cursor']})")
+
+    # THE point of the cursor: the second pass continues, it does not restart.
+    older2 = ReplayEngine([ids_at(300, 310)], cursor_end=True)
+    res = await backfill_once(older2, store, arch, sid,
+                              max_pages=2)
+    ok(older2.requested[0]["cursor"] == "CUR1",
+       f"the next pass RESUMES from the stored cursor ({older2.requested[0]['cursor']})")
+    ok(res.stop_reason == STOP_BACKFILL_DONE,
+       f"finishing under budget means X has no more to give (stop={res.stop_reason})")
+    state = await store.backfill_state(sid)
+    ok(state["done"] and state["got"] == 6,
+       f"exhausted, with the total accumulated across passes (got={state['got']})")
+
+    print()
+    print("== what backfill must NOT do ==")
+    wm = await store.get_watermark(sid)
+    ok(wm["high_tweet_id"] == r1.max_id,
+       "an older tweet never moves the watermark — that answers a forward question")
+    ok(not await store.open_gaps(sid),
+       "and a backwards walk opens no gaps; it is the thing that CLOSES them")
+
+    print()
+    print("== starvation must not silently eat the budget ==")
+
+    class Starved:
+        def pages_for(self, stream, **kw):
+            return self.search_pages(stream.query, **kw)
+
+        async def search_pages(self, *a, **kw):
+            return
+            yield  # pragma: no cover
+
+    store.db.execute(
+        "UPDATE streams SET backfill_pages = backfill_walked + 3, backfill_done = 0 "
+        "WHERE stream_id = ?", (sid,))
+    before = await store.backfill_state(sid)
+    res = await backfill_once(Starved(), store, arch, sid)
+    after = await store.backfill_state(sid)
+    ok(res.stop_reason == STOP_STARVED, f"zero pages is starvation (stop={res.stop_reason})")
+    ok(after["walked"] == before["walked"],
+       "an empty account pool spends none of the operator's pages")
+    ok(after["cursor"] == before["cursor"], "and does not disturb the resume point")
+
+    await store.close()
+
+
+def test_watchlist_depth_controls(tmp):
+    """The dashboard writes, and what it writes is what the collector reads."""
+    import store as store_mod
+
+    async def go():
+        st = store_mod.Store(pathlib.Path(tmp) / "results.db", False)
+        await st.open()
+        out = {}
+        pid = (await st.create_project("Depth"))["project_id"]
+        wid = (await st.create_watchlist(pid, "Archive", "keywords"))["watchlist_id"]
+        await st.set_watchlist_members(wid, add=["from:someone until:2025-02-20"])
+        out["five_min"] = await st.set_watchlist_interval(wid, 300)
+        out["rows"] = [dict(r) for r in st.db.execute(
+            "SELECT label, min_interval_s, max_interval_s FROM streams "
+            "WHERE label LIKE ?", (f"wl:{wid}:%",))]
+        out["auto"] = await st.set_watchlist_interval(wid, "")
+        out["rows_auto"] = [dict(r) for r in st.db.execute(
+            "SELECT min_interval_s, max_interval_s FROM streams WHERE label LIKE ?",
+            (f"wl:{wid}:%",))]
+        out["pages_bad"] = await st.set_watchlist_pages(wid, 99)
+        out["pages_ok"] = await st.set_watchlist_pages(wid, 10)
+        out["bf_bad"] = await st.set_watchlist_backfill(wid, 99999)
+        out["bf"] = await st.set_watchlist_backfill(wid, 40)
+        out["bf_again"] = await st.set_watchlist_backfill(wid, 40)
+        out["granted"] = [dict(r) for r in st.db.execute(
+            "SELECT backfill_pages, backfill_walked FROM streams WHERE label LIKE ?",
+            (f"wl:{wid}:%",))]
+        out["stop"] = await st.set_watchlist_backfill(wid, 0)
+        out["stopped"] = [dict(r) for r in st.db.execute(
+            "SELECT backfill_pages, backfill_walked FROM streams WHERE label LIKE ?",
+            (f"wl:{wid}:%",))]
+        out["view"] = (await st.watchlists(pid))[0]
+        await st.close()
+        return out
+
+    r = asyncio.run(go())
+
+    print("== the interval control pins both ends ==")
+    ok(r["rows"] and all(x["min_interval_s"] == 300 and x["max_interval_s"] == 300
+                         for x in r["rows"]),
+       "choosing '5 min' writes BOTH the floor and the ceiling")
+    ok(r["five_min"].get("pinned") is True, "and reports back that it is pinned")
+    ok(all(x["min_interval_s"] is None and x["max_interval_s"] is None
+           for x in r["rows_auto"]),
+       "'auto' clears both and hands the cadence back to the controller")
+
+    print()
+    print("== depth and backfill are bounded, and additive ==")
+    ok("error" in r["pages_bad"], f"99 pages per poll is refused: {r['pages_bad'].get('error', '')[:60]}")
+    ok(r["pages_ok"].get("max_pages_per_poll") == 10, "10 is accepted")
+    ok("error" in r["bf_bad"], "an absurd backfill grant is refused, not clamped")
+    ok(r["bf"].get("granted_pages") == 40, "a sane grant goes through")
+    ok(all(x["backfill_pages"] == x["backfill_walked"] + 40 for x in r["granted"]),
+       "a second grant asks for MORE history rather than restarting the walk")
+    ok(r["stop"].get("stopped") is True, "and it can be stopped")
+    ok(all(x["backfill_pages"] == x["backfill_walked"] for x in r["stopped"]),
+       "which withdraws the unspent remainder")
+
+    print()
+    print("== the panel is told all of it ==")
+    v = r["view"]
+    ok("backfill" in v and "running" in v["backfill"],
+       "the watchlist payload carries backfill state for the interface")
+    ok(v["backfill"]["running"] is False, "a stopped sweep does not report as running")
+    ok("interval_pinned" in v and "pages" in v,
+       "along with whether the cadence is pinned, and the depth setting")
+
+
 def main():
     root = HERE / ".tmp"
     cwd = os.getcwd()
@@ -3035,6 +3259,11 @@ def main():
         section("collector (watermark, dedup, gaps, intervals)")
         asyncio.run(run_collector(fresh("collector")))
         test_interval()
+        test_pinned_interval()
+
+        section("backfill (walking a query backwards, on a budget)")
+        asyncio.run(run_backfill(fresh("backfill")))
+        test_watchlist_depth_controls(fresh("depthctl"))
 
         section("instagram (one stable device per account)")
         test_ig_device(fresh("ig"))

@@ -347,6 +347,119 @@ function XListMembers({ listId }) {
   );
 }
 
+// Depth and history — the two controls that answer "why has this stopped?".
+//
+// Watchlist collection is watermark-first: every poll walks the timeline from
+// the top and stops the moment it reaches a post it already has. That is what
+// makes it cheap and fast on a live account, and it is also why a watchlist can
+// sit at a frozen number for days while apparently running perfectly. Two
+// different things can be going on, they have two different fixes, and until
+// now the interface offered neither:
+//
+//   * Posts arrive faster than one poll reaches. The poll runs out of pages
+//     before it gets down to known ground, and the window in between is missed.
+//     Fix: more pages per check.
+//   * There is nothing NEW to find, and everything worth having is older than
+//     the watermark — an archival query (`until:2025-02-20`), or an account
+//     that has stopped posting. No cadence and no page count helps here; the
+//     poller is doing its job and its job is the wrong shape. Fix: walk
+//     backwards, which is what "fetch older" grants budget for.
+//
+// Both are shown together because from the outside the symptom is identical,
+// and an operator who can see both controls can tell which one they have.
+function DepthRow({ w, onChanged }) {
+  const [busy, setBusy] = useState(false);
+  const [err, setErr] = useState("");
+  const [want, setWant] = useState("50");
+  const bf = w.backfill || {};
+  const remaining = Math.max(0, (bf.pages || 0) - (bf.walked || 0));
+
+  const run = async (fn) => {
+    setBusy(true); setErr("");
+    try {
+      const r = await fn();
+      if (r && r.error) setErr(r.error); else onChanged();
+    } catch (e) { setErr(String(e.message || e)); }
+    finally { setBusy(false); }
+  };
+
+  return (
+    <div className="filters" style={{ margin: "10px 0 0", alignItems: "center",
+                                      flexWrap: "wrap", rowGap: 8 }}>
+      <label className="fpill" style={{ padding: "5px 6px 5px 11px" }}
+             title={"How far down the timeline ONE check is allowed to go, in "
+                    + "pages of about 20 posts.\n\nRaise this if a busy "
+                    + "watchlist is missing posts between checks. It will NOT "
+                    + "help a watchlist that has stopped growing — a check "
+                    + "still stops at the newest post it already has, however "
+                    + "many pages it is allowed. Use 'fetch older' for that."}>
+        <span>depth</span>
+        <select value={w.pages ? String(w.pages) : ""} disabled={busy}
+                onChange={(e) => run(() =>
+                  api.watchlistDepth(w.watchlist_id, e.target.value))}>
+          <option value="">default</option>
+          <option value="1">1 page (~20)</option>
+          <option value="3">3 pages (~60)</option>
+          <option value="5">5 pages (~100)</option>
+          <option value="10">10 pages (~200)</option>
+          <option value="25">25 pages (~500)</option>
+        </select>
+      </label>
+
+      {bf.running ? (
+        <>
+          <span className="chip" title="pages of older history still to walk">
+            fetching older — {fmtN(bf.got || 0)} found, {remaining} page
+            {remaining === 1 ? "" : "s"} to go
+          </span>
+          <button className="btn btn-ghost btn-sm" disabled={busy}
+                  onClick={() => run(() => api.watchlistBackfill(w.watchlist_id, 0))}>
+            Stop
+          </button>
+        </>
+      ) : (
+        <>
+          <label className="fpill" style={{ padding: "5px 6px 5px 11px" }}
+                 title={"Walk BACKWARDS through this watchlist's query and "
+                        + "collect posts older than what it already has.\n\n"
+                        + "This is the control for an archival query, or an "
+                        + "account that has stopped posting — cases where "
+                        + "checking more often finds nothing because there is "
+                        + "nothing new to find. It resumes where it left off, "
+                        + "spends a few pages at a time inside the rate limit, "
+                        + "and never disturbs live collection."}>
+            <span>fetch older</span>
+            <select value={want} disabled={busy}
+                    onChange={(e) => setWant(e.target.value)}>
+              <option value="10">10 pages (~200)</option>
+              <option value="25">25 pages (~500)</option>
+              <option value="50">50 pages (~1,000)</option>
+              <option value="150">150 pages (~3,000)</option>
+              <option value="500">500 pages (~10,000)</option>
+            </select>
+          </label>
+          <button className="btn btn-brand btn-sm" disabled={busy || !w.streams.length}
+                  onClick={() => run(() => api.watchlistBackfill(w.watchlist_id, want))}>
+            {busy ? "…" : bf.got ? "Fetch more" : "Fetch older posts"}
+          </button>
+        </>
+      )}
+
+      {/* Exhausted is worth saying out loud. Without it, a sweep that finished
+          because X genuinely has no more results is indistinguishable from one
+          that quietly failed, and the natural response — grant more budget —
+          spends requests to be told the same thing again. */}
+      {!bf.running && bf.exhausted && bf.walked > 0 && (
+        <span className="chip" title="X returned no further results for this query">
+          history complete — {fmtN(bf.got || 0)} older post
+          {bf.got === 1 ? "" : "s"} collected
+        </span>
+      )}
+      {err && <span style={{ color: "var(--critical)", fontSize: 12.5 }}>{err}</span>}
+    </div>
+  );
+}
+
 function XDetail({ w, onChanged }) {
   const [adding, setAdding] = useState("");
   const [search, setSearch] = useState("");
@@ -401,7 +514,11 @@ function XDetail({ w, onChanged }) {
         {paused && <span className="chip warn">paused</span>}
         <span className="right" style={{ display: "flex", gap: 8, alignItems: "center" }}>
           <label className="fpill" style={{ padding: "5px 6px 5px 11px" }}
-                 title="how often the collector re-checks this watchlist">
+                 title={"How often the collector re-checks this watchlist.\n\n"
+                        + "A chosen interval is EXACT — it pins both ends of the "
+                        + "scheduler, so 5 min means 5 min. 'auto' hands the "
+                        + "cadence back to the adaptive controller, which speeds "
+                        + "up on busy streams and slows down on quiet ones."}>
             <span>every</span>
             <select value={curInterval} onChange={(e) => setInterval(e.target.value)}>
               <option value="">auto</option>
@@ -426,6 +543,8 @@ function XDetail({ w, onChanged }) {
           ? `Collected through X List ${w.list_id} — members are managed on x.com.`
           : `${w.members.length} ${w.kind === "keywords" ? "keyword rule" : "handle"}${w.members.length === 1 ? "" : "s"} → ${live.length} live stream${live.length === 1 ? "" : "s"}`}
       </div>
+
+      <DepthRow w={w} onChanged={onChanged} />
 
       {w.kind !== "xlist" && (
         <>

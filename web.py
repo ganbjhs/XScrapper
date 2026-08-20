@@ -1614,6 +1614,49 @@ def _watchlist_interval(body):
         wid, body.get("seconds")))
 
 
+def _watchlist_depth(body):
+    try:
+        wid = int(body.get("watchlist_id") or 0)
+    except (TypeError, ValueError):
+        return {"error": "watchlist_id must be a number"}
+    return _with_store(lambda st: st.set_watchlist_pages(wid, body.get("pages")))
+
+
+def _watchlist_backfill(body):
+    """
+    Grant or withdraw budget for walking this watchlist's query BACKWARDS.
+
+    Guard-checked exactly like /api/fetch, and for the same reason: this is the
+    other endpoint that can be made to spend real rate-limit budget on request.
+    The grant is bounded and drip-fed by the collector, so the assessment here
+    is against ONE pass rather than the whole grant -- refusing a 200-page grant
+    because 200 requests would not fit in the current 15-minute window would be
+    wrong, since it is never going to ask for 200 requests in one window.
+    """
+    try:
+        wid = int(body.get("watchlist_id") or 0)
+    except (TypeError, ValueError):
+        return {"error": "watchlist_id must be a number"}
+
+    pages = body.get("pages")
+    stopping = pages in (None, "", 0, "0")
+
+    if not stopping:
+        try:
+            import guard
+            import collector as _c
+            v = guard.assess(_CFG, action="fetch",
+                             cost=_c.BACKFILL_PAGES_PER_PASS, queue="search")
+            if v.blocked:
+                b = v.blocks[0]
+                return {"error": f"{b.title} — {b.remedy}", "blocked": True,
+                        "guard": v.to_json()}
+        except Exception:
+            pass    # a guard that cannot be consulted must not block collection
+
+    return _with_store(lambda st: st.set_watchlist_backfill(wid, pages))
+
+
 def _watchlist_filters(body):
     try:
         wid = int(body.get("watchlist_id") or 0)
@@ -3971,6 +4014,10 @@ class Handler(BaseHTTPRequestHandler):
                 return self._send(200, _watchlist_filters(body))
             if u.path == "/api/watchlists/interval":
                 return self._send(200, _watchlist_interval(body))
+            if u.path == "/api/watchlists/depth":
+                return self._send(200, _watchlist_depth(body))
+            if u.path == "/api/watchlists/backfill":
+                return self._send(200, _watchlist_backfill(body))
             if u.path == "/api/watchlists/remove":
                 return self._send(200, _watchlist_remove(body))
             if u.path == "/api/streams/attach":
