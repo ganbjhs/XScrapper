@@ -10,10 +10,16 @@ row shape.
     collector stores a tweet  ->  sender notices  ->  values.append -> your sheet
 
 FOUR COLUMNS, ALWAYS: date | link | text | media
-Written once as a header row when the tab is empty, then appended to, oldest
-at the top, newest at the bottom. Append (rather than insert-at-row-2) is what
-makes this safe next to the cursor: a row that lands is never moved again, so
-nothing a human is reading or filtering shifts underneath them.
+Written once as a header row when the tab is empty, then appended to.
+
+ORDER. Rows ARRIVE in collection order, which is not the order anyone wants to
+read: a backwards sweep collects 2024 while live polling adds today, so a pure
+append interleaves them. Via the Apps Script route the sheet is re-sorted on
+arrival so the newest post sits at the top and the oldest at the bottom, and
+duplicate links are dropped so an overlapping "send past posts" is harmless.
+Both are switches at the top of the script. The service-account route still
+appends in collection order -- see RULEBOOK 4; the two routes do not currently
+produce the same sheet.
 
 WHY A HAND-ROLLED SERVICE-ACCOUNT JWT AND NOT google-auth
 ---------------------------------------------------------
@@ -470,6 +476,29 @@ SCRIPT_SOURCE = r"""/**
 var TOKEN = '%TOKEN%';
 var HEADER = ['date', 'link', 'text', 'media'];
 
+// Keep the newest post at the top and the oldest at the bottom, by POST date.
+//
+// Rows arrive in COLLECTION order, which is not the order anyone wants to read.
+// A backwards sweep collects history newest-first while live polling keeps
+// adding today's posts, so a pure append interleaves them: a 2024 post, then a
+// 2026 one, then more 2024. Sorting on arrival is what makes the sheet read as
+// a timeline instead of as a delivery log.
+//
+// The cost, stated plainly: rows MOVE. If you are scrolled into the middle of
+// the sheet when a batch lands, what is under your cursor shifts. Set this to
+// false to get the old append-only behaviour back, where a row that lands is
+// never touched again.
+var SORT_NEWEST_FIRST = true;
+
+// Never write the same post twice.
+//
+// "Send past posts" does not move the delivery cursor, so a window that
+// overlaps what was already delivered would otherwise duplicate every post in
+// it -- and the natural way to fill a gap is to ask for a generous window.
+// Matching on the link column makes the whole endpoint idempotent: send the
+// same range as often as you like, only genuinely new posts land.
+var SKIP_DUPLICATES = true;
+
 function doPost(e) {
   // One writer at a time. A live batch and a "send past posts" run can
   // overlap, and two appends computing the same last row would overwrite
@@ -494,12 +523,42 @@ function doPost(e) {
     if (sheet.getLastRow() === 0) {
       sheet.getRange(1, 1, 1, HEADER.length).setValues([HEADER]);
     }
+
     var rows = body.rows || [];
+    var skipped = 0;
+
+    if (rows.length && SKIP_DUPLICATES && sheet.getLastRow() > 1) {
+      // Column B is the post link -- unique per post, and already text.
+      var seen = {};
+      var links = sheet.getRange(2, 2, sheet.getLastRow() - 1, 1).getValues();
+      for (var i = 0; i < links.length; i++) {
+        var v = String(links[i][0] || '');
+        if (v) { seen[v] = true; }
+      }
+      var fresh = [];
+      for (var j = 0; j < rows.length; j++) {
+        var link = String(rows[j][1] || '');
+        if (link && seen[link]) { skipped++; continue; }
+        if (link) { seen[link] = true; }   // guard against dupes inside one batch
+        fresh.push(rows[j]);
+      }
+      rows = fresh;
+    }
+
     if (rows.length) {
       sheet.getRange(sheet.getLastRow() + 1, 1, rows.length, HEADER.length)
            .setValues(rows);
     }
-    return reply({ ok: true, appended: rows.length, tab: name });
+
+    // Sort AFTER appending, over everything below the header. Done even when
+    // this batch added nothing new, so a sheet that predates this script gets
+    // put in order by the first delivery that reaches it.
+    if (SORT_NEWEST_FIRST && sheet.getLastRow() > 2) {
+      sheet.getRange(2, 1, sheet.getLastRow() - 1, HEADER.length)
+           .sort({ column: 1, ascending: false });
+    }
+
+    return reply({ ok: true, appended: rows.length, skipped: skipped, tab: name });
   } catch (err) {
     return reply({ error: String(err) });
   } finally {

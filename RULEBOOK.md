@@ -148,11 +148,28 @@ precision past 2^53; snowflake ids are well past it).
   wrong.
 - **Google Sheet targets append, never insert.** Four columns —
   `date | link | text | media` — with the header written only into a tab that
-  is empty, so a sheet a human has already shaped is left alone. Appending
-  means a row that lands is never moved again, which is what makes it safe to
-  run under someone who is reading and filtering the same sheet. Cells are
+  is empty, so a sheet a human has already shaped is left alone. Cells are
   parsed on write (real dates, clickable links), so any cell starting
   `= + - @` is apostrophe-escaped — scraped text must never become a formula.
+- **The sheet is ordered by POST date, newest first — and that is a reversal,
+  with a cost.** Rows arrive in COLLECTION order, which nobody wants to read:
+  a backwards sweep collects 2024 while live polling adds today, so a pure
+  append interleaves decades. The Apps Script therefore sorts the range below
+  the header descending on arrival (`SORT_NEWEST_FIRST`), which means rows DO
+  move under a reader — the exact property append-only was chosen to protect.
+  The trade is deliberate and reversible per sheet by flipping the flag in the
+  script. NOTE the asymmetry: the `service_account` route still appends in
+  collection order, because the REST path would need a separate `sortRange`
+  batchUpdate keyed on the numeric gid. Closing that gap is real work, not an
+  oversight — until it is done, the two routes do NOT produce the same sheet.
+- **The sheet endpoint is idempotent, keyed on the link column.** "Send past
+  posts" deliberately does not move the delivery cursor, so any window that
+  overlaps what was already delivered would duplicate every post in it — and
+  the natural way to fill a gap is to ask for a generous window. The script
+  reads column B and drops rows it already has (`SKIP_DUPLICATES`), so a range
+  can be re-sent as often as the operator likes. Without this the honest advice
+  for a gap would have been "compute the exact untouched window yourself",
+  which nobody can do from the dashboard.
 - **A sheet has two routes in, and the credential-free one is the default.**
   Google requires a credential for every write, so `sheet_mode='script'` puts
   the receiver INSIDE the sheet (an Apps Script web app running as its owner)

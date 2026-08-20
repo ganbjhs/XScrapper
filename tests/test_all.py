@@ -2786,6 +2786,18 @@ def test_sheets_script(tmp):
        "the script is a complete web-app receiver")
     ok("LockService" in code,
        "it takes a lock — a live batch and a history send must not interleave")
+    # The sheet is a TIMELINE, not a delivery log. Rows arrive in collection
+    # order, so a backwards sweep and live polling interleave decades unless
+    # the receiver reorders them.
+    ok("SORT_NEWEST_FIRST" in code and "ascending: false" in code,
+       "it sorts newest-first on arrival, so the oldest post ends up last")
+    ok(".sort({ column: 1" in code,
+       "sorting on column 1 — the POST date, not the collection order")
+    # Idempotence is what makes "send past posts" safe to use for a gap: the
+    # one-shot never moves the cursor, so an overlapping window would otherwise
+    # duplicate every post in it.
+    ok("SKIP_DUPLICATES" in code and "getRange(2, 2" in code,
+       "and drops posts whose link is already in the sheet, keyed on column B")
     ok(str(sh.HEADER) .replace('"', "'") in code.replace('"', "'"),
        "the script writes the SAME four columns this module builds")
     ok("'" not in sh.script_source("has'quote").split("var TOKEN = '")[1].split("'")[0],
