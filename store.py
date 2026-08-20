@@ -570,11 +570,24 @@ CREATE TABLE IF NOT EXISTS collection_items (
 CREATE TABLE IF NOT EXISTS delivery_targets (
   target_id  INTEGER PRIMARY KEY AUTOINCREMENT,
   project_id INTEGER NOT NULL,
-  kind       TEXT NOT NULL,                 -- 'webhook' | 'telegram'
+  kind       TEXT NOT NULL,                 -- 'webhook' | 'telegram' | 'sheet'
   name       TEXT NOT NULL,                 -- human label ("Watch-Tower")
   url        TEXT,                          -- webhook
   secret_env TEXT,                          -- webhook: NAME of the .env var
   chat_id    TEXT,                          -- telegram
+  -- sheet: which spreadsheet and which tab. The service-account KEY is not
+  -- here for the same reason a webhook secret is not -- it is a credential,
+  -- so it lives in .env (GOOGLE_SHEETS_CREDENTIALS), shared by every sheet
+  -- target exactly as TELEGRAM_BOT_TOKEN is shared by every chat.
+  sheet_id   TEXT,                          -- sheet+service_account: the id
+  sheet_tab  TEXT,                          -- sheet: the tab name
+  -- 'script'          = an Apps Script web app living in the sheet itself;
+  --                     `url` is its /exec address and `secret_env` names the
+  --                     shared token, exactly as a webhook's does.
+  -- 'service_account' = the Sheets REST API with a key from .env.
+  -- NULL reads as 'script' (see sheets.mode_of): the column arrived after the
+  -- table, and the credential-free mode is the safer assumption.
+  sheet_mode TEXT,
   batch_size INTEGER NOT NULL DEFAULT 50,
   enabled    INTEGER NOT NULL DEFAULT 1,
   created_at TEXT NOT NULL
@@ -801,6 +814,12 @@ class Store:
         # default in order to leave it alone.
         wanted = {"polls": {"rl_reset": "INTEGER"},
                   "tweets": {"media_json": "TEXT"},
+                  # Google Sheet targets arrived after delivery_targets did,
+                  # so a database created before them has the table but not
+                  # these two columns.
+                  "delivery_targets": {"sheet_id": "TEXT",
+                                       "sheet_tab": "TEXT",
+                                       "sheet_mode": "TEXT"},
                   # Collection filters, as JSON — checkboxes in the UI that
                   # compile into X advanced-search operators on every one of
                   # the watchlist's streams. See WATCHLIST_FILTERS.
@@ -1480,7 +1499,10 @@ class Store:
     async def create_delivery_target(self, project_id: int, kind: str,
                                      name: str, url: str = "",
                                      secret_env: str = "", chat_id: str = "",
-                                     batch_size: int = 50) -> dict:
+                                     batch_size: int = 50,
+                                     sheet_id: str = "",
+                                     sheet_tab: str = "",
+                                     sheet_mode: str = "") -> dict:
         if not self.db.execute("SELECT 1 FROM projects WHERE project_id = ?",
                                (int(project_id),)).fetchone():
             return {"error": f"no project {project_id}"}
@@ -1500,17 +1522,51 @@ class Store:
             if not re.fullmatch(r"-?\d{1,20}|@[A-Za-z0-9_]{4,32}", chat_id or ""):
                 return {"error": "a chat id is a number like -1001234567890, "
                                  "or a public channel like @mychannel"}
+        elif kind == "sheet":
+            import sheets as _sheets
+
+            sheet_mode = _sheets.mode_of(sheet_mode)
+            sheet_tab = (sheet_tab or "").strip() or "Sheet1"
+            if len(sheet_tab) > 100:
+                return {"error": "that tab name is too long"}
+            if sheet_mode == _sheets.MODE_SCRIPT:
+                url = (url or "").strip()
+                secret_env = (secret_env or "").strip()
+                if not (url.startswith(_sheets.SCRIPT_URL_PREFIX)
+                        and "/exec" in url):
+                    return {"error": "that is not an Apps Script web app URL — "
+                                     "deploy the script and paste the address "
+                                     "ending in /exec"}
+                # Same rule as a webhook secret, and for the same reason: the
+                # token is a credential, so the database stores its NAME.
+                if not re.fullmatch(r"[A-Z][A-Z0-9_]*", secret_env or ""):
+                    return {"error": "secret_env must NAME an .env variable, "
+                                     "like SHEET_TOKEN_DAILY (never the token "
+                                     "itself)"}
+                sheet_id = ""
+            else:
+                # The URL is accepted and reduced to the id here, not in the
+                # UI, so the API is as forgiving as the form: operators copy
+                # the address bar, not the 44 characters in the middle of it.
+                sheet_id = _sheets.sheet_id(sheet_id)
+                if not re.fullmatch(r"[A-Za-z0-9_-]{20,}", sheet_id or ""):
+                    return {"error": "paste the Google Sheet's URL, or its id "
+                                     "(the long part of the URL after /d/)"}
+                url, secret_env = "", ""
         else:
-            return {"error": "kind must be 'webhook' or 'telegram'"}
+            return {"error": "kind must be 'webhook', 'telegram' or 'sheet'"}
         try:
             batch_size = min(200, max(1, int(batch_size)))
         except (TypeError, ValueError):
             return {"error": "batch_size must be a whole number"}
         cur = self.db.execute(
             "INSERT INTO delivery_targets(project_id, kind, name, url, secret_env, "
-            " chat_id, batch_size, created_at) VALUES(?,?,?,?,?,?,?,?)",
+            " chat_id, sheet_id, sheet_tab, sheet_mode, batch_size, created_at) "
+            "VALUES(?,?,?,?,?,?,?,?,?,?,?)",
             (int(project_id), kind, name, url or None, secret_env or None,
-             chat_id or None, batch_size, _iso_ms(int(time.time() * 1000))))
+             chat_id or None, sheet_id or None, sheet_tab or None,
+             (sheet_mode if kind == "sheet" else None),
+             batch_size, _iso_ms(int(time.time() * 1000))))
         return {"target_id": cur.lastrowid}
 
     async def update_delivery_target(self, target_id: int, values: dict) -> bool:

@@ -58,7 +58,9 @@ FB: fb_state  ->   engine_fb.py     ->   collect_fb.py ->   store_fb.py -> fb_re
                    gql capture,          or favorites mode,   removed_pages tombstones)
                    login breaker)        paused/blocked-aware)
 
-  DELIVERY (webhook.py): push loop -> Watch-Tower webhook + Telegram + alerts
+  DELIVERY (webhook.py): push loop -> webhook + Telegram + Google Sheet + alerts
+  SHEETS (sheets.py):    Apps Script web app (default) or service-account JWT;
+                         date|link|text|media, header once, append only
   GUARD (guard.py):      advisory risk checks, never mutates
   API (api.py):          API-key JSON service for Instagram pull
   LOG (activity_log.py): every collector/engine line -> activity.db -> dashboard
@@ -86,7 +88,8 @@ The organizing layer (in `store.py` + `web.py`):
 | `engine.py` | Transport/parse seam over pinned `twscrape`; yields `Page` objects |
 | `collector.py` | X poll loop: watermark stop, dedup, stop-reasons, adaptive intervals |
 | `store.py` | `results.db`: tweets (hot row) + `tweet_raw` (payloads, LEFT JOIN when needed), streams, polls, projects/watchlists/collections/alerts, FTS5 search, retention |
-| `webhook.py` | Delivery loop: signed webhook push, Telegram, alert ticking; cursor-based |
+| `webhook.py` | Delivery loop: signed webhook push, Telegram, Google Sheet, alert ticking; cursor-based |
+| `sheets.py` | Google Sheets transport, two modes: Apps Script web app (no cloud project) or service-account JWT (no new deps); header-once, append-only `date\|link\|text\|media` |
 | `alerts.py` | Velocity-alert decision + tick (pure logic, testable) |
 | `guard.py` | Advisory risk findings; never changes state |
 | `activity_log.py` | Persistent account-activity log (`activity.db`); `logger()` wraps every collector's log= |

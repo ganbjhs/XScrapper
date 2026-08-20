@@ -54,6 +54,10 @@ export const api = {
     request("/api/delivery/targets/remove", { method: "POST", body: { target_id } }),
   deliveryBackfill: (body) =>
     request("/api/delivery/backfill", { method: "POST", body }),
+  testSheet: (body) =>
+    request("/api/delivery/sheet/test", { method: "POST", body }),
+  sheetScript: (body) =>
+    request("/api/delivery/sheet/script", { method: "POST", body }),
   projectFetch: (project, ack) =>
     request("/api/project/fetch", { method: "POST", body: { project, ack } }),
   setCollection: (paused) =>
@@ -208,4 +212,32 @@ export const fmtAgo = (iso) => {
   if (s < 3600) return `${Math.floor(s / 60)}m ago`;
   if (s < 86400) return `${Math.floor(s / 3600)}h ago`;
   return `${Math.floor(s / 86400)}d ago`;
+};
+
+// Beyond this, "how long ago" stops being the useful answer.
+const AGO_LIMIT_DAYS = 30;
+
+/**
+ * When a post was PUBLISHED, for a human reading a feed.
+ *
+ * Relative up to a month ("3h ago", "12d ago"), then the actual date. The
+ * cutover exists because the two questions are different: for something from
+ * this week "how fresh is it" is what you want, but "97d ago" answers nothing
+ * — nobody counts backwards from today to find July, and a feed showing a
+ * month of history turns into a column of three-digit day counts you have to
+ * do arithmetic on.
+ *
+ * Deliberately NOT folded into fmtAgo. That one measures OUR freshness —
+ * when we last collected, last delivered, last polled — where a big number is
+ * itself the alarm and a date would hide it. This measures someone else's
+ * timeline.
+ */
+export const fmtPosted = (iso) => {
+  const t = typeof iso === "number" ? iso : Date.parse(iso);
+  if (!t) return "—";
+  const days = (Date.now() - t) / 86_400_000;
+  if (days < AGO_LIMIT_DAYS) return fmtAgo(t);
+  return new Date(t).toLocaleDateString("en-IN", {
+    day: "numeric", month: "short", year: "numeric",
+  });
 };

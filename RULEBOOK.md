@@ -80,6 +80,35 @@ precision past 2^53; snowflake ids are well past it).
 - **Facebook/Instagram delivery is pull.** Watch-Tower pulls IG/FB via
   `/api/fb/posts` and `/api/instagram/posts`; X is pushed via webhook. Both are
   the same normalized shape.
+- **A new delivery target is a transport, never a second pipeline.** Webhook,
+  Telegram and Google Sheet share one cursor, one back-off, one filter set and
+  one loop; a target kind adds a `deliver_*` function and a row shape and
+  nothing else. If a target needs its own scheduling, it is being designed
+  wrong.
+- **Google Sheet targets append, never insert.** Four columns —
+  `date | link | text | media` — with the header written only into a tab that
+  is empty, so a sheet a human has already shaped is left alone. Appending
+  means a row that lands is never moved again, which is what makes it safe to
+  run under someone who is reading and filtering the same sheet. Cells are
+  parsed on write (real dates, clickable links), so any cell starting
+  `= + - @` is apostrophe-escaped — scraped text must never become a formula.
+- **A sheet has two routes in, and the credential-free one is the default.**
+  Google requires a credential for every write, so `sheet_mode='script'` puts
+  the receiver INSIDE the sheet (an Apps Script web app running as its owner)
+  and we hold only a URL and a token; `sheet_mode='service_account'` is the
+  REST API with a key from `.env`. A NULL mode reads as `script`. Both build
+  rows with the same `sheets.sheet_rows`, so the sheet never reveals which was
+  used — if the two ever produce different columns, that is the bug.
+- **"How long ago" has a shelf life.** A post's PUBLISHED time reads as
+  relative for its first 30 days and as a real date after that (`fmtPosted`),
+  because "97d ago" makes a reader do arithmetic to arrive at "mid-May".
+  `fmtAgo` is untouched and still measures OUR freshness — last collected,
+  last delivered, last polled — where a large number IS the alarm and a date
+  would bury it. Do not merge the two.
+- **A per-deployment secret is NAMED, never stored.** The Apps Script token
+  follows the webhook-secret rule (`secret_env` holds the variable's name),
+  not the Telegram-token rule (one global value), because there is one token
+  per sheet. `/exec` URLs are addresses and are stored; tokens are not.
 
 ## 5. Security rules
 

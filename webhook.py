@@ -143,6 +143,8 @@ def _tweet_json(row: dict, labels: list) -> dict:
 # TG_GAP_S below is 3.2s, not the 1.2s that sufficed when messages were packed.
 # A batch of 20 therefore takes just over a minute to land. That is the correct
 # trade: arriving a minute later is a nuisance, collecting 429s is an outage.
+SHEET_URL_PREFIX = "https://docs.google.com/spreadsheets/d/"
+
 TELEGRAM_API = "https://api.telegram.org"
 TG_MAX_CHARS = 3500          # the hard cap is 4096; leave room for the footer
 TG_GAP_S = 3.2               # ~20 messages/minute into one group, Telegram's cap
@@ -249,6 +251,34 @@ async def deliver_telegram(client, hook, store, rows: list) -> tuple[bool, str]:
     return True, ""
 
 
+# --------------------------------------------------------------------------
+# Google Sheets
+# --------------------------------------------------------------------------
+#
+# A third target, and the one that adds the least: sheets.py owns the
+# transport and the row shape, and everything else -- the cursor, the
+# back-off, the per-target filters, "never block collection" -- is the
+# machinery above, used unchanged. See sheets.py for the columns and setup.
+#
+# Unlike Telegram there is no pacing constant here. Sheets takes the whole
+# batch in ONE values.append call, which is both faster and safer: the batch
+# lands completely or not at all, so the cursor can never advance over a
+# half-written batch.
+
+
+async def deliver_sheet(client, hook, store, rows: list) -> tuple[bool, str]:
+    """
+    Append a batch to the target's sheet. Never raises.
+
+    Which of the two routes (the sheet's own Apps Script, or the REST API with
+    a service account) is sheets.deliver's business, not ours — from here a
+    sheet is one target with one cursor, exactly like the other two kinds.
+    """
+    import sheets as _sheets
+
+    return await _sheets.deliver(client, hook, rows)
+
+
 async def deliver_batch(client, hook, store, rows: list) -> tuple[bool, str]:
     """
     Deliver one batch. Returns (ok, error). Never raises.
@@ -256,8 +286,11 @@ async def deliver_batch(client, hook, store, rows: list) -> tuple[bool, str]:
     The cursor is the caller's business: it advances only when this says ok,
     which is what makes a failure retry the same tweets rather than skip them.
     """
-    if getattr(hook, "kind", "webhook") == "telegram":
+    kind = getattr(hook, "kind", "webhook")
+    if kind == "telegram":
         return await deliver_telegram(client, hook, store, rows)
+    if kind == "sheet":
+        return await deliver_sheet(client, hook, store, rows)
 
     labels_for = {r["tweet_id"]: await store.stream_labels_for(r["tweet_id"])
                   for r in rows}
@@ -436,10 +469,28 @@ class DbTarget:
         self.name = row["name"]
         self.project_id = row["project_id"]
         self.batch_size = row["batch_size"] or 50
-        self.url = row["url"] or TELEGRAM_API
         self.secret = secret
         self.token = token
         self.chat_id = str(row["chat_id"] or "")
+        self.sheet_id = str(row["sheet_id"] or "") if "sheet_id" in row else ""
+        self.sheet_tab = (str(row["sheet_tab"] or "") if "sheet_tab" in row
+                          else "") or "Sheet1"
+        self.sheet_mode = str(row["sheet_mode"] or "") if "sheet_mode" in row else ""
+        # `url` is for the log line and the dashboard as well as, in script
+        # mode, the address we actually POST to.
+        #
+        # In service-account mode there is no stored URL, so one is built from
+        # the id: an operator reading a log line should get something they can
+        # click, not 44 characters they have to paste into a browser.
+        if self.kind == "sheet":
+            import sheets as _sheets
+
+            if _sheets.mode_of(self.sheet_mode) == _sheets.MODE_API:
+                self.url = f"{SHEET_URL_PREFIX}{self.sheet_id}"
+            else:
+                self.url = row["url"] or ""
+        else:
+            self.url = row["url"] or TELEGRAM_API
 
 
 async def db_targets(store, log=print) -> list:
@@ -460,6 +511,27 @@ async def db_targets(store, log=print) -> list:
                     f".env — target skipped")
                 continue
             out.append(DbTarget(r, secret=secret))
+        elif r["kind"] == "sheet":
+            import sheets as _sheets
+
+            # Same shape as the two above: a target whose credential is
+            # missing is skipped LOUDLY. Silence here would look identical to
+            # "nothing has been collected yet", which is the one failure that
+            # wastes a day.
+            if _sheets.mode_of(r.get("sheet_mode")) == _sheets.MODE_API:
+                if not _sheets.load_creds():
+                    log(f"[delivery:{r['name']}] {_sheets.CREDS_ENV} is not set "
+                        f"(or is not a readable service-account JSON key) "
+                        f"— skipped")
+                    continue
+                out.append(DbTarget(r))
+            else:
+                token = os.getenv(r["secret_env"] or "", "").strip()
+                if not token:
+                    log(f"[delivery:{r['name']}] {r['secret_env']} is not set in "
+                        f".env — target skipped")
+                    continue
+                out.append(DbTarget(r, token=token))
         else:
             token = telegram_token()
             if not token:

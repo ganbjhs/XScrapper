@@ -1,24 +1,93 @@
 // The pipe's outbound half, scoped to the current project: this project's
 // own targets (created right here), plus the global ones from config.toml.
 // "Behind: 0" is the whole point of the product.
-import React, { useState } from "react";
+import React, { useEffect, useState } from "react";
 import { api, fmtAgo, fmtN, useApi } from "../api/client.js";
 import { PageHead, useProject } from "../App.jsx";
 import { Empty, ErrorState, Loading, Modal } from "../components/ui.jsx";
 
-function AddTargetModal({ pid, onDone, onClose }) {
+function Copyable({ label, value, rows }) {
+  const [done, setDone] = useState(false);
+  const copy = async () => {
+    try {
+      await navigator.clipboard.writeText(value);
+    } catch {
+      return;                       // an insecure origin blocks the API
+    }
+    setDone(true);
+    setTimeout(() => setDone(false), 1500);
+  };
+  return (
+    <div className="field">
+      <label>{label}</label>
+      <textarea readOnly value={value} rows={rows || 3} spellCheck="false"
+                onFocus={(e) => e.target.select()}
+                style={{ width: "100%", fontFamily: "ui-monospace, monospace",
+                         fontSize: 12, whiteSpace: "pre", overflowX: "auto" }} />
+      <button className="btn btn-ghost btn-sm" style={{ marginTop: 6 }}
+              onClick={copy}>
+        {done ? "Copied" : "Copy"}
+      </button>
+    </div>
+  );
+}
+
+function AddTargetModal({ pid, serviceAccount, onDone, onClose }) {
   const [kind, setKind] = useState("webhook");
   const [name, setName] = useState("");
   const [url, setUrl] = useState("");
   const [secretEnv, setSecretEnv] = useState("");
   const [chat, setChat] = useState("");
+  const [sheetUrl, setSheetUrl] = useState("");
+  const [sheetTab, setSheetTab] = useState("Sheet1");
+  // Apps Script by default: it needs no Google Cloud project and no key on
+  // the server, which is the difference between "set this up now" and "set
+  // this up one day".
+  const [sheetMode, setSheetMode] = useState("script");
+  const [script, setScript] = useState(null);
+  const [check, setCheck] = useState(null);
+  const [checking, setChecking] = useState(false);
   const [err, setErr] = useState("");
+
+  // Mint the token and build the script as soon as the operator asks for a
+  // sheet. Nothing is stored by this — it is a page of text and a random
+  // string until they paste both somewhere.
+  useEffect(() => {
+    if (kind !== "sheet" || sheetMode !== "script" || script) return;
+    let live = true;
+    api.sheetScript({ name })
+      .then((r) => {
+        if (!live || r.error) return;
+        setScript(r);
+        setSecretEnv((v) => v || r.secret_env);
+      })
+      .catch(() => {});
+    return () => { live = false; };
+  }, [kind, sheetMode]);           // eslint-disable-line react-hooks/exhaustive-deps
+
+  const testSheet = async () => {
+    setChecking(true);
+    setCheck(null);
+    try {
+      const r = await api.testSheet({
+        sheet_mode: sheetMode, sheet_id: sheetUrl, sheet_tab: sheetTab,
+        url, secret_env: secretEnv, token: script?.token,
+      });
+      setCheck(r.error ? `\u2717 ${r.error}`
+                       : "\u2713 Connected — the header row is ready");
+    } catch (e) {
+      setCheck(`\u2717 ${String(e.message || e)}`);
+    } finally {
+      setChecking(false);
+    }
+  };
 
   const create = async () => {
     setErr("");
     try {
       await api.createDeliveryTarget({
         project: pid, kind, name, url, secret_env: secretEnv, chat_id: chat,
+        sheet_id: sheetUrl, sheet_tab: sheetTab, sheet_mode: sheetMode,
       });
       onDone();
       onClose();
@@ -26,6 +95,12 @@ function AddTargetModal({ pid, onDone, onClose }) {
       setErr(String(e.message || e));
     }
   };
+
+  const ready = name.trim() && (
+    kind === "webhook" ? url.trim() && secretEnv.trim()
+      : kind === "telegram" ? chat.trim()
+        : sheetMode === "script" ? url.trim() && secretEnv.trim()
+          : sheetUrl.trim());
 
   return (
     <Modal title="New delivery target" onClose={onClose}
@@ -35,12 +110,14 @@ function AddTargetModal({ pid, onDone, onClose }) {
         <select id="dkind" value={kind} onChange={(e) => setKind(e.target.value)}>
           <option value="webhook">Webhook (Watch-Tower or any system)</option>
           <option value="telegram">Telegram chat/channel</option>
+          <option value="sheet">Google Sheet</option>
         </select>
       </div>
       <div className="field">
         <label htmlFor="dname">Name</label>
         <input id="dname" value={name} onChange={(e) => setName(e.target.value)}
-               placeholder={kind === "webhook" ? "Watch-Tower" : "War-room group"} />
+               placeholder={kind === "webhook" ? "Watch-Tower"
+                 : kind === "sheet" ? "Daily posts sheet" : "War-room group"} />
       </div>
       {kind === "webhook" ? (
         <>
@@ -61,17 +138,145 @@ function AddTargetModal({ pid, onDone, onClose }) {
             </div>
           </div>
         </>
-      ) : (
+      ) : kind === "telegram" ? (
         <div className="field">
           <label htmlFor="dchat">Chat id</label>
           <input id="dchat" value={chat} onChange={(e) => setChat(e.target.value)}
                  placeholder="-1001234567890 or @channel" />
         </div>
+      ) : (
+        <>
+          <div className="field">
+            <label htmlFor="dmode">How the sheet is reached</label>
+            <select id="dmode" value={sheetMode}
+                    onChange={(e) => { setSheetMode(e.target.value); setCheck(null); }}>
+              <option value="script">
+                Apps Script — no Google Cloud project (easiest)
+              </option>
+              <option value="service_account">
+                Service account — Sheets API, needs a Google Cloud key
+              </option>
+            </select>
+          </div>
+
+          <div className="field">
+            <label htmlFor="dtab">Tab name</label>
+            <input id="dtab" value={sheetTab}
+                   onChange={(e) => setSheetTab(e.target.value)}
+                   placeholder="Sheet1" />
+            <div style={{ color: "var(--ink-3)", fontSize: 12, marginTop: 6 }}>
+              Columns <code>date</code>, <code>link</code>, <code>text</code>,{" "}
+              <code>media</code> are written as a header row if the tab is
+              empty. Posts are appended underneath, newest at the bottom.
+            </div>
+          </div>
+
+          {sheetMode === "script" ? (
+            <>
+              <div className="state" style={{ textAlign: "left", marginTop: 4 }}>
+                <b>Three steps, about two minutes</b>
+                The script runs inside your own sheet, as you — so there is no
+                Google Cloud project, no key file, and nothing to share.
+              </div>
+
+              {script ? (
+                <>
+                  <Copyable rows={12} value={script.code}
+                            label="1. In the sheet: Extensions → Apps Script. Replace everything with this, then Save." />
+                  <div className="field">
+                    <label>2. Deploy → New deployment → Web app</label>
+                    <div style={{ fontSize: 12, marginTop: 2 }}>
+                      Set <b>Execute as: Me</b> and{" "}
+                      <b>Who has access: Anyone</b>. Google will ask you to
+                      authorise it once. Copy the <code>/exec</code> URL it
+                      gives you back and paste it below.
+                      <div style={{ color: "var(--ink-3)", marginTop: 4 }}>
+                        “Anyone” is safe here because the token above is what
+                        the script actually checks.
+                      </div>
+                    </div>
+                  </div>
+                  <Copyable rows={2} value={script.env_line}
+                            label="3. Add this line to .env on the server, then restart the collector." />
+                </>
+              ) : (
+                <div className="field">
+                  <label>Preparing your script…</label>
+                </div>
+              )}
+
+              <div className="field">
+                <label htmlFor="dexec">Web app URL</label>
+                <input id="dexec" value={url}
+                       onChange={(e) => setUrl(e.target.value)}
+                       placeholder="https://script.google.com/macros/s/…/exec" />
+              </div>
+              <div className="field">
+                <label htmlFor="dsenv">Token — the NAME of the .env variable</label>
+                <input id="dsenv" value={secretEnv}
+                       onChange={(e) => setSecretEnv(e.target.value.toUpperCase())}
+                       placeholder="SHEET_TOKEN_MAIN" />
+                <div style={{ color: "var(--ink-3)", fontSize: 12, marginTop: 6 }}>
+                  The token itself is never stored in the database — only this
+                  name, so the value can be rotated without touching a target.
+                </div>
+              </div>
+            </>
+          ) : (
+            <>
+              <div className="field">
+                <label htmlFor="dsheet">Google Sheet link</label>
+                <input id="dsheet" value={sheetUrl}
+                       onChange={(e) => setSheetUrl(e.target.value)}
+                       placeholder="https://docs.google.com/spreadsheets/d/…" />
+                <div style={{ color: "var(--ink-3)", fontSize: 12, marginTop: 6 }}>
+                  Paste the whole address from your browser — the id is picked
+                  out of it.
+                </div>
+              </div>
+              <div className="field">
+                <label>Share the sheet first</label>
+                {serviceAccount ? (
+                  <>
+                    <div style={{ fontSize: 12, marginTop: 2 }}>
+                      In the sheet, click <b>Share</b> and give <b>Editor</b>{" "}
+                      access to
+                    </div>
+                    <code style={{ display: "block", marginTop: 6, wordBreak: "break-all" }}>
+                      {serviceAccount}
+                    </code>
+                  </>
+                ) : (
+                  <div className="err" style={{ marginTop: 2 }}>
+                    No service-account key on the server yet — set{" "}
+                    <code>GOOGLE_SHEETS_CREDENTIALS</code> in <code>.env</code>{" "}
+                    to the path of the downloaded JSON key, then restart. If
+                    you would rather not make a Google Cloud project, switch
+                    the option above to Apps Script.
+                  </div>
+                )}
+              </div>
+            </>
+          )}
+
+          <div className="filters" style={{ marginTop: 0, marginBottom: 6 }}>
+            <button className="btn btn-ghost btn-sm"
+                    disabled={checking
+                      || !(sheetMode === "script" ? url.trim() : sheetUrl.trim())}
+                    onClick={testSheet}>
+              {checking ? "Checking…" : "Check access"}
+            </button>
+            {check && (
+              <span className={check.startsWith("\u2713") ? "st-good" : "st-crit"}
+                    style={{ fontWeight: 600 }}>{check}</span>
+            )}
+          </div>
+        </>
       )}
       {err && <div className="err">{err}</div>}
       <div className="row">
         <button className="btn btn-ghost" onClick={onClose}>Cancel</button>
-        <button className="btn btn-brand" disabled={!name.trim()} onClick={create}>
+        <button className="btn btn-brand" disabled={!ready} onClick={create}>
           Create target
         </button>
       </div>
@@ -143,7 +348,11 @@ function BackfillModal({ t, onClose }) {
         </>
       )}
       <div className="field">
-        <label htmlFor="bflimit">At most (Telegram allows ~20/min; max 50)</label>
+        <label htmlFor="bflimit">
+          {t.kind === "sheet"
+            ? "At most (one append, max 2000 rows)"
+            : "At most (Telegram allows ~20/min; max 50)"}
+        </label>
         <input id="bflimit" inputMode="numeric" value={limit}
                onChange={(e) => setLimit(e.target.value)} />
       </div>
@@ -157,7 +366,8 @@ function BackfillModal({ t, onClose }) {
         <button className="btn btn-ghost" onClick={onClose}>Close</button>
         <button className="btn btn-brand" disabled={busy || (mode === "dates" && !fromDate)}
                 onClick={send}>
-          {busy ? "Sending… (paced for Telegram)" : "Send"}
+          {busy ? (t.kind === "sheet" ? "Writing rows…" : "Sending… (paced for Telegram)")
+                : "Send"}
         </button>
       </div>
     </Modal>
@@ -176,13 +386,32 @@ function TargetPanel({ t, reload }) {
           {t.name}
         </h3>
         <span className="right">
-          {t.kind} → {t.url}
+          {t.kind === "sheet"
+            ? `sheet → ${t.sheet_mode === "service_account"
+                ? "Sheets API" : "Apps Script"}`
+            : `${t.kind} → ${t.url}`}
           {t.scope === "global" ? " · global (config.toml)" : ""}
         </span>
       </div>
-      {own && t.kind === "webhook" && !t.secret_ready && (
+      {own && !t.secret_ready && (
         <div className="kv"><span>Not sending</span>
-          <b className="st-crit">{t.secret_env} is not set in .env on the server</b></div>
+          <b className="st-crit">
+            {t.kind === "sheet"
+              ? `${t.creds_env || "GOOGLE_SHEETS_CREDENTIALS"} is not set in .env on the server`
+              : `${t.secret_env} is not set in .env on the server`}
+          </b></div>
+      )}
+      {own && t.kind === "sheet" && (
+        <div className="kv"><span>Writing to</span>
+          <b>
+            {t.sheet_mode === "service_account" ? (
+              <a href={t.url} target="_blank" rel="noreferrer">open the sheet</a>
+            ) : (
+              "the sheet's own Apps Script"
+            )}
+            {" · tab "}<code>{t.sheet_tab || "Sheet1"}</code>
+            {" · date | link | text | media"}
+          </b></div>
       )}
       {!t.started ? (
         <div className="kv">
@@ -215,7 +444,7 @@ function TargetPanel({ t, reload }) {
                   }}>
             {t.enabled ? "Pause" : "Resume"}
           </button>
-          {t.kind === "telegram" && (
+          {(t.kind === "telegram" || t.kind === "sheet") && (
             <button className="btn btn-ghost btn-sm" onClick={() => setBackfilling(true)}>
               Send past posts…
             </button>
@@ -254,8 +483,9 @@ export default function Delivery({ onMenu }) {
       {error && !data && <ErrorState error={error} retry={reload} />}
       {data && targets.length === 0 && (
         <Empty title="Nothing is delivered anywhere yet">
-          Add a target — a Watch-Tower webhook or a Telegram chat — and every
-          post this project collects is sent there, seconds after collection.
+          Add a target — a Watch-Tower webhook, a Telegram chat or a Google
+          Sheet — and every post this project collects is sent there, seconds
+          after collection.
         </Empty>
       )}
 
@@ -282,7 +512,8 @@ export default function Delivery({ onMenu }) {
       )}
 
       {adding && pid && (
-        <AddTargetModal pid={pid} onDone={reload} onClose={() => setAdding(false)} />
+        <AddTargetModal pid={pid} serviceAccount={data?.sheet_service_account}
+                        onDone={reload} onClose={() => setAdding(false)} />
       )}
     </>
   );

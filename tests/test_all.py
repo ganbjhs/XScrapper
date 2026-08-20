@@ -2515,6 +2515,425 @@ async def run_webhook(tmp):
         srv.shutdown()
 
 
+def test_sheets(tmp):
+    """
+    Google Sheet delivery, end to end, without Google.
+
+    Everything that can be wrong here is wrong quietly: a tab name that needed
+    quoting sends rows to the wrong sheet, a tweet starting "=" becomes a
+    formula, a header row written twice pushes every column one row down. So
+    the transport is exercised against a fake client that records exactly what
+    would have been sent.
+    """
+    import json as _json
+
+    import store as store_mod
+    import webhook as wh
+
+    import sheets as sh
+
+    print("== addressing ==")
+    ok(sh.sheet_id("https://docs.google.com/spreadsheets/d/1AbC_dEf-123/edit#gid=0")
+       == "1AbC_dEf-123", "the id is picked out of a pasted URL")
+    ok(sh.sheet_id("  1AbC_dEf-123  ") == "1AbC_dEf-123", "a bare id passes through")
+    ok(sh.a1("Sheet1") == "'Sheet1'!A:D", "the range is quoted and spans the columns")
+    ok(sh.a1("July posts") == "'July posts'!A:D", "a tab name with a space survives")
+    ok(sh.a1("Bob's tab") == "'Bob''s tab'!A:D",
+       "a single quote in the tab name is doubled, not left to break the range")
+    ok(sh.a1("") == "'Sheet1'!A:D", "an empty tab name falls back to Sheet1")
+
+    print("== the row ==")
+    ok(len(sh.HEADER) == 4 and sh.COLS == "A:D",
+       "the header and the column range describe the same four columns")
+    os.environ["SHEET_TZ"] = "UTC"
+    row = {"tweet_id": 123, "created_ms": 1784303502259,
+           "url": "https://x.com/a/status/123", "text": "hello world",
+           "media_json": _json.dumps([
+               {"type": "photo", "url": "https://pbs.twimg.com/a.jpg",
+                "thumb": "https://pbs.twimg.com/a.jpg"},
+               {"type": "video", "url": "https://video.twimg.com/b.mp4",
+                "thumb": "https://pbs.twimg.com/b.jpg"}])}
+    built = sh.sheet_row(row)
+    ok(len(built) == len(sh.HEADER), "a row has exactly as many cells as the header")
+    ok(built[0] == "2026-07-17 15:51:42",
+       "date is the POSTED time, formatted so Sheets reads it as a datetime")
+    ok(built[1] == "https://x.com/a/status/123", "link is the post's own URL")
+    ok(built[2] == "hello world", "text is the post text, untouched")
+    ok(built[3] == "https://pbs.twimg.com/a.jpg\nhttps://video.twimg.com/b.mp4",
+       "media is every URL, one per line — the video's mp4, not its thumbnail")
+
+    ok(sh.sheet_row({**row, "media_json": "[]"})[3] == "",
+       "a post with no media gets an empty cell, not '[]'")
+    ok(sh.sheet_row({**row, "media_json": "not json"})[3] == "",
+       "a malformed media column degrades to empty instead of stopping delivery")
+    ok(sh.sheet_row({**row, "url": None, "tweet_id": 55})[1]
+       == "https://x.com/i/status/55", "a missing URL is rebuilt from the id")
+
+    print("== formula injection ==")
+    ok(sh.sheet_row({**row, "text": "=IMPORTXML(A1,\"//x\")"})[2].startswith("'="),
+       "a post that starts '=' is forced to text — scraped input is never a formula")
+    for lead in ("+", "-", "@"):
+        ok(sh.sheet_row({**row, "text": lead + "ok"})[2] == "'" + lead + "ok",
+           f"a post starting '{lead}' is escaped too")
+    ok(sh.sheet_row({**row, "text": "normal"})[2] == "normal",
+       "ordinary text is left exactly alone")
+
+    print("== the service-account assertion ==")
+    from cryptography.hazmat.primitives import hashes, serialization
+    from cryptography.hazmat.primitives.asymmetric import padding, rsa
+    key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+    pem = key.private_bytes(
+        serialization.Encoding.PEM,
+        serialization.PrivateFormat.PKCS8,
+        serialization.NoEncryption()).decode()
+    creds = {"client_email": "bot@proj.iam.gserviceaccount.com", "private_key": pem}
+    tok = sh._assertion(creds, 1_700_000_000)
+    head, body, sig = tok.split(".")
+    import base64 as _b64
+
+    def unb64(x):
+        return _json.loads(_b64.urlsafe_b64decode(x + "=" * (-len(x) % 4)))
+    ok(unb64(head)["alg"] == "RS256", "the assertion is RS256, as Google requires")
+    claims = unb64(body)
+    ok(claims["iss"] == creds["client_email"] and claims["aud"] == sh.TOKEN_URL,
+       "the claims name the service account and Google's token endpoint")
+    ok(claims["exp"] - claims["iat"] == 3600, "the assertion expires in an hour")
+    key.public_key().verify(
+        _b64.urlsafe_b64decode(sig + "=" * (-len(sig) % 4)),
+        f"{head}.{body}".encode(), padding.PKCS1v15(), hashes.SHA256())
+    ok(True, "the signature verifies against the service account's public key")
+
+    print("== credentials ==")
+    keyfile = pathlib.Path(tmp) / "svc.json"
+    keyfile.write_text(_json.dumps(creds))
+    os.environ[sh.CREDS_ENV] = str(keyfile)
+    ok((sh.load_creds() or {}).get("client_email") == creds["client_email"],
+       "a path to the JSON key is read from disk")
+    os.environ[sh.CREDS_ENV] = _json.dumps(creds)
+    ok(sh.load_creds() is not None, "the JSON itself also works, for a keyless disk")
+    os.environ[sh.CREDS_ENV] = "/no/such/file.json"
+    ok(sh.load_creds() is None, "a missing key file returns None, it does not raise")
+    os.environ[sh.CREDS_ENV] = _json.dumps({"client_email": "x"})
+    ok(sh.load_creds() is None, "a key with no private_key is refused")
+    os.environ[sh.CREDS_ENV] = str(keyfile)
+
+    print("== a delivery, against a fake Google ==")
+
+    class Rep:
+        def __init__(self, code, payload=None, text=""):
+            self.status_code, self._p, self.text = code, payload, text
+
+        def json(self):
+            if self._p is None:
+                raise ValueError("not json")
+            return self._p
+
+    class FakeGoogle:
+        """Records every call and answers like the Sheets API does."""
+
+        def __init__(self, existing_header=None, append_code=200):
+            self.calls = []
+            self.existing = existing_header
+            self.append_code = append_code
+
+        async def post(self, url, **kw):
+            self.calls.append(("post", url, kw))
+            if url == sh.TOKEN_URL:
+                return Rep(200, {"access_token": "tok-1", "expires_in": 3600})
+            if self.append_code != 200:
+                return Rep(self.append_code,
+                           {"error": {"message": "The caller does not have permission"}})
+            return Rep(200, {"updates": {"updatedRows": len(kw["json"]["values"])}})
+
+        async def get(self, url, **kw):
+            self.calls.append(("get", url, kw))
+            return Rep(200, {"values": self.existing} if self.existing else {})
+
+        async def put(self, url, **kw):
+            self.calls.append(("put", url, kw))
+            return Rep(200, {})
+
+    def run_deliver(client, rows, tab="Sheet1"):
+        sh._tokens.clear()
+        sh._header_done.clear()
+        return asyncio.run(sh.via_api(client, "SHEETID", tab, rows))
+
+    rows = [row, {**row, "tweet_id": 124, "text": "second"}]
+    g = FakeGoogle()
+    good, err = run_deliver(g, rows)
+    ok(good and not err, f"a clean batch delivers ({err})")
+    puts = [c for c in g.calls if c[0] == "put"]
+    ok(len(puts) == 1 and puts[0][2]["json"]["values"] == [sh.HEADER],
+       "an empty tab gets the header row, exactly once")
+    appends = [c for c in g.calls if c[0] == "post" and c[1] != sh.TOKEN_URL]
+    ok(len(appends) == 1, "the whole batch is ONE append — it lands or it does not")
+    body = appends[0][2]
+    ok(body["params"]["insertDataOption"] == "INSERT_ROWS",
+       "rows are INSERTed at the end, never overwriting into a gap")
+    ok(body["params"]["valueInputOption"] == "USER_ENTERED",
+       "cells are parsed, which is why the formula escape above matters")
+    ok(len(body["json"]["values"]) == 2
+       and body["json"]["values"][1][2] == "second",
+       "every post in the batch is a row, in order")
+    ok(appends[0][1].endswith("/values/'Sheet1'!A:D:append"),
+       "the append is addressed at the quoted tab range")
+
+    g2 = FakeGoogle(existing_header=[["date", "link", "text", "media"]])
+    ok(run_deliver(g2, rows)[0] and not [c for c in g2.calls if c[0] == "put"],
+       "a tab that already has rows is never given a second header")
+
+    g3 = FakeGoogle(existing_header=[["my own heading"]])
+    ok(run_deliver(g3, rows)[0] and not [c for c in g3.calls if c[0] == "put"],
+       "a header someone changed by hand is left alone — we are a guest here")
+
+    g4 = FakeGoogle(append_code=403)
+    good, err = run_deliver(g4, rows)
+    ok(not good and "share the sheet" in err.lower(),
+       "a 403 says the fix (share the sheet), not just 'HTTP 403'")
+
+    os.environ[sh.CREDS_ENV] = ""
+    good, err = run_deliver(FakeGoogle(), rows)
+    ok(not good and sh.CREDS_ENV in err,
+       "no key on the server is a reported failure, never a silent no-op")
+    os.environ[sh.CREDS_ENV] = str(keyfile)
+
+    print("== the target ==")
+    db = pathlib.Path(tmp) / "results.db"
+
+    async def run():
+        st = store_mod.Store(db, False)
+        await st.open()
+        pid = (await st.create_project("Sheets"))["project_id"]
+        out = {}
+        out["url"] = await st.create_delivery_target(
+            pid, "sheet", "Daily",
+            sheet_id="https://docs.google.com/spreadsheets/d/1AbCdEfGhIjKlMnOpQrStUvWxYz0123456789/edit",
+            sheet_tab="July posts", sheet_mode="service_account")
+        out["bad"] = await st.create_delivery_target(
+            pid, "sheet", "Junk", sheet_id="not a sheet",
+            sheet_mode="service_account")
+        out["kind"] = await st.create_delivery_target(pid, "carrier-pigeon", "No")
+        out["rows"] = await st.delivery_targets(pid, enabled_only=True)
+        await st.close()
+        return out
+
+    r = asyncio.run(run())
+    ok("target_id" in r["url"], "a target created from a pasted URL is accepted")
+    ok("error" in r["bad"], "a spreadsheet id that is not one is refused at creation")
+    ok("error" in r["kind"] and "sheet" in r["kind"]["error"],
+       "an unknown kind is refused, and the message lists the real ones")
+    made = [t for t in r["rows"] if t["kind"] == "sheet"]
+    ok(len(made) == 1, "only the valid target was stored")
+    ok(made[0]["sheet_id"] == "1AbCdEfGhIjKlMnOpQrStUvWxYz0123456789",
+       "the id was reduced from the URL before it was stored")
+    ok(made[0]["sheet_tab"] == "July posts", "the tab name is stored as typed")
+
+    t = wh.DbTarget(made[0])
+    ok(t.kind == "sheet" and t.label == f"dt:{made[0]['target_id']}",
+       "the sender treats it as one more target on the shared cursor")
+    ok(t.url == wh.SHEET_URL_PREFIX + t.sheet_id,
+       "its logged/displayed URL is one an operator can actually click")
+    ok(wh.DbTarget({**made[0], "sheet_tab": None}).sheet_tab == "Sheet1",
+       "a target with no tab name defaults to Sheet1 rather than failing at send")
+
+    print("== migrating an older database ==")
+    old = pathlib.Path(tmp) / "old.db"
+    con = sqlite3_connect(old)
+    con.execute("CREATE TABLE delivery_targets (target_id INTEGER PRIMARY KEY "
+                "AUTOINCREMENT, project_id INTEGER NOT NULL, kind TEXT NOT NULL, "
+                "name TEXT NOT NULL, url TEXT, secret_env TEXT, chat_id TEXT, "
+                "batch_size INTEGER NOT NULL DEFAULT 50, "
+                "enabled INTEGER NOT NULL DEFAULT 1, created_at TEXT NOT NULL)")
+    con.commit()
+    con.close()
+
+    async def migrate():
+        st = store_mod.Store(old, False)
+        await st.open()
+        cols = {c[1] for c in st.db.execute("PRAGMA table_info(delivery_targets)")}
+        await st.close()
+        return cols
+
+    cols = asyncio.run(migrate())
+    ok({"sheet_id", "sheet_tab", "sheet_mode"} <= cols,
+       "a database made before sheets existed gains the new columns on open")
+
+
+def test_sheets_script(tmp):
+    """
+    The Apps Script route: a sheet that runs its own receiver.
+
+    This is the mode with no Google Cloud project behind it, so the failures
+    it can have are all deployment settings — and every one of them looks the
+    same from Python (an HTML page where JSON was expected). What is tested
+    here is mostly that each of them is turned back into the setting to fix.
+    """
+    import store as store_mod
+    import webhook as wh
+
+    import sheets as sh
+
+    print("== the script we hand out ==")
+    tok = sh.new_token()
+    ok(len(tok) >= 32, f"a generated token is long enough to be one ({len(tok)})")
+    ok(sh.new_token() != tok, "every deployment gets its own")
+    code = sh.script_source(tok)
+    ok("%TOKEN%" not in code and f"var TOKEN = '{tok}';" in code,
+       "the token is baked into the script, so nothing is left to retype")
+    ok("function doPost(e)" in code and "ContentService" in code,
+       "the script is a complete web-app receiver")
+    ok("LockService" in code,
+       "it takes a lock — a live batch and a history send must not interleave")
+    ok(str(sh.HEADER) .replace('"', "'") in code.replace('"', "'"),
+       "the script writes the SAME four columns this module builds")
+    ok("'" not in sh.script_source("has'quote").split("var TOKEN = '")[1].split("'")[0],
+       "a quote in a token cannot break out of the string it is pasted into")
+
+    print("== a delivery ==")
+
+    class Rep:
+        def __init__(s, code_, payload=None, text=""):
+            s.status_code, s._p, s.text = code_, payload, text
+
+        def json(s):
+            if s._p is None:
+                raise ValueError("not json")
+            return s._p
+
+    class FakeScript:
+        def __init__(s, reply=None):
+            s.seen = []
+            s.reply = reply
+
+        async def post(s, url, **kw):
+            s.seen.append((url, kw))
+            if s.reply is not None:
+                return s.reply
+            body = kw["json"]
+            if body.get("token") != tok:
+                return Rep(200, {"error": "bad token"})
+            return Rep(200, {"ok": True, "appended": len(body["rows"]),
+                             "tab": body["tab"]})
+
+    row = {"tweet_id": 9, "created_ms": 1784303502259,
+           "url": "https://x.com/a/status/9", "text": "hello",
+           "media_json": "[]"}
+    EXEC = "https://script.google.com/macros/s/AKfyc123/exec"
+
+    c = FakeScript()
+    good, err = asyncio.run(sh.via_script(c, EXEC, tok, "July", [row]))
+    ok(good and not err, f"a batch is accepted ({err})")
+    url, kw = c.seen[0]
+    ok(url == EXEC, "posted straight at the /exec URL")
+    ok(kw.get("follow_redirects") is True,
+       "redirects are followed for THIS call — Apps Script always 302s, even "
+       "though the delivery client refuses redirects everywhere else")
+    ok(kw["json"]["tab"] == "July", "the tab travels with the batch")
+    ok(kw["json"]["header"] == sh.HEADER, "so does the header the script writes")
+    ok(kw["json"]["rows"] == sh.sheet_rows([row]),
+       "the rows are built by the same builder the REST path uses")
+    ok(kw["json"]["token"] == tok, "and the token, which is what makes us welcome")
+
+    ok(asyncio.run(sh.via_script(c, EXEC, "wrong-token", "July", [row]))[0] is False,
+       "a token the script does not hold is a failed delivery, not a silent one")
+    _, err = asyncio.run(sh.via_script(c, EXEC, "wrong-token", "July", [row]))
+    ok("re-deployed" in err.lower(),
+       "and the message names the step people miss — redeploying after an edit")
+
+    print("== the deployment settings people get wrong ==")
+    login = FakeScript(Rep(200, None, "<!DOCTYPE html><html>Sign in</html>"))
+    _, err = asyncio.run(sh.via_script(login, EXEC, tok, "July", [row]))
+    ok("Anyone" in err,
+       "an HTML sign-in page is reported as 'Who has access' being wrong, "
+       "not as unparseable JSON")
+    gone = FakeScript(Rep(404, None, "not found"))
+    _, err = asyncio.run(sh.via_script(gone, EXEC, tok, "July", [row]))
+    ok("Manage deployments" in err,
+       "a 404 says where to fetch the current URL from")
+    boom = FakeScript(Rep(200, {"error": "Exception: no permission"}))
+    _, err = asyncio.run(sh.via_script(boom, EXEC, tok, "July", [row]))
+    ok("no permission" in err, "an error the script itself reports is passed through")
+
+    _, err = asyncio.run(sh.via_script(FakeScript(), EXEC, "", "July", [row]))
+    ok("token" in err, "no token in .env is a reported failure, never a no-op")
+    _, err = asyncio.run(sh.via_script(FakeScript(), "", tok, "July", [row]))
+    ok("URL" in err, "and so is a target with no URL")
+
+    print("== check access writes nothing ==")
+    c2 = FakeScript()
+    ok(asyncio.run(sh.check_script_access(c2, EXEC, tok, "July"))[0],
+       "the check passes against a healthy deployment")
+    ok(c2.seen[0][1]["json"]["rows"] == [],
+       "it sends ZERO rows — the tab is left ready, not left with test data")
+
+    print("== the target ==")
+    db = pathlib.Path(tmp) / "results.db"
+
+    async def run():
+        st = store_mod.Store(db, False)
+        await st.open()
+        pid = (await st.create_project("S"))["project_id"]
+        out = {}
+        out["made"] = await st.create_delivery_target(
+            pid, "sheet", "Daily", url=EXEC, secret_env="SHEET_TOKEN_DAILY",
+            sheet_tab="July", sheet_mode="script")
+        out["badurl"] = await st.create_delivery_target(
+            pid, "sheet", "X", url="https://example.com/hook",
+            secret_env="SHEET_TOKEN_DAILY", sheet_mode="script")
+        out["badenv"] = await st.create_delivery_target(
+            pid, "sheet", "X", url=EXEC, secret_env="not upper", sheet_mode="script")
+        out["rows"] = await st.delivery_targets(pid)
+        os.environ["SHEET_TOKEN_DAILY"] = tok
+        out["built"] = await wh.db_targets(st, log=lambda m: None)
+        os.environ.pop("SHEET_TOKEN_DAILY")
+        out["missing"] = await wh.db_targets(st, log=lambda m: None)
+        await st.close()
+        return out
+
+    r = asyncio.run(run())
+    ok("target_id" in r["made"], "a script target is created from URL + env name")
+    ok("error" in r["badurl"] and "/exec" in r["badurl"]["error"],
+       "a URL that is not an Apps Script deployment is refused")
+    ok("error" in r["badenv"],
+       "the token must be NAMED, never pasted into the database")
+    stored = [t for t in r["rows"] if t["kind"] == "sheet"][0]
+    ok(stored["sheet_mode"] == "script", "the mode is stored")
+    ok(stored["url"] == EXEC and stored["secret_env"] == "SHEET_TOKEN_DAILY",
+       "and so are the address and the NAME of the token")
+    ok(not stored["sheet_id"],
+       "script mode stores no spreadsheet id — it never needs one")
+    ok(len(r["built"]) == 1 and r["built"][0].token == tok,
+       "the sender picks the token out of .env at build time")
+    ok(r["built"][0].url == EXEC, "and posts to the deployment, not to a docs URL")
+    ok(r["missing"] == [],
+       "with the .env line gone the target is skipped, loudly, not sent tokenless")
+
+    print("== the two modes meet at one call ==")
+    ok(sh.mode_of(None) == sh.MODE_SCRIPT and sh.mode_of("") == sh.MODE_SCRIPT,
+       "a row written before the column existed reads as script mode")
+    ok(sh.mode_of("service_account") == sh.MODE_API, "an explicit mode is kept")
+    ok(sh.mode_of("nonsense") == sh.MODE_SCRIPT,
+       "anything unrecognised falls back to the mode needing no server key")
+
+    class T:
+        kind = "sheet"
+        sheet_mode = "script"
+        sheet_id = ""
+        sheet_tab = "July"
+        url = EXEC
+        token = tok
+
+    c3 = FakeScript()
+    ok(asyncio.run(sh.deliver(c3, T(), [row]))[0],
+       "sheets.deliver routes a script target to the script")
+    ok(len(c3.seen) == 1, "in exactly one request")
+
+
+def sqlite3_connect(path):
+    import sqlite3
+    return sqlite3.connect(str(path))
+
+
 def main():
     root = HERE / ".tmp"
     cwd = os.getcwd()
@@ -2573,6 +2992,12 @@ def main():
 
         section("keywords, stream assignment, per-project delivery")
         test_keywords_and_project_delivery(fresh("kwdeliv"))
+
+        section("google sheets (columns, quoting, injection, one append)")
+        test_sheets(fresh("sheets"))
+
+        section("google sheets via apps script (no cloud project)")
+        test_sheets_script(fresh("sheetscript"))
 
         section("webhook (signing, cursor, receiver outage)")
         asyncio.run(run_webhook(fresh("webhook")))

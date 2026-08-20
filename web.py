@@ -1222,6 +1222,9 @@ def _live_rows(con, last_ms: int, last_tweet_id: int, project: int = 0,
 # read-only views the SPA needs: delivery, activity, metrics
 # --------------------------------------------------------------------------
 
+_sheets_url = "https://docs.google.com/spreadsheets/d/"
+
+
 def _delivery_json(q=None):
     """
     Where every delivery target stands. The number that matters is `behind`:
@@ -1286,20 +1289,53 @@ def _delivery_json(q=None):
         except sqlite3.Error:
             pass
         try:
+            import sheets as _sheets
+
             for r in con.execute(
                     "SELECT * FROM delivery_targets "
                     + ("WHERE project_id = ? " if pid else "")
                     + "ORDER BY target_id", ([pid] if pid else [])):
+                # .keys() rather than r["sheet_id"]: a database that has not
+                # been through _migrate yet still has the table without the
+                # sheet columns, and one missing column must not blank the
+                # whole Delivery page.
+                cols = set(r.keys())
+                sid = (r["sheet_id"] if "sheet_id" in cols else "") or ""
+                stab = (r["sheet_tab"] if "sheet_tab" in cols else "") or "Sheet1"
+                smode = (r["sheet_mode"] if "sheet_mode" in cols else "") or ""
+                smode = _sheets.mode_of(smode)
+                creds_env = None
+                if r["kind"] == "sheet" and smode == _sheets.MODE_API:
+                    url = f"{_sheets_url}{sid}"
+                    ready = bool(_sheets.load_creds())
+                    creds_env = _sheets.CREDS_ENV
+                elif r["kind"] == "sheet":
+                    # Apps Script mode: the /exec URL is the address and the
+                    # token named by secret_env is what makes us welcome.
+                    url = r["url"] or ""
+                    ready = bool(os.getenv(r["secret_env"] or "", "").strip())
+                    creds_env = r["secret_env"]
+                elif r["kind"] == "webhook":
+                    url = r["url"] or ""
+                    ready = bool(os.getenv(r["secret_env"] or "", "").strip())
+                else:
+                    url = (r["chat_id"] and f"Telegram {r['chat_id']}") or ""
+                    ready = True
                 targets.append({
                     "label": f"dt:{r['target_id']}", "name": r["name"],
                     "target_id": r["target_id"], "kind": r["kind"],
-                    "url": r["url"] or (r["chat_id"] and f"Telegram {r['chat_id']}") or "",
+                    "url": url,
                     "streams": [], "scope": r["project_id"],
                     "project_id": r["project_id"], "enabled": bool(r["enabled"]),
                     "secret_env": r["secret_env"], "chat_id": r["chat_id"],
-                    "secret_ready": bool(
-                        r["kind"] != "webhook"
-                        or os.getenv(r["secret_env"] or "", "").strip()),
+                    "sheet_id": sid, "sheet_tab": stab,
+                    "sheet_mode": smode if r["kind"] == "sheet" else None,
+                    # What the operator must fix before anything is sent. For a
+                    # sheet that is the service-account key; the *sharing* of
+                    # the sheet cannot be known without asking Google, which is
+                    # what the "Check access" button does.
+                    "secret_ready": ready,
+                    "creds_env": creds_env,
                 })
         except sqlite3.Error:
             pass
@@ -1338,6 +1374,17 @@ def _delivery_json(q=None):
                 "last_error": cur["last_error"],
                 "started": bool(cur["last_ms"] or cur["sent"]),
             })
+
+    # The address a Google Sheet has to be SHARED with. Shown on the page
+    # because it is the one thing that cannot be discovered from the sheet's
+    # side, and forgetting it is the single most common way a sheet target
+    # ends up silently delivering nothing.
+    try:
+        import sheets as _sh
+        out["sheet_service_account"] = _sh.service_account_email()
+        out["sheet_creds_env"] = _sh.CREDS_ENV
+    except Exception:
+        out["sheet_service_account"] = ""
     return out
 
 
@@ -1615,7 +1662,9 @@ def _delivery_target_post(body):
     return _with_store(lambda st: st.create_delivery_target(
         pid, (body.get("kind") or "").strip(), body.get("name") or "",
         body.get("url") or "", body.get("secret_env") or "",
-        body.get("chat_id") or "", body.get("batch_size") or 50))
+        body.get("chat_id") or "", body.get("batch_size") or 50,
+        body.get("sheet_id") or "", body.get("sheet_tab") or "",
+        body.get("sheet_mode") or ""))
 
 
 def _delivery_target_update(body):
@@ -1683,17 +1732,45 @@ def _delivery_backfill(body):
                           (tid,)).fetchone()
     if not row:
         return {"error": f"no target {tid}"}
-    if row["kind"] != "telegram":
-        return {"error": "history send is for Telegram targets (a webhook "
-                         "receiver should read your API instead)"}
-    token = wh.telegram_token()
-    if not token:
-        return {"error": "TELEGRAM_BOT_TOKEN is not set in .env"}
+    kind = row["kind"]
+    if kind not in ("telegram", "sheet"):
+        return {"error": "history send is for Telegram and Google Sheet targets "
+                         "(a webhook receiver should read your API instead)"}
+
+    import sheets as _sheets
+
+    token, sheet_target = "", None
+    if kind == "telegram":
+        token = wh.telegram_token()
+        if not token:
+            return {"error": "TELEGRAM_BOT_TOKEN is not set in .env"}
+    else:
+        # Build the SAME object the live sender uses, so a history send cannot
+        # drift from normal delivery in shape, columns or mode handling.
+        d = dict(row)
+        if _sheets.mode_of(d.get("sheet_mode")) == _sheets.MODE_API:
+            if not _sheets.load_creds():
+                return {"error": f"{_sheets.CREDS_ENV} is not set in .env on the "
+                                 f"server (or is not a readable service-account "
+                                 f"key)"}
+            if not (d.get("sheet_id") or ""):
+                return {"error": "this target has no spreadsheet id"}
+            sheet_target = wh.DbTarget(d)
+        else:
+            tok = os.getenv(d.get("secret_env") or "", "").strip()
+            if not tok:
+                return {"error": f"{d.get('secret_env')} is not set in .env on "
+                                 f"the server — the script would reject us"}
+            sheet_target = wh.DbTarget(d, token=tok)
     lo, hi, err = _date_window(body)
     if err:
         return {"error": err}
+    # A sheet has no per-minute limit and takes the whole window in ONE append,
+    # so its cap is about how much history is sensible to paste in at once, not
+    # about pacing. Telegram's 50 is a rate limit and stays.
+    cap = 50 if kind == "telegram" else 2000
     try:
-        limit = min(50, max(1, int(body.get("limit") or 20)))
+        limit = min(cap, max(1, int(body.get("limit") or 20)))
     except (TypeError, ValueError):
         return {"error": "limit must be a whole number"}
 
@@ -1709,20 +1786,137 @@ def _delivery_backfill(body):
     if not rows:
         return {"sent": 0, "note": "nothing collected in that window for this project"}
 
+    chat_id = row["chat_id"]
+
     async def go():
         import httpx
         sent = 0
         async with httpx.AsyncClient() as client:
+            if kind == "sheet":
+                # One write for the whole window: all of it lands or none of
+                # it does, so a half-written history is not a state that exists.
+                ok_, err = await _sheets.deliver(client, sheet_target, rows)
+                return {"sent": len(rows)} if ok_ else {"sent": 0, "error": err}
             for i, msg in enumerate(wh.tg_format(rows)):
                 if i:
                     await asyncio.sleep(wh.TG_GAP_S)
-                ok_, err = await wh.tg_send(client, token, row["chat_id"], msg)
+                ok_, err = await wh.tg_send(client, token, chat_id, msg)
                 if not ok_:
                     return {"sent": sent, "error": err}
                 sent += 1
         return {"sent": sent}
     # 50 messages at Telegram pace is ~160s; the request waits it out.
     return _run(go(), timeout=280)
+
+
+def _sheet_script(body):
+    """
+    The script to paste into the sheet, with a freshly minted token in it.
+
+    The token is generated HERE rather than asked for. Apps Script web apps
+    have to be deployed as "Anyone" for a server to reach them at all, so this
+    string is the only thing standing in front of the endpoint — which makes
+    "pick a password" exactly the wrong question to ask a human.
+
+    Nothing is stored by this call. The operator pastes the code into their
+    sheet and the token into .env; the database only ever learns the NAME of
+    that .env variable, the same way it does for a webhook secret.
+    """
+    import sheets as _sheets
+
+    token = (body.get("token") or "").strip() or _sheets.new_token()
+    name = (body.get("name") or "").strip()
+    env = re.sub(r"[^A-Z0-9]+", "_", name.upper()).strip("_")[:24]
+    env = f"SHEET_TOKEN_{env}" if env else "SHEET_TOKEN_MAIN"
+    return {"token": token, "secret_env": env,
+            "env_line": f"{env}={token}",
+            "code": _sheets.script_source(token)}
+
+
+def _test_sheet(body):
+    """
+    Prove a Google Sheet target will work, WITHOUT writing a post into it.
+
+    Deliberately not the Telegram test's approach of sending real tweets: a
+    chat is a stream you scroll past, a spreadsheet is a document someone
+    keeps, and a test that leaves three rows behind for them to find and
+    delete is a test that costs more than it proves.
+
+    What it does prove is the whole chain that actually breaks — for a script,
+    that it is deployed, reachable without a login, and holding the same token
+    we are; for a service account, that the key parses, Google accepts it, and
+    the sheet has been shared. Either way the tab is left with its header row
+    in place, ready to receive.
+    """
+    import sheets as _sheets
+
+    mode = _sheets.mode_of(body.get("sheet_mode"))
+    sid = _sheets.sheet_id(body.get("sheet_id") or "")
+    url = (body.get("url") or "").strip()
+    tab = (body.get("sheet_tab") or "").strip() or "Sheet1"
+    token = (body.get("token") or "").strip()
+    secret_env = (body.get("secret_env") or "").strip()
+
+    # Called with a target_id instead? Read its settings rather than making
+    # the caller repeat them.
+    if body.get("target_id") and not (sid or url):
+        try:
+            tid = int(body["target_id"])
+        except (TypeError, ValueError):
+            return {"error": "target_id must be a number"}
+        with _connect() as con:
+            row = con.execute("SELECT * FROM delivery_targets WHERE target_id = ?",
+                              (tid,)).fetchone()
+        if not row:
+            return {"error": f"no target {tid}"}
+        d = dict(row)
+        mode = _sheets.mode_of(d.get("sheet_mode"))
+        sid = d.get("sheet_id") or ""
+        url = d.get("url") or ""
+        tab = d.get("sheet_tab") or "Sheet1"
+        secret_env = d.get("secret_env") or ""
+
+    if mode == _sheets.MODE_API:
+        email = _sheets.service_account_email()
+        if not sid:
+            return {"error": "paste the Google Sheet's URL first", "email": email}
+        if not _sheets.load_creds():
+            return {"error": f"{_sheets.CREDS_ENV} is not set in .env on the "
+                             f"server, or does not point at a readable "
+                             f"service-account JSON key"}
+
+        async def go_api():
+            import httpx
+            async with httpx.AsyncClient() as client:
+                return await _sheets.check_api_access(client, sid, tab)
+
+        ok, err = _run(go_api(), timeout=60)
+        if not ok:
+            return {"error": err, "email": email}
+        return {"ok": True, "email": email, "sheet_id": sid, "sheet_tab": tab,
+                "url": f"{_sheets_url}{sid}"}
+
+    if not url:
+        return {"error": "paste the Apps Script web app URL (it ends in /exec)"}
+    # The token may come straight from the setup form — the operator has it on
+    # screen and has not restarted the server yet, so requiring .env first
+    # would mean the check could not be run until after the thing it checks.
+    if not token and secret_env:
+        token = os.getenv(secret_env, "").strip()
+        if not token:
+            return {"error": f"{secret_env} is not set in .env on the server yet "
+                             f"— add it and restart, or run this check from the "
+                             f"setup form where the token is still on screen"}
+    if not token:
+        return {"error": "no token to check with"}
+
+    async def go_script():
+        import httpx
+        async with httpx.AsyncClient() as client:
+            return await _sheets.check_script_access(client, url, token, tab)
+
+    ok, err = _run(go_script(), timeout=90)
+    return {"ok": True, "sheet_tab": tab, "url": url} if ok else {"error": err}
 
 
 def _delivery_target_remove(body):
@@ -3748,6 +3942,10 @@ class Handler(BaseHTTPRequestHandler):
                 return self._send(200, _delivery_target_remove(body))
             if u.path == "/api/delivery/backfill":
                 return self._send(200, _delivery_backfill(body))
+            if u.path == "/api/delivery/sheet/test":
+                return self._send(200, _test_sheet(body))
+            if u.path == "/api/delivery/sheet/script":
+                return self._send(200, _sheet_script(body))
             if u.path == "/api/alerts":
                 return self._send(200, _alert_post(body))
             if u.path == "/api/alerts/update":

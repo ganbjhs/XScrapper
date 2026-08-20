@@ -1,7 +1,7 @@
 // One collected post — X or Instagram — with the Collector's own chrome:
 // platform badge, lag badge, watchlist attribution, media thumbnails.
 import React from "react";
-import { fmtAgo, fmtLag, fmtN } from "../api/client.js";
+import { fmtAgo, fmtLag, fmtN, fmtPosted } from "../api/client.js";
 
 const PFP_COLORS = ["#2a6b46", "#a8552e", "#7a4a9e", "#3f6b8f", "#8a6100", "#54303f"];
 const pfpColor = (s) => {
@@ -100,9 +100,10 @@ export default function PostCard({ t, onPin, onUnpin, terms }) {
           {t.is_retweet ? <span className="badge rt">RT</span> : null}
         </div>
         <p className="ctext">{withLinks(t.text, terms)}</p>
-        <div className="cwl">
+        <div className="cwl" title={t.created_at
+          ? `posted ${new Date(t.created_at).toLocaleString("en-IN")}` : ""}>
           {t.streams?.length ? `Stream: ${t.streams.join(", ")} · ` : ""}
-          collected {fmtAgo(t.collected_at)} · posted {fmtAgo(t.created_at)}
+          collected {fmtAgo(t.collected_at)} · posted {fmtPosted(t.created_at)}
         </div>
         <div className="cstats">
           <span>❤ {fmtN(t.like_count ?? t.metrics?.likes)}</span>
