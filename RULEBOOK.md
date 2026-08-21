@@ -51,6 +51,38 @@ delivery, the UI card — already generalizes over it, so a fourth platform
 touches no downstream code. `tweet_id` is always a **string** (JS loses integer
 precision past 2^53; snowflake ids are well past it).
 
+### The three-column source: a PERSON, a HANDLE, an ID — never one string
+
+A source row holds three different facts with three different lifetimes, and
+they may never share a column:
+
+| column | is | example | written by |
+|---|---|---|---|
+| `label` | the **person** | `Narendra Modi` | **a human, only** |
+| `value` | the **handle** on this platform | `narendramodi` | a human |
+| `platform_id` | the platform's **numeric id** | `1550693326` | the collector |
+
+- **`label` is the cross-platform identity key, and nothing automated may write
+  it.** The same person is `@narendramodi` on Instagram and `@modinarendra` on
+  Facebook; `label` is what makes those one profile — one avatar (§6, X is the
+  canonical avatar source), one display name, one `WHERE label = ?` instead of
+  three hand-maintained handle lists. It is also the only one of the three that
+  cannot be re-derived if it is lost.
+- **`platform_id` is a CACHE derived from `value`.** Resolve once, store it,
+  fetch by it forever. If `value` changes, the cached id is stale and MUST be
+  dropped — an id pointing at a name the row no longer claims collects the
+  wrong person's posts under the right person's identity, silently, which is
+  the worst failure available here.
+- **An unresolved row still fetches by name** (`user_id` returns
+  `platform_id or value`). This is what makes the model safe to deploy: nothing
+  breaks on the first pass, rows simply stop failing as they fill in.
+
+Paid for on 2026-08-20 (see §6, Instagram). Implemented for Instagram;
+`IDENTITY_MODEL.md` carries the design and the migration order for Facebook
+(whose `sources.label` is still the page handle, so it has no identity column
+yet) and X (whose `watchlist_members` already has all three, under other
+names).
+
 ## 3. Collection rules
 
 - **Watermark, newest-first, stop at the first already-seen post.** Every poll
@@ -330,8 +362,34 @@ single request. These are hard rules, not tuning:
 - **One relogin attempt per pass, never into a checkpoint.** The `checkpoint_at`
   breaker is absolute — retrying a locked account is the fastest way to kill
   it permanently.
-- **The numeric pk beats the @name** for user sources; validate sessions
-  against the feed endpoint, not `account_info`.
+- **The numeric pk beats the @name for FETCHING — but the source still stores
+  the name.** (CORRECTED 2026-08-21. The old rule said "use the numeric pk for
+  user sources", which was read as *put the number in the source*, and that is
+  what took a whole project offline: every source was keyed by a number or by a
+  name that could not be looked up, and `value` could not be both.) Name lookup
+  and media reads are SEPARATE permissions — measured on a live restricted
+  session, `user_medias_paginated_v1('787132')` returned posts while
+  `user_id_from_username('natgeo')`, `user_info_by_username_v1` and
+  `search_users` all returned `login_required`. So: keep the handle in `value`,
+  resolve it ONCE into `sources.platform_id`, and fetch by the id forever after
+  (§2, the three-column source). Validate sessions against the feed endpoint,
+  not `account_info`.
+- **A username lookup has three ways in, and a failed one is CACHED as a
+  question, never retried in a loop.** `engine_ig.resolve_user` tries the
+  private API, then the web `web_profile_info` endpoint (browser `X-IG-App-ID`
+  — a different gate, commonly open when the private one is shut), then the
+  profile HTML. Every path reuses the logged-in client's cookies, proxy and
+  user-agent, because a lookup leaving from a different IP than the session it
+  claims is a louder signal than the lookup itself (IG1). If all three refuse,
+  the error names a human fix (`collect_ig.py set-id`) and the source waits —
+  it does not re-ask on the next pass and the one after that.
+- **A resolved id is written to the DB, not just to memory.** An in-process
+  cache dies with the process, so a restarting service re-resolves — and
+  re-fails — every name on every pass. That is exactly what one checkpointed
+  account did on 2026-08-20: the same `RetryError` on every source, all night,
+  each one spending pacing budget to accomplish nothing. `on_resolved` →
+  `store_ig.cache_platform_id` makes the lookup a one-time cost. Any future
+  name→id resolution on any platform carries the same obligation.
 - **Test on throwaways first.** A hot account stays hot; never debug against
   the account you depend on.
 
@@ -497,6 +555,10 @@ updated, never deleted (the pre-commit hook blocks the deletion).
   per-watchlist check intervals and collection-time filters.
 - Instagram sources: user / hashtag / home-feed, managed from the dashboard
   (`/api/ig/source`), collected by the IG service.
+- The three-column source contract (§2): `label` = person, `value` = handle,
+  `platform_id` = numeric id. No code path may write `label`, and no path may
+  collapse the three back into one column — that collapse is the bug the model
+  exists to prevent.
 - Facebook pages with per-page cadence, pause/resume per page and globally,
   plus favorites mode (one richer feed pass, posts attributed per page).
 - Watermark polling everywhere (one cheap request per quiet poll), FB two-key
@@ -518,6 +580,10 @@ updated, never deleted (the pre-commit hook blocks the deletion).
   timestamped, browsable per platform in the dashboard.
 - Guard (advisory only), `doctor`, pinned scraper versions with startup
   asserts, additive self-applying migrations.
+- IG username→id resolution: three independent paths, the answer persisted to
+  `platform_id`, and a human escape hatch (`collect_ig.py set-id`) when a
+  restricted session can resolve nothing. Removing a fallback or the write-back
+  returns the collector to re-failing every name on every pass.
 - Login walls / bans surface in the UI in plain words — never silent.
 
 **Dashboard**

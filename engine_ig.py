@@ -308,6 +308,106 @@ def client_from_store(store, username: str, proxy: str = "", log=lambda m: None)
 
 
 # ==========================================================================
+# username -> numeric id, the two fallbacks
+# ==========================================================================
+#
+# Both of these deliberately reuse the LOGGED-IN client's cookies, proxy and
+# user-agent rather than opening a clean connection. A lookup that leaves from
+# a different IP, or carries a different fingerprint, than the session it claims
+# to belong to is a louder signal than the lookup itself — same reasoning as
+# build_client pinning the device (IG1).
+
+def _browser_session(cl):
+    """A requests.Session that looks like this account's browser tab.
+
+    Cookies and proxy come from the live client, so the request exits the same
+    way every other request from this account does.
+    """
+    import requests
+
+    sess = requests.Session()
+    for src in ("private", "public"):
+        jar = getattr(getattr(cl, src, None), "cookies", None)
+        if jar:
+            sess.cookies.update(jar)
+    try:
+        sess.cookies.update(cl.cookie_dict or {})
+    except Exception:
+        pass
+    proxies = (getattr(getattr(cl, "private", None), "proxies", None)
+               or getattr(getattr(cl, "public", None), "proxies", None))
+    if proxies:
+        sess.proxies.update(proxies)
+
+    # The web endpoint wants a WEB user-agent. A seeded client's UA is the
+    # mobile app string, which this endpoint does not expect; the harvested
+    # browser UA is kept in settings when there is one, so prefer it.
+    ua = ""
+    try:
+        ua = cl.settings.get("web_user_agent") or ""
+    except Exception:
+        pass
+    if "Mozilla" not in ua:
+        ua = getattr(cl, "user_agent", "") or ""
+    if "Mozilla" not in ua:
+        ua = ("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 "
+              "(KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36")
+    sess.headers.update({
+        "User-Agent": ua,
+        "Accept": "*/*",
+        "Accept-Language": "en-US,en;q=0.9",
+        "X-IG-App-ID": WEB_APP_ID,
+        "X-Requested-With": "XMLHttpRequest",
+    })
+    csrf = sess.cookies.get("csrftoken")
+    if csrf:
+        sess.headers["X-CSRFToken"] = csrf
+    return sess
+
+
+def _pk_via_web_profile_info(cl, name: str, timeout: int = 15):
+    """The endpoint instagram.com hits when you open a profile in a tab.
+
+    Gated separately from the app API — this is the path that usually still
+    answers on a session where user_id_from_username returns login_required.
+    Returns the numeric pk as a string, or None if the payload has no id.
+    """
+    sess = _browser_session(cl)
+    r = sess.get("https://www.instagram.com/api/v1/users/web_profile_info/",
+                 params={"username": name},
+                 headers={"Referer": f"https://www.instagram.com/{name}/"},
+                 timeout=timeout)
+    r.raise_for_status()
+    user = ((r.json() or {}).get("data") or {}).get("user") or {}
+    pk = user.get("id") or user.get("pk")
+    return str(pk) if pk else None
+
+
+def _pk_via_profile_html(cl, name: str, timeout: int = 15):
+    """Last resort: load the profile page and read the id out of the markup.
+
+    Instagram does not always inline it any more, so this is genuinely a
+    fallback — but when it IS there it costs one ordinary page load and no
+    API surface at all.
+    """
+    import re
+
+    sess = _browser_session(cl)
+    sess.headers["Accept"] = ("text/html,application/xhtml+xml,application/xml;"
+                              "q=0.9,*/*;q=0.8")
+    sess.headers.pop("X-Requested-With", None)
+    r = sess.get(f"https://www.instagram.com/{name}/", timeout=timeout)
+    r.raise_for_status()
+    for pat in (r'"profile_id"\s*:\s*"(\d+)"',
+                r'"owner"\s*:\s*\{\s*"id"\s*:\s*"(\d+)"',
+                r'"user_id"\s*:\s*"(\d+)"'):
+        m = re.search(pat, r.text)
+        if m:
+            return m.group(1)
+    return None
+
+
+# ==========================================================================
 # the engine
 # ==========================================================================
 
@@ -323,10 +423,16 @@ class IGEngine:
     good hygiene and costs nothing.
     """
 
-    def __init__(self, client, account: str | None = None):
+    def __init__(self, client, account: str | None = None, on_resolved=None):
         self.cl = client
         self.account = account
         self._pk_cache: dict = {}
+        # Called as on_resolved(handle, numeric_pk) the moment a name is
+        # resolved. The collector points this at store_ig.cache_platform_id so
+        # the lookup is paid ONCE, ever — not once per process. Without it the
+        # cache below dies with the engine, which is why a restarting service
+        # re-resolves (and re-fails) the same names on every single pass.
+        self.on_resolved = on_resolved
 
     def resolve_user(self, who) -> str:
         """
@@ -341,28 +447,79 @@ class IGEngine:
         configured by name can be unfetchable while the very same source
         configured by id collects perfectly.
 
-        Hence: resolve once, cache it, and if resolution fails say exactly that
-        — the fix is a numeric id in the source, not a new login.
+        THE ANSWER IS NOT "STOP USING NAMES". A name is the only part of this
+        that a human can read, and in this system the label above it is the
+        cross-platform identity key. So: keep the name, resolve it ONCE, and
+        persist the answer next to it (store_ig.sources.platform_id). After the
+        first success this method never touches the network again for that
+        handle, on this process or any future one.
+
+        Three ways in, cheapest and most likely first. They fail independently,
+        which is the entire reason there is more than one:
+
+          1. instagrapi's private user_id_from_username — the app-flavoured
+             endpoint. First choice on a healthy session; the first thing
+             withdrawn under a checkpoint.
+          2. the WEB endpoint api/v1/users/web_profile_info, with the browser
+             X-IG-App-ID. This is what instagram.com itself calls when you open
+             a profile in a tab, and it is gated separately from the app API —
+             it routinely answers on exactly the sessions where (1) returns
+             login_required. This is usually the one that saves a restricted
+             account.
+          3. the profile HTML, scraped for "profile_id". Least reliable (the id
+             is not always inlined any more) and last for that reason, but it
+             costs one ordinary page load and sometimes it is simply there.
+
+        If all three refuse, the error says so and points at `set-id`, because
+        at that point the fix is one number typed by a human, not a new login.
         """
-        s = str(who)
+        s = str(who).strip()
         if s.isdigit():
             return s
-        if s in self._pk_cache:
-            return self._pk_cache[s]
+        # Key the cache on the NORMALISED name, so 'natgeo' and '@natgeo' are
+        # one entry and not two lookups.
         name = s.lstrip("@")
-        try:
-            pk = str(self.cl.user_id_from_username(name))
-        except Exception as e:
+        if name in self._pk_cache:
+            return self._pk_cache[name]
+
+        attempts, pk = [], None
+        for how, fn in (("private user_id_from_username",
+                         lambda: self.cl.user_id_from_username(name)),
+                        ("web_profile_info",
+                         lambda: _pk_via_web_profile_info(self.cl, name)),
+                        ("profile HTML",
+                         lambda: _pk_via_profile_html(self.cl, name))):
+            try:
+                got = fn()
+            except Exception as e:
+                attempts.append(f"{how}: {type(e).__name__}")
+                continue
+            if got and str(got).isdigit():
+                pk, via = str(got), how
+                break
+            attempts.append(f"{how}: no id in the response")
+
+        if pk is None:
             raise RuntimeError(
-                f"could not resolve the username '{name}' to a numeric id: "
-                f"{type(e).__name__}. Instagram gates name lookup separately from "
-                f"media reads, so this can fail on a session that fetches fine.\n"
-                f"  Fix: give the source the NUMERIC id instead of the name — "
-                f"open https://www.instagram.com/{name}/ , view source and search "
-                f"for \"profile_id\", then re-add:\n"
-                f"    python3 collect_ig.py add-source --label <label> --type user "
-                f"--value <numeric_id>") from e
-        self._pk_cache[s] = pk
+                f"could not resolve the username '{name}' to a numeric id. "
+                f"Instagram gates name lookup separately from media reads, so "
+                f"this can fail on a session that fetches fine.\n"
+                f"  tried — {'; '.join(attempts)}\n"
+                f"  Fix: cache the id by hand, ONCE. The label and the handle "
+                f"both stay exactly as they are:\n"
+                f"    open https://www.instagram.com/{name}/ , view source, "
+                f"search for \"profile_id\"\n"
+                f"    python3 collect_ig.py set-id --label <label> --id <numeric_id>\n"
+                f"  Or resolve every pending source in one paced pass:\n"
+                f"    python3 collect_ig.py resolve-ids")
+
+        self._pk_cache[name] = pk
+        if self.on_resolved:
+            # Never let a caching failure break a fetch that just succeeded.
+            try:
+                self.on_resolved(name, pk)
+            except Exception:
+                pass
         return pk
 
     # -- one target account -------------------------------------------------

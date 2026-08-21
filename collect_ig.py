@@ -10,19 +10,37 @@ the same numeric "have I reached known ground" test works — no snowflake math.
 
 CLI (the working model — simple on purpose):
 
-  python3 collect_ig.py add-source --label natgeo --type user --value 787132
+  python3 collect_ig.py add-source --label "Narendra Modi" --type user --value narendramodi
   python3 collect_ig.py add-source --label home   --type following
+  python3 collect_ig.py set-id --label "Narendra Modi" --id 1550693326
+  python3 collect_ig.py resolve-ids
   python3 collect_ig.py list-sources
   python3 collect_ig.py run                 # one pass over every enabled source
   python3 collect_ig.py run --loop --every 300
 
-PREFER THE NUMERIC USER ID over the username in a `user` source. Instagram
-grants name lookup and media reads as separate permissions, and a restricted
-session (anything with an open checkpoint) routinely serves media by id while
-refusing to resolve the name — so a source keyed by name can be uncollectable
-while the identical source keyed by id works. A username still works when the
-account is unrestricted; the id simply never stops working. To find it, open
-https://www.instagram.com/<name>/ and search the page source for "profile_id".
+NAME YOUR SOURCES HOWEVER YOU LIKE — the numeric id is no longer your problem.
+A source carries three separate things and the collector keeps them apart:
+
+    label        the PERSON     "Narendra Modi"   <- your cross-platform key
+    value        the HANDLE     narendramodi      <- readable, yours to set
+    platform_id  the NUMERIC ID 1550693326        <- resolved once, cached
+
+Instagram grants name lookup and media reads as separate permissions, and a
+restricted session (anything with an open checkpoint) routinely serves media by
+id while refusing to resolve the name. That used to mean a source keyed by name
+was uncollectable. Now the id is resolved once — via the private API, the web
+web_profile_info endpoint, or the profile HTML, whichever answers — cached into
+platform_id, and used for every fetch after that. The handle and the label are
+never overwritten, so the identity mapping that links this account to the same
+person on Facebook and X stays intact.
+
+If all three lookups refuse (a badly restricted session), type the id in once:
+
+  python3 collect_ig.py set-id --label "Narendra Modi" --id 1550693326
+  python3 collect_ig.py resolve-ids      # or: try every pending source, paced
+
+To find an id by hand: open https://www.instagram.com/<name>/ , view source,
+search for "profile_id".
 
 A `following` source needs the HOME feed, which is account-scoped and is the
 first thing Instagram withdraws under a checkpoint. user/hashtag sources are
@@ -108,7 +126,8 @@ async def collect_source(engine, store, source, *, page_size=12, max_pages=2, lo
     new = store.upsert_posts(collected, source.label)
     if newest and (not wm or newest > wm):
         store.set_watermark(source.label, newest)
-    log(f"  [{source.label}] type={source.type} value={source.value or '-'} "
+    log(f"  [{source.label}] type={source.type} handle={source.value or '-'} "
+        f"id={source.platform_id or '(unresolved)'} "
         f"new={new} (had watermark={'yes' if wm else 'no'})")
     return new
 
@@ -155,7 +174,11 @@ async def run_once(store_path="ig_results.db", account_override="", *,
                     f"tomorrow")
                 continue
 
-            engine = IGEngine(cl, account=acct)
+            # on_resolved turns a successful name lookup into a permanent row
+            # in the DB. This is what makes the lookup a one-time cost instead
+            # of a per-restart one — see engine_ig.resolve_user.
+            engine = IGEngine(cl, account=acct,
+                              on_resolved=store.cache_platform_id)
             refreshed = False       # relogin is attempted at most ONCE per pass
             # Did this account manage a single clean source this pass? That is
             # the honest definition of "the session still works", and it is what
@@ -204,7 +227,8 @@ async def run_once(store_path="ig_results.db", account_override="", *,
                 except Exception as e:
                     log(f"  cannot refresh @{acct}: {e}")
                     continue
-                engine = IGEngine(cl, account=acct)
+                engine = IGEngine(cl, account=acct,
+                                  on_resolved=store.cache_platform_id)
                 try:
                     total += await collect_source(engine, store, s, page_size=page_size,
                                               max_pages=max_pages, log=log)
@@ -221,6 +245,57 @@ async def run_once(store_path="ig_results.db", account_override="", *,
         return total
 
 
+async def resolve_ids(store_path="ig_results.db", account_override="", *,
+                      log=print) -> int:
+    """Fill platform_id for every user source that still has only a handle.
+
+    Runs the same paced rhythm as a collection pass — one lookup, a human gap,
+    the next — because a burst of profile lookups is exactly the pattern that
+    earns a checkpoint, and a checkpoint is what caused this problem in the
+    first place. Failures are reported and skipped, never retried in a tight
+    loop; a source that cannot be resolved keeps its handle and waits for a
+    `set-id`.
+
+    Returns the number of sources newly resolved.
+    """
+    log = _persist_log(log)
+    with store_ig.Store(store_path) as store:
+        pending = store.unresolved_sources()
+        if not pending:
+            log("every user source already has a numeric id — nothing to do")
+            return 0
+        log(f"{len(pending)} source(s) need an id")
+
+        by_account = {}
+        for s in pending:
+            acct = s.account or account_override or _active_account()
+            by_account.setdefault(acct, []).append(s)
+
+        done = 0
+        for acct, group in by_account.items():
+            try:
+                cl = ig_session.load_client(acct, log=log)
+            except Exception as e:
+                log(f"  could not load @{acct}: {e}")
+                continue
+            engine = IGEngine(cl, account=acct, on_resolved=store.cache_platform_id)
+            for i, src in enumerate(group):
+                if i > 0:
+                    await _asyncio.sleep(ig_human.source_gap())
+                try:
+                    pk = await _asyncio.to_thread(engine.resolve_user, src.value)
+                except Exception as e:
+                    log(f"  [{src.label}] {src.value}: unresolved — {e}")
+                    continue
+                # cache_platform_id has already run via on_resolved, but a row
+                # whose handle differs in case would be missed by that path.
+                store.set_platform_id(src.label, pk)
+                log(f"  [{src.label}] {src.value} -> {pk}")
+                done += 1
+        log(f"resolved {done}/{len(pending)}")
+        return done
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description="Collect Instagram posts into store_ig")
     sub = ap.add_subparsers(dest="cmd", required=True)
@@ -232,6 +307,15 @@ def main() -> int:
     a.add_argument("--account", default="")
 
     sub.add_parser("list-sources")
+
+    si = sub.add_parser("set-id", help="cache the numeric Instagram id for a source "
+                                       "(label and handle are left untouched)")
+    si.add_argument("--label", required=True)
+    si.add_argument("--id", required=True, dest="pk")
+
+    ri = sub.add_parser("resolve-ids", help="resolve every source that still has "
+                                            "only a handle, paced like a human")
+    ri.add_argument("--account", default="", help="override which IG login looks up")
 
     d = sub.add_parser("disable"); d.add_argument("label")
     e = sub.add_parser("enable");  e.add_argument("label")
@@ -258,6 +342,21 @@ def main() -> int:
         print(f"added source '{args.label}' ({args.type} {args.value})")
         return 0
 
+    if args.cmd == "set-id":
+        if not str(args.pk).isdigit():
+            print("--id must be numeric (the Instagram profile_id)"); return 1
+        with store_ig.Store(store_path) as st:
+            if not st.db.execute("SELECT 1 FROM sources WHERE label=?",
+                                 (args.label,)).fetchone():
+                print(f"no source labelled '{args.label}' — add it first"); return 1
+            st.set_platform_id(args.label, args.pk)
+        print(f"[{args.label}] id cached: {args.pk} (handle unchanged)")
+        return 0
+
+    if args.cmd == "resolve-ids":
+        asyncio.run(resolve_ids(store_path, args.account))
+        return 0
+
     if args.cmd in ("enable", "disable"):
         with store_ig.Store(store_path) as st:
             st.set_enabled(args.label, args.cmd == "enable")
@@ -270,7 +369,8 @@ def main() -> int:
             if not rows:
                 print("no sources yet")
             for s in rows:
-                print(f"  {s.label:16} {s.type:10} {s.value or '-':20} "
+                print(f"  {s.label:22} {s.type:10} {s.value or '-':20} "
+                      f"id={s.platform_id or '-':<14} "
                       f"account={s.account or '(active)'}")
             print("stats:", st.stats())
         return 0

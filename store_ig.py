@@ -47,15 +47,45 @@ CREATE INDEX IF NOT EXISTS ix_posts_user    ON posts(username);
 CREATE INDEX IF NOT EXISTS ix_posts_source  ON posts(source_label);
 
 CREATE TABLE IF NOT EXISTS sources (
-  label        TEXT PRIMARY KEY,          -- short name, unique
+  label        TEXT PRIMARY KEY,          -- IDENTITY: the person, e.g. 'Narendra Modi'.
+                                          -- This is the cross-platform join key. It is
+                                          -- never touched by the collector.
   type         TEXT NOT NULL,             -- 'following' | 'user' | 'hashtag'
-  value        TEXT NOT NULL DEFAULT '',  -- username / hashtag ('' for following)
+  value        TEXT NOT NULL DEFAULT '',  -- HANDLE: the human-readable platform name
+                                          -- ('narendramodi'), or the hashtag.
+                                          -- '' for a following source.
+  platform_id  TEXT NOT NULL DEFAULT '',  -- MACHINE ID: Instagram's numeric pk for that
+                                          -- handle. Resolved once, cached forever, and
+                                          -- used for every fetch. Never displayed.
+                                          -- See the note on the three-column split below.
   account      TEXT NOT NULL DEFAULT '',  -- which IG login collects it ('' = the active one)
   enabled      INTEGER NOT NULL DEFAULT 1,
   watermark_pk INTEGER,                   -- newest pk seen; stop the walk here
   last_run     INTEGER,
   created_at   INTEGER NOT NULL
 );
+
+-- WHY label / value / platform_id ARE THREE COLUMNS AND NOT ONE
+--
+-- They are three different kinds of fact with three different lifetimes:
+--
+--   label        the PERSON. Stable across every platform. "Narendra Modi" is
+--                @narendramodi on Instagram and @modinarendra on Facebook, and
+--                the label is what ties those rows to one profile — one avatar
+--                fetch, one identity, three feeds. Nothing here ever rewrites it.
+--   value        the HANDLE on THIS platform. Human-readable, verifiable by eye,
+--                what the dashboard shows. Changes only when the person renames.
+--   platform_id  the numeric pk Instagram actually accepts on its media endpoint.
+--                Opaque, permanent, meaningless to a human.
+--
+-- Before this split, `value` had to be all three at once, which forced an
+-- impossible trade: store the handle and the fetch breaks on any restricted
+-- session (Instagram gates name lookup separately from media reads — see
+-- engine_ig.resolve_user), or store the numeric id and lose the handle that made
+-- the cross-platform mapping legible. Splitting the columns retires the trade.
+--
+-- Invariant: platform_id is a CACHE derived from value. If value changes, the
+-- cached id is stale and add_source drops it (see the ON CONFLICT clause).
 
 CREATE TABLE IF NOT EXISTS settings (
   key    TEXT PRIMARY KEY,                -- e.g. 'ig_paused', 'ig_interval_s'
@@ -71,6 +101,7 @@ class Source:
     type: str
     value: str = ""
     account: str = ""
+    platform_id: str = ""
 
     @property
     def following(self) -> bool:
@@ -78,7 +109,26 @@ class Source:
 
     @property
     def user_id(self):
+        """What the fetcher hands Instagram: the numeric pk when we have one,
+        otherwise the handle (which the engine will try to resolve, and cache).
+
+        This is the whole point of the split. A row that has been resolved once
+        never asks Instagram to resolve a name again, and a row that has not
+        behaves exactly as it did before — so nothing breaks on the first run
+        after the migration; rows simply stop failing as they fill in."""
+        if self.type != "user":
+            return None
+        return self.platform_id or self.value
+
+    @property
+    def handle(self):
+        """The human-readable name, always — never the numeric id. Use this for
+        display and for matching this row to the same person on another platform."""
         return self.value if self.type == "user" else None
+
+    @property
+    def resolved(self) -> bool:
+        return bool(self.platform_id)
 
     @property
     def hashtag(self):
@@ -94,8 +144,24 @@ class Store:
         self.db = sqlite3.connect(self.path, timeout=10)
         self.db.row_factory = sqlite3.Row
         self.db.executescript(SCHEMA)
+        self._migrate()
         self.db.commit()
         return self
+
+    def _migrate(self) -> None:
+        """Bring an older ig_results.db up to the current schema, in place.
+
+        CREATE TABLE IF NOT EXISTS is a no-op on a table that already exists, so
+        a database written before platform_id existed keeps the old five-column
+        sources table and every read of r["platform_id"] would raise. Adding the
+        column here means the upgrade happens the first time the service opens
+        the file — no separate migration step is required for the column itself.
+        (migrate_ig_sources.py exists for the data move, which is a judgement
+        call and deliberately not automatic.)"""
+        have = {r["name"] for r in self.db.execute("PRAGMA table_info(sources)")}
+        if "platform_id" not in have:
+            self.db.execute(
+                "ALTER TABLE sources ADD COLUMN platform_id TEXT NOT NULL DEFAULT ''")
 
     def close(self):
         if self.db:
@@ -127,15 +193,68 @@ class Store:
         self.close()
 
     # -- sources ------------------------------------------------------------
-    def add_source(self, label, type_, value="", account="") -> None:
+    def add_source(self, label, type_, value="", account="", platform_id="") -> None:
+        """Register (or update) a source.
+
+        label is the person; value is the handle. platform_id is optional and
+        almost never passed by hand — the collector fills it in on first resolve.
+
+        A numeric `value` is accepted and routed to platform_id, so the old
+        `add-source --value 787132` calling convention still does the right
+        thing: the id lands in the id column instead of masquerading as a handle.
+
+        On re-add, a cached id survives only if the handle is unchanged. Rename
+        the handle and the id is dropped, because it now points at a name this
+        row no longer claims — better one wasted lookup than a silently wrong
+        account collected under someone else's identity."""
         if type_ not in ("following", "user", "hashtag"):
             raise ValueError("type must be following | user | hashtag")
+        value = str(value or "").strip().lstrip("@")
+        platform_id = str(platform_id or "").strip()
+        if type_ == "user" and value.isdigit() and not platform_id:
+            value, platform_id = "", value
         self.db.execute(
-            "INSERT INTO sources(label,type,value,account,enabled,created_at) "
-            "VALUES(?,?,?,?,1,?) ON CONFLICT(label) DO UPDATE SET "
-            "type=excluded.type, value=excluded.value, account=excluded.account",
-            (label, type_, value, account, _now()))
+            "INSERT INTO sources(label,type,value,platform_id,account,enabled,created_at) "
+            "VALUES(?,?,?,?,?,1,?) ON CONFLICT(label) DO UPDATE SET "
+            "type=excluded.type, value=excluded.value, account=excluded.account, "
+            "platform_id = CASE "
+            "  WHEN excluded.platform_id != '' THEN excluded.platform_id "
+            "  WHEN sources.value = excluded.value THEN sources.platform_id "
+            "  ELSE '' END",
+            (label, type_, value, platform_id, account, _now()))
         self.db.commit()
+
+    def set_platform_id(self, label, platform_id) -> None:
+        """Cache the numeric id for one source, by label."""
+        self.db.execute("UPDATE sources SET platform_id=? WHERE label=?",
+                        (str(platform_id), label))
+        self.db.commit()
+
+    def cache_platform_id(self, handle, platform_id) -> int:
+        """Cache a resolved id against every user source carrying that handle.
+
+        Keyed by handle, not label, because the engine only ever learns the name
+        it was asked to resolve — it has no idea which identity row sent it. Two
+        projects watching the same account both benefit from the one lookup.
+        Returns how many rows were filled."""
+        h = str(handle or "").strip().lstrip("@")
+        if not h or str(platform_id or "").strip() == "":
+            return 0
+        cur = self.db.execute(
+            "UPDATE sources SET platform_id=? "
+            "WHERE type='user' AND platform_id='' AND lower(value)=lower(?)",
+            (str(platform_id), h))
+        self.db.commit()
+        return cur.rowcount
+
+    def unresolved_sources(self) -> list:
+        """User sources that still have a handle but no cached id — the rows
+        that will cost a name lookup on the next pass, and the exact worklist
+        for `collect_ig.py resolve-ids`."""
+        return [Source(r["label"], r["type"], r["value"], r["account"], r["platform_id"])
+                for r in self.db.execute(
+                    "SELECT * FROM sources WHERE type='user' AND platform_id='' "
+                    "AND value != '' ORDER BY label")]
 
     def set_enabled(self, label, enabled: bool) -> None:
         self.db.execute("UPDATE sources SET enabled=? WHERE label=?",
@@ -146,7 +265,7 @@ class Store:
         q = "SELECT * FROM sources"
         if only_enabled:
             q += " WHERE enabled=1"
-        return [Source(r["label"], r["type"], r["value"], r["account"])
+        return [Source(r["label"], r["type"], r["value"], r["account"], r["platform_id"])
                 for r in self.db.execute(q + " ORDER BY label")]
 
     def watermark(self, label):
@@ -214,7 +333,10 @@ class Store:
         total = c("SELECT COUNT(*) n FROM posts").fetchone()["n"]
         srcs = c("SELECT COUNT(*) n FROM sources WHERE enabled=1").fetchone()["n"]
         newest = c("SELECT MAX(taken_at) t FROM posts").fetchone()["t"]
-        return {"posts": total, "sources_enabled": srcs, "newest_taken_at": newest}
+        unres = c("SELECT COUNT(*) n FROM sources WHERE enabled=1 AND type='user' "
+                  "AND platform_id='' AND value != ''").fetchone()["n"]
+        return {"posts": total, "sources_enabled": srcs, "newest_taken_at": newest,
+                "sources_unresolved": unres}
 
 
 def _now() -> int:

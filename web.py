@@ -3348,8 +3348,12 @@ def _ig_status():
             with store_ig.Store(rp) as st:
                 # Read enabled straight off the table — store_ig.sources() drops
                 # it, and the dashboard's pause toggle needs the real value.
+                # platform_id rides along so the panel can show which rows are
+                # resolved (fetching by id) and which still owe a name lookup.
+                # It is diagnostic only — the handle in `value` stays the thing
+                # a human reads and the thing that maps to the other platforms.
                 out["sources"] = [dict(r) for r in st.db.execute(
-                    "SELECT label, type, value, account, enabled "
+                    "SELECT label, type, value, platform_id, account, enabled "
                     "FROM sources ORDER BY label")]
                 out["totals"] = st.stats()
                 settings = {r["key"]: r["value"] for r in st.db.execute(
@@ -3481,18 +3485,28 @@ def _ig_source_post(body):
             value = str(body.get("value") or "").strip()
             if typ in ("user", "hashtag") and not value:
                 return {"error": f"a {typ} source needs a value "
-                                 f"({'numeric id or username' if typ == 'user' else 'the hashtag'})"}
+                                 f"({'the username' if typ == 'user' else 'the hashtag'})"}
             try:
-                st.add_source(label, typ, value, str(body.get("account") or ""))
+                # A username is the expected input now; the collector resolves it
+                # to a numeric id once and caches that in platform_id. A numeric
+                # value is still accepted and routed to platform_id by
+                # store_ig.add_source, so old callers keep working.
+                st.add_source(label, typ, value, str(body.get("account") or ""),
+                              str(body.get("platform_id") or ""))
             except ValueError as e:
                 return {"error": str(e)}
+        elif action == "set-id":
+            pk = str(body.get("platform_id") or "").strip()
+            if not pk.isdigit():
+                return {"error": "platform_id must be the numeric Instagram id"}
+            st.set_platform_id(label, pk)
         elif action == "remove":
             st.db.execute("DELETE FROM sources WHERE label = ?", (label,))
             st.db.commit()
         elif action == "enable":
             st.set_enabled(label, bool(body.get("enabled")))
         else:
-            return {"error": "action must be add, remove, or enable"}
+            return {"error": "action must be add, remove, enable, or set-id"}
     return {"ok": True}
 
 

@@ -1336,11 +1336,69 @@ def test_ig_device(tmp):
        f"clients are built with a delay_range of {ig_session.DELAY_RANGE}")
 
     print()
+    print("== the three-column source: identity, handle, id ==")
+    # label / value / platform_id are three different facts with three different
+    # lifetimes, and the collector is only ever allowed to write the third.
+    # `label` is the cross-platform identity key ("Narendra Modi" is
+    # @narendramodi here and @modinarendra on Facebook) — if anything in this
+    # module can overwrite it, the profile mapping silently rots.
+    import store_ig, tempfile as _tf, os as _os
+
+    sp = _os.path.join(_tf.mkdtemp(), "sources.db")
+    with store_ig.Store(sp) as st:
+        st.add_source("Narendra Modi", "user", "narendramodi")
+        src = st.sources()[0]
+        ok(src.user_id == "narendramodi",
+           "an unresolved source still fetches by name — nothing breaks on day one")
+        ok([(x.label, x.value) for x in st.unresolved_sources()]
+           == [("Narendra Modi", "narendramodi")],
+           "and shows up on the resolve worklist")
+
+        st.cache_platform_id("narendramodi", "1550693326")
+        src = st.sources()[0]
+        ok(src.user_id == "1550693326", "once resolved it fetches by numeric id")
+        ok(src.label == "Narendra Modi" and src.value == "narendramodi",
+           "while the identity and the handle are left exactly as they were")
+        ok(st.unresolved_sources() == [], "and it leaves the worklist")
+
+        st.add_source("Narendra Modi", "user", "narendramodi")
+        ok(st.sources()[0].platform_id == "1550693326",
+           "re-adding the same handle keeps the cached id (no wasted lookup)")
+
+        st.add_source("Narendra Modi", "user", "narendramodi_new")
+        ok(st.sources()[0].platform_id == "",
+           "but renaming the handle DROPS it — a stale id would collect the "
+           "wrong account under the right name")
+
+        st.add_source("natgeo", "user", "787132")
+        ng = [x for x in st.sources() if x.label == "natgeo"][0]
+        ok(ng.platform_id == "787132" and ng.value == "",
+           "a numeric --value still works and lands in the id column, not the handle")
+
+    # An ig_results.db written before platform_id existed must upgrade itself on
+    # open, or every read of a source row raises on a file the service already has.
+    import sqlite3 as _sq
+    old = _os.path.join(_tf.mkdtemp(), "old.db")
+    _c = _sq.connect(old)
+    _c.executescript(
+        "CREATE TABLE sources (label TEXT PRIMARY KEY, type TEXT NOT NULL, "
+        "value TEXT NOT NULL DEFAULT '', account TEXT NOT NULL DEFAULT '', "
+        "enabled INTEGER NOT NULL DEFAULT 1, watermark_pk INTEGER, "
+        "last_run INTEGER, created_at INTEGER NOT NULL);"
+        "INSERT INTO sources(label,type,value,created_at) "
+        "VALUES('Yogi Adityanath','user','myogi_adityanath',1);")
+    _c.commit(); _c.close()
+    with store_ig.Store(old) as st:
+        ok(st.sources()[0].user_id == "myogi_adityanath",
+           "an old database gains platform_id on open and keeps collecting")
+
+    print()
     print("== username -> pk resolution ==")
     # Instagram grants name LOOKUP and media READS separately: a live session
     # was measured fetching user_medias_paginated_v1('787132') while every
     # username resolver returned login_required. So a numeric id must never be
     # sent through a lookup it does not need, and a failed lookup must say so.
+    import engine_ig
     from engine_ig import IGEngine
 
     class Blocked:
@@ -1350,16 +1408,48 @@ def test_ig_device(tmp):
             Blocked.calls += 1
             raise RuntimeError("login_required")
 
-    eng = IGEngine(Blocked())
-    ok(eng.resolve_user("787132") == "787132", "a numeric id passes straight through")
-    ok(eng.resolve_user(787132) == "787132", "including when it arrives as an int")
-    ok(Blocked.calls == 0, "and costs ZERO lookup requests")
+    # The two fallbacks are stubbed for the whole block: this is a unit test of
+    # the resolution LOGIC, and it must never touch the network.
+    _real_web, _real_html = (engine_ig._pk_via_web_profile_info,
+                             engine_ig._pk_via_profile_html)
+    web_calls = []
     try:
-        eng.resolve_user("natgeo")
-        ok(False, "a blocked lookup raises")
-    except RuntimeError as e:
-        ok("numeric id" in str(e) and "add-source" in str(e),
-           "a blocked lookup names the fix (use the numeric id) rather than the trace")
+        engine_ig._pk_via_web_profile_info = lambda cl, n, timeout=15: None
+        engine_ig._pk_via_profile_html = lambda cl, n, timeout=15: None
+
+        eng = IGEngine(Blocked())
+        ok(eng.resolve_user("787132") == "787132", "a numeric id passes straight through")
+        ok(eng.resolve_user(787132) == "787132", "including when it arrives as an int")
+        ok(Blocked.calls == 0, "and costs ZERO lookup requests")
+        try:
+            eng.resolve_user("natgeo")
+            ok(False, "a lookup blocked on every path raises")
+        except RuntimeError as e:
+            ok("numeric id" in str(e) and "set-id" in str(e),
+               "which names the fix (cache the id) rather than the trace")
+            ok("web_profile_info" in str(e) and "profile HTML" in str(e),
+               "and reports every path it tried, not just the first")
+
+        # The point of the fallback: the private API is dead, the WEB endpoint
+        # is not, and the source collects anyway. This is the case that used to
+        # take a whole project offline.
+        engine_ig._pk_via_web_profile_info = lambda cl, n, timeout=15: (
+            web_calls.append(n), "787132")[1]
+        cached = []
+        eng2 = IGEngine(Blocked(), on_resolved=lambda h, pk: cached.append((h, pk)))
+        ok(eng2.resolve_user("natgeo") == "787132",
+           "a name resolves through the web endpoint when the private one is gated")
+        ok(cached == [("natgeo", "787132")],
+           "and the answer is handed to the store, so it is looked up ONCE ever")
+        ok(eng2.resolve_user("@natgeo") == "787132" and len(web_calls) == 1,
+           "the in-process cache is keyed on the bare name, so '@natgeo' is free")
+
+        eng3 = IGEngine(Blocked(), on_resolved=lambda h, pk: 1 / 0)
+        ok(eng3.resolve_user("natgeo") == "787132",
+           "a failing write-back never breaks a resolve that succeeded")
+    finally:
+        engine_ig._pk_via_web_profile_info = _real_web
+        engine_ig._pk_via_profile_html = _real_html
 
 
 # ==========================================================================
