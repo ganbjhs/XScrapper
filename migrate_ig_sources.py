@@ -113,12 +113,42 @@ def main() -> int:
         print("sources.platform_id: present")
 
     if "platform_id" not in _cols(db, "sources"):
-        print("\n(dry run — the steps below are reported against the old schema)")
-        moves = [dict(r) for r in db.execute(
-            "SELECT label, value FROM sources WHERE type='user' AND value GLOB '[0-9]*'")]
-        for m in moves:
-            print(f"  would move id out of value: [{m['label']}] {m['value']}")
-        print("\nre-run with --apply to perform the migration")
+        # Dry run against the OLD schema. There is no platform_id to query, so
+        # everything below is derived from `value` alone — but it must still
+        # answer the only question the operator actually has, which is "what is
+        # this going to do to my sources". An early return that prints nothing
+        # is a dry run that tells you nothing.
+        print("\n(dry run — reported against the old schema)")
+        rows = [dict(r) for r in db.execute(
+            "SELECT label, type, value FROM sources ORDER BY label")]
+        moves = [r for r in rows
+                 if r["type"] == "user" and r["value"] and r["value"].isdigit()]
+        names = [r for r in rows
+                 if r["type"] == "user" and r["value"] and not r["value"].isdigit()]
+        other = [r for r in rows if r["type"] != "user"]
+
+        print(f"\n{len(rows)} source(s) total")
+        if moves:
+            print(f"\n{len(moves)} carrying a numeric id in the handle column "
+                  f"— the id moves to platform_id, the handle is left empty:")
+            for m in moves:
+                print(f"  [{m['label']}] {m['value']}")
+        else:
+            print("\nno numeric values sitting in the handle column — nothing to move")
+
+        if names:
+            print(f"\n{len(names)} keyed by handle. The migration does NOT touch "
+                  f"these; they keep collecting by name and are resolved to an id "
+                  f"on the next pass (or all at once with `collect_ig.py "
+                  f"resolve-ids`):")
+            for n in names:
+                print(f"  [{n['label']}] {n['value']}")
+        if other:
+            print(f"\n{len(other)} non-user source(s), untouched: "
+                  f"{', '.join(repr(o['label']) for o in other)}")
+
+        print("\nNo label is written, in this mode or any other.")
+        print("Re-run with --apply to perform the migration.")
         return 0
 
     # -- 2. numeric handles are ids in the wrong column ---------------------

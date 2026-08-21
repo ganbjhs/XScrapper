@@ -2290,8 +2290,15 @@ def test_facebook(tmp):
             ]
     _orig = _efb.FacebookEngine
     _orig_login = collect_fb._can_log_in
+    _orig_blocked = _efb.login_blocked
     _efb.FacebookEngine = lambda *a, **k: _FakeFav()
     collect_fb._can_log_in = lambda: True     # no real FB creds in the test env
+    # And no real fb_health.json either. login_blocked() reads that file
+    # relative to the CWD, so on the server — where a live checkpoint is
+    # recorded — run_favorites short-circuited before it ever reached the fake
+    # engine, and these four assertions failed on the VPS while passing on a
+    # laptop. A test that reads live server state is not offline. (2026-08-21)
+    _efb.login_blocked = lambda: None
     try:
         # No project → only the already-tracked page is saved.
         got = asyncio.run(collect_fb.run_favorites(str(db)))
@@ -2301,6 +2308,7 @@ def test_facebook(tmp):
     finally:
         _efb.FacebookEngine = _orig
         collect_fb._can_log_in = _orig_login
+        _efb.login_blocked = _orig_blocked
     ok(got2 == 1, "an untracked favorited page auto-registers and its post saves")
     with store_fb.Store(db) as st2:
         rows = [r for r in st2.recent(project_id=7) if r["post_id"] == "narendramodi:20"]
@@ -2309,6 +2317,64 @@ def test_facebook(tmp):
         labels = {s["label"] for s in st2.sources()}
         ok("randompage" in labels,
            "the new favorited page was auto-added as a source under the project")
+
+
+def test_no_undefined_names():
+    """Every module-level name a module LOADS must be one it defines or imports.
+
+    Paid for on 2026-08-21: `collect_ig.py` used `os.getenv` on the `--loop`
+    path without ever importing `os`. It had been that way since the ig_human
+    commit, so the systemd IG service crashed on start every single time —
+    `NameError` inside `main()`, under a second, `Restart=always` hiding it in
+    a restart loop. Nobody noticed because the dashboard's Fetch-now button
+    calls `collect_ig.run_once` DIRECTLY (web.py), never through `main()`, so
+    Instagram collection appeared to work while the service was dead.
+
+    Two lessons, and this test is the second one:
+      * a path only systemd runs is a path nothing tests. `main()` is code.
+      * an import error is not a subtle bug — it is free to catch, and only
+        stayed alive because nothing ever compiled the file's name table.
+
+    A full linter would be better; this is the 20-line version that needs no
+    dependency and catches exactly the failure that bit us.
+    """
+    import ast as _ast, builtins as _bi
+
+    MODULES = ["collect_ig.py", "collect_fb.py", "collector.py", "engine_ig.py",
+               "engine.py", "engine_fb.py", "store_ig.py", "store_fb.py",
+               "store.py", "web.py", "main.py", "ig_human.py", "pool_link.py",
+               "activity_log.py", "alerts.py", "webhook.py", "sheets.py",
+               "migrate_ig_sources.py"]
+    # Module dunders are supplied by the import machinery, not by the source.
+    builtin_names = set(dir(_bi)) | {
+        "__file__", "__name__", "__doc__", "__package__", "__spec__",
+        "__loader__", "__builtins__", "__debug__"}
+    root = pathlib.Path(__file__).resolve().parent.parent
+
+    for name in MODULES:
+        path = root / name
+        if not path.exists():
+            continue
+        tree = _ast.parse(path.read_text(), str(path))
+        defined = set()
+        for n in _ast.walk(tree):
+            if isinstance(n, (_ast.Import, _ast.ImportFrom)):
+                for a in n.names:
+                    defined.add((a.asname or a.name).split(".")[0])
+            elif isinstance(n, (_ast.FunctionDef, _ast.AsyncFunctionDef, _ast.ClassDef)):
+                defined.add(n.name)
+            elif isinstance(n, _ast.Name) and isinstance(n.ctx, _ast.Store):
+                defined.add(n.id)
+            elif isinstance(n, _ast.arg):
+                defined.add(n.arg)
+            elif isinstance(n, _ast.ExceptHandler) and n.name:
+                defined.add(n.name)
+        missing = sorted({n.id for n in _ast.walk(tree)
+                          if isinstance(n, _ast.Name) and isinstance(n.ctx, _ast.Load)
+                          and n.id not in defined and n.id not in builtin_names})
+        ok(not missing,
+           f"{name} references no name it never defines"
+           + (f" — MISSING: {', '.join(missing)}" if missing else ""))
 
 
 # ==========================================================================
@@ -3540,6 +3606,9 @@ def main():
 
         section("web (shared event loop)")
         test_web_event_loop(fresh("web"))
+
+        section("no undefined names (the import that systemd found first)")
+        test_no_undefined_names()
 
         section("cli (routing, exit codes, end to end)")
         d = fresh("cli")

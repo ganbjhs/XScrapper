@@ -495,6 +495,25 @@ before changing the engine; nearly every "obvious" idea has been tried.)
 - **`python3 tests/test_all.py` stays green, offline, and grows a test for the
   new behavior.** The suite is the contract; it needs no accounts and spends no
   budget. Run it as a script, not under pytest.
+- **A path only systemd runs is a path nothing tests — `main()` is code.**
+  `collect_ig.py` called `os.getenv` on its `--loop` branch without importing
+  `os`, from the ig_human commit onward. The IG service therefore crashed on
+  start EVERY time, in under a second, with `Restart=always` hiding it in a
+  restart loop — while Instagram collection still appeared to work, because the
+  dashboard's Fetch-now calls `collect_ig.run_once` directly and never goes
+  through `main()`. A green suite plus a working dashboard said "fine" for
+  weeks. `tests/test_all.py::test_no_undefined_names` now walks every module's
+  name table, which is the cheap half; the expensive half is remembering that
+  the service entrypoint is not covered just because the library under it is
+  (2026-08-21).
+- **Offline also means isolated from the WORKING DIRECTORY.** A test may not
+  read whatever live state happens to sit next to it. The FB favorites tests
+  stubbed `_can_log_in` but not `login_blocked`, which reads `fb_health.json`
+  relative to the CWD — so on the VPS, where a real checkpoint is recorded,
+  `run_favorites` returned 0 before reaching the fake engine and four
+  assertions failed on the server while passing on every laptop. A suite that
+  disagrees with itself by machine cannot be a contract. When a code path
+  consults a file, an env var or a clock, the test stubs it (2026-08-21).
 - **Watchlists are ONE structure across platforms.** The Watchlists page is
   master-detail (compact list left, one detail panel right — long member lists
   scroll inside their own box, never the page) with two tabs: "Watchlists"
