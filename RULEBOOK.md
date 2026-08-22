@@ -536,6 +536,22 @@ before changing the engine; nearly every "obvious" idea has been tried.)
 - **`python3 tests/test_all.py` stays green, offline, and grows a test for the
   new behavior.** The suite is the contract; it needs no accounts and spends no
   budget. Run it as a script, not under pytest.
+- **A service must be OBSERVABLE and its restart limiter must actually apply.**
+  Two unit-file defects, found together on 2026-08-22, and between them they
+  are why a service that had been dead for weeks looked alive:
+    * `Environment=PYTHONUNBUFFERED=1` on every Python unit. Python
+      block-buffers stdout when it is not a TTY, so `print()` sits in an 8KB
+      buffer and never reaches journald — `journalctl -f` on a healthy,
+      working collector showed nothing but systemd's own lines.
+    * `StartLimitIntervalSec` / `StartLimitBurst` go in **`[Unit]`**, not
+      `[Service]`. systemd ignores them in `[Service]` and logs "Unknown key
+      name … ignoring". With `Restart=always` and an inert limiter, a service
+      that crashes on start restarts forever instead of hitting
+      `start-limit-hit` and going `failed`. Nothing ever goes red, so nothing
+      is ever noticed — which is exactly how `collect_ig.py` survived a
+      missing `import os`.
+  A service you cannot see and cannot catch failing is not deployed, it is
+  merely installed. Check both on any new unit.
 - **A path only systemd runs is a path nothing tests — `main()` is code.**
   `collect_ig.py` called `os.getenv` on its `--loop` branch without importing
   `os`, from the ig_human commit onward. The IG service therefore crashed on

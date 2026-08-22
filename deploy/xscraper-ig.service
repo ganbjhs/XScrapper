@@ -3,12 +3,28 @@ Description=Instagram Collector (human-paced poll loop)
 After=network-online.target
 Wants=network-online.target
 
+# StartLimit* belong in [Unit], NOT [Service]. systemd ignores them in
+# [Service] and says so in the journal ("Unknown key name ... ignoring"), which
+# means the restart rate-limit below was never in effect on any of these units.
+# That is not cosmetic: with Restart=always and an inert limiter, a service that
+# crashes on start restarts forever instead of hitting start-limit-hit and going
+# `failed`. collect_ig.py spent weeks in exactly that loop over a missing
+# `import os`, and nothing ever went red. (2026-08-22)
+StartLimitIntervalSec=900
+StartLimitBurst=4
+
 [Service]
 Type=simple
 User=xscraper
 Group=xscraper
 WorkingDirectory=/opt/xscraper/app
 Environment=DO_NOT_TRACK=1
+# Python block-buffers stdout when it is not a TTY, so print() output sits in an
+# 8KB buffer and never reaches journald — the collectors looked completely
+# silent under `journalctl -f` while running perfectly. Unbuffered is the only
+# way a long-running Python service is observable.
+Environment=PYTHONUNBUFFERED=1
+
 # The loop re-reads its cadence and pause switch from the dashboard every
 # cycle (ig_results.db settings). ig_human.py adds active-hours, humanized
 # gaps, a daily budget and warm-up on top — so the base interval here is just
@@ -19,8 +35,6 @@ ExecStart=/opt/xscraper/app/.venv/bin/python3 collect_ig.py run --loop --every 3
 # PleaseWaitFewMinutes), so back off hard rather than hot-loop on a bad session.
 Restart=always
 RestartSec=120
-StartLimitIntervalSec=900
-StartLimitBurst=4
 
 NoNewPrivileges=true
 PrivateTmp=true

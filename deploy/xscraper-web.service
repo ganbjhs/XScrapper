@@ -10,6 +10,12 @@ Group=xscraper
 WorkingDirectory=/opt/xscraper/app
 Environment=TWS_TELEMETRY=0
 Environment=DO_NOT_TRACK=1
+# Python block-buffers stdout when it is not a TTY, so print() output sits in an
+# 8KB buffer and never reaches journald — the collectors looked completely
+# silent under `journalctl -f` while running perfectly. Unbuffered is the only
+# way a long-running Python service is observable.
+Environment=PYTHONUNBUFFERED=1
+
 # Loopback only. nginx terminates TLS and proxies in; the app is never
 # reachable from outside even if the firewall is wrong.
 #

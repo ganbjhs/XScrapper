@@ -3,12 +3,28 @@ Description=Facebook Collector (per-page cadence / favorites mode)
 After=network-online.target
 Wants=network-online.target
 
+# StartLimit* belong in [Unit], NOT [Service]. systemd ignores them in
+# [Service] and says so in the journal ("Unknown key name ... ignoring"), which
+# means the restart rate-limit below was never in effect on any of these units.
+# That is not cosmetic: with Restart=always and an inert limiter, a service that
+# crashes on start restarts forever instead of hitting start-limit-hit and going
+# `failed`. collect_ig.py spent weeks in exactly that loop over a missing
+# `import os`, and nothing ever went red. (2026-08-22)
+StartLimitIntervalSec=900
+StartLimitBurst=4
+
 [Service]
 Type=simple
 User=xscraper
 Group=xscraper
 WorkingDirectory=/opt/xscraper/app
 Environment=DO_NOT_TRACK=1
+# Python block-buffers stdout when it is not a TTY, so print() output sits in an
+# 8KB buffer and never reaches journald — the collectors looked completely
+# silent under `journalctl -f` while running perfectly. Unbuffered is the only
+# way a long-running Python service is observable.
+Environment=PYTHONUNBUFFERED=1
+
 # Mode (pages vs favorites), cadence and the global pause all come from the
 # dashboard settings, re-read every cycle — no restart to steer collection.
 # --tick is how often the loop wakes to check which pages are due.
@@ -17,8 +33,6 @@ ExecStart=/opt/xscraper/app/.venv/bin/python3 collect_fb.py run --loop --tick 30
 # A headless browser is heavy and Facebook dislikes churn; back off on restart.
 Restart=always
 RestartSec=120
-StartLimitIntervalSec=900
-StartLimitBurst=4
 
 # Chromium's sandbox needs to gain privileges to build itself — same reason
 # the web unit is not NoNewPrivileges.
