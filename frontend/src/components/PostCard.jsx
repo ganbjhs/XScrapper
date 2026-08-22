@@ -1,5 +1,6 @@
-// One collected post — X or Instagram — with the Collector's own chrome:
-// platform badge, lag badge, watchlist attribution, media thumbnails.
+// One collected post — X, Instagram or Facebook — with the Collector's own
+// chrome: platform badge, lag badge, content label, watchlist attribution,
+// media thumbnails.
 import React from "react";
 import { fmtAgo, fmtLag, fmtN, fmtPosted } from "../api/client.js";
 
@@ -78,7 +79,48 @@ function Pfp({ t, name }) {
   );
 }
 
-export default function PostCard({ t, onPin, onUnpin, terms }) {
+// The content label, as a chip. `cats` is the project's vocabulary so the chip
+// can show the human name; without it the key is shown, which is ugly but true
+// — better than an empty chip while the vocabulary is still loading.
+function LabelChip({ t, cats }) {
+  if (!t.label) return null;
+  const cat = (cats || []).find((c) => c.key === t.label);
+  return (
+    <span className={`badge cat cat-${t.label}`}
+          title={t.label_source === "human"
+            ? "labelled by you" + (t.label_ms ? ` ${fmtAgo(t.label_ms)}` : "")
+            : "labelled by Grok" + (t.label_ms ? ` ${fmtAgo(t.label_ms)}` : "")}>
+      {cat?.name || t.label}
+      {t.label_source === "human" ? " ✎" : ""}
+    </span>
+  );
+}
+
+// Re-label by hand. Writes source='human', which is what stops the next
+// classify run overwriting the correction.
+function LabelPicker({ t, cats, onLabel }) {
+  const [busy, setBusy] = React.useState(false);
+  const change = async (key) => {
+    setBusy(true);
+    try {
+      await onLabel(t, key);
+    } finally {
+      setBusy(false);
+    }
+  };
+  return (
+    <select className="lbl-pick" value={t.label || ""} disabled={busy}
+            aria-label="Change this post's label"
+            onChange={(e) => change(e.target.value)}>
+      <option value="">{t.label ? "— clear label —" : "not classified"}</option>
+      {(cats || []).map((c) => (
+        <option key={c.key} value={c.key}>{c.name}</option>
+      ))}
+    </select>
+  );
+}
+
+export default function PostCard({ t, onPin, onUnpin, terms, cats, onLabel }) {
   const name = t.author_display_name || t.author_username || "unknown";
   const media = t.media || [];
   return (
@@ -98,6 +140,7 @@ export default function PostCard({ t, onPin, onUnpin, terms }) {
             </span>
           )}
           {t.is_retweet ? <span className="badge rt">RT</span> : null}
+          <LabelChip t={t} cats={cats} />
         </div>
         <p className="ctext">{withLinks(t.text, terms)}</p>
         <div className="cwl" title={t.created_at
@@ -117,10 +160,11 @@ export default function PostCard({ t, onPin, onUnpin, terms }) {
             Open on {{ instagram: "Instagram", facebook: "Facebook" }[t.platform] || "X"}
           </a>
           <button onClick={() => navigator.clipboard?.writeText(t.url)}>Copy link</button>
-          {onPin && t.platform === "x" && (
-            <button onClick={() => onPin(t)}>+ Collection</button>
-          )}
+          {/* Every platform can be pinned now: boards key on
+              (platform, post_id), not on an X tweet id. */}
+          {onPin && <button onClick={() => onPin(t)}>+ Collection</button>}
           {onUnpin && <button onClick={() => onUnpin(t)}>Unpin</button>}
+          {onLabel && <LabelPicker t={t} cats={cats} onLabel={onLabel} />}
           {media.length > 0 && (
             <a href={media[0].url || media[0].thumb} target="_blank" rel="noreferrer" download>
               Download media

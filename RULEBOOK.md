@@ -25,10 +25,29 @@ rule won.)
    only where there is no other way in: the one-time X sign-in, and Facebook's
    rendered page. Never drive a browser to "click through" a feed — it is slow,
    fragile, and a ban magnet.
-2. **Extract here; analyse in Watch-Tower.** This tool collects, normalizes,
-   stores, and delivers. Sentiment, scoring, AI, entity work — none of it lives
-   here. The Collector's job is to make clean, complete, timely data available;
-   the intelligence is Watch-Tower's job. Do not grow an analysis layer here.
+2. **Extract here; analyse in Watch-Tower — with ONE named exception.** This
+   tool collects, normalizes, stores, and delivers. Sentiment, scoring, entity
+   work, topic modelling — none of it lives here, and the Collector must not
+   grow a general analysis layer. The single exception, added 2026-08-22 at the
+   operator's explicit request, is **content labelling**: one
+   operator-triggered category per post, produced by an external model
+   (`classify.py` → Grok), stored as a stamped fact beside the post.
+
+   Why this one and nothing else. The dashboard is where the operator triages,
+   and triage without a label means reading every post; a client watching four
+   political beats cannot do that by hand. The old rule's real worry —
+   *"duplicating analysis here would only create two answers that can
+   disagree"* (`store_ig.py`) — is answered by the label travelling WITH the
+   post in delivery, so Watch-Tower reads this answer rather than forming a
+   second one.
+
+   The boundary, which is the part that must not erode: labelling is never
+   automatic, never on a keystroke, never a side effect of collection, and
+   never feeds back into WHAT gets collected. It is a button, it is metered
+   against a hard monthly cap, and a human's correction always outranks the
+   model's. Anything beyond one category per post — scores, summaries,
+   sentiment, entity extraction, a second model — is still Watch-Tower's, and
+   adding it is a new operator decision, not an extension of this one.
 3. **Media travels as URLs, never bytes.** Photos and videos are stored as
    their CDN URLs (with a thumbnail URL). We never download media. Watch-Tower
    and viewers fetch it from the platform directly. This keeps storage tiny and
@@ -150,6 +169,33 @@ names).
   rejected with the reason, not quietly shrunk — a silent clamp still spends
   budget the caller never agreed to. This covers backfill grants too: an absurd
   page count is refused with the ceiling named, never trimmed to fit.
+- **Labelling is a fetch too, and spends money instead of budget.** Everything
+  the two rules above say about going out to a platform applies to going out to
+  Grok: explicit (the Classify button, never a timer), serialized behind ONE
+  lock (`_CLASSIFY_LOCK` — two concurrent runs would read the same "unlabelled"
+  set and pay twice for the same posts), and it reports what it cost in dollars
+  when it finishes. Month-to-date spend is metered in `label_runs` and checked
+  against `classify_cap_usd` before and between batches; a run that would cross
+  the cap is REFUSED with the ceiling named, never trimmed to fit — the same
+  rule as page counts, for the same reason. Per-run and per-month ceilings both
+  live in the dashboard.
+- **A post is paid for once.** A run only ever sends posts with no label. A
+  re-classification is a separate, deliberate act — never something a changed
+  category or a new prompt version triggers on its own, or editing a word in a
+  description would silently re-bill the whole archive.
+- **A human's label outranks the model's, permanently.** `post_labels.source`
+  is `'human'` or `'grok'`, and a `'grok'` write refuses to touch a `'human'`
+  row (one WHERE clause in `store.set_post_labels`). That is the whole reason
+  re-running is safe. It is also why nothing automatic may ever write a label
+  onto a SOURCE: a category attached to a person is an identity fact, and
+  `IDENTITY_MODEL.md` reserves those for humans. Labels attach to POSTS.
+- **The category vocabulary lives in the database, and the prompt is built from
+  it.** Categories are per project, edited in the dashboard, and their
+  `description` is handed to the model verbatim. An editor whose text never
+  reached the prompt would be theatre. The catch-all (`other`) may be renamed
+  but not archived: without somewhere to put a post about cricket, the model is
+  forced to file it under a political category, and the Hate Speech board fills
+  with noise.
 - **Per-source cadence is the source's own.** X watchlists and FB pages each
   carry their own check interval; a scheduler collects only what is *due*. Idle
   ticks cost nothing (no browser opened when nothing is due).
@@ -677,6 +723,12 @@ updated, never deleted (the pre-commit hook blocks the deletion).
 - Login walls / bans surface in the UI in plain words — never silent.
 
 **Dashboard**
+- Content labelling (`classify.py`, `/api/classify`): the Classify button on
+  the Live Feed, the per-project category editor, the category filter and the
+  card chips, the auto board per category, the human-correction override, and
+  the monthly spend cap with its meter. Added 2026-08-22 as the one named
+  exception to prime directive 2 — a refactor that "tidies" it away, or that
+  quietly makes it automatic, is a rule violation either way.
 - Live Feed: X + IG + FB in one stream, SSE real-time, keyword highlighting,
   profile pictures with X as the canonical avatar source.
 - Watchlists page: master-detail with tabs ("Watchlists" /
@@ -709,7 +761,7 @@ updated, never deleted (the pre-commit hook blocks the deletion).
   immutable account id, never from a renameable label.
 - Activity Log page: structured X poll history + raw account log with
   platform/level filters.
-- Collections (pins, CSV export), Alerts (velocity → Telegram), Delivery
+- Collections (cross-platform pins keyed (platform, post_id), CSV export), Alerts (velocity → Telegram), Delivery
   (targets, backfill, behind-count), Search, Guard views.
 - Every operational switch editable in the dashboard; service loops re-read
   settings each cycle (no restart to apply).

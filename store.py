@@ -119,6 +119,14 @@ FIELDS_EXT = FIELDS + [
     "collected_at", "lag_ms", "stream_label", "bookmark_count", "source",
 ]
 
+# The column set for a COLLECTION export. A board can hold X, Instagram and
+# Facebook posts side by side, so it carries two columns FIELDS does not: which
+# platform the row came from (without it "tweet_id" silently holds a Facebook
+# post id) and the content label, which is the reason most boards now exist.
+# FIELDS itself stays frozen — /api/export and every downstream consumer of it
+# are unchanged.
+FIELDS_BOARD = FIELDS + ["platform", "label"]
+
 # Columns the store persists as JSON arrays.
 LIST_FIELDS = ("hashtags", "mentions", "urls", "media_urls")
 
@@ -556,6 +564,102 @@ CREATE TABLE IF NOT EXISTS collection_items (
   PRIMARY KEY (collection_id, tweet_id)
 ) WITHOUT ROWID;
 
+-- The cross-platform pin table, and the reason collection_items above is now
+-- legacy. Boards used to hold X tweet ids only: an INTEGER column with a
+-- WITHOUT ROWID primary key, which cannot be widened by ALTER. So this table
+-- replaces it the same way tweet_raw replaced tweets.raw_json -- new table,
+-- one-shot backfill on open, old table left in place and unread until a
+-- cleanup commit. post_id is TEXT because Instagram and Facebook ids are not
+-- integers and ids cross every wire as strings (RULEBOOK §2).
+--
+-- pinned_by says who put it here. A board the labeller fills is still a board:
+-- the operator can unpin by hand and the run will not put it back, because a
+-- post is only auto-pinned at the moment it is labelled.
+CREATE TABLE IF NOT EXISTS collection_posts (
+  collection_id INTEGER NOT NULL,
+  platform      TEXT    NOT NULL,           -- 'x' | 'instagram' | 'facebook'
+  post_id       TEXT    NOT NULL,
+  added_ms      INTEGER NOT NULL,
+  pinned_by     TEXT    NOT NULL DEFAULT 'human',   -- 'human' | 'label'
+  PRIMARY KEY (collection_id, platform, post_id)
+) WITHOUT ROWID;
+
+-- ---------------------------------------------------------------------------
+-- Content labelling. The ONE analysis exception (RULEBOOK §1 directive 2):
+-- one operator-triggered category per post, from an external model, stored as
+-- a stamped fact beside the post. It never feeds back into what gets
+-- collected, and it travels with the post in delivery so Watch-Tower reads the
+-- same answer rather than forming a second one.
+-- ---------------------------------------------------------------------------
+
+-- One label per post per project. Project-scoped because a project is one
+-- client: two clients watching the same tweet want their own vocabulary and
+-- their own answer, and neither should be able to see or overwrite the other's.
+--
+-- source is the whole reason a re-run is safe: 'human' means the operator
+-- corrected it, and nothing automatic may ever overwrite that.
+CREATE TABLE IF NOT EXISTS post_labels (
+  project_id  INTEGER NOT NULL,
+  platform    TEXT    NOT NULL,
+  post_id     TEXT    NOT NULL,
+  label       TEXT    NOT NULL,             -- a label_categories.key
+  source      TEXT    NOT NULL DEFAULT 'grok',   -- 'grok' | 'human'
+  confidence  REAL,
+  model       TEXT,
+  prompt_ver  INTEGER NOT NULL DEFAULT 1,
+  labelled_ms INTEGER NOT NULL,
+  PRIMARY KEY (project_id, platform, post_id)
+) WITHOUT ROWID;
+
+-- The project's vocabulary, seeded from classify.DEFAULT_CATEGORIES the first
+-- time a project is labelled and edited from the dashboard afterwards. It
+-- lives here rather than in code so a second client gets its own categories
+-- without a deploy (RULEBOOK §6: every operational switch lives on the
+-- dashboard). `description` is the sentence the model is actually given --
+-- editing it changes the prompt, or the editor would be theatre.
+--
+-- rank is precedence, not display order: it is what the prompt tells the model
+-- to use when a post could sit in two categories at once.
+CREATE TABLE IF NOT EXISTS label_categories (
+  project_id  INTEGER NOT NULL,
+  key         TEXT    NOT NULL,
+  name        TEXT    NOT NULL,
+  description TEXT    NOT NULL,
+  rank        INTEGER NOT NULL DEFAULT 100,
+  archived    INTEGER NOT NULL DEFAULT 0,
+  PRIMARY KEY (project_id, key)
+) WITHOUT ROWID;
+
+-- Every run: what it asked for, what it got, what it cost, why it stopped.
+-- Two jobs. It is the month-to-date meter the spend cap is checked against
+-- (the FB byte-meter pattern), and it is what lets the dashboard say "stopped
+-- at the cap" or "Grok returned 429 -- 18 done, 25 left" instead of going
+-- quiet.
+CREATE TABLE IF NOT EXISTS label_runs (
+  run_id      INTEGER PRIMARY KEY AUTOINCREMENT,
+  project_id  INTEGER NOT NULL,
+  started_ms  INTEGER NOT NULL,
+  finished_ms INTEGER,
+  requested   INTEGER NOT NULL DEFAULT 0,
+  labelled    INTEGER NOT NULL DEFAULT 0,
+  failed      INTEGER NOT NULL DEFAULT 0,
+  in_tokens   INTEGER NOT NULL DEFAULT 0,
+  out_tokens  INTEGER NOT NULL DEFAULT 0,
+  cost_usd    REAL    NOT NULL DEFAULT 0,
+  model       TEXT,
+  stop_reason TEXT,       -- done | cap | no_key | error | partial | empty
+  error       TEXT
+);
+
+-- Operational switches for results.db, the same key/value shape store_ig and
+-- store_fb already use: the dashboard writes here and the code re-reads on
+-- every run, so nothing needs a restart. Secrets are NOT here -- XAI_API_KEY
+-- lives in .env and is never shown or edited in the UI (RULEBOOK §5, §6).
+CREATE TABLE IF NOT EXISTS settings (
+  key   TEXT PRIMARY KEY,
+  value TEXT
+);
+
 -- Velocity alerts: "this scope is posting far above its usual pace." Counts
 -- only — no sentiment, no AI (analysis stays in Watch-Tower). A rule scopes
 -- to one watchlist or a whole project, compares the last hour against the
@@ -592,6 +696,13 @@ CREATE TABLE IF NOT EXISTS delivery_targets (
   enabled    INTEGER NOT NULL DEFAULT 1,
   created_at TEXT NOT NULL
 );
+
+CREATE INDEX IF NOT EXISTS ix_post_labels_project
+  ON post_labels(project_id, label);
+CREATE INDEX IF NOT EXISTS ix_collection_posts_post
+  ON collection_posts(platform, post_id);
+CREATE INDEX IF NOT EXISTS ix_label_runs_project
+  ON label_runs(project_id, started_ms);
 
 CREATE TABLE IF NOT EXISTS alerts (
   alert_id      INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -814,6 +925,13 @@ class Store:
         # default in order to leave it alone.
         wanted = {"polls": {"rl_reset": "INTEGER"},
                   "tweets": {"media_json": "TEXT"},
+                  # A board the labeller owns. auto=1 boards are created and
+                  # refilled by a classify run and are shown as such, so the
+                  # operator can tell "posts I chose" from "posts the model
+                  # sorted". label_key ties the board to its category, which
+                  # is what makes a renamed category keep its board.
+                  "collections": {"auto": "INTEGER NOT NULL DEFAULT 0",
+                                  "label_key": "TEXT"},
                   # Google Sheet targets arrived after delivery_targets did,
                   # so a database created before them has the table but not
                   # these two columns.
@@ -950,6 +1068,40 @@ class Store:
                 (oldest["project_id"],))
 
         self._externalize_raw()
+        self._migrate_collection_pins()
+
+    def _migrate_collection_pins(self):
+        """
+        One-time move of board pins from collection_items to collection_posts.
+
+        Same shape and same reasoning as _externalize_raw: gated on a meta flag
+        so the check costs one indexed row on every open, done in one
+        transaction so a crash mid-way simply reruns. The old table is left
+        exactly as it was -- nothing reads it after this, but a board that took
+        the operator months to curate is not something to delete on the way
+        past.
+        """
+        done = self.db.execute(
+            "SELECT 1 FROM meta WHERE key = 'pins_cross_platform'").fetchone()
+        if done:
+            return
+        self.db.execute("BEGIN IMMEDIATE")
+        try:
+            # Every pre-existing pin is an X post, pinned by a human: that is
+            # the only thing the old table could hold.
+            self.db.execute(
+                "INSERT INTO collection_posts"
+                "  (collection_id, platform, post_id, added_ms, pinned_by) "
+                "SELECT collection_id, 'x', CAST(tweet_id AS TEXT), added_ms, "
+                "       'human' FROM collection_items "
+                "WHERE true ON CONFLICT DO NOTHING")
+            self.db.execute(
+                "INSERT INTO meta(key, value) VALUES('pins_cross_platform','1') "
+                "ON CONFLICT(key) DO UPDATE SET value = '1'")
+            self.db.execute("COMMIT")
+        except BaseException:
+            self.db.execute("ROLLBACK")
+            raise
 
     def _externalize_raw(self):
         """
@@ -1543,11 +1695,19 @@ class Store:
     # ----------------------------------------------------------------------
 
     async def collections(self, project_id: int) -> list:
+        # Counted off collection_posts: collection_items is the legacy X-only
+        # table, migrated once on open and unread since (_migrate_collection_pins).
         return [dict(r) for r in self.db.execute(
-            "SELECT c.*, COUNT(i.tweet_id) AS items "
-            "FROM collections c LEFT JOIN collection_items i USING(collection_id) "
-            "WHERE c.project_id = ? GROUP BY c.collection_id ORDER BY c.collection_id",
+            "SELECT c.*, COUNT(i.post_id) AS items "
+            "FROM collections c LEFT JOIN collection_posts i USING(collection_id) "
+            "WHERE c.project_id = ? GROUP BY c.collection_id "
+            "ORDER BY c.auto DESC, c.collection_id",
             (int(project_id),))]
+
+    async def collection_meta(self, collection_id: int) -> dict | None:
+        r = self.db.execute("SELECT * FROM collections WHERE collection_id = ?",
+                            (int(collection_id),)).fetchone()
+        return dict(r) if r else None
 
     async def create_collection(self, project_id: int, name: str) -> dict:
         name = (name or "").strip()
@@ -1570,8 +1730,13 @@ class Store:
             return {"error": f"no collection {collection_id}"}
         self.db.execute("DELETE FROM collection_items WHERE collection_id = ?",
                         (int(collection_id),))
+        self.db.execute("DELETE FROM collection_posts WHERE collection_id = ?",
+                        (int(collection_id),))
         self.db.execute("DELETE FROM collections WHERE collection_id = ?",
                         (int(collection_id),))
+        # An auto board deleted here comes back on the next classify run, by
+        # design: the boards are a view of the labels, and the labels are still
+        # there. Nothing collected is ever removed either way.
         return {"removed": True, "tweets_kept": True}
 
     async def collection_pin(self, collection_id: int,
@@ -1594,9 +1759,16 @@ class Store:
                 missing.append(str(t)); continue
             if self.db.execute("SELECT 1 FROM tweets WHERE tweet_id = ?",
                                (tid,)).fetchone():
+                # Written to the CROSS-PLATFORM table: this method keeps
+                # its old signature and its "only pin what exists" check, but
+                # there is exactly one place pins are read from, and it is
+                # collection_posts. Two pin tables that could disagree is how
+                # a board shows one count and lists another.
                 self.db.execute(
-                    "INSERT OR IGNORE INTO collection_items(collection_id, tweet_id, added_ms) "
-                    "VALUES(?,?,?)", (int(collection_id), tid, now))
+                    "INSERT OR IGNORE INTO collection_posts"
+                    "  (collection_id, platform, post_id, added_ms, pinned_by) "
+                    "VALUES(?, 'x', ?, ?, 'human')",
+                    (int(collection_id), str(tid), now))
                 pinned += 1
             else:
                 missing.append(str(t))
@@ -1607,8 +1779,9 @@ class Store:
             except (TypeError, ValueError):
                 continue
             cur = self.db.execute(
-                "DELETE FROM collection_items WHERE collection_id = ? AND tweet_id = ?",
-                (int(collection_id), tid))
+                "DELETE FROM collection_posts WHERE collection_id = ? "
+                "AND platform = 'x' AND post_id = ?",
+                (int(collection_id), str(tid)))
             removed += cur.rowcount
         out = {"pinned": pinned, "removed": removed}
         if missing:
@@ -1616,16 +1789,368 @@ class Store:
         return out
 
     async def collection_rows(self, collection_id: int) -> list:
-        """The board's posts, newest pin first, as full tweet rows."""
+        """
+        The board's X posts, newest pin first, as full tweet rows.
+
+        X only, by construction — it joins the tweets table. A board holding
+        Instagram or Facebook posts needs the three-database resolver in
+        web._resolve_pins; this stays for the callers that only ever wanted
+        tweets (the CSV path used to, the tests still do).
+        """
         return [dict(r) for r in self.db.execute(
             "SELECT t.*, i.added_ms, "
             "  json_extract(COALESCE(r.raw_json, t.raw_json), "
             "               '$.user.profileImageUrl') AS author_avatar "
-            "FROM collection_items i "
-            "JOIN tweets t USING(tweet_id) "
+            "FROM collection_posts i "
+            "JOIN tweets t ON t.tweet_id = CAST(i.post_id AS INTEGER) "
             "LEFT JOIN tweet_raw r USING(tweet_id) "
-            "WHERE i.collection_id = ? "
+            "WHERE i.collection_id = ? AND i.platform = 'x' "
             "ORDER BY i.added_ms DESC, t.tweet_id DESC", (int(collection_id),))]
+
+    # ----------------------------------------------------------------------
+    # cross-platform pins
+    #
+    # collection_pin/collection_rows above are the X-only originals, kept
+    # because the old /api/collections/pin contract still speaks integer tweet
+    # ids. Everything new goes through these: a pin is (platform, post_id), and
+    # the rows are resolved by the caller because X, Instagram and Facebook
+    # posts live in three separate databases and this store owns only one of
+    # them.
+    # ----------------------------------------------------------------------
+
+    async def collection_pin_posts(self, collection_id: int,
+                                   add: list | None = None,
+                                   remove: list | None = None,
+                                   pinned_by: str = "human") -> dict:
+        """
+        Pin/unpin (platform, post_id) pairs. Returns {"pinned", "removed"}.
+
+        Unlike collection_pin, this does NOT check the post exists first: only
+        the X posts live in this database, so a check here could validate one
+        platform and wave the other two through, which is worse than not
+        checking at all. The read path drops a pin whose post has gone and says
+        so, which is where a hole would actually be visible.
+        """
+        if not self.db.execute("SELECT 1 FROM collections WHERE collection_id = ?",
+                               (int(collection_id),)).fetchone():
+            return {"error": f"no collection {collection_id}"}
+        now = int(time.time() * 1000)
+        pinned = 0
+        for plat, pid in (add or []):
+            if not plat or not pid:
+                continue
+            cur = self.db.execute(
+                "INSERT INTO collection_posts"
+                "  (collection_id, platform, post_id, added_ms, pinned_by) "
+                "VALUES(?,?,?,?,?) ON CONFLICT DO NOTHING",
+                (int(collection_id), str(plat), str(pid), now, str(pinned_by)))
+            pinned += cur.rowcount
+        removed = 0
+        for plat, pid in (remove or []):
+            cur = self.db.execute(
+                "DELETE FROM collection_posts WHERE collection_id = ? "
+                "AND platform = ? AND post_id = ?",
+                (int(collection_id), str(plat), str(pid)))
+            removed += cur.rowcount
+        return {"pinned": pinned, "removed": removed}
+
+    async def collection_post_rows(self, collection_id: int) -> list:
+        """The board's pins, newest first. Resolving them is the caller's job."""
+        return [dict(r) for r in self.db.execute(
+            "SELECT platform, post_id, added_ms, pinned_by "
+            "FROM collection_posts WHERE collection_id = ? "
+            "ORDER BY added_ms DESC, post_id DESC", (int(collection_id),))]
+
+    # ----------------------------------------------------------------------
+    # settings (operational switches; the store_ig / store_fb shape)
+    # ----------------------------------------------------------------------
+
+    async def setting(self, key: str, default=None):
+        r = self.db.execute("SELECT value FROM settings WHERE key = ?",
+                            (str(key),)).fetchone()
+        # An empty string reads as "not set", so clearing a box in the
+        # dashboard restores the default instead of pinning it to nothing.
+        if not r or r["value"] in (None, ""):
+            return default
+        return r["value"]
+
+    async def set_setting(self, key: str, value) -> None:
+        self.db.execute(
+            "INSERT INTO settings(key, value) VALUES(?,?) "
+            "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            (str(key), "" if value is None else str(value)))
+
+    # ----------------------------------------------------------------------
+    # content labelling (RULEBOOK §1 directive 2, the named exception)
+    #
+    # Named post_label_* throughout: `label` on its own has meant a STREAM
+    # label in this codebase since the first commit (streams.label,
+    # stream_labels_for), and two things called label at one call site is how
+    # the wrong one gets passed.
+    # ----------------------------------------------------------------------
+
+    async def post_label_categories(self, project_id: int,
+                                    include_archived: bool = False) -> list:
+        """The project's vocabulary, in precedence order."""
+        where = "project_id = ?" + ("" if include_archived else " AND archived = 0")
+        return [dict(r) for r in self.db.execute(
+            f"SELECT * FROM label_categories WHERE {where} "
+            "ORDER BY rank, key", (int(project_id),))]
+
+    async def seed_post_label_categories(self, project_id: int,
+                                         categories: list) -> int:
+        """
+        Give a project the default vocabulary, once.
+
+        INSERT OR IGNORE, so it is safe on every run and can never undo an
+        edit: a category the operator reworded stays reworded, and one they
+        archived stays archived.
+        """
+        added = 0
+        for i, c in enumerate(categories, 1):
+            cur = self.db.execute(
+                "INSERT OR IGNORE INTO label_categories"
+                "  (project_id, key, name, description, rank) VALUES(?,?,?,?,?)",
+                (int(project_id), c["key"], c["name"], c["description"],
+                 int(c.get("rank") or i)))
+            added += cur.rowcount
+        return added
+
+    async def set_post_label_category(self, project_id: int, key: str,
+                                      name: str = None, description: str = None,
+                                      rank: int = None,
+                                      archived: bool = None) -> dict:
+        """
+        Create or edit one category. Returns the row, or {"error"}.
+
+        The catch-all may be renamed but never archived: the prompt needs
+        somewhere to put a post about the weather, and without it the model is
+        forced to file every unrelated post under a political category.
+        """
+        key = (key or "").strip().lower().replace(" ", "_")
+        if not key:
+            return {"error": "a category needs a key"}
+        if not key.replace("_", "").isalnum():
+            return {"error": "a category key may hold letters, numbers and "
+                             "underscores only"}
+        row = self.db.execute(
+            "SELECT * FROM label_categories WHERE project_id = ? AND key = ?",
+            (int(project_id), key)).fetchone()
+        if archived and key == "other":
+            return {"error": "the 'other' category cannot be archived — "
+                             "without it every unrelated post is forced into a "
+                             "political category"}
+        if row is None:
+            if not (name or "").strip():
+                return {"error": "a new category needs a name"}
+            if not (description or "").strip():
+                return {"error": "a new category needs a description — it is "
+                                 "the sentence the model is given, so a blank "
+                                 "one labels nothing"}
+            self.db.execute(
+                "INSERT INTO label_categories"
+                "  (project_id, key, name, description, rank, archived) "
+                "VALUES(?,?,?,?,?,0)",
+                (int(project_id), key, name.strip(), description.strip(),
+                 int(rank if rank is not None else 100)))
+        else:
+            sets, params = [], []
+            for col, val in (("name", name), ("description", description)):
+                if val is not None and str(val).strip():
+                    sets.append(f"{col} = ?"); params.append(str(val).strip())
+            if rank is not None:
+                sets.append("rank = ?"); params.append(int(rank))
+            if archived is not None:
+                sets.append("archived = ?"); params.append(1 if archived else 0)
+            if sets:
+                params += [int(project_id), key]
+                self.db.execute(
+                    f"UPDATE label_categories SET {', '.join(sets)} "
+                    "WHERE project_id = ? AND key = ?", params)
+        r = self.db.execute(
+            "SELECT * FROM label_categories WHERE project_id = ? AND key = ?",
+            (int(project_id), key)).fetchone()
+        return dict(r)
+
+    async def post_labels_for(self, project_id: int, keys: list) -> dict:
+        """
+        {(platform, post_id): row} for the posts named, so a page of feed rows
+        costs one query rather than one per post.
+        """
+        keys = list(keys or [])
+        if not keys:
+            return {}
+        out = {}
+        # Chunked: SQLite's parameter limit is 999 by default and a feed page
+        # can ask for 500 posts across three platforms.
+        for i in range(0, len(keys), 300):
+            batch = keys[i:i + 300]
+            marks = ",".join(["(?,?)"] * len(batch))
+            params = [int(project_id)]
+            for plat, pid in batch:
+                params += [str(plat), str(pid)]
+            for r in self.db.execute(
+                    "SELECT * FROM post_labels WHERE project_id = ? "
+                    f"AND (platform, post_id) IN ({marks})", params):
+                out[(r["platform"], r["post_id"])] = dict(r)
+        return out
+
+    async def labelled_post_ids(self, project_id: int,
+                                platform: str = None) -> set:
+        """Every post this project has already labelled — the 'do not re-pay' set."""
+        sql = "SELECT platform, post_id FROM post_labels WHERE project_id = ?"
+        params = [int(project_id)]
+        if platform:
+            sql += " AND platform = ?"; params.append(str(platform))
+        return {(r["platform"], r["post_id"])
+                for r in self.db.execute(sql, params)}
+
+    async def set_post_labels(self, project_id: int, rows: list,
+                              source: str = "grok", model: str = None,
+                              prompt_ver: int = 1) -> int:
+        """
+        Write labels. rows = [(platform, post_id, label, confidence)].
+
+        A 'human' write always wins; a 'grok' write refuses to touch a row a
+        human already set. That single WHERE clause is what makes re-running
+        the classifier safe: the operator's corrections are not collateral.
+        """
+        now = int(time.time() * 1000)
+        written = 0
+        for plat, pid, label, conf in rows:
+            cur = self.db.execute(
+                "INSERT INTO post_labels(project_id, platform, post_id, label, "
+                "  source, confidence, model, prompt_ver, labelled_ms) "
+                "VALUES(?,?,?,?,?,?,?,?,?) "
+                "ON CONFLICT(project_id, platform, post_id) DO UPDATE SET "
+                "  label = excluded.label, source = excluded.source, "
+                "  confidence = excluded.confidence, model = excluded.model, "
+                "  prompt_ver = excluded.prompt_ver, "
+                "  labelled_ms = excluded.labelled_ms "
+                "WHERE post_labels.source != 'human' OR excluded.source = 'human'",
+                (int(project_id), str(plat), str(pid), str(label), str(source),
+                 conf, model, int(prompt_ver), now))
+            written += cur.rowcount
+        return written
+
+    async def post_label_counts(self, project_id: int) -> dict:
+        """{label_key: n} for the project — what the boards and the pills show."""
+        return {r["label"]: r["n"] for r in self.db.execute(
+            "SELECT label, COUNT(*) n FROM post_labels WHERE project_id = ? "
+            "GROUP BY label", (int(project_id),))}
+
+    async def ensure_label_collection(self, project_id: int, key: str,
+                                      name: str) -> int:
+        """
+        The auto board for one category, created on first use.
+
+        Matched on label_key, not on name, so renaming a category renames its
+        board instead of stranding the old one and starting a second. A board
+        the operator deleted is simply created again by the next run — that is
+        the honest behaviour for something described as automatic.
+        """
+        r = self.db.execute(
+            "SELECT collection_id, name FROM collections "
+            "WHERE project_id = ? AND label_key = ?",
+            (int(project_id), str(key))).fetchone()
+        if r:
+            if r["name"] != name:
+                # Free unless a manual board already holds the new name, in
+                # which case the board keeps the name it has rather than the
+                # rename failing the whole run.
+                try:
+                    self.db.execute(
+                        "UPDATE collections SET name = ? WHERE collection_id = ?",
+                        (name, r["collection_id"]))
+                except sqlite3.IntegrityError:
+                    pass
+            return int(r["collection_id"])
+        try:
+            cur = self.db.execute(
+                "INSERT INTO collections(project_id, name, created_at, auto, "
+                "  label_key) VALUES(?,?,?,1,?)",
+                (int(project_id), name, _iso_ms(int(time.time() * 1000)),
+                 str(key)))
+            return int(cur.lastrowid)
+        except sqlite3.IntegrityError:
+            # A manual board already owns this name. Adopt it rather than
+            # refusing: the operator plainly meant this board.
+            row = self.db.execute(
+                "SELECT collection_id FROM collections "
+                "WHERE project_id = ? AND name = ?",
+                (int(project_id), name)).fetchone()
+            self.db.execute(
+                "UPDATE collections SET auto = 1, label_key = ? "
+                "WHERE collection_id = ?", (str(key), row["collection_id"]))
+            return int(row["collection_id"])
+
+    async def repin_labelled(self, project_id: int, platform: str, post_id: str,
+                             key: str, boards: dict) -> None:
+        """
+        Put one post on its category's board and off every other auto board.
+
+        Only auto boards are touched. A post the operator pinned by hand to
+        their own board stays there whatever the model says — that pin is a
+        human decision and this is not allowed to overrule it.
+        """
+        cid = boards.get(key)
+        for k, other in boards.items():
+            if k == key:
+                continue
+            self.db.execute(
+                "DELETE FROM collection_posts WHERE collection_id = ? "
+                "AND platform = ? AND post_id = ? AND pinned_by = 'label'",
+                (int(other), str(platform), str(post_id)))
+        if cid:
+            self.db.execute(
+                "INSERT INTO collection_posts"
+                "  (collection_id, platform, post_id, added_ms, pinned_by) "
+                "VALUES(?,?,?,?, 'label') ON CONFLICT DO NOTHING",
+                (int(cid), str(platform), str(post_id),
+                 int(time.time() * 1000)))
+
+    # ---- runs and the spend meter ----------------------------------------
+
+    async def start_label_run(self, project_id: int, requested: int,
+                              model: str) -> int:
+        cur = self.db.execute(
+            "INSERT INTO label_runs(project_id, started_ms, requested, model) "
+            "VALUES(?,?,?,?)",
+            (int(project_id), int(time.time() * 1000), int(requested),
+             str(model)))
+        return int(cur.lastrowid)
+
+    async def finish_label_run(self, run_id: int, labelled: int = 0,
+                               failed: int = 0, in_tokens: int = 0,
+                               out_tokens: int = 0, cost: float = 0.0,
+                               stop_reason: str = "done",
+                               error: str = None) -> None:
+        self.db.execute(
+            "UPDATE label_runs SET finished_ms = ?, labelled = ?, failed = ?, "
+            "  in_tokens = ?, out_tokens = ?, cost_usd = ?, stop_reason = ?, "
+            "  error = ? WHERE run_id = ?",
+            (int(time.time() * 1000), int(labelled), int(failed),
+             int(in_tokens), int(out_tokens), float(cost), str(stop_reason),
+             error, int(run_id)))
+
+    async def label_spend_month(self, since_ms: int) -> float:
+        """
+        Month-to-date spend, across every project.
+
+        Across every project on purpose: the cap guards one API key and one
+        bill, and a per-project cap would let five projects spend five times
+        the ceiling the operator set.
+        """
+        r = self.db.execute(
+            "SELECT COALESCE(SUM(cost_usd), 0) c FROM label_runs "
+            "WHERE started_ms >= ?", (int(since_ms),)).fetchone()
+        return float(r["c"] or 0.0)
+
+    async def last_label_run(self, project_id: int) -> dict | None:
+        r = self.db.execute(
+            "SELECT * FROM label_runs WHERE project_id = ? "
+            "ORDER BY run_id DESC LIMIT 1", (int(project_id),)).fetchone()
+        return dict(r) if r else None
 
     # ----------------------------------------------------------------------
     # delivery targets (per-project, dashboard-managed)
@@ -2224,8 +2749,9 @@ class Store:
              retention_days      — drop WHOLE tweet rows older than N days
                                    (by posting time), plus their hit edges,
                                    payloads and poll/gap audit rows. Pinned
-                                   posts (collection_items) are always kept —
-                                   a curation board must never grow holes.
+                                   posts (collection_posts, and the legacy
+                                   collection_items) are always kept — a
+                                   curation board must never grow holes.
         2. wal_checkpoint(TRUNCATE): fold the WAL into the main file and cut
            the -wal file back to zero. Under constant collector writes the
            passive autocheckpoint rarely gets to truncate, which is exactly
@@ -2248,9 +2774,18 @@ class Store:
                                 "(tweet_id INTEGER PRIMARY KEY)")
                 self.db.execute("DELETE FROM _prune")
                 self.db.execute(
+                    # Both pin tables. collection_posts is where pins live
+                    # now; collection_items is the migrated-from table, still
+                    # consulted so a board that predates the migration and
+                    # somehow missed it cannot be quietly hollowed out here.
+                    # Getting this wrong deletes collected posts, which is the
+                    # one thing retention is not allowed to do to a board.
                     "INSERT INTO _prune SELECT tweet_id FROM tweets "
                     "WHERE created_ms < ? AND tweet_id NOT IN "
-                    "  (SELECT tweet_id FROM collection_items)", (cutoff,))
+                    "  (SELECT tweet_id FROM collection_items) "
+                    "AND CAST(tweet_id AS TEXT) NOT IN "
+                    "  (SELECT post_id FROM collection_posts "
+                    "   WHERE platform = 'x')", (cutoff,))
                 out["tweets_pruned"] = self.db.execute(
                     "DELETE FROM tweets WHERE tweet_id IN "
                     "  (SELECT tweet_id FROM _prune)").rowcount

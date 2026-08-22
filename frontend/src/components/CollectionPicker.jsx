@@ -13,7 +13,10 @@ export default function CollectionPicker({ t, pid, onClose }) {
   const pin = async (cid, name) => {
     setErr("");
     try {
-      await api.collectionPin(cid, [String(t.tweet_id)], []);
+      // Pins carry their platform now — a board can hold X, Instagram and
+      // Facebook posts, and an id alone no longer says which.
+      await api.collectionPin(
+        cid, [{ platform: t.platform || "x", post_id: String(t.tweet_id) }], []);
       setDone(name);
       setTimeout(onClose, 650);
     } catch (e) {

@@ -12,6 +12,10 @@ import { Empty, ErrorState, Loading } from "../components/ui.jsx";
 const normIg = (p) => ({
   platform: "instagram",
   tweet_id: p.id,
+  // Content label, stamped by the server on every platform's feed.
+  label: p.label,
+  label_source: p.label_source,
+  label_ms: p.label_ms,
   url: p.url,
   text: p.text,
   created_at: p.created_at,
@@ -51,12 +55,19 @@ function Pill({ label, value, onChange, options }) {
 export default function LiveFeed({ onMenu }) {
   const { project, projectsError } = useProject();
   const pid = project?.project_id;
-  const [flt, setFlt] = useState({ source: "all", sort: "latest", dur: "24h" });
+  const [flt, setFlt] = useState({ source: "all", sort: "latest", dur: "24h",
+                                   label: "all" });
 
   const metrics = useApi(() => api.metrics(pid), [pid], { every: 30_000 });
   const status = useApi(() => api.status(), [], { every: 30_000 });
   const delivery = useApi(() => api.delivery(pid), [pid], { every: 15_000 });
   const wls = useApi(() => (pid ? api.watchlists(pid) : Promise.resolve({ watchlists: [] })), [pid]);
+  // Labelling state: how many posts are waiting, the project's vocabulary, and
+  // whether the server even has a key. Polled slowly — none of it moves unless
+  // somebody presses Classify.
+  const labels = useApi(
+    () => (pid ? api.labelStatus(pid) : Promise.resolve(null)), [pid],
+    { every: 60_000 });
 
   // Load-more: every platform is fetched at pageN × PAGE and the duration
   // filter now applies to ALL three (Instagram/Facebook used to ignore it).
@@ -109,6 +120,8 @@ export default function LiveFeed({ onMenu }) {
   const [pinTarget, setPinTarget] = useState(null);
   const [fetching, setFetching] = useState(false);
   const [fetchMsg, setFetchMsg] = useState("");
+  const [classifying, setClassifying] = useState(false);
+  const [classMsg, setClassMsg] = useState("");
 
   // Refresh = ask X for the newest posts RIGHT NOW (one page per stream),
   // then the collector's normal cadence carries on. Not just a re-read.
@@ -154,6 +167,45 @@ export default function LiveFeed({ onMenu }) {
       setTimeout(() => setFetchMsg(""), 6000);
     }
   };
+  // Classify = send this project's UNLABELLED posts to Grok, once, on purpose.
+  // It spends money, so it is a button and never a timer, and it reports what
+  // it cost rather than just finishing quietly.
+  const runClassify = async () => {
+    if (!pid || classifying) return;
+    setClassifying(true);
+    setClassMsg("");
+    try {
+      const r = await api.classify(pid);
+      if (r.message) {
+        setClassMsg(`✓ ${r.message}`);
+      } else {
+        const bits = [`${r.labelled} labelled`];
+        if (r.failed) bits.push(`${r.failed} not`);
+        bits.push(`$${Number(r.cost_usd || 0).toFixed(3)}`);
+        if (r.stop_reason === "cap") bits.push("stopped at the monthly cap");
+        if (r.stop_reason === "partial") bits.push("some batches failed");
+        setClassMsg(`✓ ${bits.join(" · ")}`);
+      }
+      feed.reload(true);
+      labels.reload(true);
+    } catch (e) {
+      setClassMsg(`✗ ${String(e.message || e)}`);
+    } finally {
+      setClassifying(false);
+      // Longer than the fetch toast: a cost and a stop-reason are worth
+      // reading twice.
+      setTimeout(() => setClassMsg(""), 12000);
+    }
+  };
+
+  // Correcting one post by hand. Written as a human label, which is what
+  // stops the next run overwriting it.
+  const relabel = async (t, key) => {
+    await api.setLabel(pid, t.platform || "x", String(t.tweet_id), key);
+    feed.reload(true);
+    labels.reload(true);
+  };
+
   useEffect(() => {
     if (!pid) return;
     setPushed([]);
@@ -208,7 +260,10 @@ export default function LiveFeed({ onMenu }) {
       return Number.isNaN(c) && Number.isNaN(g);
     };
     const out = latest.filter((t) =>
-      (flt.source === "all" || t.platform === flt.source) && inWindow(t));
+      (flt.source === "all" || t.platform === flt.source)
+      && (flt.label === "all"
+          || (flt.label === "none" ? !t.label : t.label === flt.label))
+      && inWindow(t));
     // Latest/Oldest order by the post's OWN time, not collection time — a 2024
     // post collected five minutes ago must not outrank a 2025 post. Facebook
     // sometimes has no exact post time, so fall back to collected time there.
@@ -289,11 +344,37 @@ export default function LiveFeed({ onMenu }) {
             {fetchMsg}
           </span>
         )}
+        {classMsg && (
+          <span style={{ fontSize: 12.5, fontWeight: 600 }}
+                className={classMsg.startsWith("✓") ? "st-good" : "st-crit"}>
+            {classMsg}
+          </span>
+        )}
         {watcherUp && (
           <button className="btn btn-ghost" onClick={toggleCollection}>
             {paused ? "▶ Start collection" : "⏸ Pause collection"}
           </button>
         )}
+        {/* Every state by name: no key, nothing waiting, N waiting, running.
+            A button that just says "Classify" when there is no key on the
+            server would fail on click and teach nothing. */}
+        <button className="btn btn-ghost"
+                disabled={classifying || !labels.data?.key_present
+                          || !labels.data?.unlabelled}
+                title={!labels.data?.key_present
+                  ? "No Grok key on the server — add XAI_API_KEY to .env"
+                  : !labels.data?.unlabelled
+                    ? "Every post in this project already has a label"
+                    : `Send ${labels.data.unlabelled} unlabelled posts to `
+                      + `${labels.data.model} — about `
+                      + `$${(labels.data.unlabelled * 0.00025).toFixed(2)}`}
+                onClick={runClassify}>
+          {classifying ? "Classifying…"
+            : !labels.data ? "Classify"
+              : !labels.data.key_present ? "Classify — no key"
+                : !labels.data.unlabelled ? "All classified"
+                  : `Classify ${fmtN(labels.data.unlabelled)}`}
+        </button>
         <button className="btn btn-brand" disabled={fetching} onClick={() => refreshNow()}>
           {fetching ? "Fetching from X…" : "Refresh"}
         </button>
@@ -364,6 +445,21 @@ export default function LiveFeed({ onMenu }) {
         <Pill label="Duration" value={flt.dur}
               onChange={(v) => setFlt((s) => ({ ...s, dur: v }))}
               options={Object.entries(DUR_LABEL)} />
+        {/* Counts come from the whole project, not the loaded page: the number
+            beside a category is how many posts carry it, which is the number
+            somebody would go looking for. */}
+        <Pill label="Category" value={flt.label}
+              onChange={(v) => setFlt((s) => ({ ...s, label: v }))}
+              options={[
+                ["all", "All"],
+                ["none", `Not classified${labels.data?.unlabelled
+                  ? ` (${fmtN(labels.data.unlabelled)})` : ""}`],
+                ...(labels.data?.categories || []).map((c) => [
+                  c.key,
+                  `${c.name}${labels.data?.counts?.[c.key]
+                    ? ` (${fmtN(labels.data.counts[c.key])})` : ""}`,
+                ]),
+              ]} />
       </div>
 
       <div className="cols">
@@ -417,7 +513,8 @@ export default function LiveFeed({ onMenu }) {
           )}
           {visible.map((t) => (
             <PostCard key={`${t.platform}:${t.tweet_id}`} t={t}
-                      onPin={setPinTarget} terms={keywordTerms} />
+                      onPin={setPinTarget} terms={keywordTerms}
+                      cats={labels.data?.categories} onLabel={relabel} />
           ))}
           {feed.data && visible.length > 0 && (() => {
             const total = flt.source === "x" ? (feed.data.xTotal ?? 0)

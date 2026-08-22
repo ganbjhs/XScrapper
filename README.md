@@ -12,6 +12,15 @@ highlighting; per-source check intervals and Start/Pause; velocity alerts and
 collections; per-project delivery to Watch-Tower with a durable, at-least-once
 cursor.
 
+One thing it does that is NOT collection: **content labelling**. Press Classify
+and the unlabelled posts in a project go to Grok once, come back with one
+category each (the categories are yours, edited in the dashboard), and land on
+a board per category. It is manual, it is metered against a monthly dollar cap,
+and a label you correct by hand is never overwritten. That is the only analysis
+in here — everything else is still a count or a timestamp, and the deeper
+intelligence is Watch-Tower's job. See RULEBOOK §1 directive 2 for why the
+exception exists and where its edges are.
+
 **Docs — there are exactly three, on purpose:**
 
 | Doc | What it is |

@@ -172,6 +172,23 @@ header.top .grow { flex: 1; }
   line-height: 1.55;
 }
 .banner-ok b { color: var(--good-text); }
+
+/* The middle banner: something is off but nothing is broken — a board with
+   pins whose posts retention has since swept, for instance. Neither of the
+   two above fits that, and rendering it as a crisis or not at all are both
+   lies. */
+.banner-warn {
+  border: 1px solid color-mix(in srgb, var(--warning) 50%, transparent);
+  border-left: 4px solid var(--warning);
+  background: color-mix(in srgb, var(--warning) 9%, var(--surface));
+  border-radius: 12px;
+  padding: 13px 16px;
+  margin-bottom: 16px;
+  font-size: 13.5px;
+  line-height: 1.55;
+}
+.banner-warn b { color: var(--warn-text); }
+.banner-ok code, .banner-warn code { background: var(--brand-softer); border: 1px solid var(--ring); border-radius: 6px; padding: 1px 7px; }
 .banner-crit code { background: var(--brand-softer); border: 1px solid var(--ring); border-radius: 6px; padding: 1px 7px; }
 
 .stats {
@@ -206,6 +223,39 @@ header.top .grow { flex: 1; }
 .badge.lag { background: var(--brand-softer); color: var(--ink-2); border: 1px solid var(--ring); font-weight: 600; }
 .badge.lag b { color: var(--good-text); }
 .badge.rt { background: var(--brand-softer); color: var(--ink-3); border: 1px solid var(--ring); font-weight: 600; }
+
+/* Content-label chips. Every colour is a token, so dark mode follows the same
+   @media override the rest of the page does — a hardcoded hex here would look
+   right in light mode and be unreadable in dark, silently.
+
+   The palette is semantic, not decorative: hate is critical red because it is
+   the one category somebody has to act on; the communal bucket is the warning
+   amber next to it; the two party categories take the validated chart series
+   so they read as a pair; "other" is grey because it is the absence of a
+   finding. Any category the operator adds falls through to .badge.cat's own
+   neutral, which is honest — the app cannot guess what a new key means. */
+.badge.cat { background: var(--brand-softer); color: var(--ink-2); border: 1px solid var(--ring); font-weight: 600; }
+.badge.cat-hate { background: color-mix(in srgb, var(--critical) 12%, transparent); color: var(--critical); border-color: color-mix(in srgb, var(--critical) 35%, transparent); }
+.badge.cat-hindu_muslim { background: color-mix(in srgb, var(--warning) 20%, transparent); color: var(--warn-text); border-color: color-mix(in srgb, var(--warning) 45%, transparent); }
+.badge.cat-bjp_pro { background: color-mix(in srgb, var(--series-1) 14%, transparent); color: var(--series-1); border-color: color-mix(in srgb, var(--series-1) 35%, transparent); }
+.badge.cat-against_congress { background: color-mix(in srgb, var(--series-2) 14%, transparent); color: var(--series-2); border-color: color-mix(in srgb, var(--series-2) 35%, transparent); }
+.badge.cat-other { background: var(--brand-softer); color: var(--ink-3); border: 1px solid var(--ring); }
+
+/* Re-label control on a card. Sized to sit in the .cactions row without
+   changing its height. */
+.lbl-pick {
+  font: inherit; font-size: 12.5px; color: var(--ink-2);
+  background: var(--surface); border: 1px solid var(--ring);
+  border-radius: 8px; padding: 2px 6px; max-width: 190px;
+}
+.lbl-pick:focus { outline: 2px solid var(--brand); outline-offset: 1px; }
+
+/* The spend meter. A number next to a cap is arithmetic the reader has to do;
+   a bar is the same fact already done. */
+.meter { height: 7px; border-radius: 999px; background: var(--brand-softer); border: 1px solid var(--ring); overflow: hidden; }
+.meter > span { display: block; height: 100%; background: var(--brand); transition: width 0.3s; }
+.meter > span.warn { background: var(--warning); }
+.meter > span.crit { background: var(--critical); }
 .ctext { margin: 10px 0 4px; line-height: 1.55; font-size: 14.5px; overflow-wrap: anywhere; white-space: pre-wrap; }
 .ctext a { color: var(--series-1); text-decoration: none; }
 /* A matched keyword-search term: tinted + underlined so a hit is verifiable

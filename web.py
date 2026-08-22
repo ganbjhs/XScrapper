@@ -423,6 +423,14 @@ def _query_tweets(p):
         ).fetchall()
 
     out = {"total": total, "rows": [_row_to_json(r) for r in rows]}
+    # Labels are project-scoped, so an unscoped read (a machine key hitting
+    # /api/tweets) sees none — which is right: it is asking for the extract.
+    try:
+        _pid = int(p.get("project") or 0)
+    except (TypeError, ValueError):
+        _pid = 0
+    if _pid:
+        _stamp_labels(out["rows"], _pid, "x")
     if rows:
         # Hand back the position to resume from, so a consumer never has to
         # work out which field to remember.
@@ -431,6 +439,69 @@ def _query_tweets(p):
                          "since_collected_ms": last["collected_ms"]}
         out["has_more"] = len(rows) == limit and total > limit
     return out
+
+
+# --------------------------------------------------------------------------
+# content labels on the read path
+#
+# Labels are project-scoped and live in results.db, including the ones on
+# Instagram and Facebook posts: results.db already owns the organizing layer
+# (projects, collections), and a label is an organizing fact, not a platform
+# one. Reads go through the read-only connection like every other read — the
+# dashboard still cannot write into a live watcher's database.
+# --------------------------------------------------------------------------
+
+def _labels_map(project_id: int, keys) -> dict:
+    """
+    {(platform, post_id): row} for the posts named. One query per page.
+
+    Returns {} rather than raising when the table is not there yet: a database
+    written before this feature only gains the table when a WRITABLE store next
+    opens it, and until then the feed must render unlabelled, not 500.
+    """
+    keys = [(str(pl), str(pi)) for pl, pi in (keys or []) if pl and pi]
+    if not keys or not project_id or not _CFG.db_results.exists():
+        return {}
+    out = {}
+    try:
+        with _connect() as con:
+            for i in range(0, len(keys), 300):
+                batch = keys[i:i + 300]
+                marks = ",".join(["(?,?)"] * len(batch))
+                params = [int(project_id)]
+                for pl, pi in batch:
+                    params += [pl, pi]
+                for r in con.execute(
+                        "SELECT platform, post_id, label, source, confidence, "
+                        "       labelled_ms FROM post_labels WHERE project_id = ? "
+                        f"AND (platform, post_id) IN ({marks})", params):
+                    out[(r["platform"], r["post_id"])] = dict(r)
+    except sqlite3.Error:
+        return {}
+    return out
+
+
+def _stamp_labels(posts: list, project_id: int, platform: str = None) -> list:
+    """
+    Attach `label` / `label_source` / `label_ms` to each post, in place.
+
+    Only the key travels, not the category's display name: the name is edited
+    from the dashboard and would go stale in a cached page, so the client holds
+    one copy of the vocabulary and looks it up. An unlabelled post gets label
+    None EXPLICITLY rather than no key at all — "not classified yet" is a state
+    the UI must be able to render by name (RULEBOOK §7).
+    """
+    if not posts:
+        return posts
+    def key(p):
+        return (platform or p.get("platform") or "x", str(p.get("tweet_id")))
+    found = _labels_map(project_id, [key(p) for p in posts]) if project_id else {}
+    for p in posts:
+        row = found.get(key(p))
+        p["label"] = row["label"] if row else None
+        p["label_source"] = row["source"] if row else None
+        p["label_ms"] = row["labelled_ms"] if row else None
+    return posts
 
 
 def _row_to_json(r):
@@ -1215,7 +1286,14 @@ def _live_rows(con, last_ms: int, last_tweet_id: int, project: int = 0,
         f"FROM tweets t LEFT JOIN tweet_raw r USING(tweet_id) "
         f"WHERE {' AND '.join(where)} "
         "ORDER BY t.collected_ms, t.tweet_id LIMIT ?", [*params, limit]).fetchall()
-    return [_row_to_json(r) for r in rows]
+    out = [_row_to_json(r) for r in rows]
+    # A post pushed over SSE carries its label if it already has one. Freshly
+    # collected posts normally do not — classification is a deliberate act, not
+    # something that happens on arrival — so this is usually a no-op, and says
+    # so honestly (label: null) rather than leaving the field out.
+    if project:
+        _stamp_labels(out, project, "x")
+    return out
 
 
 # --------------------------------------------------------------------------
@@ -2214,13 +2292,124 @@ def _collection_remove(body):
     return _with_store(lambda st: st.delete_collection(cid))
 
 
+def _pin_pairs(items, default_platform: str = "x") -> list:
+    """
+    Accept both pin shapes.
+
+    The original contract is a list of X tweet ids — ["123", "456"] — and the
+    dashboard has been sending that since collections existed, so it keeps
+    working untouched. A board can now hold three platforms, so a pin may also
+    arrive as {"platform": "facebook", "post_id": "…"} or ["facebook", "…"].
+    """
+    out = []
+    for it in (items or []):
+        if isinstance(it, dict):
+            plat = str(it.get("platform") or default_platform).lower()
+            pid = str(it.get("post_id") or it.get("tweet_id") or it.get("id") or "")
+        elif isinstance(it, (list, tuple)) and len(it) == 2:
+            plat, pid = str(it[0]).lower(), str(it[1])
+        else:
+            plat, pid = default_platform, str(it)
+        if pid:
+            out.append((plat, pid))
+    return out
+
+
 def _collection_pin(body):
     try:
         cid = int(body.get("collection_id") or 0)
     except (TypeError, ValueError):
         return {"error": "collection_id must be a number"}
-    return _with_store(lambda st: st.collection_pin(
-        cid, add=body.get("add") or [], remove=body.get("remove") or []))
+    add = _pin_pairs(body.get("add"))
+    remove = _pin_pairs(body.get("remove"))
+    return _with_store(lambda st: st.collection_pin_posts(
+        cid, add=add, remove=remove))
+
+
+def _resolve_pins(pins: list, project_id: int = 0) -> list:
+    """
+    Turn (platform, post_id) pins into posts in the ONE shared shape.
+
+    Three databases, so three lookups — but one query each, not one per pin. A
+    pin whose post has since gone (a retention sweep, a wiped platform db) is
+    simply absent from the result: the board shows what it still has and the
+    count says so, which is the honest version of a hole.
+    """
+    by_plat = {}
+    for pin in pins:
+        by_plat.setdefault(pin["platform"], []).append(str(pin["post_id"]))
+    added = {(p["platform"], str(p["post_id"])): p["added_ms"] for p in pins}
+    out = []
+
+    ids = by_plat.get("x") or []
+    if ids and _CFG.db_results.exists():
+        nums = [int(i) for i in ids if str(i).lstrip("-").isdigit()]
+        if nums:
+            marks = ",".join("?" * len(nums))
+            with _connect() as con:
+                for r in con.execute(
+                        "SELECT t.*, json_extract(COALESCE(r.raw_json, t.raw_json), "
+                        "  '$.user.profileImageUrl') AS author_avatar "
+                        "FROM tweets t LEFT JOIN tweet_raw r USING(tweet_id) "
+                        f"WHERE t.tweet_id IN ({marks})", nums):
+                    d = _row_to_json(r)
+                    d["platform"] = "x"
+                    out.append(d)
+
+    ids = by_plat.get("facebook") or []
+    rp = _CFG.root / "fb_results.db"
+    if ids and rp.exists():
+        import store_fb
+        marks = ",".join("?" * len(ids))
+        with store_fb.Store(rp) as st:
+            for r in st.db.execute(
+                    "SELECT p.*, COALESCE(p.author_avatar, pp.avatar_url) "
+                    "         AS _avatar_resolved FROM posts p "
+                    "LEFT JOIN page_profiles pp ON pp.handle = LOWER(p.page) "
+                    f"WHERE p.post_id IN ({marks})", ids):
+                d = dict(r)
+                d["author_avatar"] = d.pop("_avatar_resolved")
+                out.append(store_fb.to_feed(d))
+
+    ids = by_plat.get("instagram") or []
+    rp = _CFG.root / "ig_results.db"
+    if ids and rp.exists():
+        import store_ig
+        nums = [int(i) for i in ids if str(i).isdigit()]
+        if nums:
+            marks = ",".join("?" * len(nums))
+            with store_ig.Store(rp) as st:
+                for r in st.db.execute(
+                        f"SELECT * FROM posts WHERE pk IN ({marks})", nums):
+                    out.append(store_ig.to_feed(dict(r)))
+
+    # The X avatar for the same handle, exactly as the FB and IG feeds do it.
+    missing = {p.get("author_username") for p in out
+               if not p.get("author_avatar") and p.get("platform") != "x"}
+    missing.discard(None)
+    if missing:
+        xmap = _x_avatars_for(missing)
+        for p in out:
+            if not p.get("author_avatar"):
+                p["author_avatar"] = xmap.get(
+                    str(p.get("author_username") or "").lower())
+
+    for p in out:
+        p["added_ms"] = added.get((p.get("platform"), str(p.get("tweet_id"))), 0)
+    out.sort(key=lambda p: (p.get("added_ms") or 0, str(p.get("tweet_id"))),
+             reverse=True)
+    if project_id:
+        _stamp_labels(out, project_id)
+    return out
+
+
+def _board_rows(cid: int) -> tuple:
+    """(project_id, resolved rows) for one board. Shared by the view and the CSV."""
+    meta = _with_store(lambda st: st.collection_meta(cid))
+    if not meta:
+        return 0, []
+    pins = _with_store(lambda st: st.collection_post_rows(cid))
+    return int(meta["project_id"]), _resolve_pins(pins, int(meta["project_id"]))
 
 
 def _collection_items_json(q):
@@ -2230,8 +2419,12 @@ def _collection_items_json(q):
         cid = 0
     if not cid:
         return {"error": "which collection? pass ?id=<id>"}
-    rows = _with_store(lambda st: st.collection_rows(cid))
-    return {"count": len(rows), "rows": [_row_to_json(r) for r in rows]}
+    _pid, rows = _board_rows(cid)
+    # `pinned` is the pin count and `count` the number that still resolve to a
+    # post. They differ when a post has been swept out from under the board,
+    # and the UI says so rather than quietly showing a shorter list.
+    pins = _with_store(lambda st: st.collection_post_rows(cid))
+    return {"count": len(rows), "pinned": len(pins), "rows": rows}
 
 
 def _collection_export_csv(q):
@@ -2240,11 +2433,15 @@ def _collection_export_csv(q):
         cid = int(q.get("id") or 0)
     except (TypeError, ValueError):
         cid = 0
-    rows = _with_store(lambda st: st.collection_rows(cid)) if cid else []
+    rows = _board_rows(cid)[1] if cid else []
     import csv as _csv
     import io as _io
     buf = _io.StringIO()
-    w = _csv.DictWriter(buf, fieldnames=store_mod.FIELDS, extrasaction="ignore")
+    # FIELDS_BOARD, not FIELDS: a board can hold three platforms now, and a CSV
+    # that puts a Facebook post id under a column headed tweet_id without
+    # saying so is a file that lies to whoever opens it next.
+    w = _csv.DictWriter(buf, fieldnames=store_mod.FIELDS_BOARD,
+                        extrasaction="ignore")
     w.writeheader()
     for r in rows:
         rec = dict(r)
@@ -2253,8 +2450,493 @@ def _collection_export_csv(q):
                 rec[k] = json.loads(rec.get(k) or "[]")
             except (TypeError, ValueError):
                 rec[k] = []
-        w.writerow(store_mod.to_csv_row(rec, store_mod.FIELDS))
+        w.writerow(store_mod.to_csv_row(rec, store_mod.FIELDS_BOARD))
     return buf.getvalue()
+
+
+# --------------------------------------------------------------------------
+# content labelling — the ONE analysis exception (RULEBOOK §1 directive 2)
+#
+# Manual only. Nothing here runs on a timer, on a keystroke, or as a side
+# effect of collection: the operator presses a button, this spends money, and
+# it says exactly what it spent. The shape is the Facebook Fetch-now shape
+# (single-flight lock, coroutine on the shared loop, log echoed into the
+# response and into activity.db) because it is the same kind of act — a
+# deliberate, metered trip out to somebody else's API.
+# --------------------------------------------------------------------------
+
+# One classify run at a time. A second concurrent run would double-spend on
+# the same posts: both would read the same "unlabelled" set before either
+# wrote a row.
+_CLASSIFY_LOCK = threading.Lock()
+
+# Defaults for the dashboard-editable settings. Model and price live in the
+# database, not in code, so a model rename or a price change is an edit rather
+# than a deploy — and a cost the code cannot be told about is a cost the meter
+# reports wrongly.
+_CLASSIFY_DEFAULTS = {
+    "classify_model": None,          # filled from classify.DEFAULT_MODEL
+    "classify_cap_usd": "10",        # per calendar month, across every project
+    "classify_max_posts": "500",     # per run, so one click cannot drain the cap
+}
+
+
+def _classify_locked_run(coro, timeout=300):
+    """
+    Run a classify coroutine single-flight.
+
+    Lock released by the coroutine's done-callback, not on return — same reason
+    as _fb_locked_run: when the HTTP request times out the run is still going,
+    and releasing here would let a second click start a second run over posts
+    the first has not written yet. Returns (result, err).
+    """
+    import concurrent.futures as _cf
+    if _LOOP is None:
+        return None, {"error": "server not ready"}
+    if not _CLASSIFY_LOCK.acquire(blocking=False):
+        return None, {"error": "A classify run is already going — give it a moment."}
+    fut = asyncio.run_coroutine_threadsafe(coro, _LOOP)
+    fut.add_done_callback(lambda f: _CLASSIFY_LOCK.release())
+    try:
+        return fut.result(timeout), None
+    except _cf.TimeoutError:
+        return None, {"error": "Classifying is taking a while — it's still "
+                               "running in the background; the labels appear "
+                               "as they land, so reload in a minute."}
+    except Exception as e:
+        return None, {"error": f"{type(e).__name__}: {e}"}
+
+
+def _month_start_ms() -> int:
+    """First instant of the current UTC month — the meter's window."""
+    now = datetime.datetime.now(datetime.timezone.utc)
+    return int(datetime.datetime(now.year, now.month, 1,
+                                 tzinfo=datetime.timezone.utc).timestamp() * 1000)
+
+
+def _x_unlabelled(pid: int, labelled: set, limit: int = 0) -> list:
+    """
+    This project's X posts with no label yet, newest first.
+
+    X is the one platform whose posts share a database with the labels, so the
+    filter is a NOT EXISTS rather than a set difference in Python. limit=0
+    counts instead of listing.
+    """
+    if not _CFG.db_results.exists():
+        return 0 if not limit else []
+    sql = ("FROM tweets t WHERE t.source = 'result' "
+           "AND EXISTS (SELECT 1 FROM tweet_hits ph JOIN project_streams ps "
+           "            ON ps.stream_id = ph.stream_id "
+           "            WHERE ph.tweet_id = t.tweet_id AND ps.project_id = ?) "
+           "AND NOT EXISTS (SELECT 1 FROM post_labels l WHERE l.project_id = ? "
+           "                AND l.platform = 'x' "
+           "                AND l.post_id = CAST(t.tweet_id AS TEXT))")
+    params = [int(pid), int(pid)]
+    try:
+        with _connect() as con:
+            if not limit:
+                return con.execute(f"SELECT COUNT(*) c {sql}",
+                                   params).fetchone()["c"]
+            rows = con.execute(
+                f"SELECT t.tweet_id, t.text, t.author_username, t.collected_ms "
+                f"{sql} ORDER BY t.collected_ms DESC, t.tweet_id DESC LIMIT ?",
+                [*params, int(limit)]).fetchall()
+    except sqlite3.Error:
+        return 0 if not limit else []
+    return [{"platform": "x", "id": str(r["tweet_id"]), "text": r["text"] or "",
+             "author": r["author_username"], "when": r["collected_ms"] or 0}
+            for r in rows]
+
+
+def _ig_unlabelled(pid: int, labelled: set, limit: int = 0):
+    """Instagram posts with no label. Cross-database, so the difference is
+    taken in Python over ids — the labels live in results.db and the posts do
+    not, and ATTACHing one store's file into another's connection is not a
+    seam this project has anywhere else."""
+    rp = _CFG.root / "ig_results.db"
+    if not rp.exists():
+        return 0 if not limit else []
+    import store_ig
+    out, n = [], 0
+    try:
+        with store_ig.Store(rp) as st:
+            for r in st.db.execute(
+                    "SELECT pk, caption, username, collected_at FROM posts "
+                    "WHERE project_id = ? ORDER BY pk DESC", (int(pid),)):
+                if ("instagram", str(r["pk"])) in labelled:
+                    continue
+                n += 1
+                if limit and len(out) < limit:
+                    out.append({"platform": "instagram", "id": str(r["pk"]),
+                                "text": r["caption"] or "",
+                                "author": r["username"],
+                                "when": (r["collected_at"] or 0) * 1000})
+    except sqlite3.Error:
+        return 0 if not limit else []
+    return out if limit else n
+
+
+def _fb_unlabelled(pid: int, labelled: set, limit: int = 0):
+    """Facebook posts with no label. Same cross-database reasoning as IG."""
+    rp = _CFG.root / "fb_results.db"
+    if not rp.exists():
+        return 0 if not limit else []
+    import store_fb
+    out, n = [], 0
+    try:
+        with store_fb.Store(rp) as st:
+            for r in st.db.execute(
+                    "SELECT post_id, text, page, collected_ms FROM posts "
+                    "WHERE project_id = ? ORDER BY collected_ms DESC", (int(pid),)):
+                if ("facebook", str(r["post_id"])) in labelled:
+                    continue
+                n += 1
+                if limit and len(out) < limit:
+                    out.append({"platform": "facebook", "id": str(r["post_id"]),
+                                "text": r["text"] or "", "author": r["page"],
+                                "when": r["collected_ms"] or 0})
+    except sqlite3.Error:
+        return 0 if not limit else []
+    return out if limit else n
+
+
+def _classify_candidates(pid: int, labelled: set, limit: int) -> list:
+    """The next `limit` unlabelled posts across all three platforms, newest first."""
+    posts = (_x_unlabelled(pid, labelled, limit)
+             + _ig_unlabelled(pid, labelled, limit)
+             + _fb_unlabelled(pid, labelled, limit))
+    # A post with nothing to read cannot be classified, and paying to be told
+    # so is money for nothing. Dropped here rather than sent and discarded.
+    posts = [p for p in posts if (p.get("text") or "").strip()]
+    posts.sort(key=lambda p: p["when"], reverse=True)
+    return posts[:limit]
+
+
+async def _classify_settings(st) -> dict:
+    import classify as cls
+    model = await st.setting("classify_model", cls.DEFAULT_MODEL)
+    return {
+        "model": model or cls.DEFAULT_MODEL,
+        "cap_usd": float(await st.setting("classify_cap_usd",
+                                          _CLASSIFY_DEFAULTS["classify_cap_usd"])),
+        "max_posts": int(await st.setting("classify_max_posts",
+                                          _CLASSIFY_DEFAULTS["classify_max_posts"])),
+        "price_in": float(await st.setting("classify_price_in",
+                                           cls.DEFAULT_PRICE_IN)),
+        "price_out": float(await st.setting("classify_price_out",
+                                            cls.DEFAULT_PRICE_OUT)),
+    }
+
+
+def _labels_status_json(q):
+    """
+    Everything the Live Feed button needs to tell the truth before it is
+    pressed: how many posts are waiting, what a run would cost against, whether
+    the key is even there, and how the last run ended.
+    """
+    pid = _project_or_none(q)
+    if not pid:
+        return dict(_NO_PROJECT)
+    import classify as cls
+
+    def go(st):
+        async def run():
+            await st.seed_post_label_categories(pid, cls.DEFAULT_CATEGORIES)
+            cfg = await _classify_settings(st)
+            labelled = await st.labelled_post_ids(pid)
+            waiting = (_x_unlabelled(pid, labelled)
+                       + _ig_unlabelled(pid, labelled)
+                       + _fb_unlabelled(pid, labelled))
+            spent = await st.label_spend_month(_month_start_ms())
+            last = await st.last_label_run(pid)
+            return {
+                "unlabelled": int(waiting),
+                "labelled": len(labelled),
+                "counts": await st.post_label_counts(pid),
+                "categories": await st.post_label_categories(pid),
+                # The key is never sent, only whether the server has one: the
+                # dashboard shows what the server holds and never handles the
+                # value itself (RULEBOOK §5/§6).
+                "key_present": bool(cls.xai_api_key()),
+                "model": cfg["model"],
+                "cap_usd": cfg["cap_usd"],
+                "max_posts": cfg["max_posts"],
+                "spent_usd": round(spent, 4),
+                "last_run": last,
+            }
+        return run()
+
+    return _with_store(go)
+
+
+def _label_categories_json(q):
+    pid = _project_or_none(q)
+    if not pid:
+        return dict(_NO_PROJECT)
+    import classify as cls
+
+    def go(st):
+        async def run():
+            await st.seed_post_label_categories(pid, cls.DEFAULT_CATEGORIES)
+            return {"categories": await st.post_label_categories(
+                pid, include_archived=True)}
+        return run()
+    return _with_store(go)
+
+
+def _label_category_post(body):
+    """Create or edit one category. The prompt is built from these rows, so an
+    edit here changes what the model is actually told on the next run."""
+    pid = _project_or_none(body)
+    if not pid:
+        return dict(_NO_PROJECT)
+    rank = body.get("rank")
+    try:
+        rank = int(rank) if rank not in (None, "") else None
+    except (TypeError, ValueError):
+        return {"error": "rank must be a number"}
+    arch = body.get("archived")
+    return _with_store(lambda st: st.set_post_label_category(
+        pid, str(body.get("key") or ""),
+        name=body.get("name"), description=body.get("description"),
+        rank=rank, archived=None if arch is None else bool(arch)))
+
+
+def _label_set_post(body):
+    """
+    The operator correcting one label by hand.
+
+    Written with source='human', which is the whole point: a later run will not
+    touch it. The board moves with it, because a corrected label whose post
+    stayed on the wrong board would just be a second thing to fix.
+    """
+    pid = _project_or_none(body)
+    if not pid:
+        return dict(_NO_PROJECT)
+    plat = str(body.get("platform") or "x").lower()
+    post_id = str(body.get("post_id") or body.get("tweet_id") or "").strip()
+    key = str(body.get("label") or "").strip()
+    if not post_id:
+        return {"error": "which post? pass post_id"}
+    if plat not in ("x", "instagram", "facebook"):
+        return {"error": "platform must be x, instagram or facebook"}
+
+    def go(st):
+        async def run():
+            cats = await st.post_label_categories(pid)
+            if key and key not in {c["key"] for c in cats}:
+                return {"error": f"no category {key!r} in this project"}
+            boards = {c["key"]: await st.ensure_label_collection(
+                pid, c["key"], c["name"]) for c in cats}
+            if not key:
+                # Clearing a label: take the post off every auto board too, or
+                # it would sit on a board for a category it no longer has.
+                st.db.execute(
+                    "DELETE FROM post_labels WHERE project_id = ? "
+                    "AND platform = ? AND post_id = ?", (pid, plat, post_id))
+                await st.repin_labelled(pid, plat, post_id, None, boards)
+                return {"ok": True, "label": None}
+            await st.set_post_labels(pid, [(plat, post_id, key, None)],
+                                     source="human", model=None,
+                                     prompt_ver=0)
+            await st.repin_labelled(pid, plat, post_id, key, boards)
+            return {"ok": True, "label": key, "source": "human"}
+        return run()
+    return _with_store(go)
+
+
+def _label_settings_post(body):
+    """
+    The labelling switches: model, monthly cap, per-run ceiling, prices.
+
+    All in the database so the next run reads them without a restart, and none
+    of them is a secret — XAI_API_KEY stays in .env and is never written here
+    (RULEBOOK §6: every operational switch on the dashboard, credentials the
+    one exception).
+
+    An empty box clears the row and the default applies again; it does not pin
+    the setting to zero, which would silently mean "cap of $0, refuse
+    everything".
+    """
+    import classify as cls
+    allowed = {
+        "model": ("classify_model", str),
+        "cap_usd": ("classify_cap_usd", float),
+        "max_posts": ("classify_max_posts", int),
+        "price_in": ("classify_price_in", float),
+        "price_out": ("classify_price_out", float),
+    }
+    writes = {}
+    for name, (key, cast) in allowed.items():
+        if name not in body:
+            continue
+        raw = body.get(name)
+        if raw in (None, ""):
+            writes[key] = ""
+            continue
+        try:
+            val = cast(raw)
+        except (TypeError, ValueError):
+            return {"error": f"{name} must be a {cast.__name__}"}
+        if cast is not str and val <= 0:
+            return {"error": f"{name} must be greater than zero — leave it "
+                             f"blank to go back to the default"}
+        # The cap is shown to two decimals everywhere it appears. A sub-cent
+        # cap would therefore render as "$0.00", telling the operator their
+        # ceiling is zero when it is not — so refuse it rather than display a
+        # number that lies.
+        if name == "cap_usd" and val < 0.01:
+            return {"error": "the monthly cap must be at least $0.01 — "
+                             "anything smaller cannot be shown honestly"}
+        writes[key] = val
+    if not writes:
+        return {"error": "nothing to change"}
+
+    def go(st):
+        async def run():
+            for k, v in writes.items():
+                await st.set_setting(k, v)
+            cfg = await _classify_settings(st)
+            cfg["key_present"] = bool(cls.xai_api_key())
+            return {"ok": True, **cfg}
+        return run()
+    return _with_store(go)
+
+
+def _classify_post(body):
+    """
+    The Classify button. One pass over this project's unlabelled posts.
+
+    Returns what it did and what it cost, always — including when it refused.
+    A run that stops at the cap, or on a 429, says so and names the number,
+    because "nothing happened" is the one answer the dashboard may not give.
+    """
+    pid = _project_or_none(body)
+    if not pid:
+        return dict(_NO_PROJECT)
+    import classify as cls
+    import activity_log
+
+    key = cls.xai_api_key()
+    if not key:
+        return {"error": "No Grok key on the server — add XAI_API_KEY to .env "
+                         "and restart the dashboard. The key is never stored "
+                         "or edited here."}
+    try:
+        want = int(body.get("limit") or 0)
+    except (TypeError, ValueError):
+        return {"error": "limit must be a number"}
+
+    logs: list = []
+    _lg = activity_log.logger("classify", account=None,
+                              echo=lambda m: logs.append(str(m)),
+                              db=str(_CFG.root / "activity.db"))
+
+    async def run():
+        import httpx
+        st = store_mod.Store(_CFG.db_results, _CFG.defaults.keep_entry_json)
+        await st.open()
+        try:
+            await st.seed_post_label_categories(pid, cls.DEFAULT_CATEGORIES)
+            cats = await st.post_label_categories(pid)
+            if not cats:
+                return {"error": "this project has no categories to label with"}
+            cfg = await _classify_settings(st)
+            limit = min(want or cfg["max_posts"], cfg["max_posts"])
+            if want and want > cfg["max_posts"]:
+                # Refuse, don't silently clamp (RULEBOOK §3): a trimmed request
+                # still spends money the caller never agreed to.
+                return {"error": f"{want} posts is over this project's "
+                                 f"per-run ceiling of {cfg['max_posts']} — "
+                                 f"raise it in the labelling settings or ask "
+                                 f"for fewer."}
+
+            labelled = await st.labelled_post_ids(pid)
+            posts = _classify_candidates(pid, labelled, limit)
+            if not posts:
+                _lg("[classify] nothing left to classify in this project")
+                return {"ok": True, "labelled": 0, "failed": 0, "cost_usd": 0.0,
+                        "stop_reason": "empty", "log": logs,
+                        "message": "Nothing left to classify — every post in "
+                                   "this project already has a label."}
+
+            spent = await st.label_spend_month(_month_start_ms())
+            est = cls.cost_usd(cls.estimate_tokens(posts, ""), 0,
+                               cfg["price_in"], cfg["price_out"])
+            if spent >= cfg["cap_usd"]:
+                _lg(f"[classify] refused: ${spent:.2f} already spent this month, "
+                    f"cap is ${cfg['cap_usd']:.2f}")
+                return {"error": f"This month's labelling spend is already "
+                                 f"${spent:.2f}, at the ${cfg['cap_usd']:.2f} "
+                                 f"cap. Raise the cap in the labelling settings "
+                                 f"or wait for the month to turn over.",
+                        "log": logs}
+
+            model = cfg["model"]
+            run_id = await st.start_label_run(pid, len(posts), model)
+            boards = {c["key"]: await st.ensure_label_collection(
+                pid, c["key"], c["name"]) for c in cats}
+            _lg(f"[classify] {len(posts)} posts, {len(cats)} categories, "
+                f"model {model} (about ${est:.3f} of input)")
+
+            done = failed = tin = tout = 0
+            cost = 0.0
+            stop, err_txt = "done", None
+            async with httpx.AsyncClient() as client:
+                for batch in cls.chunk(posts, cls.BATCH):
+                    if spent + cost >= cfg["cap_usd"]:
+                        stop = "cap"
+                        _lg(f"[classify] stopped at the ${cfg['cap_usd']:.2f} "
+                            f"monthly cap — {done} labelled, "
+                            f"{len(posts) - done - failed} left")
+                        break
+                    labels, usage, err = await cls.label_batch(
+                        client, key, model, batch, cats)
+                    tin += usage.get("in", 0); tout += usage.get("out", 0)
+                    cost += cls.cost_usd(usage.get("in", 0), usage.get("out", 0),
+                                         cfg["price_in"], cfg["price_out"])
+                    if err:
+                        failed += len(batch)
+                        err_txt = err
+                        _lg(f"[classify] batch failed: {err}")
+                        # An auth or quota problem will not fix itself on the
+                        # next batch; stop rather than repeating the same
+                        # failure twenty times and reporting it once.
+                        if any(m in err for m in ("HTTP 401", "HTTP 403",
+                                                  "no XAI_API_KEY")):
+                            stop = "error"
+                            break
+                        stop = "partial"
+                        continue
+                    rows = [(p["platform"], p["id"], labels[p["id"]][0],
+                             labels[p["id"]][1])
+                            for p in batch if p["id"] in labels]
+                    await st.set_post_labels(pid, rows, source="grok",
+                                             model=model,
+                                             prompt_ver=cls.PROMPT_VERSION)
+                    for plat, post_id, lab, _c in rows:
+                        await st.repin_labelled(pid, plat, post_id, lab, boards)
+                    done += len(rows)
+                    failed += len(batch) - len(rows)
+                    _lg(f"[classify] {done}/{len(posts)} labelled "
+                        f"(${(spent + cost):.3f} this month)")
+
+            await st.finish_label_run(run_id, labelled=done, failed=failed,
+                                      in_tokens=tin, out_tokens=tout, cost=cost,
+                                      stop_reason=stop, error=err_txt)
+            counts = await st.post_label_counts(pid)
+            _lg(f"[classify] finished: {done} labelled, {failed} not, "
+                f"${cost:.4f} spent")
+            return {"ok": True, "labelled": done, "failed": failed,
+                    "cost_usd": round(cost, 4), "stop_reason": stop,
+                    "error_detail": err_txt, "counts": counts, "log": logs}
+        finally:
+            await st.close()
+
+    out, err = _classify_locked_run(run(), timeout=280)
+    if err:
+        return {**err, "log": logs}
+    return out
 
 
 def _drop_stream_from_config(label: str) -> bool:
@@ -3108,6 +3790,7 @@ def _fb_posts(q):
     # Cross-handle: a display name set on the page links it to the X avatar.
     _fill_avatars_by_name(posts, "fb",
                           lambda p: str(p.get("author_username") or "").lower())
+    _stamp_labels(posts, pid, "facebook")
     return {"count": len(rows), "total": total, "posts": posts}
 
 
@@ -3668,6 +4351,13 @@ def _ig_posts(q):
     # Cross-handle: a display name set on the source links it to the X avatar.
     _fill_avatars_by_name(posts, "ig",
                           lambda p: str((p.get("author") or {}).get("username") or "").lower())
+    # to_api keys the post as `id`, not `tweet_id`; _stamp_labels reads
+    # tweet_id, so map it here rather than teaching the stamper two shapes.
+    for _p in posts:
+        _p["tweet_id"] = _p["id"]
+    _stamp_labels(posts, pid, "instagram")
+    for _p in posts:
+        _p.pop("tweet_id", None)
     return {"count": len(posts), "total": total, "posts": posts,
             "next_cursor": posts[-1]["id"] if posts else None}
 
@@ -4196,6 +4886,10 @@ class Handler(BaseHTTPRequestHandler):
                 return self._send(200, _fb_status(q))
             if u.path == "/api/fb/posts":
                 return self._send(200, _fb_posts(q))
+            if u.path == "/api/labels/status":
+                return self._send(200, _labels_status_json(q))
+            if u.path == "/api/labels/categories":
+                return self._send(200, _label_categories_json(q))
             if u.path == "/api/pool/signin":
                 return self._send(200, _signin_status())
             if u.path == "/api/pool/signin/help":
@@ -4279,6 +4973,17 @@ class Handler(BaseHTTPRequestHandler):
                 return self._send(200, _collection_pin(body))
             if u.path == "/api/collections/remove":
                 return self._send(200, _collection_remove(body))
+            # Content labelling. Deliberately NOT in API_KEY_PATHS: /api/classify
+            # spends real money at somebody else's API, and a machine key may
+            # only read and spend fetch budget (RULEBOOK §5).
+            if u.path == "/api/classify":
+                return self._send(200, _classify_post(body))
+            if u.path == "/api/labels/set":
+                return self._send(200, _label_set_post(body))
+            if u.path == "/api/labels/categories":
+                return self._send(200, _label_category_post(body))
+            if u.path == "/api/labels/settings":
+                return self._send(200, _label_settings_post(body))
             if u.path == "/api/stream/settings":
                 return self._send(200, _stream_settings(body))
             if u.path == "/api/stream/remove":

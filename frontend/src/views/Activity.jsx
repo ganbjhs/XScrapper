@@ -24,6 +24,10 @@ const PLATFORMS = [
   ["facebook", "Facebook"],
   ["instagram", "Instagram"],
   ["x", "X"],
+  // Classify runs log here too: what they sent, what they cost, why they
+  // stopped. A run whose log lives only in the response of the click that
+  // started it is a run nobody can look up afterwards.
+  ["classify", "Labelling"],
 ];
 
 function fmtWhen(ms) {
@@ -87,8 +91,8 @@ function AccountLog() {
                     {fmtWhen(e.ts_ms)}
                   </td>
                   <td>
-                    <span className={`badge platform-${{ facebook: "fb", instagram: "ig" }[e.platform] || "x"}`}>
-                      {{ facebook: "f", instagram: "IG" }[e.platform] || "𝕏"}
+                    <span className={`badge ${{ facebook: "platform-fb", instagram: "platform-ig", classify: "cat" }[e.platform] || "platform-x"}`}>
+                      {{ facebook: "f", instagram: "IG", classify: "AI" }[e.platform] || "𝕏"}
                     </span>
                   </td>
                   <td style={{ whiteSpace: "nowrap" }}>{e.account || "—"}</td>

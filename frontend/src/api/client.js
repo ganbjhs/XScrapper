@@ -174,6 +174,20 @@ export const api = {
     request("/api/collections/pin", { method: "POST", body: { collection_id, add, remove } }),
   collectionItems: (id) => request(`/api/collections/items${qs({ id })}`),
 
+  // Content labelling. `add`/`remove` on collectionPin still accept bare X
+  // tweet ids; a board can hold three platforms now, so they also accept
+  // { platform, post_id }.
+  labelStatus: (project) => request(`/api/labels/status${qs({ project })}`),
+  labelCategories: (project) => request(`/api/labels/categories${qs({ project })}`),
+  saveLabelCategory: (project, cat) =>
+    request("/api/labels/categories", { method: "POST", body: { project, ...cat } }),
+  saveLabelSettings: (project, settings) =>
+    request("/api/labels/settings", { method: "POST", body: { project, ...settings } }),
+  classify: (project, limit) =>
+    request("/api/classify", { method: "POST", body: { project, limit } }),
+  setLabel: (project, platform, post_id, label) =>
+    request("/api/labels/set", { method: "POST", body: { project, platform, post_id, label } }),
+
   alerts: (project) => request(`/api/alerts${qs({ project })}`),
   createAlert: (body) => request("/api/alerts", { method: "POST", body }),
   updateAlert: (body) => request("/api/alerts/update", { method: "POST", body }),

@@ -445,6 +445,48 @@ def _now() -> int:
 
 # -- external JSON shape: the stable contract Watch-Tower consumes -----------
 
+def to_feed(row: dict) -> dict:
+    """
+    Map a stored row to the SHARED post shape — the same keys store_fb.to_feed
+    emits and the same ones the X read path produces (RULEBOOK §2, the one post
+    shape).
+
+    to_api above is a different contract and stays as it is: it is what
+    Watch-Tower pulls, nested and versioned. This one is for surfaces that mix
+    platforms in a single list — a collection board holding X, Instagram and
+    Facebook posts side by side cannot ask the reader to handle three shapes.
+    """
+    import datetime as _dt
+    ta = row.get("taken_at") or 0
+    created = _dt.datetime.utcfromtimestamp(ta).isoformat() + "Z" if ta else None
+    ca = row.get("collected_at") or 0
+    collected = (_dt.datetime.utcfromtimestamp(ca).isoformat() + "Z"
+                 if ca else created)
+    kind = {1: "photo", 2: "video", 8: "album"}.get(row.get("media_type"), "other")
+    thumb, video = row.get("thumbnail_url") or None, row.get("video_url") or None
+    media = ([{"type": kind, "url": video or thumb, "thumb": thumb}]
+             if (thumb or video) else [])
+    return {
+        "platform": "instagram",
+        "tweet_id": str(row["pk"]),
+        "url": row.get("url"),
+        "text": row.get("caption") or "",
+        "created_at": created,
+        "collected_at": collected,
+        "author_username": row.get("username"),
+        # Instagram gives no display name on a media row, so the handle stands
+        # in. Saying the handle twice is honest; inventing a name is not.
+        "author_display_name": row.get("username"),
+        "author_avatar": row.get("author_avatar"),
+        "media": media,
+        "like_count": row.get("like_count"),
+        "reply_count": row.get("comment_count"),
+        "retweet_count": None,
+        "view_count": row.get("play_count"),
+        "source": row.get("source_label"),
+    }
+
+
 def to_api(row: dict) -> dict:
     """
     Map a stored row to the clean, stable object the API returns. Kept separate

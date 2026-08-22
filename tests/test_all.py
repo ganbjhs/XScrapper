@@ -1977,6 +1977,526 @@ def test_collections(tmp):
 
 
 # ==========================================================================
+# content labelling (RULEBOOK §1 directive 2, the one named exception)
+#
+# Offline and unpaid: the Grok client takes its httpx client as an argument, so
+# every branch here runs against a fake that never opens a socket. XAI_API_KEY
+# is stubbed too — a test that read the real environment would pass or fail
+# depending on whose laptop it ran on.
+# ==========================================================================
+
+class FakeGrok:
+    """
+    An httpx.AsyncClient stand-in. `plan` is a list of (status, payload) served
+    one per call, so a test can make the second batch fail and check that the
+    first batch's labels were still kept and still paid for.
+    """
+
+    def __init__(self, plan):
+        self.plan = list(plan)
+        self.calls = []
+
+    async def post(self, url, json=None, headers=None, timeout=None):
+        self.calls.append(json)
+        status, payload = self.plan.pop(0) if self.plan else (200, {})
+
+        class Rep:
+            status_code = status
+            text = payload if isinstance(payload, str) else ""
+
+            def json(self_inner):
+                if isinstance(payload, str):
+                    raise ValueError("not json")
+                return payload
+        return Rep()
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *a):
+        return False
+
+
+def _grok_reply(pairs, in_tok=1000, out_tok=100):
+    """A well-formed chat-completions body labelling each (id, label)."""
+    body = {"labels": [{"id": str(i), "label": l, "confidence": 0.9}
+                       for i, l in pairs]}
+    return {"choices": [{"message": {"content": json.dumps(body)}}],
+            "usage": {"prompt_tokens": in_tok, "completion_tokens": out_tok}}
+
+
+def test_classify_pure(tmp):
+    """The prompt builder, the parser and the pricing — no store, no network."""
+    import classify as cls
+
+    cats = cls.DEFAULT_CATEGORIES
+    keys = [c["key"] for c in cats]
+    prompt = cls.build_prompt(cats)
+
+    ok(all(c["key"] in prompt and c["description"][:30] in prompt for c in cats),
+       "every category's key AND its description reach the prompt "
+       "(an editor whose text never arrives is theatre)")
+    ok(prompt.index("hate") < prompt.index("bjp_pro"),
+       "categories are listed in precedence order, which is what the tie-break "
+       "instruction refers to")
+    ok("ONE" in prompt and "other" in prompt,
+       "the prompt states one-category-only and names the catch-all")
+
+    got = cls.parse_response(json.dumps(
+        {"labels": [{"id": "1", "label": "hate", "confidence": 0.8}]}),
+        keys, ["1"])
+    ok(got == {"1": ("hate", 0.8)}, "a well-formed answer parses to (label, confidence)")
+
+    ok(cls.parse_response('```json\n{"labels":[{"id":"1","label":"bjp_pro"}]}\n```',
+                          keys, ["1"]) == {"1": ("bjp_pro", None)},
+       "a fenced code block still parses, and a missing confidence is None "
+       "rather than a guess")
+    ok(cls.parse_response('Sure! {"labels":[{"id":"1","label":"hate"}]} hope that helps',
+                          keys, ["1"]) == {"1": ("hate", None)},
+       "JSON wrapped in chatter is recovered rather than losing the batch")
+    ok(cls.parse_response('{"labels":[{"id":"1","label":"anti_national"}]}',
+                          keys, ["1"]) == {"1": ("other", None)},
+       "a category the model invented becomes the catch-all — a label the "
+       "operator never defined must never reach a board")
+    ok(cls.parse_response('{"labels":[{"id":"77","label":"hate"}]}',
+                          keys, ["1"]) == {},
+       "a label for a post we did not ask about is dropped, not misattributed")
+    ok(cls.parse_response('{"labels":[{"id":"1","label":"hate","confidence":7}]}',
+                          keys, ["1"]) == {"1": ("hate", None)},
+       "an out-of-range confidence is discarded, not stored as 7.0")
+    ok(cls.parse_response("total garbage", keys, ["1"]) == {}
+       and cls.parse_response("", keys, ["1"]) == {},
+       "an unparseable reply is an empty result, never an exception")
+    ok(cls.parse_response('{"labels":[{"id":"1","label":"hate"}]}', keys, ["1", "2"])
+       == {"1": ("hate", None)},
+       "a post the model skipped is simply absent, so the caller can count it "
+       "as failed instead of inventing a label for it")
+
+    ok(abs(cls.cost_usd(1_000_000, 1_000_000, 2.0, 6.0) - 8.0) < 1e-9,
+       "cost is input x price_in + output x price_out, per million tokens")
+    ok(cls.cost_usd(0, 0) == 0.0, "a call that used nothing costs nothing")
+    ok(len(list(cls.chunk(list(range(55)), 25))) == 3,
+       "work is split into request-sized batches")
+
+    ok(cls.CATCHALL in keys and keys[-1] == cls.CATCHALL,
+       "the shipped vocabulary ends with the catch-all")
+
+
+def test_classify_call(tmp):
+    """label_batch against a fake client: happy path and every failure mode."""
+    import classify as cls
+
+    cats = cls.DEFAULT_CATEGORIES
+    posts = [{"id": "1", "text": "great work by the government", "author": "a"},
+             {"id": "2", "text": "cricket score tonight", "author": "b"}]
+
+    async def run():
+        out = {}
+        c = FakeGrok([(200, _grok_reply([("1", "bjp_pro"), ("2", "other")]))])
+        out["ok"] = await cls.label_batch(c, "k", "grok-4.6", posts, cats)
+        out["sent"] = c.calls[0]
+
+        out["nokey"] = await cls.label_batch(c, "", "grok-4.6", posts, cats)
+
+        c2 = FakeGrok([(429, "rate limited, slow down")])
+        out["429"] = await cls.label_batch(c2, "k", "m", posts, cats)
+
+        c3 = FakeGrok([(200, "<html>gateway</html>")])
+        out["notjson"] = await cls.label_batch(c3, "k", "m", posts, cats)
+
+        # A 400 is retried once WITHOUT response_format, because the likeliest
+        # cause is a deployment that does not accept structured output.
+        c4 = FakeGrok([(400, "unsupported"),
+                       (200, _grok_reply([("1", "hate"), ("2", "other")]))])
+        out["retry"] = await cls.label_batch(c4, "k", "m", posts, cats)
+        out["retry_bodies"] = c4.calls
+
+        class Boom(FakeGrok):
+            async def post(self, *a, **k):
+                raise OSError("connection reset")
+        out["boom"] = await cls.label_batch(Boom([]), "k", "m", posts, cats)
+
+        out["empty"] = await cls.label_batch(FakeGrok([]), "k", "m", [], cats)
+        return out
+
+    r = asyncio.run(run())
+
+    labels, usage, err = r["ok"]
+    ok(labels == {"1": ("bjp_pro", 0.9), "2": ("other", 0.9)} and not err,
+       "a good reply comes back as {id: (label, confidence)}")
+    ok(usage == {"in": 1000, "out": 100},
+       "token usage is read off the reply, so the meter bills what was used")
+    body = r["sent"]
+    ok(body["temperature"] == 0,
+       "temperature 0: the same post must label the same way twice, or a "
+       "re-run is a coin flip rather than a correction")
+    ok(body["response_format"]["json_schema"]["schema"]["properties"]["labels"]
+       ["items"]["properties"]["label"]["enum"] == [c["key"] for c in cats],
+       "the structured-output schema pins the answer to this project's keys")
+    ok(posts[0]["text"] in body["messages"][1]["content"]
+       and "ID: 1" in body["messages"][1]["content"],
+       "each post is sent with its id, so labels come back attributable rather "
+       "than positional")
+
+    ok(r["nokey"][0] == {} and "XAI_API_KEY" in r["nokey"][2],
+       "a missing key is an error naming the variable, not a crash")
+    ok(r["429"][0] == {} and "429" in r["429"][2] and "slow down" in r["429"][2],
+       "an HTTP error carries the provider's own words, not just the status")
+    ok(r["notjson"][0] == {} and "JSON" in r["notjson"][2],
+       "a gateway page instead of JSON is an error string")
+    ok(r["retry"][0] and len(r["retry_bodies"]) == 2
+       and "response_format" not in r["retry_bodies"][1],
+       "a 400 retries once without response_format rather than failing the run")
+    ok(r["boom"][0] == {} and "OSError" in r["boom"][2],
+       "a transport blow-up is returned, never raised — a run must not lose "
+       "the batches it already paid for")
+    ok(r["empty"] == ({}, {}, ""), "an empty batch is a no-op, not a request")
+
+
+def test_labels_store(tmp):
+    """Labels, auto boards, the human override, and the spend meter."""
+    import classify as cls
+    import store as store_mod
+
+    db = pathlib.Path(tmp) / "results.db"
+
+    async def run():
+        st = store_mod.Store(db, False)
+        await st.open()
+        out = {}
+        pid = (await st.create_project("Client A"))["project_id"]
+        pid2 = (await st.create_project("Client B"))["project_id"]
+
+        out["seed"] = await st.seed_post_label_categories(pid, cls.DEFAULT_CATEGORIES)
+        out["seed2"] = await st.seed_post_label_categories(pid, cls.DEFAULT_CATEGORIES)
+        cats = await st.post_label_categories(pid)
+        out["order"] = [c["key"] for c in cats]
+
+        boards = {c["key"]: await st.ensure_label_collection(pid, c["key"], c["name"])
+                  for c in cats}
+        boards2 = {c["key"]: await st.ensure_label_collection(pid, c["key"], c["name"])
+                   for c in cats}
+        out["boards_stable"] = boards == boards2
+        out["board_count"] = len(await st.collections(pid))
+
+        # One post per platform, to prove the key is (platform, post_id).
+        rows = [("x", "111", "hate", 0.9),
+                ("instagram", "222", "bjp_pro", 0.5),
+                ("facebook", "pfbid_x", "other", None)]
+        out["wrote"] = await st.set_post_labels(pid, rows, source="grok",
+                                                model="m", prompt_ver=1)
+        for plat, post_id, key, _c in rows:
+            await st.repin_labelled(pid, plat, post_id, key, boards)
+        out["counts"] = await st.post_label_counts(pid)
+        out["hate_board"] = await st.collection_post_rows(boards["hate"])
+        out["fb_board"] = await st.collection_post_rows(boards["other"])
+
+        # A different project labelling the SAME post keeps its own answer.
+        await st.seed_post_label_categories(pid2, cls.DEFAULT_CATEGORIES)
+        await st.set_post_labels(pid2, [("x", "111", "other", None)])
+        got = await st.post_labels_for(pid, [("x", "111")])
+        got2 = await st.post_labels_for(pid2, [("x", "111")])
+        out["scoped"] = (got[("x", "111")]["label"], got2[("x", "111")]["label"])
+
+        # The operator corrects a label; a later run must not undo it.
+        await st.set_post_labels(pid, [("x", "111", "other", None)], source="human")
+        await st.repin_labelled(pid, "x", "111", "other", boards)
+        await st.set_post_labels(pid, [("x", "111", "hate", 0.99)], source="grok")
+        after = await st.post_labels_for(pid, [("x", "111")])
+        out["human"] = (after[("x", "111")]["label"], after[("x", "111")]["source"])
+        out["moved_off"] = await st.collection_post_rows(boards["hate"])
+        out["moved_on"] = [p["post_id"] for p in
+                           await st.collection_post_rows(boards["other"])]
+
+        # A hand-pinned post on a manual board is never moved by a relabel.
+        mine = (await st.create_collection(pid, "My picks"))["collection_id"]
+        await st.collection_pin_posts(mine, add=[("x", "111")])
+        await st.repin_labelled(pid, "x", "111", "bjp_pro", boards)
+        out["manual_kept"] = len(await st.collection_post_rows(mine))
+
+        out["already"] = sorted(await st.labelled_post_ids(pid))
+        out["catchall"] = await st.set_post_label_category(pid, "other",
+                                                           archived=True)
+        out["badkey"] = await st.set_post_label_category(pid, "bad key!",
+                                                         name="x", description="y")
+        out["newcat"] = await st.set_post_label_category(
+            pid, "against_bjp", name="Against BJP",
+            description="Attacks the BJP.", rank=5)
+
+        rid = await st.start_label_run(pid, 50, "grok-4.6")
+        await st.finish_label_run(rid, labelled=48, failed=2, in_tokens=1_000_000,
+                                  out_tokens=0, cost=cls.cost_usd(1_000_000, 0),
+                                  stop_reason="cap")
+        out["spend"] = await st.label_spend_month(0)
+        out["spend_after"] = await st.label_spend_month(9_999_999_999_999)
+        out["last"] = await st.last_label_run(pid)
+
+        out["settings_default"] = await st.setting("classify_cap_usd", "10")
+        await st.set_setting("classify_cap_usd", "25")
+        out["settings_set"] = await st.setting("classify_cap_usd", "10")
+        await st.set_setting("classify_cap_usd", "")
+        out["settings_cleared"] = await st.setting("classify_cap_usd", "10")
+        await st.close()
+        return out
+
+    r = asyncio.run(run())
+    ok(r["seed"] == 5 and r["seed2"] == 0,
+       "the vocabulary seeds once and never re-seeds over an operator's edits")
+    ok(r["order"][0] == "hate" and r["order"][-1] == "other",
+       "categories come back in precedence order, catch-all last")
+    ok(r["boards_stable"] and r["board_count"] == 5,
+       "each category gets exactly one auto board, and asking again reuses it")
+    ok(r["wrote"] == 3 and r["counts"] == {"hate": 1, "bjp_pro": 1, "other": 1},
+       "labels persist for X, Instagram and Facebook alike")
+    ok([p["post_id"] for p in r["hate_board"]] == ["111"]
+       and [p["post_id"] for p in r["fb_board"]] == ["pfbid_x"],
+       "a labelled post lands on its category's board, whatever its platform")
+    ok(r["fb_board"][0]["platform"] == "facebook",
+       "a board pin carries its platform — an id alone cannot say which")
+    ok(r["scoped"] == ("hate", "other"),
+       "two projects label the same post independently: one client's answer is "
+       "never the other's")
+    ok(r["human"] == ("other", "human"),
+       "a hand-set label survives a later Grok run untouched — the WHERE clause "
+       "that makes re-running safe")
+    ok(r["moved_off"] == [] and "111" in r["moved_on"],
+       "re-labelling moves the post between auto boards instead of leaving it "
+       "on both")
+    ok(r["manual_kept"] == 1,
+       "a post the operator pinned by hand stays pinned however the label "
+       "changes — only auto boards are the labeller's to rearrange")
+    ok(r["already"] == [("facebook", "pfbid_x"), ("instagram", "222"),
+                        ("x", "111")],
+       "the already-labelled set is what stops a run paying for a post twice")
+    ok("error" in r["catchall"],
+       "the catch-all cannot be archived: without it every unrelated post is "
+       "forced into a political category")
+    ok("error" in r["badkey"], "a category key with a space is refused")
+    ok(r["newcat"]["name"] == "Against BJP" and r["newcat"]["rank"] == 5,
+       "the operator can add a category without a code change")
+    ok(abs(r["spend"] - 2.0) < 1e-9 and r["spend_after"] == 0.0,
+       "the meter sums a month's runs and ignores everything before its window")
+    ok(r["last"]["stop_reason"] == "cap" and r["last"]["labelled"] == 48,
+       "a run records how it ended, so 'stopped at the cap' can be said out loud")
+    ok(r["settings_default"] == "10" and r["settings_set"] == "25"
+       and r["settings_cleared"] == "10",
+       "a switch reads its default until set, and clearing it restores the "
+       "default rather than pinning it to nothing")
+
+
+def test_cross_platform_pins(tmp):
+    """The pin migration, and the retention rule that must not eat a board."""
+    import store as store_mod
+
+    db = pathlib.Path(tmp) / "results.db"
+
+    async def seed_tweets(st, ids, created_ms):
+        info = list(st.db.execute("PRAGMA table_info(tweets)"))
+        required = [x[1] for x in info if x[3] and x[4] is None and not x[5]]
+        text_cols = {x[1] for x in info if "TEXT" in (x[2] or "").upper()}
+        for tid in ids:
+            row = {c: ("" if c in text_cols else 0) for c in required}
+            row.update(tweet_id=tid, created_ms=created_ms, collected_ms=created_ms,
+                       source="result")
+            st.db.execute(
+                f"INSERT OR IGNORE INTO tweets({','.join(row)}) "
+                f"VALUES({','.join('?' * len(row))})", list(row.values()))
+
+    async def run():
+        out = {}
+        st = store_mod.Store(db, False)
+        await st.open()
+        pid = (await st.create_project("P"))["project_id"]
+        cid = (await st.create_collection(pid, "Old board"))["collection_id"]
+        old_ms = int(time.time() * 1000) - 400 * 86_400_000
+        await seed_tweets(st, [501, 502], old_ms)
+        # Pretend this database predates cross-platform pins: an old-style pin,
+        # and the migration flag cleared.
+        st.db.execute("INSERT INTO collection_items(collection_id, tweet_id, "
+                      "added_ms) VALUES(?,?,?)", (cid, 501, 1))
+        st.db.execute("DELETE FROM collection_posts")
+        st.db.execute("DELETE FROM meta WHERE key = 'pins_cross_platform'")
+        await st.close()
+
+        st = store_mod.Store(db, False)
+        await st.open()
+        out["migrated"] = await st.collection_post_rows(cid)
+        await st.close()
+
+        st = store_mod.Store(db, False)      # again: must not double up
+        await st.open()
+        out["again"] = len(await st.collection_post_rows(cid))
+        out["listed"] = (await st.collections(pid))[0]["items"]
+
+        # Retention: 501 is pinned and must survive; 502 is not and must go.
+        st.retention_days = 30
+        out["swept"] = await st.maintain()
+        out["left"] = sorted(x["tweet_id"] for x in
+                             st.db.execute("SELECT tweet_id FROM tweets"))
+        await st.close()
+        return out
+
+    r = asyncio.run(run())
+    ok([p["post_id"] for p in r["migrated"]] == ["501"]
+       and r["migrated"][0]["platform"] == "x"
+       and r["migrated"][0]["pinned_by"] == "human",
+       "an existing board migrates to cross-platform pins as X posts pinned by "
+       "a human, which is the only thing the old table could hold")
+    ok(r["again"] == 1, "the migration is gated on a flag and never doubles a pin")
+    ok(r["listed"] == 1, "the board list counts the migrated pins")
+    ok(501 in r["left"] and 502 not in r["left"],
+       "retention keeps a PINNED post and sweeps an unpinned one — reading the "
+       "old pin table here would have deleted every newly pinned post")
+
+
+def test_labels_web(tmp):
+    """
+    The read path: labels stamped onto every platform's feed, and a board
+    resolved out of three separate databases.
+
+    web.py is the one place the three stores meet, so it is the one place a
+    label can go missing from a feed or a pin can render as a hole. Driven
+    through the module's own functions rather than a socket, the way the auth
+    tests above drive it.
+    """
+    import shutil as _sh
+    import sqlite3
+
+    import config as _config
+    import store as store_mod
+    import store_fb
+    import web
+
+    tmp = pathlib.Path(tmp)
+    _sh.copy(pathlib.Path(__file__).resolve().parent.parent / "config.toml.example",
+             tmp / "config.toml")
+    cfg = _config.load_config(root=tmp)
+    web._CFG = cfg
+    web._start_loop()
+    now = int(time.time() * 1000)
+
+    async def seed():
+        st = store_mod.Store(cfg.db_results, False)
+        await st.open()
+        pid = (await st.create_project("Desk"))["project_id"]
+        sid = await st.ensure_stream("s", "from:a", "Latest", True)
+        st.db.execute("INSERT INTO project_streams(project_id, stream_id) "
+                      "VALUES(?,?)", (pid, sid))
+        info = list(st.db.execute("PRAGMA table_info(tweets)"))
+        req = [x[1] for x in info if x[3] and x[4] is None and not x[5]]
+        txt = {x[1] for x in info if "TEXT" in (x[2] or "").upper()}
+        for tid, body in ((7001, "praise for the scheme"), (7002, "unrelated")):
+            row = {c: ("" if c in txt else 0) for c in req}
+            row.update(tweet_id=tid, created_ms=now, collected_ms=now,
+                       source="result", text=body, author_username="acct")
+            st.db.execute(
+                f"INSERT INTO tweets({','.join(row)}) VALUES({','.join('?' * len(row))})",
+                list(row.values()))
+            st.db.execute("INSERT INTO tweet_hits(stream_id, tweet_id, "
+                          "first_seen_ms) VALUES(?,?,?)", (sid, tid, now))
+        await st.close()
+        return pid
+
+    pid = asyncio.run(seed())
+    with store_fb.Store(cfg.root / "fb_results.db") as fst:
+        fst.db.execute(
+            "INSERT INTO posts(post_id, page, text, created_ms, collected_ms, "
+            "project_id) VALUES('pfbid9','apage','a communal incident',?,?,?)",
+            (now, now, pid))
+        fst.db.commit()
+
+    out = {}
+    out["waiting"] = (web._x_unlabelled(pid, set())
+                      + web._fb_unlabelled(pid, set()))
+
+    async def label():
+        st = store_mod.Store(cfg.db_results, False)
+        await st.open()
+        await st.set_post_labels(pid, [("x", "7001", "bjp_pro", 0.8),
+                                       ("facebook", "pfbid9", "hindu_muslim", 0.7)])
+        cid = (await st.create_collection(pid, "Mixed"))["collection_id"]
+        await st.collection_pin_posts(cid, add=[("x", "7001"),
+                                                ("facebook", "pfbid9"),
+                                                ("x", "999999")])
+        await st.close()
+        return cid
+
+    cid = asyncio.run(label())
+
+    out["after"] = web._x_unlabelled(pid, {("x", "7001")})
+    rows = [{"platform": "x", "tweet_id": "7001"},
+            {"platform": "x", "tweet_id": "7002"}]
+    web._stamp_labels(rows, pid)
+    out["stamped"] = rows
+    out["unscoped"] = web._stamp_labels(
+        [{"platform": "x", "tweet_id": "7001"}], 0)
+
+    pins = [{"platform": "x", "post_id": "7001", "added_ms": 20},
+            {"platform": "facebook", "post_id": "pfbid9", "added_ms": 30},
+            {"platform": "x", "post_id": "999999", "added_ms": 40}]
+    out["resolved"] = web._resolve_pins(pins, pid)
+    out["board"] = web._board_rows(cid)[1]
+
+    out["pairs"] = web._pin_pairs(
+        ["123", {"platform": "facebook", "post_id": "abc"}, ["instagram", "9"]])
+
+    month = datetime.fromtimestamp(web._month_start_ms() / 1000, timezone.utc)
+    out["month"] = (month.day, month.hour, month.minute)
+
+    ok(out["waiting"] == 3,
+       "the waiting count spans X and Facebook — one number for the button")
+    ok(out["after"] == 1, "a labelled post drops out of the waiting count")
+
+    st = {r["tweet_id"]: r for r in out["stamped"]}
+    ok(st["7001"]["label"] == "bjp_pro" and st["7001"]["label_source"] == "grok",
+       "a labelled feed row carries its label and who set it")
+    ok("label" in st["7002"] and st["7002"]["label"] is None,
+       "an unlabelled row says so with an explicit null — 'not classified yet' "
+       "is a state the UI has to be able to render, not a missing key")
+    ok(out["unscoped"][0]["label"] is None,
+       "without a project there are no labels to stamp: they are project facts")
+
+    got = {r["tweet_id"]: r for r in out["resolved"]}
+    ok(set(got) == {"7001", "pfbid9"},
+       "a pin whose post is gone resolves to nothing rather than a hole")
+    ok(got["pfbid9"]["platform"] == "facebook"
+       and got["pfbid9"]["text"] == "a communal incident"
+       and "author_username" in got["pfbid9"] and "media" in got["pfbid9"],
+       "a Facebook pin comes back out of its own database in the shared shape")
+    ok(got["pfbid9"]["label"] == "hindu_muslim",
+       "and carries the label, which lives in a third database again")
+    ok([r["tweet_id"] for r in out["resolved"]] == ["pfbid9", "7001"],
+       "a mixed board is ordered newest pin first, across platforms")
+    ok(len(out["board"]) == 2,
+       "_board_rows resolves a real board end to end")
+
+    ok(out["pairs"] == [("x", "123"), ("facebook", "abc"), ("instagram", "9")],
+       "a bare id still means an X post, so the old pin contract keeps working "
+       "beside the new one")
+    ok(out["month"] == (1, 0, 0),
+       "the spend meter's window starts at midnight UTC on the 1st")
+
+    # An older database that a writable Store has not opened yet has no
+    # post_labels table at all. The read path must render it unlabelled, not 500.
+    old = tmp / "old.db"
+    con = sqlite3.connect(old)
+    con.execute("CREATE TABLE tweets(tweet_id INTEGER PRIMARY KEY)")
+    con.commit(); con.close()
+    saved = web._CFG
+    try:
+        class _Shim:
+            db_results = old
+            root = tmp
+        web._CFG = _Shim()
+        ok(web._labels_map(pid, [("x", "7001")]) == {},
+           "a database written before labelling existed reads as unlabelled "
+           "rather than raising: the dashboard opens it READ-ONLY and cannot "
+           "create the table itself")
+    finally:
+        web._CFG = saved
+
+
+# ==========================================================================
 # keywords, stream assignment, per-project delivery
 # ==========================================================================
 
@@ -3698,6 +4218,13 @@ def main():
 
         section("collections (curation boards)")
         test_collections(fresh("collections"))
+
+        section("content labelling (Grok)")
+        test_classify_pure(fresh("classify_pure"))
+        test_classify_call(fresh("classify_call"))
+        test_labels_store(fresh("labels_store"))
+        test_cross_platform_pins(fresh("pins"))
+        test_labels_web(fresh("labels_web"))
 
         section("facebook (store, cap, collect loop)")
         test_facebook(fresh("facebook"))

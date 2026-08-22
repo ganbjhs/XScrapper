@@ -29,8 +29,13 @@ ends (read before touching the FB engine).
 2. **Freshness-first watermark polling.** Each poll walks a timeline from the
    newest item and stops at the first already-seen one, so a normal poll costs
    one request. Dedup is the backstop, never the mechanism.
-3. **Extract here, analyse in Watch-Tower.** No sentiment, topics or AI here.
-   Everything this tool computes is a count or a timestamp.
+3. **Extract here, analyse in Watch-Tower — one exception.** No sentiment, no
+   topics, no scoring. Everything this tool computes is a count or a timestamp,
+   except **content labels**: one operator-triggered category per post from an
+   external model (`classify.py` → Grok), stored beside the post and delivered
+   with it. Manual, metered, capped, and overridable by hand. RULEBOOK §1
+   directive 2 holds the full boundary; the short version is that this is a
+   triage label, not an analysis layer.
 4. **Humans clear walls, scripts never retry into them.** A login wall gets
    ONE scripted attempt; then the cause is recorded and a human acts from the
    dashboard. (The FB circuit breaker, `fb_health.json`.)
@@ -58,6 +63,8 @@ FB: fb_state  ->   engine_fb.py     ->   collect_fb.py ->   store_fb.py -> fb_re
                    gql capture,          or favorites mode,   removed_pages tombstones)
                    login breaker)        paused/blocked-aware)
 
+  LABELS (classify.py):  Classify button -> Grok -> one category per post,
+                         auto-pinned to that category's board (manual, capped)
   DELIVERY (webhook.py): push loop -> webhook + Telegram + Google Sheet + alerts
   SHEETS (sheets.py):    Apps Script web app (default) or service-account JWT;
                          date|link|text|media, header once, append only
@@ -75,7 +82,12 @@ The organizing layer (in `store.py` + `web.py`):
   `(from:a OR from:b)` chunks ≤20 handles; `kind='keywords'` → rule streams;
   `kind='xlist'` → one X-List stream). Compiled streams carry `watched=1` so
   the watcher polls them with no config entry. Shrinking pauses, never deletes.
-- **Collection** — a curation board; pins are references, never copies.
+- **Collection** — a curation board; pins are references, never copies, keyed
+  `(platform, post_id)` so one board holds X, IG and FB posts together. A board
+  marked `auto` belongs to a label category and is filled by classify runs.
+- **Label** — one category per post per project, from `classify.py`. Manual
+  only, metered against a monthly cap, and a hand correction outranks the
+  model's answer forever.
 - **Alert** — pace-surge → Telegram; baseline = trailing 24h ending an hour
   ago; cooldown 30 min; evaluated in the delivery loop.
 
@@ -87,10 +99,11 @@ The organizing layer (in `store.py` + `web.py`):
 | `auth.py` | X sessions via real Chromium + persistent profile; validates before marking active |
 | `engine.py` | Transport/parse seam over pinned `twscrape`; yields `Page` objects |
 | `collector.py` | X poll loop: watermark stop, dedup, stop-reasons, adaptive intervals |
-| `store.py` | `results.db`: tweets (hot row) + `tweet_raw` (payloads, LEFT JOIN when needed), streams, polls, projects/watchlists/collections/alerts, FTS5 search, retention |
+| `store.py` | `results.db`: tweets (hot row) + `tweet_raw` (payloads, LEFT JOIN when needed), streams, polls, projects/watchlists/collections/alerts, cross-platform pins (`collection_posts`), content labels (`post_labels`, `label_categories`, `label_runs`), settings, FTS5 search, retention |
 | `webhook.py` | Delivery loop: signed webhook push, Telegram, Google Sheet, alert ticking; cursor-based |
 | `sheets.py` | Google Sheets transport, two modes: Apps Script web app (no cloud project) or service-account JWT (no new deps); header-once, append-only `date\|link\|text\|media` |
 | `alerts.py` | Velocity-alert decision + tick (pure logic, testable) |
+| `classify.py` | Content labelling: builds the prompt from the project's categories, calls Grok over injectable async httpx, parses and validates the answer, prices it. Pure — no DB, no globals, never raises |
 | `guard.py` | Advisory risk findings; never changes state |
 | `activity_log.py` | Persistent account-activity log (`activity.db`); `logger()` wraps every collector's log= |
 | `store_accounts.py` / `accounts_api.py` | Managed account pool (encrypted secrets, TOTP, backup codes, failover) + its API |
@@ -141,7 +154,9 @@ bytes), `activity.db` (account log), `api_keys.db` (hashes only),
 `/api/activity/logs`), tweets with rich filters + two cursors, SSE `/api/live`,
 CRUD for projects/watchlists/collections/alerts, `/api/fb/*` (status, posts,
 source, fetch, favorites, control, health, settings), `/api/ig/*` (status,
-posts, source), account pool `/api/pool*`.
+posts, source), account pool `/api/pool*`, and labelling `/api/classify` +
+`/api/labels/{status,categories,set,settings}`. `/api/classify` is deliberately
+NOT in `API_KEY_PATHS`: it spends money, and a machine key may only read.
 
 **API-key pull.** Fixed read-only allowlist (`API_KEY_PATHS`); keys never
 manage accounts or sessions. Before any second consumer: project-locked keys.
@@ -165,7 +180,9 @@ on the server). Install the pre-commit hook:
 2. Watermark stop = one request per quiet poll. Never fetch date ranges.
 3. Pin the scraping libs and assert their internals at startup.
 4. One stable device + one steady IP per account, forever.
-5. Extract here, analyse in Watch-Tower.
+5. Extract here, analyse in Watch-Tower — except the one content label per
+   post, which is manual, metered and travels with the post so there is one
+   answer rather than two.
 6. Secrets never touch git; API keys stored as hashes.
 7. Guard is advisory, never destructive.
 8. Migrations are additive and self-applying; old DBs upgrade in place.
@@ -240,6 +257,14 @@ living rulebook + protected documents enforced by pre-commit; IG structural
 parity — dashboard pause/cadence re-read per cycle, checkpoint state surfaced
 in the UI with the human recovery steps (the sidecar `checkpoint_at` breaker
 predates FB's and stays).
+
+Content labelling as the one named exception to "analyse in Watch-Tower":
+per-project category vocabulary edited in the dashboard, an
+operator-triggered Grok pass over unlabelled posts across all three platforms,
+a spend meter with a hard monthly cap that refuses rather than trims, chips and
+a category filter on the Live Feed, an auto board per category, and hand
+corrections the model can never overwrite; collection pins made cross-platform
+(`collection_posts`, migrated from `collection_items` on open).
 
 **Parked roadmap** (build when asked): media archiving (local copies so
 deleted posts keep evidence); DOCX rundown export; promote-to-X-List
