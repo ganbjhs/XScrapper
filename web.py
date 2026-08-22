@@ -408,8 +408,8 @@ def _query_tweets(p):
               "views": "t.view_count DESC, t.tweet_id DESC"}
     if not cursoring and p.get("sort") in _SORTS:
         order_by, order = _SORTS[p["sort"]], ""
-    limit = min(int(p.get("limit") or 50), 500)
-    offset = int(p.get("offset") or 0)
+    limit = max(1, min(int(p.get("limit") or 50), 500))
+    offset = max(0, int(p.get("offset") or 0))
 
     with _connect() as con:
         total = con.execute(
@@ -1568,13 +1568,18 @@ def _metrics_json(q=None):
     if rp.exists() and pid:
         try:
             con = sqlite3.connect(f"file:{rp}?mode=ro", uri=True, timeout=5)
-            con.row_factory = sqlite3.Row
-            # store_ig keys taken_at in unix SECONDS.
-            ig_by_day = {int(r["d"]): r["c"] for r in con.execute(
-                "SELECT (taken_at * 1000) / ? AS d, COUNT(*) c FROM posts "
-                "WHERE taken_at * 1000 >= ? AND project_id = ? GROUP BY d",
-                (day_ms, week_ago, pid))}
-            con.close()
+            # close() in a finally: without it a query that raises leaks this
+            # read-only handle for the life of the process, and the chart is
+            # exactly the kind of query that raises after a schema change.
+            try:
+                con.row_factory = sqlite3.Row
+                # store_ig keys taken_at in unix SECONDS.
+                ig_by_day = {int(r["d"]): r["c"] for r in con.execute(
+                    "SELECT (taken_at * 1000) / ? AS d, COUNT(*) c FROM posts "
+                    "WHERE taken_at * 1000 >= ? AND project_id = ? GROUP BY d",
+                    (day_ms, week_ago, pid))}
+            finally:
+                con.close()
         except Exception:
             pass
 
@@ -1585,12 +1590,14 @@ def _metrics_json(q=None):
     if fp.exists() and pid:
         try:
             con = sqlite3.connect(f"file:{fp}?mode=ro", uri=True, timeout=5)
-            con.row_factory = sqlite3.Row
-            fb_where, fb_params = "collected_ms >= ? AND project_id = ?", [week_ago, pid]
-            fb_by_day = {int(r["d"]): r["c"] for r in con.execute(
-                f"SELECT collected_ms / ? AS d, COUNT(*) c FROM posts "
-                f"WHERE {fb_where} GROUP BY d", (day_ms, *fb_params))}
-            con.close()
+            try:
+                con.row_factory = sqlite3.Row
+                fb_where, fb_params = "collected_ms >= ? AND project_id = ?", [week_ago, pid]
+                fb_by_day = {int(r["d"]): r["c"] for r in con.execute(
+                    f"SELECT collected_ms / ? AS d, COUNT(*) c FROM posts "
+                    f"WHERE {fb_where} GROUP BY d", (day_ms, *fb_params))}
+            finally:
+                con.close()
         except Exception:
             pass
 
@@ -4694,6 +4701,12 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("Cache-Control", "no-store")
         self.send_header("Connection", "close")
         self.end_headers()
+
+        # A HEAD request (uptime monitors, `curl -I`) wants the headers, not the
+        # stream. Without this it would enter the infinite loop below and tie up
+        # this worker thread until the client disconnected.
+        if self._head_only:
+            return
 
         # Start from NOW: the page already loaded its backlog over /api/tweets;
         # replaying history here would double every post on screen.

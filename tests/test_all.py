@@ -1976,6 +1976,60 @@ def test_collections(tmp):
        "deleting a whole board leaves every collected tweet in place")
 
 
+def test_forget_stream_purges_raw(tmp):
+    """
+    forget_stream(delete_tweets=True) must not orphan the externalized raw
+    payload. The raw Tweet.json lives in its own tweet_raw table (~10x the
+    searchable row) with no cascade, so a delete that skipped it would leave
+    the bulk of every "destroyed" tweet sitting in the database forever.
+    Regression guard for that leak, and for the shared-tweet EXCEPT rule.
+    """
+    import store as store_mod
+
+    db = pathlib.Path(tmp) / "results.db"
+
+    async def run():
+        st = store_mod.Store(db, False)
+        await st.open()
+        sid_a = await st.ensure_stream("gone", "q1", "Latest", True)
+        sid_b = await st.ensure_stream("kept", "q2", "Latest", True)
+
+        info = list(st.db.execute("PRAGMA table_info(tweets)"))
+        required = [x[1] for x in info if x[3] and x[4] is None and not x[5]]
+        text_cols = {x[1] for x in info if "TEXT" in (x[2] or "").upper()}
+
+        def add_tweet(tid, stream_ids):
+            row = {c: ("" if c in text_cols else 0) for c in required}
+            row.update(tweet_id=tid, created_ms=tid, collected_ms=tid, source="result")
+            st.db.execute(
+                f"INSERT INTO tweets({','.join(row)}) VALUES({','.join('?' * len(row))})",
+                list(row.values()))
+            st.db.execute("INSERT INTO tweet_raw(tweet_id, raw_json) VALUES(?, ?)",
+                          (tid, '{"id":"%d"}' % tid))
+            for s in stream_ids:
+                st.db.execute(
+                    "INSERT INTO tweet_hits(stream_id, tweet_id, first_seen_ms) "
+                    "VALUES(?,?,?)", (s, tid, tid))
+
+        add_tweet(201, [sid_a])              # only in the doomed stream
+        add_tweet(202, [sid_a, sid_b])       # shared with a stream we keep
+        st.db.commit()
+
+        res = await st.forget_stream("gone", delete_tweets=True)
+        out = {
+            "res": res,
+            "tweets": {r["tweet_id"] for r in st.db.execute("SELECT tweet_id FROM tweets")},
+            "raw": {r["tweet_id"] for r in st.db.execute("SELECT tweet_id FROM tweet_raw")},
+        }
+        await st.close()
+        return out
+
+    r = asyncio.run(run())
+    ok(r["res"]["tweets_deleted"] == 1, "only the unshared tweet is destroyed")
+    ok(r["tweets"] == {202}, "the tweet shared with a kept stream survives")
+    ok(r["raw"] == {202}, "its raw payload is purged with it — no orphan in tweet_raw")
+
+
 # ==========================================================================
 # content labelling (RULEBOOK §1 directive 2, the one named exception)
 #
@@ -4225,6 +4279,9 @@ def main():
         test_labels_store(fresh("labels_store"))
         test_cross_platform_pins(fresh("pins"))
         test_labels_web(fresh("labels_web"))
+
+        section("forget stream (delete_tweets purges externalized raw)")
+        test_forget_stream_purges_raw(fresh("forget"))
 
         section("facebook (store, cap, collect loop)")
         test_facebook(fresh("facebook"))

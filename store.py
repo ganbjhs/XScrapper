@@ -2528,6 +2528,16 @@ class Store:
                 "  SELECT tweet_id FROM tweet_hits WHERE stream_id = ?"
                 "  EXCEPT SELECT tweet_id FROM tweet_hits WHERE stream_id != ?)",
                 (sid, sid))
+            # The raw payload is externalized into its own table (~10x the size
+            # of the searchable row) with no cascade, so it must be deleted too
+            # — otherwise "destroy the data" leaves the bulk of every removed
+            # tweet orphaned forever. Same id set as the tweets delete above;
+            # runs while tweet_hits is still intact (it is cleared below).
+            self.db.execute(
+                "DELETE FROM tweet_raw WHERE tweet_id IN ("
+                "  SELECT tweet_id FROM tweet_hits WHERE stream_id = ?"
+                "  EXCEPT SELECT tweet_id FROM tweet_hits WHERE stream_id != ?)",
+                (sid, sid))
 
         for table in ("tweet_hits", "polls", "watermarks", "gaps"):
             self.db.execute(f"DELETE FROM {table} WHERE stream_id = ?", (sid,))
