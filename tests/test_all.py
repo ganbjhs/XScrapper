@@ -2403,6 +2403,66 @@ def test_cross_platform_pins(tmp):
        "old pin table here would have deleted every newly pinned post")
 
 
+def test_api_key_allowlist(tmp):
+    """
+    The API-key allowlist is a pair of literal sets, and the (method, path)
+    split IS the safety property — GET /api/projects lists, POST /api/projects
+    creates. Nothing enforces that but the sets themselves, so a path added to
+    the wrong one is a silent privilege grant that no other test would notice.
+
+    This guards the two ways it rots: an endpoint added later landing in a set
+    it does not belong in, and the method split being collapsed back to a
+    path-only check.
+    """
+    import web
+
+    read, write = web.API_KEY_READ_PATHS, web.API_KEY_WRITE_PATHS
+
+    # /api/fetch spends real X rate-limit budget. It is the only write a key
+    # gets, and that is a deliberate, argued exception — not a default.
+    ok(write == {"/api/fetch"},
+       f"a key may write exactly one path, /api/fetch (got {sorted(write)})")
+
+    # Classification calls a paid external model. A key that could POST it
+    # could spend the monthly cap from outside the dashboard.
+    ok("/api/classify" not in read and "/api/classify" not in write,
+       "/api/classify is not reachable with an API key (it spends money)")
+
+    # The label WRITE paths edit the vocabulary and override human labels.
+    for path in ("/api/labels/set", "/api/labels/settings"):
+        ok(path not in read and path not in write,
+           f"{path} is not reachable with an API key (it writes)")
+
+    # Credentials and processes are not data. These are the ones whose leak
+    # would be worst, so they are named rather than left to a rule.
+    for path in ("/api/pool/signin", "/api/stress/accounts", "/api/login/start"):
+        ok(path not in read and path not in write,
+           f"{path} stays cookie-only (credentials, not data)")
+
+    # The split itself. A path-only check would make these two identical.
+    def allowed(method, path):
+        return (method == "GET" and path in read) or path in write
+
+    ok(allowed("GET", "/api/projects"), "GET /api/projects is readable")
+    ok(not allowed("POST", "/api/projects"),
+       "POST /api/projects is refused — the method split is what stops a read "
+       "key creating projects")
+    ok(not allowed("DELETE", "/api/projects"), "DELETE /api/projects is refused")
+    ok(allowed("POST", "/api/fetch"), "POST /api/fetch is still granted")
+
+    # Every allowlisted path must actually be routed: a typo here fails open in
+    # the confusing direction — the caller gets 404 from a path we believe we
+    # granted, and debugging starts at the wrong end.
+    import pathlib as _pl
+    import re as _re
+    src = (_pl.Path(web.__file__)).read_text()
+    routed = set(_re.findall(r'u\.path == "(/api/[^"]+)"', src))
+    routed |= set(_re.findall(r'u\.path\.startswith\("(/api/[^"]+)"', src))
+    missing = sorted(p for p in (read | write)
+                     if p not in routed and not any(r.startswith(p) for r in routed))
+    ok(not missing, f"every allowlisted path is routed (unrouted: {missing})")
+
+
 def test_labels_web(tmp):
     """
     The read path: labels stamped onto every platform's feed, and a board
@@ -4279,6 +4339,9 @@ def main():
         test_labels_store(fresh("labels_store"))
         test_cross_platform_pins(fresh("pins"))
         test_labels_web(fresh("labels_web"))
+
+        section("api key allowlist (method split, paid paths shut)")
+        test_api_key_allowlist(fresh("apikeys"))
 
         section("forget stream (delete_tweets purges externalized raw)")
         test_forget_stream_purges_raw(fresh("forget"))
