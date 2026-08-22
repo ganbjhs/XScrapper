@@ -381,6 +381,14 @@ names).
   exactly what Watch-Tower did, six 403s deep, while nothing was blocking it.
   A 403 body carries `allowed_get` and `allowed_post`; a 401 says the key is
   missing or invalid, not that the endpoint is forbidden.
+- **Granting a read does not grant its addresses.** `/api/delivery` is readable
+  with a key so an integration can see how far behind each target is; the target
+  URLs and `sheet_id`s are masked to their host for machine callers and shown in
+  full only on a cookie. An Apps Script `/exec` deployment id, a Telegram chat
+  id and a link-shared spreadsheet id are all capability-ish — they are
+  infrastructure, not the collected data the key was issued for, and the whole
+  query string goes with them because a webhook URL may carry its token there.
+  The operator needs the address; the integration needs the number.
 - **One account, one steady IP.** Hopping IPs, or hammering a fresh account, is
   what gets accounts checkpointed. FB runs from the server IP; IG uses the
   residential pool; don't cross them.

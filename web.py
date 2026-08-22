@@ -1334,7 +1334,39 @@ def _live_rows(con, last_ms: int, last_tweet_id: int, project: int = 0,
 _sheets_url = "https://docs.google.com/spreadsheets/d/"
 
 
-def _delivery_json(q=None):
+def _mask_delivery(out: dict) -> dict:
+    """
+    Blunt the delivery view for a MACHINE caller.
+
+    /api/delivery is readable with an API key so an integration can see how far
+    behind each target is. The addresses are a different matter: a Google Apps
+    Script /exec URL and a sheet_id are infrastructure, and a spreadsheet shared
+    "anyone with the link" makes its id a read capability on its own. The
+    progress numbers are what a key holder actually needs; the addresses are
+    what the operator needs, and the operator is on a cookie.
+
+    Host, not nothing: "script.google.com" still tells an integrator which kind
+    of target this is, which is the only thing the URL was answering for them.
+    """
+    for t in out.get("targets", []):
+        url = t.get("url") or ""
+        if url.startswith("http"):
+            try:
+                u = urllib.parse.urlparse(url)
+                t["url"] = f"{u.scheme}://{u.netloc}" if u.netloc else ""
+            except ValueError:
+                t["url"] = ""
+        elif url.startswith("Telegram "):
+            t["url"] = "Telegram"        # the chat id is not theirs to have
+        if t.get("sheet_id"):
+            t["sheet_id"] = ""
+        if t.get("chat_id"):
+            t["chat_id"] = None
+        t["masked"] = True
+    return out
+
+
+def _delivery_json(q=None, mask: bool = False):
     """
     Where every delivery target stands. The number that matters is `behind`:
     how many collected tweets sit past the target's cursor — the same
@@ -1494,7 +1526,7 @@ def _delivery_json(q=None):
         out["sheet_creds_env"] = _sh.CREDS_ENV
     except Exception:
         out["sheet_service_account"] = ""
-    return out
+    return _mask_delivery(out) if mask else out
 
 
 def _activity_json(q):
@@ -4621,6 +4653,9 @@ class Handler(BaseHTTPRequestHandler):
     def _require_auth(self) -> bool:
         """True if the request may proceed; otherwise responds and returns False."""
         path = urllib.parse.urlparse(self.path).path
+        # Reset per request: this handler instance is reused across a keep-alive
+        # connection, so a stale True would mask a later cookie request.
+        self._via_api_key = False
 
         # A machine key gets an explicit allowlist of endpoints, never "whatever
         # a signed-in human can do". Checked before the cookie so an API client
@@ -4658,6 +4693,7 @@ class Handler(BaseHTTPRequestHandler):
                         "dashboard-only. Sign in with a browser for those."),
                 })
                 return False
+            self._via_api_key = True
             return True
 
         if self._authed():
@@ -4720,6 +4756,9 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
 
     _head_only = False
+    # Set per request by _require_auth. Cookie (a signed-in human) sees the
+    # delivery addresses; a machine key does not.
+    _via_api_key = False
 
     def _redirect(self, where: str):
         """303 See Other — used to send the old page URLs into the React app."""
@@ -4901,7 +4940,7 @@ class Handler(BaseHTTPRequestHandler):
             if u.path == "/api/watchlists":
                 return self._send(200, _watchlists_json(q))
             if u.path == "/api/delivery":
-                return self._send(200, _delivery_json(q))
+                return self._send(200, _delivery_json(q, mask=self._via_api_key))
             if u.path == "/api/streams/assignments":
                 return self._send(200, _stream_assignments_json())
             if u.path == "/api/live":

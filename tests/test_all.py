@@ -2462,6 +2462,44 @@ def test_api_key_allowlist(tmp):
                      if p not in routed and not any(r.startswith(p) for r in routed))
     ok(not missing, f"every allowlisted path is routed (unrouted: {missing})")
 
+    # /api/delivery is granted so an integration can watch how far behind each
+    # target is. The ADDRESSES are not part of that: an Apps Script /exec URL
+    # and a sheet_id are infrastructure, and a link-shared spreadsheet makes its
+    # id a read capability on its own. A token carried in a webhook query string
+    # is the sharpest case, which is why the whole query is dropped, not escaped.
+    import copy as _copy
+    raw = {"targets": [
+        {"label": "dt:6", "kind": "sheet",
+         "url": "https://script.google.com/macros/s/AKfycbxSECRET/exec",
+         "sheet_id": "1AbCdEfGhIjK", "chat_id": None},
+        {"label": "dt:3", "kind": "telegram", "url": "Telegram -1001234567890",
+         "sheet_id": "", "chat_id": "-1001234567890"},
+        {"label": "wh", "kind": "webhook",
+         "url": "https://watchtower.example.com/ingest?token=abc123",
+         "sheet_id": "", "chat_id": None},
+    ]}
+    m = {t["label"]: t for t in web._mask_delivery(_copy.deepcopy(raw))["targets"]}
+    ok(m["dt:6"]["url"] == "https://script.google.com",
+       "a masked Apps Script URL keeps its host and loses the deployment id")
+    ok(m["dt:6"]["sheet_id"] == "", "a masked target discloses no sheet_id")
+    ok(m["dt:3"]["url"] == "Telegram" and m["dt:3"]["chat_id"] is None,
+       "a masked Telegram target discloses no chat id")
+    ok("token" not in m["wh"]["url"] and m["wh"]["url"].endswith("example.com"),
+       "masking drops the query string, so a token in a webhook URL is not "
+       "handed to a key holder")
+    ok(all(t.get("masked") for t in m.values()),
+       "a masked response says so, rather than looking like a target with no "
+       "address configured")
+
+    # The flag must reset per request: one handler instance serves a whole
+    # keep-alive connection, so a key request followed by a dashboard request
+    # on the same socket would otherwise mask the dashboard's own view.
+    src_auth = src[src.index("def _require_auth"):]
+    src_auth = src_auth[:src_auth.index("def ", 10)]
+    ok("self._via_api_key = False" in src_auth,
+       "_require_auth resets the key flag before deciding, so it cannot leak "
+       "across a keep-alive connection")
+
 
 def test_labels_web(tmp):
     """
