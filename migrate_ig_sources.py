@@ -6,8 +6,14 @@ single identity.
 
 RUN THIS ON THE MACHINE THAT HOLDS THE DATABASE (the server), once:
 
-    python3 migrate_ig_sources.py --db ig_results.db          # report only
-    python3 migrate_ig_sources.py --db ig_results.db --apply  # do it
+    python3 migrate_ig_sources.py --db ig_results.db                    # report only
+    python3 migrate_ig_sources.py --db ig_results.db --apply            # do it
+    python3 migrate_ig_sources.py --db ig_results.db --apply --project 2
+
+The third form also assigns every source and post that has no project to
+project 2. Instagram data predates project scoping, so without it an existing
+database reads as EMPTY in the dashboard — the rows are all still there, but
+every read is scoped now and nothing belongs to project 0.
 
 WHAT CHANGED AND WHY THERE IS A MIGRATION AT ALL
 ------------------------------------------------
@@ -73,6 +79,11 @@ def main() -> int:
                     help="actually write; without it this is a dry run")
     ap.add_argument("--seed", action="append", default=[], metavar="LABEL=ID",
                     help="cache a numeric id you already know; repeatable")
+    ap.add_argument("--project", type=int, default=None, metavar="N",
+                    help="assign every source and post that has NO project to "
+                         "project N. Without this they keep project 0, which "
+                         "means the dashboard and the API show nothing — see "
+                         "the note below.")
     args = ap.parse_args()
 
     path = Path(args.db)
@@ -102,15 +113,30 @@ def main() -> int:
     db = sqlite3.connect(path, timeout=15)
     db.row_factory = sqlite3.Row
 
-    # -- 1. the column -----------------------------------------------------
-    if "platform_id" not in _cols(db, "sources"):
-        print("sources.platform_id: MISSING -> add")
-        if args.apply:
-            db.execute("ALTER TABLE sources ADD COLUMN "
-                       "platform_id TEXT NOT NULL DEFAULT ''")
-            db.commit()
-    else:
-        print("sources.platform_id: present")
+    # -- 1. the columns ----------------------------------------------------
+    #
+    # This script talks to sqlite directly rather than going through
+    # store_ig.Store, so it must add EVERY column store_ig._migrate would.
+    # (Paid for immediately: the first version added only platform_id, so the
+    # --project step below found no project_id column and skipped itself
+    # without a word. A migration that half-runs is worse than one that
+    # refuses.) Keep this list in step with store_ig.Store._migrate.
+    COLUMNS = [
+        ("sources", "platform_id", "TEXT NOT NULL DEFAULT ''"),
+        ("sources", "project_id", "INTEGER NOT NULL DEFAULT 0"),
+        ("posts", "project_id", "INTEGER NOT NULL DEFAULT 0"),
+    ]
+    for table, col, decl in COLUMNS:
+        if col not in _cols(db, table):
+            print(f"{table}.{col}: MISSING -> add")
+            if args.apply:
+                db.execute(f"ALTER TABLE {table} ADD COLUMN {col} {decl}")
+        else:
+            print(f"{table}.{col}: present")
+    if args.apply:
+        db.execute("CREATE INDEX IF NOT EXISTS ix_posts_project ON posts(project_id)")
+        db.execute("CREATE INDEX IF NOT EXISTS ix_sources_project ON sources(project_id)")
+        db.commit()
 
     if "platform_id" not in _cols(db, "sources"):
         # Dry run against the OLD schema. There is no platform_id to query, so
@@ -147,6 +173,23 @@ def main() -> int:
             print(f"\n{len(other)} non-user source(s), untouched: "
                   f"{', '.join(repr(o['label']) for o in other)}")
 
+        # Project assignment, reported from the old schema too. This branch
+        # early-returns, and the first version of it said nothing about the
+        # step that decides whether the dashboard comes back empty — which is
+        # the single most consequential thing this script does.
+        n_all = len(rows)
+        if args.project:
+            print(f"\nevery source ({n_all}) and every post currently has no "
+                  f"project; all of them would be assigned to project "
+                  f"{args.project}")
+        else:
+            print(f"\nNO --project GIVEN. All {n_all} source(s) and every post "
+                  f"would keep project 0.")
+            print("  Every dashboard and API read is project-scoped, and "
+                  "nothing matches project 0 — so the Instagram panel will "
+                  "read EMPTY until you assign one.")
+            print("  Add --project <id> unless you mean to park this data.")
+
         print("\nNo label is written, in this mode or any other.")
         print("Re-run with --apply to perform the migration.")
         return 0
@@ -182,6 +225,34 @@ def main() -> int:
 
     if args.apply:
         db.commit()
+
+    # -- 3b. project assignment --------------------------------------------
+    #
+    # Instagram data predates project scoping, so every existing row has
+    # project_id 0 — and a scoped read returns nothing for project 0, by
+    # design. That means an un-migrated database looks EMPTY in the dashboard
+    # even though every post is still there. This step is what makes it
+    # visible again, and it is opt-in because only the operator knows which
+    # project the existing collection was actually for.
+    if "project_id" in _cols(db, "sources"):
+        n_src = db.execute("SELECT COUNT(*) c FROM sources "
+                           "WHERE project_id = 0").fetchone()["c"]
+        n_post = db.execute("SELECT COUNT(*) c FROM posts "
+                            "WHERE project_id = 0").fetchone()["c"]
+        if args.project:
+            print(f"\nassigning {n_src} source(s) and {n_post} post(s) with no "
+                  f"project -> project {args.project}")
+            if args.apply:
+                db.execute("UPDATE sources SET project_id = ? WHERE project_id = 0",
+                           (args.project,))
+                db.execute("UPDATE posts SET project_id = ? WHERE project_id = 0",
+                           (args.project,))
+                db.commit()
+        elif n_src or n_post:
+            print(f"\n{n_src} source(s) and {n_post} post(s) have NO project.")
+            print("  They are collected but invisible: every dashboard and API "
+                  "read is project-scoped, and nothing matches project 0.")
+            print("  Re-run with --project <id> to assign them.")
 
     # -- 4. the worklist ---------------------------------------------------
     pending = [dict(r) for r in db.execute(

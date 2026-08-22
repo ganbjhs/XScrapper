@@ -51,6 +51,47 @@ delivery, the UI card — already generalizes over it, so a fourth platform
 touches no downstream code. `tweet_id` is always a **string** (JS loses integer
 precision past 2^53; snowflake ids are well past it).
 
+### Instagram and Facebook data is PROJECT-SCOPED, and the default is closed
+
+A request that names no project returns NOTHING, and says so. It does not
+return everything.
+
+Both platforms used to accept `?project=N` and do `pid or None` at every call
+site, and `None` reached the store as "no WHERE clause". Scoping therefore
+worked exactly as long as the caller remembered to ask for it, and silently did
+not when they forgot. **A filter that defaults open is not a boundary, it is a
+suggestion** — one dropped query parameter (a bookmarked URL, a refactored
+fetch, a curl during debugging) and one project's operator is reading another
+project's collection. Instagram was worse: it had no project mapping at all,
+and `_metrics_json` drew the same global chart under every project.
+
+The rules:
+
+- **Every `/api/ig/*` and `/api/fb/*` DATA endpoint requires a project** —
+  status, posts, source, fetch, favorites. No project, no data, with the reason
+  in the response (`web.py::_NO_PROJECT`).
+- **Enforcement is at the BOUNDARY, not in the store.** `store_ig`/`store_fb`
+  still accept `project_id=None` for "every project", because the collector has
+  to walk every source in one pass and the migration has to see rows that
+  belong to nobody. Capability underneath, policy at the edge — one place to
+  audit, and no chance of a collector silently collecting nothing because a
+  filter defaulted closed.
+- **A post inherits its project from the source that collected it**, stamped at
+  write time (`store_ig.upsert_posts`). Reassigning a source does NOT rewrite
+  history: a post genuinely was gathered for whoever was watching at the time.
+- **The external API key CARRIES its scope** (`api_keys.project_id`). Not a
+  query parameter — a third party must not be able to ask for another project
+  by editing a number in a URL. A key issued before scoping has project 0 and
+  is REFUSED with an explanation, because its old behaviour was "all Instagram
+  data" and quietly preserving that is the exact leak this closes.
+- **Project 0 means UNASSIGNED, never "all".** A parked source still collects;
+  it is invisible, not disabled. `collect_ig.py list-sources` names parked
+  sources explicitly so they cannot be forgotten.
+- **Operational switches are NOT scoped.** Pause/resume, cadence, login health
+  describe the one collector, not anyone's data. Pausing Instagram pauses
+  Instagram. Accounts are likewise global — a login belongs to the server, and
+  the Accounts panel shows it in every project view.
+
 ### The three-column source: a PERSON, a HANDLE, an ID — never one string
 
 A source row holds three different facts with three different lifetimes, and
@@ -574,6 +615,9 @@ updated, never deleted (the pre-commit hook blocks the deletion).
   per-watchlist check intervals and collection-time filters.
 - Instagram sources: user / hashtag / home-feed, managed from the dashboard
   (`/api/ig/source`), collected by the IG service.
+- Project scoping on IG and FB, defaulting CLOSED (§2). No endpoint may be
+  changed back to serving every project when the caller names none, and the
+  external API key may not gain a project query parameter.
 - The three-column source contract (§2): `label` = person, `value` = handle,
   `platform_id` = numeric id. No code path may write `label`, and no path may
   collapse the three back into one column — that collapse is the bug the model

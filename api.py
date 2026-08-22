@@ -46,6 +46,9 @@ CREATE TABLE IF NOT EXISTS api_keys (
   prefix     TEXT PRIMARY KEY,     -- 'wt_' + 8 chars, shown in listings
   key_hash   TEXT NOT NULL UNIQUE, -- sha256 of the full key; the key is never stored
   name       TEXT NOT NULL,
+  project_id INTEGER NOT NULL DEFAULT 0,  -- THE SCOPE. A key sees one project's
+                                          -- posts and nothing else. 0 = scoped
+                                          -- to nothing, and is refused at use.
   revoked    INTEGER NOT NULL DEFAULT 0,
   created_at INTEGER NOT NULL,
   last_used  INTEGER,
@@ -53,11 +56,33 @@ CREATE TABLE IF NOT EXISTS api_keys (
 );
 """
 
+# WHY THE KEY CARRIES THE SCOPE, RATHER THAN THE REQUEST
+#
+# This service is the one surface a THIRD PARTY talks to. If the project were a
+# query parameter, scoping would be a request for the caller to make correctly,
+# and any caller could ask for any project by changing a number in a URL. That
+# is not a boundary, it is a naming convention.
+#
+# Binding the project to the key inverts it: the caller cannot express "someone
+# else's data" at all. There is no parameter to tamper with, the audit question
+# ("what can this key see?") is answered by one column, and revoking a key
+# revokes exactly one project's access.
+#
+# A key created before this column existed has project_id 0 and is REFUSED with
+# an explanation, not silently served everything. That is deliberate: the old
+# behaviour of those keys was "all Instagram data", and quietly keeping it would
+# be the exact leak this closes. Re-issue them against a project.
+
 
 def _keydb(path=KEY_DB):
     db = sqlite3.connect(path, timeout=10)
     db.row_factory = sqlite3.Row
     db.executescript(KEY_SCHEMA)
+    # Self-applying migration, same discipline as the stores (RULEBOOK §7).
+    have = {r[1] for r in db.execute("PRAGMA table_info(api_keys)")}
+    if "project_id" not in have:
+        db.execute("ALTER TABLE api_keys ADD COLUMN "
+                   "project_id INTEGER NOT NULL DEFAULT 0")
     db.commit()
     return db
 
@@ -66,15 +91,31 @@ def _hash(token: str) -> str:
     return hashlib.sha256(token.encode()).hexdigest()
 
 
-def create_key(name: str, path=KEY_DB) -> str:
+def create_key(name: str, path=KEY_DB, project_id: int = 0) -> str:
+    """Issue a key FOR ONE PROJECT. A key with project_id 0 authenticates but
+    is refused at every data endpoint — there is no such thing as a key that
+    reads everything."""
     token = "wt_" + secrets.token_urlsafe(24)
     prefix = token[:11]
     db = _keydb(path)
-    db.execute("INSERT INTO api_keys(prefix,key_hash,name,created_at) VALUES(?,?,?,?)",
-               (prefix, _hash(token), name, int(time.time())))
+    db.execute("INSERT INTO api_keys(prefix,key_hash,name,project_id,created_at) "
+               "VALUES(?,?,?,?,?)",
+               (prefix, _hash(token), name, int(project_id or 0), int(time.time())))
     db.commit()
     db.close()
     return token
+
+
+def set_key_project(prefix: str, project_id: int, path=KEY_DB) -> bool:
+    """Re-scope an existing key — the migration path for keys issued before
+    scoping existed."""
+    db = _keydb(path)
+    cur = db.execute("UPDATE api_keys SET project_id=? WHERE prefix=?",
+                     (int(project_id or 0), prefix))
+    db.commit()
+    n = cur.rowcount
+    db.close()
+    return n > 0
 
 
 def verify_key(token: str, path=KEY_DB):
@@ -152,12 +193,26 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/v1/health":
             return self._send(200, {"ok": True, "service": "collector-api", "version": VERSION})
 
-        if self._auth_or_401() is None:
+        key = self._auth_or_401()
+        if key is None:
             return
+
+        # The key IS the scope. A key with no project reads nothing — see the
+        # note above KEY_SCHEMA for why this refuses rather than defaults open.
+        pid = int(key.get("project_id") or 0)
+        if not pid:
+            return self._send(403, {
+                "error": "key not scoped to a project",
+                "detail": ("This API key was issued before project scoping and "
+                           "is not bound to a project, so it can read nothing. "
+                           "Re-issue it against a project, or re-scope it with "
+                           "api.set_key_project(<prefix>, <project_id>)."),
+                "key": key.get("prefix")})
 
         if path == "/v1/stats":
             with store_ig.Store(self.results_db) as st:
-                return self._send(200, st.stats())
+                return self._send(200, {**st.stats(project_id=pid),
+                                        "project_id": pid})
 
         if path == "/v1/instagram/posts":
             def one(name, cast=str, default=None):
@@ -173,10 +228,12 @@ class Handler(BaseHTTPRequestHandler):
                 rows = st.query(
                     since=one("since", int), until=one("until", int),
                     source=one("source"), username=one("username"),
-                    before_pk=one("cursor", int), limit=limit)
+                    before_pk=one("cursor", int), limit=limit,
+                    project_id=pid)
             posts = [store_ig.to_api(r) for r in rows]
             next_cursor = posts[-1]["id"] if len(posts) == limit and posts else None
-            return self._send(200, {"platform": "instagram", "count": len(posts),
+            return self._send(200, {"platform": "instagram", "project_id": pid,
+                                    "count": len(posts),
                                     "next_cursor": next_cursor, "posts": posts})
 
         return self._send(404, {"error": "not found",
@@ -203,9 +260,16 @@ def main() -> int:
     ap = argparse.ArgumentParser(description="Collector data-extraction API + key management")
     sub = ap.add_subparsers(dest="cmd", required=True)
 
-    n = sub.add_parser("newkey"); n.add_argument("--name", required=True)
+    n = sub.add_parser("newkey")
+    n.add_argument("--name", required=True)
+    n.add_argument("--project", type=int, required=True,
+                   help="the project this key may read. Required: there is no "
+                        "key that reads everything.")
     sub.add_parser("listkeys")
     rv = sub.add_parser("revoke"); rv.add_argument("prefix")
+    sk = sub.add_parser("scope", help="re-scope an existing key to a project")
+    sk.add_argument("prefix")
+    sk.add_argument("--project", type=int, required=True)
     s = sub.add_parser("serve")
     s.add_argument("--host", default="127.0.0.1")
     s.add_argument("--port", type=int, default=8790)
@@ -214,11 +278,18 @@ def main() -> int:
     args = ap.parse_args()
 
     if args.cmd == "newkey":
-        token = create_key(args.name)
+        token = create_key(args.name, project_id=args.project)
         print("API key created. This is shown ONCE — copy it now:\n")
         print(f"    {token}\n")
-        print(f"Give it to {args.name}. Test it:")
+        print(f"Give it to {args.name}. It can read project {args.project} "
+              f"and nothing else. Test it:")
         print(f'    curl -H "Authorization: Bearer {token}" http://127.0.0.1:8790/v1/instagram/posts')
+        return 0
+
+    if args.cmd == "scope":
+        print(f"{args.prefix} -> project {args.project}"
+              if set_key_project(args.prefix, args.project)
+              else "no key with that prefix")
         return 0
 
     if args.cmd == "listkeys":
@@ -227,7 +298,9 @@ def main() -> int:
             print("no keys yet — create one with `api.py newkey --name <who>`")
         for r in rows:
             state = "REVOKED" if r["revoked"] else "active"
-            print(f"  {r['prefix']}…  {r['name']:16} {state:8} calls={r['calls']}")
+            proj = r["project_id"] or "NONE — reads nothing, re-scope it"
+            print(f"  {r['prefix']}…  {r['name']:16} {state:8} "
+                  f"project={proj}  calls={r['calls']}")
         return 0
 
     if args.cmd == "revoke":

@@ -124,11 +124,14 @@ async def collect_source(engine, store, source, *, page_size=12, max_pages=2, lo
         if stop:
             break
 
-    new = store.upsert_posts(collected, source.label)
+    # project_id comes from the source row, not from this call — see
+    # store_ig.upsert_posts. A post belongs to whoever was watching for it.
+    new = store.upsert_posts(collected, source.label, source.project_id)
     if newest and (not wm or newest > wm):
         store.set_watermark(source.label, newest)
     log(f"  [{source.label}] type={source.type} handle={source.value or '-'} "
         f"id={source.platform_id or '(unresolved)'} "
+        f"project={source.project_id or '(unassigned)'} "
         f"new={new} (had watermark={'yes' if wm else 'no'})")
     return new
 
@@ -306,6 +309,15 @@ def main() -> int:
     a.add_argument("--type", required=True, choices=["following", "user", "hashtag"])
     a.add_argument("--value", default="")
     a.add_argument("--account", default="")
+    a.add_argument("--project", type=int, default=0,
+                   help="which project owns this source. A source with no "
+                        "project is collected but invisible to every scoped "
+                        "read — assign one unless you mean to park it.")
+
+    sp = sub.add_parser("set-project", help="move a source to a project "
+                                            "(0 parks it, hiding it everywhere)")
+    sp.add_argument("--label", required=True)
+    sp.add_argument("--project", type=int, required=True)
 
     sub.add_parser("list-sources")
 
@@ -339,8 +351,23 @@ def main() -> int:
         if args.type == "hashtag" and not args.value:
             print("--value is the hashtag for a hashtag source"); return 1
         with store_ig.Store(store_path) as st:
-            st.add_source(args.label, args.type, args.value, args.account)
-        print(f"added source '{args.label}' ({args.type} {args.value})")
+            st.add_source(args.label, args.type, args.value, args.account,
+                          project_id=args.project)
+        where = f"project {args.project}" if args.project else "NO project (parked)"
+        print(f"added source '{args.label}' ({args.type} {args.value}) -> {where}")
+        if not args.project:
+            print("  note: a source with no project is invisible to the "
+                  "dashboard and the API. Set one with `set-project`.")
+        return 0
+
+    if args.cmd == "set-project":
+        with store_ig.Store(store_path) as st:
+            if not st.db.execute("SELECT 1 FROM sources WHERE label=?",
+                                 (args.label,)).fetchone():
+                print(f"no source labelled '{args.label}'"); return 1
+            st.set_project(args.label, args.project)
+        print(f"[{args.label}] -> project {args.project or '(none — parked)'}"
+              "  (posts already collected keep the project they were collected under)")
         return 0
 
     if args.cmd == "set-id":
@@ -372,7 +399,14 @@ def main() -> int:
             for s in rows:
                 print(f"  {s.label:22} {s.type:10} {s.value or '-':20} "
                       f"id={s.platform_id or '-':<14} "
+                      f"project={s.project_id or '-':<6} "
                       f"account={s.account or '(active)'}")
+            parked = [s.label for s in rows if not s.project_id]
+            if parked:
+                print(f"\n  {len(parked)} source(s) with NO project — collected, "
+                      f"but invisible to the dashboard and the API:")
+                for lab in parked:
+                    print(f"    {lab}")
             print("stats:", st.stats())
         return 0
 

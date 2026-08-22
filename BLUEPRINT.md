@@ -96,7 +96,7 @@ The organizing layer (in `store.py` + `web.py`):
 | `store_accounts.py` / `accounts_api.py` | Managed account pool (encrypted secrets, TOTP, backup codes, failover) + its API |
 | `config.py` / `config.toml` | What to watch + accounts; passwords live in `.env` by name |
 | `web.py` | THE server: JSON API, SSE live stream, auth, serves `frontend/dist` at `/app` |
-| `api.py` | API-key service (hash-stored keys) serving Instagram posts to Watch-Tower |
+| `api.py` | API-key service (hash-stored keys) serving Instagram posts to Watch-Tower. A key carries its `project_id` — the key IS the scope; an unscoped key reads nothing |
 | `ig.py`, `ig_import.py`, `ig_login.py`, `ig_session.py` | Instagram session acquisition/persistence (cookie or password; device pinned) |
 | `engine_ig.py`, `collect_ig.py`, `store_ig.py` | Instagram engine / poll loop (+ human pacing) / store (`ig_results.db`, settings). Sources are three columns: `label` person, `value` handle, `platform_id` numeric id |
 | `migrate_ig_sources.py` | One-time, manual, idempotent: moves an old `ig_results.db` onto the three-column source model. Backs up first; never writes `label` |

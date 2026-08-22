@@ -1393,6 +1393,112 @@ def test_ig_device(tmp):
            "an old database gains platform_id on open and keeps collecting")
 
     print()
+    print("== project scoping: no project, no data ==")
+    # The old behaviour was `pid or None` at every call site, and None reached
+    # the store as "no WHERE clause". Scoping therefore worked exactly as long
+    # as the caller remembered to ask for it. These assertions pin the default
+    # CLOSED: a read that names no project returns nothing, never everything.
+    import store_ig as _sig, tempfile as _tf2, os as _os2
+
+    sp2 = _os2.path.join(_tf2.mkdtemp(), "scope.db")
+    with _sig.Store(sp2) as st:
+        st.add_source("Modi", "user", "narendramodi", project_id=2)
+        st.add_source("Kejriwal", "user", "arvindkejriwal", project_id=3)
+        st.add_source("Parked", "user", "someoneelse")          # no project
+        st.upsert_posts([{"pk": 100, "code": "a", "taken_at": 1}], "Modi")
+        st.upsert_posts([{"pk": 200, "code": "b", "taken_at": 2}], "Kejriwal")
+        st.upsert_posts([{"pk": 300, "code": "c", "taken_at": 3}], "Parked")
+
+        ok(st.db.execute("SELECT project_id FROM posts WHERE pk=100").fetchone()[0] == 2,
+           "a post inherits its project from the source that collected it")
+        ok([x.label for x in st.sources(project_id=2)] == ["Modi"],
+           "a project sees its own sources")
+        ok([x.label for x in st.sources(project_id=3)] == ["Kejriwal"],
+           "and only its own — the other project's source is not there")
+        ok([r["pk"] for r in st.query(project_id=2)] == [100],
+           "a project sees its own posts")
+        ok([r["pk"] for r in st.query(project_id=3)] == [200],
+           "and cannot see the other project's")
+        ok([r["pk"] for r in st.query(project_id=0)] == [300],
+           "project 0 is a real id matching the UNASSIGNED rows — not a "
+           "wildcard, and not an alias for 'all'")
+        ok(len(st.query()) == 3,
+           "the store CAN still read unscoped — the collector and the migration "
+           "need it; the boundary is what refuses (web.py, api.py)")
+        ok(st.stats(project_id=2)["posts"] == 1 and st.stats()["posts"] == 3,
+           "stats scope the same way")
+
+        # A parked source still collects. It is invisible, not disabled — the
+        # posts are there the moment someone assigns it.
+        ok([x.label for x in st.sources(project_id=0)] == ["Parked"],
+           "an unassigned source is parked, not lost")
+        st.set_project("Parked", 3)
+        ok(sorted(x.label for x in st.sources(project_id=3)) == ["Kejriwal", "Parked"],
+           "assigning it makes it visible to that project")
+        ok([r["pk"] for r in st.query(project_id=3)] == [200],
+           "but its already-collected posts keep the project they were "
+           "collected under — history is not retroactively reassigned")
+
+    # THE BOUNDARY. The assertions above prove the store can scope; these prove
+    # the endpoints actually DO. That distinction is the whole bug: the store
+    # could always scope, and every call site defaulted to not bothering.
+    import web as _web
+
+    # _ig_status reads the ACCOUNT pool whatever the project, so it needs a
+    # config even on the refused path. Point it at an empty temp root: no
+    # accounts to find, which is exactly what we want to assert around.
+    class _Cfg:
+        root = pathlib.Path(_tf2.mkdtemp())
+    _orig_cfg = _web._CFG
+    _web._CFG = _Cfg()
+    try:
+        _scoping_boundary_checks(_web)
+    finally:
+        _web._CFG = _orig_cfg
+
+    # The API key IS the scope: there is no parameter for a caller to tamper
+    # with, and a key issued before scoping reads nothing rather than all.
+    import api as _api
+    kp = _os2.path.join(_tf2.mkdtemp(), "keys.db")
+    tok2 = _api.create_key("watchtower", path=kp, project_id=2)
+    tok0 = _api.create_key("legacy", path=kp)
+    ok(_api.verify_key(tok2, kp)["project_id"] == 2,
+       "a key carries the project it may read")
+    ok(_api.verify_key(tok0, kp)["project_id"] == 0,
+       "a key issued with no project carries 0, which the service refuses")
+    pre = _api.verify_key(tok0, kp)["prefix"]
+    ok(_api.set_key_project(pre, 7, kp) and _api.verify_key(tok0, kp)["project_id"] == 7,
+       "and can be re-scoped rather than reissued")
+
+
+def _scoping_boundary_checks(_web):
+    """Every IG/FB data endpoint, called with no project."""
+    for fn, arg, what in [(_web._ig_posts, {}, "/api/ig/posts"),
+                          (_web._fb_posts, {}, "/api/fb/posts"),
+                          (_web._fb_status, {}, "/api/fb/status"),
+                          (_web._ig_fetch, {}, "/api/ig/fetch"),
+                          (_web._fb_fetch, {}, "/api/fb/fetch"),
+                          (_web._fb_favorites, {}, "/api/fb/favorites")]:
+        r = fn(arg)
+        ok(r.get("error") == "no project selected" and not r.get("posts")
+           and not r.get("sources"),
+           f"{what} with no project returns nothing, and says why")
+    r = _web._ig_status({})
+    ok(r.get("error") == "no project selected" and r["sources"] == [],
+       "/api/ig/status with no project lists no sources")
+    ok("accounts" in r,
+       "...but still reports ACCOUNTS — a login belongs to the server, not to "
+       "a project, and the Accounts panel needs it in every view")
+    for act in ("add",):
+        r = _web._ig_source_post({"action": act, "label": "X", "value": "x"})
+        ok(r.get("error") == "no project selected",
+           "adding an Instagram source with no project is refused, not parked "
+           "silently")
+        r = _web._fb_source_post({"action": act, "label": "somepage"})
+        ok(r.get("error") == "no project selected",
+           "and the same for a Facebook page")
+
+    print()
     print("== username -> pk resolution ==")
     # Instagram grants name LOOKUP and media READS separately: a live session
     # was measured fetching user_medias_paginated_v1('787132') while every

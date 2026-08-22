@@ -1428,10 +1428,10 @@ def _metrics_json(q=None):
     The stat strip and the 7-day chart, from what is actually stored. Days are
     UTC to match every other timestamp in the store.
 
-    ?project=N scopes the X and Facebook numbers to that project (X via
-    project_streams, Facebook via posts.project_id). Instagram is a GLOBAL pool
-    with no project mapping, so its line is the same global flow in every view
-    rather than reading zero.
+    ?project=N scopes ALL THREE platforms to that project — X via
+    project_streams, Facebook and Instagram via posts.project_id. With no
+    project the platform lines read zero rather than showing everyone's flow:
+    a chart is data, and data is scoped.
     """
     try:
         pid = int((q or {}).get("project") or 0)
@@ -1481,18 +1481,21 @@ def _metrics_json(q=None):
     else:
         by_day = {}
 
-    # Instagram is a GLOBAL pool (no project mapping), so its line is the same
-    # in every project view — show it rather than zeroing it under a project.
+    # Instagram posts now carry project_id (store_ig), so this line describes
+    # THIS project exactly as the X and Facebook lines do. It used to be the
+    # global flow drawn into every project's chart, which made the same graph
+    # appear under every project and overstated all of them.
     ig_by_day = {}
     rp = _CFG.root / "ig_results.db"
-    if rp.exists():
+    if rp.exists() and pid:
         try:
             con = sqlite3.connect(f"file:{rp}?mode=ro", uri=True, timeout=5)
             con.row_factory = sqlite3.Row
             # store_ig keys taken_at in unix SECONDS.
             ig_by_day = {int(r["d"]): r["c"] for r in con.execute(
                 "SELECT (taken_at * 1000) / ? AS d, COUNT(*) c FROM posts "
-                "WHERE taken_at * 1000 >= ? GROUP BY d", (day_ms, week_ago))}
+                "WHERE taken_at * 1000 >= ? AND project_id = ? GROUP BY d",
+                (day_ms, week_ago, pid))}
             con.close()
         except Exception:
             pass
@@ -1501,14 +1504,11 @@ def _metrics_json(q=None):
     # same way X is, so it describes THIS project. Uses collected_ms to match X.
     fb_by_day = {}
     fp = _CFG.root / "fb_results.db"
-    if fp.exists():
+    if fp.exists() and pid:
         try:
             con = sqlite3.connect(f"file:{fp}?mode=ro", uri=True, timeout=5)
             con.row_factory = sqlite3.Row
-            fb_where, fb_params = "collected_ms >= ?", [week_ago]
-            if pid:
-                fb_where += " AND project_id = ?"
-                fb_params.append(pid)
+            fb_where, fb_params = "collected_ms >= ? AND project_id = ?", [week_ago, pid]
             fb_by_day = {int(r["d"]): r["c"] for r in con.execute(
                 f"SELECT collected_ms / ? AS d, COUNT(*) c FROM posts "
                 f"WHERE {fb_where} GROUP BY d", (day_ms, *fb_params))}
@@ -2934,12 +2934,54 @@ LOGIN_PAGE = """<!doctype html>
 </form></body></html>"""
 
 
-def _fb_status(q=None):
-    """Facebook sources + totals for a project (or all)."""
+# ==========================================================================
+# project scoping for Instagram and Facebook
+# ==========================================================================
+#
+# THE RULE: a data request that names no project returns NOTHING and says so.
+#
+# It used to return everything. Both platforms accepted `?project=N` and both
+# did `pid or None`, and `None` reached the store as "no WHERE clause" — so the
+# scoping worked exactly as long as the caller remembered to ask for it, and
+# silently didn't when they forgot. A filter that defaults open is not a
+# boundary; it is a suggestion. One dropped query parameter — a bookmarked URL,
+# a refactored fetch, a curl during debugging — and one project's operator is
+# reading another project's collection.
+#
+# So the default is now closed, and it is closed HERE rather than in the store,
+# because the store has legitimate unscoped readers (the collector walks every
+# source in one pass; the migration touches rows that belong to nobody yet).
+# Policy at the boundary, capability underneath. See the note above the schema
+# in store_ig.py.
+#
+# Operational switches — pause/resume, cadence, login health — are deliberately
+# NOT scoped. They describe the collector, not anyone's data, and there is one
+# collector. Pausing Instagram pauses Instagram.
+
+_NO_PROJECT = {
+    "error": "no project selected",
+    "detail": ("Instagram and Facebook data is scoped to a project. Pass "
+               "?project=<id> (or \"project\" in the body). There is no "
+               "cross-project view: a request that names no project returns "
+               "nothing rather than everything."),
+    "sources": [], "posts": [], "count": 0,
+    "totals": {"posts": 0}, "next_cursor": None,
+}
+
+
+def _project_or_none(src):
+    """The project id in a query dict or a POST body, or 0 if absent/garbage."""
     try:
-        pid = int((q or {}).get("project") or 0)
+        return int((src or {}).get("project") or 0)
     except (TypeError, ValueError):
-        pid = 0
+        return 0
+
+
+def _fb_status(q=None):
+    """Facebook sources + totals for ONE project. No project, no data."""
+    pid = _project_or_none(q)
+    if not pid:
+        return dict(_NO_PROJECT)
     out = {"sources": [], "totals": {"posts": 0}, "enabled": False}
     rp = _CFG.root / "fb_results.db"
     # Configured if ANY login path exists: raw cookies, email+password, or a
@@ -2973,14 +3015,14 @@ def _fb_status(q=None):
         try:
             import store_fb
             with store_fb.Store(rp) as st:
-                srcs = st.sources(project_id=pid or None)
+                srcs = st.sources(project_id=pid)
                 # Map each page's stored interval back to the named speed the
                 # panel offers, so re-opening shows what is actually set.
                 inv = {v: k for k, v in FB_SPEEDS.items()}
                 for s in srcs:
                     s["speed"] = inv.get(s.get("interval_s"), "")
                 out["sources"] = srcs
-                out["totals"] = {"posts": st.total(pid or None)}
+                out["totals"] = {"posts": st.total(pid)}
                 settings = st.settings_all()
         except Exception as e:
             out["error"] = f"{type(e).__name__}: {e}"
@@ -3001,15 +3043,14 @@ def _fb_status(q=None):
 
 
 def _fb_posts(q):
-    """Collected Facebook posts, newest first, in the shared feed shape."""
+    """Collected Facebook posts for ONE project, newest first."""
+    pid = _project_or_none(q)
+    if not pid:
+        return dict(_NO_PROJECT)
     rp = _CFG.root / "fb_results.db"
     if not rp.exists():
         return {"count": 0, "posts": []}
     import store_fb
-    try:
-        pid = int(q.get("project") or 0)
-    except (TypeError, ValueError):
-        pid = 0
     since_ms = None
     if q.get("since"):
         try:
@@ -3021,11 +3062,9 @@ def _fb_posts(q):
     except (TypeError, ValueError):
         limit = 50
     with store_fb.Store(rp) as st:
-        rows = st.recent(project_id=pid or None, limit=limit, since_ms=since_ms)
+        rows = st.recent(project_id=pid, limit=limit, since_ms=since_ms)
         # TRUE count for the window (project-scoped, since FB carries project_id).
-        fw, fa = [], []
-        if pid:
-            fw.append("project_id = ?"); fa.append(pid)
+        fw, fa = ["project_id = ?"], [pid]
         if since_ms:
             fw.append("collected_ms >= ?"); fa.append(since_ms)
         try:
@@ -3077,12 +3116,14 @@ def _fb_source_post(body):
         return {"error": "Paste the page's handle (the part after facebook.com/), "
                          "e.g. narendramodi."}
     label = re.sub(r"[^A-Za-z0-9_.-]", "", raw).strip(".")
-    try:
-        pid = int(body.get("project") or 0)
-    except (TypeError, ValueError):
-        return {"error": "project must be a number"}
+    pid = _project_or_none(body)
     if not label:
         return {"error": "a Facebook page name is required"}
+    if not pid and action == "add":
+        return {"error": "no project selected",
+                "detail": "A Facebook page belongs to a project. Select one "
+                          "before adding it — a page with no project is "
+                          "collected but visible to nobody."}
     rp = _CFG.root / "fb_results.db"
     with store_fb.Store(rp) as st:
         if action == "remove":
@@ -3140,23 +3181,22 @@ def _fb_fetch(body):
     reports how many new posts it saved plus the raw run log so a bad login or
     checkpoint is visible in the UI rather than silent.
     """
+    pid = _project_or_none(body)
+    if not pid:
+        return dict(_NO_PROJECT)
     rp = _CFG.root / "fb_results.db"
-    try:
-        pid = int(body.get("project") or 0)
-    except (TypeError, ValueError):
-        pid = 0
 
     import store_fb
     srcs = []
     if rp.exists():
         try:
             with store_fb.Store(rp) as st:
-                srcs = st.sources(project_id=pid or None, enabled_only=True)
+                srcs = st.sources(project_id=pid, enabled_only=True)
         except Exception as e:
             return {"error": f"{type(e).__name__}: {e}"}
     if not srcs:
-        return {"error": "Add a Facebook page first (the Facebook pages panel), "
-                         "then press Fetch."}
+        return {"error": "This project has no Facebook pages yet. Add one in "
+                         "the Facebook pages panel, then press Fetch."}
 
     from collect_fb import _can_log_in, run_once
     if not _can_log_in():
@@ -3171,7 +3211,7 @@ def _fb_fetch(body):
     _lg = activity_log.logger(
         "facebook", account=os.getenv("FB_EMAIL", "").strip() or None,
         echo=lambda m: logs.append(str(m)), db=str(_CFG.root / "activity.db"))
-    n, err = _fb_locked_run(run_once(str(rp), project_id=pid or None,
+    n, err = _fb_locked_run(run_once(str(rp), project_id=pid,
                                      log=_lg), timeout=300)
     if err:
         return {**err, "log": logs}
@@ -3187,15 +3227,20 @@ def _fb_fetch(body):
 
 def _fb_favorites(body):
     """
-    Read the account's Favorites feed once and attribute posts to tracked pages
-    (across all projects). Global by nature — one burner account has one
-    favorites list — so it is not project-scoped.
+    Read the account's Favorites feed once and attribute posts to tracked pages.
+
+    The FEED is global by nature — one burner account has one favorites list —
+    but the RUN is not, and now must name a project. Two reasons. A favorited
+    page nobody tracks yet auto-registers under the project that asked for the
+    pass, so with no project it would register under none and become a source
+    that collects into a black hole. And the pass writes posts, which have to
+    belong to somebody. Pages already tracked by OTHER projects keep their own
+    project, as they always did — this scopes the new arrivals, not the feed.
     """
+    pid = _project_or_none(body)
+    if not pid:
+        return dict(_NO_PROJECT)
     rp = _CFG.root / "fb_results.db"
-    try:
-        pid = int(body.get("project") or 0)
-    except (TypeError, ValueError):
-        pid = 0
     from collect_fb import _can_log_in, run_favorites
     if not _can_log_in():
         return {"error": "Facebook login isn't set up on the server yet — add "
@@ -3207,7 +3252,7 @@ def _fb_favorites(body):
         echo=lambda m: logs.append(str(m)), db=str(_CFG.root / "activity.db"))
     # pid lets favorited pages auto-register under THIS project, so the feed
     # just flows in without hand-adding each page.
-    n, err = _fb_locked_run(run_favorites(str(rp), project_id=pid or None,
+    n, err = _fb_locked_run(run_favorites(str(rp), project_id=pid,
                                           log=_lg), timeout=300)
     if err:
         return {**err, "log": logs}
@@ -3302,9 +3347,17 @@ def _fb_settings_post(body):
     return {"ok": True}
 
 
-def _ig_status():
-    """Instagram accounts + sources + totals for the dashboard's Instagram view."""
+def _ig_status(q=None):
+    """Instagram accounts + sources + totals for the dashboard's Instagram view.
+
+    ACCOUNTS are global and always returned: a login belongs to the server, not
+    to a project, and the Accounts & Sessions panel has to show it whichever
+    project happens to be selected. SOURCES and TOTALS are the project's data
+    and require ?project=<id>; without one they come back empty with the reason
+    attached, never as everyone's sources.
+    """
     import sqlite3
+    pid = _project_or_none(q)
     root = _CFG.root
     out = {"accounts": [], "sources": [], "totals": {"posts": 0}}
     ap = root / "ig_accounts.db"
@@ -3340,9 +3393,23 @@ def _ig_status():
             con.close()
         except Exception as e:
             out["accounts_error"] = f"{type(e).__name__}: {e}"
+    if not pid:
+        out.update({k: v for k, v in _NO_PROJECT.items()
+                    if k in ("error", "detail", "sources", "totals")})
     rp = root / "ig_results.db"
     settings = {}
     if rp.exists():
+        try:
+            import store_ig
+            with store_ig.Store(rp) as st:
+                # Settings are read whatever the project: pause/cadence describe
+                # the one collector, and the toggle must show its real state
+                # even on a view that is showing no data.
+                settings = {r["key"]: r["value"] for r in st.db.execute(
+                    "SELECT key, value FROM settings")}
+        except Exception as e:
+            out["sources_error"] = f"{type(e).__name__}: {e}"
+    if rp.exists() and pid:
         try:
             import store_ig
             with store_ig.Store(rp) as st:
@@ -3353,11 +3420,10 @@ def _ig_status():
                 # It is diagnostic only — the handle in `value` stays the thing
                 # a human reads and the thing that maps to the other platforms.
                 out["sources"] = [dict(r) for r in st.db.execute(
-                    "SELECT label, type, value, platform_id, account, enabled "
-                    "FROM sources ORDER BY label")]
-                out["totals"] = st.stats()
-                settings = {r["key"]: r["value"] for r in st.db.execute(
-                    "SELECT key, value FROM settings")}
+                    "SELECT label, type, value, platform_id, project_id, account, "
+                    "enabled FROM sources WHERE project_id = ? ORDER BY label",
+                    (pid,))]
+                out["totals"] = st.stats(project_id=pid)
         except Exception as e:
             out["sources_error"] = f"{type(e).__name__}: {e}"
     out["paused"] = settings.get("ig_paused") == "1"
@@ -3439,6 +3505,9 @@ def _ig_fetch(body):
     being up. Reports new-post count + the run log, so a checkpoint or a
     missing source is visible in the UI instead of silent.
     """
+    pid = _project_or_none(body)
+    if not pid:
+        return dict(_NO_PROJECT)
     rp = _CFG.root / "ig_results.db"
     import store_ig
     srcs = []
@@ -3446,12 +3515,14 @@ def _ig_fetch(body):
         try:
             with store_ig.Store(rp) as st:
                 srcs = [r for r in st.db.execute(
-                    "SELECT label FROM sources WHERE enabled = 1")]
+                    "SELECT label FROM sources WHERE enabled = 1 "
+                    "AND project_id = ?", (pid,))]
         except Exception as e:
             return {"error": f"{type(e).__name__}: {e}"}
     if not srcs:
-        return {"error": "Add an Instagram source first (Watchlists → + New "
-                         "watchlist → Instagram), then press Fetch."}
+        return {"error": "This project has no Instagram sources yet. Add one "
+                         "(Watchlists → + New watchlist → Instagram), then "
+                         "press Fetch."}
     try:
         from collect_ig import run_once
     except Exception as e:
@@ -3476,8 +3547,14 @@ def _ig_source_post(body):
     import store_ig
     action = (body.get("action") or "add").lower()
     label = str(body.get("label") or "").strip()
+    pid = _project_or_none(body)
     if not label:
         return {"error": "a source label is required"}
+    if not pid and action == "add":
+        return {"error": "no project selected",
+                "detail": "An Instagram source belongs to a project. Select "
+                          "one before adding it — a source with no project is "
+                          "collected but visible to nobody."}
     rp = _CFG.root / "ig_results.db"
     with store_ig.Store(rp) as st:
         if action == "add":
@@ -3492,9 +3569,11 @@ def _ig_source_post(body):
                 # value is still accepted and routed to platform_id by
                 # store_ig.add_source, so old callers keep working.
                 st.add_source(label, typ, value, str(body.get("account") or ""),
-                              str(body.get("platform_id") or ""))
+                              str(body.get("platform_id") or ""), project_id=pid)
             except ValueError as e:
                 return {"error": str(e)}
+        elif action == "set-project":
+            st.set_project(label, pid)
         elif action == "set-id":
             pk = str(body.get("platform_id") or "").strip()
             if not pk.isdigit():
@@ -3506,12 +3585,16 @@ def _ig_source_post(body):
         elif action == "enable":
             st.set_enabled(label, bool(body.get("enabled")))
         else:
-            return {"error": "action must be add, remove, enable, or set-id"}
+            return {"error": "action must be add, remove, enable, set-id, "
+                             "or set-project"}
     return {"ok": True}
 
 
 def _ig_posts(q):
-    """Collected Instagram posts, newest first, in the shared API shape."""
+    """Collected Instagram posts for ONE project, newest first."""
+    pid = _project_or_none(q)
+    if not pid:
+        return dict(_NO_PROJECT)
     rp = _CFG.root / "ig_results.db"
     if not rp.exists():
         return {"count": 0, "posts": [], "next_cursor": None}
@@ -3531,6 +3614,7 @@ def _ig_posts(q):
                         since=since,
                         source=q.get("source") or None,
                         username=q.get("username") or None,
+                        project_id=pid,
                         before_pk=int(q["cursor"]) if q.get("cursor") else None)
         posts = [store_ig.to_api(r) for r in rows]
         # TRUE count for the window (not the page) so the UI number is real,
@@ -4083,7 +4167,7 @@ class Handler(BaseHTTPRequestHandler):
             if u.path == "/api/stress/accounts":
                 return self._send(200, _stress_accounts(q))
             if u.path == "/api/ig/status":
-                return self._send(200, _ig_status())
+                return self._send(200, _ig_status(q))
             if u.path == "/api/ig/posts":
                 return self._send(200, _ig_posts(q))
             if u.path == "/api/fb/status":
