@@ -36,14 +36,17 @@ frontend/node_modules/
 
 # OS
 .DS_Store
+# FUSE leaves these behind when a mounted file is deleted while still open
+# (the desktop bridge cannot unlink, so they accumulate). Two of them were
+# committed by accident; they are junk, never source.
+.fuse_hidden*
 
+# Account pool
 pool.db
 pool.db-*
 
-pool.db
-pool.db-*
-
-pool.db
-pool.db-*
+# Local scratch — the bridge cannot delete, so removals are staged here first.
 _to_delete/
+
+# Per-machine Claude Code settings and worktrees.
 .claude/
