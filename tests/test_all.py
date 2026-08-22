@@ -1475,7 +1475,6 @@ def _scoping_boundary_checks(_web):
     """Every IG/FB data endpoint, called with no project."""
     for fn, arg, what in [(_web._ig_posts, {}, "/api/ig/posts"),
                           (_web._fb_posts, {}, "/api/fb/posts"),
-                          (_web._fb_status, {}, "/api/fb/status"),
                           (_web._ig_fetch, {}, "/api/ig/fetch"),
                           (_web._fb_fetch, {}, "/api/fb/fetch"),
                           (_web._fb_favorites, {}, "/api/fb/favorites")]:
@@ -1483,12 +1482,21 @@ def _scoping_boundary_checks(_web):
         ok(r.get("error") == "no project selected" and not r.get("posts")
            and not r.get("sources"),
            f"{what} with no project returns nothing, and says why")
+    # status endpoints are a SPLIT, not a refusal: the server half always
+    # answers (the Accounts panel calls them with no project at all), the
+    # project half does not.
     r = _web._ig_status({})
     ok(r.get("error") == "no project selected" and r["sources"] == [],
        "/api/ig/status with no project lists no sources")
     ok("accounts" in r,
        "...but still reports ACCOUNTS — a login belongs to the server, not to "
        "a project, and the Accounts panel needs it in every view")
+    r = _web._fb_status({})
+    ok(r.get("error") == "no project selected" and r["sources"] == [],
+       "/api/fb/status with no project lists no sources")
+    ok("session" in r and "health" in r and "config" in r,
+       "...but still reports the LOGIN, its health and the collector config — "
+       "server facts, which the Accounts panel renders with no project set")
     for act in ("add",):
         r = _web._ig_source_post({"action": act, "label": "X", "value": "x"})
         ok(r.get("error") == "no project selected",

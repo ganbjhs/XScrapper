@@ -83,13 +83,13 @@ function AddModal({ pid, onDone, onClose }) {
         for (const n of names) await api.fbAddSource(pid, n);
       } else if (platform === "ig") {
         if (kind === "following") {
-          await api.igSource({ action: "add", label: "home", type: "following", value: "" });
+          await api.igSource({ action: "add", label: "home", type: "following", value: "", project: pid });
         } else {
           // Bulk: one source per line/word — paste many at once (like Facebook).
           const items = handles.split(/[\s,]+/).filter(Boolean);
           for (const it of items) {
             const v = it.replace(/^[@#]/, "");
-            await api.igSource({ action: "add", label: v, type: kind, value: v });
+            await api.igSource({ action: "add", label: v, type: kind, value: v, project: pid });
           }
         }
       }
@@ -847,7 +847,7 @@ function IgDetail({ pid, data, reload, gotoSettings }) {
   };
   const act = async (body) => {
     setMsg("");
-    try { await api.igSource(body); reload(); }
+    try { await api.igSource({ project: pid, ...body }); reload(); }
     catch (e) { setMsg(String(e.message || e)); }
   };
   const fetchNow = async () => {
@@ -868,7 +868,7 @@ function IgDetail({ pid, data, reload, gotoSettings }) {
     try {
       for (const u of adding.split(/[\s,]+/).filter(Boolean)) {
         const name = u.replace(/^[@#]/, "");
-        await api.igSource({ action: "add", label: name, type: "user", value: name });
+        await api.igSource({ action: "add", label: name, type: "user", value: name, project: pid });
       }
       setAdding(""); reload();
     } catch (e) { setMsg(String(e.message || e)); }
@@ -1299,7 +1299,7 @@ export default function Watchlists({ onMenu }) {
     [pid],
   );
   const fb = useApi(() => api.fbStatus(pid), [pid], { every: 30_000 });
-  const ig = useApi(() => api.igStatus(), [], { every: 60_000 });
+  const ig = useApi(() => api.igStatus(pid), [pid], { every: 60_000 });
   const [tab, setTab] = useState("lists");
   const [sel, setSel] = useState(null);        // "x:<id>" | "fb" | "ig"
   const [creating, setCreating] = useState(false);

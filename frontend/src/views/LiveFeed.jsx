@@ -76,7 +76,8 @@ export default function LiveFeed({ onMenu }) {
               order: flt.sort === "oldest" ? "asc" : undefined,
             })
           : Promise.resolve({ rows: [] }),
-        api.igPosts({ limit: lim, since }).catch(() => ({ posts: [] })),
+        pid ? api.igPosts({ project: pid, limit: lim, since }).catch(() => ({ posts: [] }))
+            : Promise.resolve({ posts: [] }),
         pid ? api.fbPosts({ project: pid, limit: lim, since }).catch(() => ({ posts: [] }))
             : Promise.resolve({ posts: [] }),
       ]);

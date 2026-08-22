@@ -64,7 +64,10 @@ export const api = {
     request("/api/collection", { method: "POST", body: { paused } }),
   tweets: (p) => request(`/api/tweets${qs(p)}`),
   igPosts: (p) => request(`/api/ig/posts${qs(p)}`),
-  igStatus: () => request("/api/ig/status"),
+  // Instagram is project-scoped like Facebook: pass the selected project or the
+  // server returns no sources (server-side accounts still come back — a login
+  // belongs to the machine, not to a project).
+  igStatus: (project) => request(`/api/ig/status${qs({ project })}`),
   igSource: (body) => request("/api/ig/source", { method: "POST", body }),
   igFetch: (project) => request("/api/ig/fetch", { method: "POST", body: { project } }),
   igControl: (action) => request("/api/ig/control", { method: "POST", body: { action } }),

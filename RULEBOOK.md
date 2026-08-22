@@ -91,6 +91,17 @@ The rules:
   describe the one collector, not anyone's data. Pausing Instagram pauses
   Instagram. Accounts are likewise global — a login belongs to the server, and
   the Accounts panel shows it in every project view.
+- **An endpoint that returns BOTH server facts and project data SPLITS; it does
+  not refuse wholesale.** `_ig_status` and `_fb_status` each carry two kinds of
+  thing: the login, its circuit-breaker health and the collector config (the
+  server's) alongside sources and totals (the project's). The server half must
+  answer whatever the project, because the Accounts & Sessions panel calls both
+  with no project at all — it is describing the machine. Only the project half
+  is gated. (Paid for the same day the gate landed: `_fb_status` returned the
+  bare refusal object and blanked the Facebook account card, which had been
+  correct to ask unscoped. **Closing a default means finding every caller that
+  was relying on it being open** — grep the frontend for the endpoint before
+  assuming a refusal is safe.)
 
 ### The three-column source: a PERSON, a HANDLE, an ID — never one string
 

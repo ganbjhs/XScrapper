@@ -2969,6 +2969,10 @@ _NO_PROJECT = {
 }
 
 
+class _Unscoped(Exception):
+    """Internal: stop before reading project data, keep what was read already."""
+
+
 def _project_or_none(src):
     """The project id in a query dict or a POST body, or 0 if absent/garbage."""
     try:
@@ -2978,11 +2982,23 @@ def _project_or_none(src):
 
 
 def _fb_status(q=None):
-    """Facebook sources + totals for ONE project. No project, no data."""
+    """Facebook status: server facts always, project data only when scoped.
+
+    Same split as _ig_status, and for the same reason. The LOGIN — whether
+    Facebook is configured, which identity, the circuit-breaker health, the
+    collector's pause and cadence — belongs to the server, and the Accounts &
+    Sessions panel calls this with no project at all to render its Facebook
+    card. Returning the bare "no project" object there blanked a card that
+    describes something global.
+
+    SOURCES and TOTALS are the project's data and still require ?project=<id>;
+    without one they come back empty with the reason attached.
+    """
     pid = _project_or_none(q)
-    if not pid:
-        return dict(_NO_PROJECT)
     out = {"sources": [], "totals": {"posts": 0}, "enabled": False}
+    if not pid:
+        out.update({k: v for k, v in _NO_PROJECT.items()
+                    if k in ("error", "detail", "sources", "totals")})
     rp = _CFG.root / "fb_results.db"
     # Configured if ANY login path exists: raw cookies, email+password, or a
     # session already saved on disk from an earlier successful login.
@@ -3015,6 +3031,11 @@ def _fb_status(q=None):
         try:
             import store_fb
             with store_fb.Store(rp) as st:
+                # Settings are global (the collector's switches) and are read
+                # whatever the project; sources and totals are not.
+                settings = st.settings_all()
+                if not pid:
+                    raise _Unscoped
                 srcs = st.sources(project_id=pid)
                 # Map each page's stored interval back to the named speed the
                 # panel offers, so re-opening shows what is actually set.
@@ -3023,7 +3044,8 @@ def _fb_status(q=None):
                     s["speed"] = inv.get(s.get("interval_s"), "")
                 out["sources"] = srcs
                 out["totals"] = {"posts": st.total(pid)}
-                settings = st.settings_all()
+        except _Unscoped:
+            pass          # settings were read; project data deliberately not
         except Exception as e:
             out["error"] = f"{type(e).__name__}: {e}"
     # The whole operating configuration, dashboard-settings first, env as the
