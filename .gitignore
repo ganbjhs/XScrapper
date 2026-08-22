@@ -20,6 +20,21 @@ browser-check.jpg
 exports/
 logs/
 
+# Debug artefacts. Every Facebook dead end leaves a rendered page, a probe
+# dump or a screenshot next to the code; on the VPS these accumulate until
+# `git status` is unreadable and a real untracked file hides among forty of
+# them. Named by shape rather than one-by-one so the next probe is covered too.
+fb_*.html
+fbli_*.html
+fbdoc.html
+fb_*.json
+fb_*.png
+*.pid
+
+# Hand-made safety copies, and the timestamped ones the migrations leave.
+*.bak
+*.bak-*
+
 # Python
 __pycache__/
 *.py[cod]
