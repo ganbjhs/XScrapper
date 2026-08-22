@@ -117,19 +117,50 @@ def _auth_configured() -> bool:
 # Several so a consumer can be revoked on its own, by deleting its key, without
 # re-issuing to everyone else.
 #
-# WHAT A KEY MAY NOT DO. It reads collected data and may spend rate-limit
-# budget through /api/fetch, and that is the whole list. It cannot add an
-# account, open a sign-in browser, or hide a stream — those write secrets to
-# disk, launch a process, or change what a human sees, and none of them is
-# something a remote integration should reach. The rule is enforced by an
-# allowlist in _require_auth, not by the caller being polite.
+# WHAT A KEY MAY NOT DO. It READS every collected-data and telemetry endpoint,
+# and may spend rate-limit budget through /api/fetch. That is the whole list.
+# It cannot add an account, open a sign-in browser, or hide a stream — those
+# write secrets to disk, launch a process, or change what a human sees, and
+# none of them is something a remote integration should reach. The rule is
+# enforced by an allowlist in _require_auth, not by the caller being polite.
 MIN_API_KEY_LEN = 24
 
-# Endpoints a key may call. Everything else is cookie-only, deliberately.
-API_KEY_PATHS = {
-    "/api/tweets", "/api/status", "/api/streams", "/api/export", "/api/guard",
-    "/api/fetch",
+# THE ALLOWLIST IS SPLIT BY METHOD, AND THAT SPLIT IS THE WHOLE SAFETY PROPERTY.
+#
+# Most of these paths exist under BOTH verbs and mean opposite things: GET
+# /api/projects lists projects, POST /api/projects creates one; GET
+# /api/collections reads a collection, POST /api/collections writes one. A
+# single method-blind set — which is what this was — would hand a read
+# integration the write half of every endpoint it was granted. So reads are
+# enumerated for GET only, and the write set stays a closed, deliberate list.
+#
+# Adding a path here is granting it to every holder of every key in API_KEYS.
+# Put it in the READ set only if it is genuinely a read.
+API_KEY_READ_PATHS = {
+    # X — the collected corpus and the streams that produced it.
+    "/api/tweets", "/api/export", "/api/streams", "/api/streams/assignments",
+    "/api/projects", "/api/watchlists", "/api/watchlist/xmembers",
+    "/api/identities", "/api/live",
+    # Instagram and Facebook — same corpus, other platforms.
+    "/api/ig/posts", "/api/ig/status", "/api/fb/posts", "/api/fb/status",
+    # Curated sets.
+    "/api/collections", "/api/collections/items", "/api/collections/export",
+    # Operational telemetry: health, throughput, alerts, delivery progress.
+    "/api/status", "/api/guard", "/api/metrics", "/api/alerts",
+    "/api/activity", "/api/activity/logs", "/api/delivery",
 }
+
+# Writes a key may perform. /api/fetch spends X rate-limit budget on a live
+# fetch and is the ONLY one — it was already granted, and nothing else here is
+# a read. Everything absent from both sets is cookie-only, deliberately:
+# /api/pool* (the burner-account control panel), /api/stress/accounts and the
+# /api/login/* sign-in browser handle credentials and processes, not data, and
+# a data integration has no business in any of them.
+API_KEY_WRITE_PATHS = {"/api/fetch"}
+
+# Kept as the union so anything still reading the old name sees every granted
+# path rather than silently narrowing to nothing.
+API_KEY_PATHS = API_KEY_READ_PATHS | API_KEY_WRITE_PATHS
 
 
 def _api_keys() -> set:
@@ -4599,12 +4630,32 @@ class Handler(BaseHTTPRequestHandler):
             if not _valid_api_key(presented):
                 self._send(401, {"error": "invalid API key"})
                 return False
-            if path not in API_KEY_PATHS:
+            # Method matters: nearly every read path here also exists as a POST
+            # that WRITES (GET /api/projects lists, POST /api/projects creates),
+            # so a path-only check would grant the write half along with the read.
+            method = (self.command or "").upper()
+            allowed = (method == "GET" and path in API_KEY_READ_PATHS) \
+                or path in API_KEY_WRITE_PATHS
+            if not allowed:
+                # Say which of the two it is. "That path is closed" and "that
+                # path is readable but you used POST" send an integrator down
+                # completely different paths, and guessing between them is what
+                # makes a caller retry variants of a URL that will never work.
+                readable_via_get = path in API_KEY_READ_PATHS
                 self._send(403, {
-                    "error": f"an API key cannot use {path}",
+                    "error": (f"an API key cannot {method} {path}"
+                              if readable_via_get else
+                              f"an API key cannot use {path}"),
+                    "allowed_get": sorted(API_KEY_READ_PATHS),
+                    "allowed_post": sorted(API_KEY_WRITE_PATHS),
+                    # Kept: callers written against the old single-list shape.
                     "allowed": sorted(API_KEY_PATHS),
-                    "detail": "Adding accounts, signing in and changing the view "
-                              "are dashboard-only. Sign in with a browser for those.",
+                    "detail": (
+                        f"{path} is readable with GET; this key may not write to it."
+                        if readable_via_get else
+                        "An API key reads collected data and telemetry. Managing "
+                        "accounts, signing in and changing what a human sees are "
+                        "dashboard-only. Sign in with a browser for those."),
                 })
                 return False
             return True

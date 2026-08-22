@@ -360,6 +360,27 @@ names).
   account, open a sign-in browser, or change what a human sees. Enforced by an
   allowlist server-side, not by the caller being polite. Keys are compared in
   constant time.
+- **The API-key allowlist is keyed on (METHOD, path), never path alone.** Most
+  endpoints mean opposite things under the two verbs — `GET /api/projects`
+  lists, `POST /api/projects` creates; likewise watchlists, collections and
+  alerts. A path-only allowlist cannot express "read this", only "reach this",
+  so every path granted for reading silently grants its write half too. Reads
+  go in `API_KEY_READ_PATHS` (GET only); `API_KEY_WRITE_PATHS` stays a short,
+  deliberate list. (Written when the key was widened from 6 paths to 23 for
+  Watch-Tower: under the old path-only check that same edit would have handed a
+  read-only analytics consumer the power to delete every project.)
+- **Accounts are not data.** `/api/pool*`, `/api/stress/accounts` and
+  `/api/login/*` stay cookie-only no matter how wide read access gets — they
+  expose the burner pool and launch sign-in processes. "Give the integration
+  everything" means every post and every metric, never the credentials that
+  collect them.
+- **An auth denial says which denial it is.** "That path does not exist here",
+  "that path is readable but you used POST" and "your key is invalid" send an
+  integrator down three different paths, and a caller that cannot tell them
+  apart retries URL variants until it concludes it has been blocked — which is
+  exactly what Watch-Tower did, six 403s deep, while nothing was blocking it.
+  A 403 body carries `allowed_get` and `allowed_post`; a 401 says the key is
+  missing or invalid, not that the endpoint is forbidden.
 - **One account, one steady IP.** Hopping IPs, or hammering a fresh account, is
   what gets accounts checkpointed. FB runs from the server IP; IG uses the
   residential pool; don't cross them.

@@ -158,8 +158,13 @@ posts, source), account pool `/api/pool*`, and labelling `/api/classify` +
 `/api/labels/{status,categories,set,settings}`. `/api/classify` is deliberately
 NOT in `API_KEY_PATHS`: it spends money, and a machine key may only read.
 
-**API-key pull.** Fixed read-only allowlist (`API_KEY_PATHS`); keys never
-manage accounts or sessions. Before any second consumer: project-locked keys.
+**API-key pull.** Method-split allowlist: `API_KEY_READ_PATHS` covers every
+collected-data and telemetry endpoint on GET, `API_KEY_WRITE_PATHS` is
+`/api/fetch` alone. The split is the safety property — most read paths also
+exist as a POST that writes, so a path-only check would grant the write half
+with the read. Keys never reach `/api/pool*`, `/api/stress/accounts` or
+`/api/login/*`: accounts and sessions are credentials, not data. Before any
+second consumer: project-locked keys.
 
 ## 6. Going live (VPS runbook)
 
