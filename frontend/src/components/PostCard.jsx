@@ -39,7 +39,11 @@ function Media({ media }) {
 // hit is verifiable at a glance.
 function highlightTerms(text, terms, keyBase) {
   if (!terms || terms.length === 0) return text;
-  const esc = terms
+  // Longest first: regex alternation takes the first branch that matches at a
+  // position, so with ["Devendra", "Devendra Fadnavis"] the phrase could never
+  // win — half of it would highlight and the rest would look unmatched.
+  const esc = [...new Set(terms)]
+    .sort((a, b) => String(b).length - String(a).length)
     .map((t) => String(t).trim().replace(/[.*+?^${}()|[\]\\]/g, "\\$&"))
     .filter(Boolean);
   if (esc.length === 0) return text;

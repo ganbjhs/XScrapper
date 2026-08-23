@@ -309,16 +309,38 @@ export default function LiveFeed({ onMenu }) {
     status.reload(true);
   };
   // Every term from this project's KEYWORD watchlists, so the feed can
-  // underline where each keyword-search hit actually matched. "a AND b" is two
-  // terms; surrounding quotes are stripped so a phrase highlights as the phrase.
+  // underline where each keyword-search hit actually matched.
+  //
+  // A rule is X search syntax, not a word, so it has to be TOKENISED rather
+  // than split on one operator. Splitting on AND alone (what this used to do)
+  // left "a OR b" as the single literal term `a OR b`, which no post can
+  // contain — so every OR rule, and every rule carrying an operator or an
+  // internal quote, highlighted nothing at all while a bare word worked. That
+  // looked like "highlighting works on some posts but not others".
+  //
+  // Quotes bind first so a phrase stays one term; AND/OR/NOT are joins, not
+  // content; a -negation is what must NOT be there, so highlighting it would
+  // point at the opposite of a match; and from:/lang:/filter: style operators
+  // are syntax. #tags and @mentions ARE content and stay.
   const keywordTerms = useMemo(() => {
     const set = new Set();
     for (const w of wls.data?.watchlists || []) {
       if (w.kind !== "keywords") continue;
       for (const m of w.members || []) {
-        for (const piece of String(m.handle || "").split(/\s+AND\s+/i)) {
-          const term = piece.trim().replace(/^["']+|["']+$/g, "").trim();
-          if (term.length >= 2) set.add(term);
+        const re = /"([^"]*)"|(\S+)/g;
+        let hit;
+        while ((hit = re.exec(String(m.handle || "")))) {
+          if (hit[1] !== undefined) {
+            const phrase = hit[1].trim();
+            if (phrase.length >= 2) set.add(phrase);
+            continue;
+          }
+          const tok = hit[2].replace(/^\(+|\)+$/g, "");
+          if (tok.length < 2) continue;
+          if (/^(AND|OR|NOT)$/i.test(tok)) continue;
+          if (tok.startsWith("-")) continue;
+          if (/^[A-Za-z_]+:/.test(tok)) continue;
+          set.add(tok);
         }
       }
     }

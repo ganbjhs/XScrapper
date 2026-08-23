@@ -36,7 +36,7 @@ const splitAdd = (kind, raw) =>
 const PLATFORM_KINDS = {
   x: [
     ["query", "Handles (built here — no X List needed)"],
-    ["keywords", "Keywords (topics, phrases, AND combinations)"],
+    ["keywords", "Keywords (topics, phrases, AND / OR combinations)"],
     ["xlist", "Existing X List (fastest polling)"],
   ],
   fb: [
@@ -140,9 +140,10 @@ function AddModal({ pid, onDone, onClose }) {
             <div className="field">
               <label>Keywords — one rule per line</label>
               <textarea rows="5" value={handles} onChange={(e) => setHandles(e.target.value)}
-                        placeholder={'finance AND gst\n"vishnu deo sai"\n#Chhattisgarh'} />
+                        placeholder={'finance AND gst\ngst OR vat OR "input tax credit"\n#Chhattisgarh'} />
               <div style={{ color: "var(--ink-3)", fontSize: 12, marginTop: 6 }}>
-                Lines combine as OR; <b>AND</b> means both words must appear.
+                Lines combine as OR. Within one line, <b>AND</b> means every
+                word must appear and <b>OR</b> means any of them will do.
                 Quotes = exact phrase. X search operators pass through.
               </div>
             </div>
@@ -598,7 +599,7 @@ function XDetail({ w, onChanged }) {
           <div className="filters" style={{ marginBottom: 0 }}>
             <input value={adding}
                    placeholder={w.kind === "keywords"
-                     ? "finance AND gst — or several rules separated by commas"
+                     ? "finance AND gst, or gst OR vat — several rules separated by commas"
                      : "@handle, profile URL, or several separated by spaces"}
                    style={{ flex: 1, minWidth: 200 }}
                    onChange={(e) => setAdding(e.target.value)}
