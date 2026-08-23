@@ -36,7 +36,7 @@ const splitAdd = (kind, raw) =>
 const PLATFORM_KINDS = {
   x: [
     ["query", "Handles (built here — no X List needed)"],
-    ["keywords", "Keywords (topics, phrases, AND / OR combinations)"],
+    ["keywords", "Keywords (comma = any, AND = both required)"],
     ["xlist", "Existing X List (fastest polling)"],
   ],
   fb: [
@@ -138,13 +138,15 @@ function AddModal({ pid, onDone, onClose }) {
             </div>
           ) : kind === "keywords" ? (
             <div className="field">
-              <label>Keywords — one rule per line</label>
+              <label>Keywords — one rule per line, or separated by commas</label>
               <textarea rows="5" value={handles} onChange={(e) => setHandles(e.target.value)}
-                        placeholder={'finance AND gst\ngst OR vat OR "input tax credit"\n#Chhattisgarh'} />
+                        placeholder={'Devendra Fadnavis, \u0926\u0947\u0935\u0947\u0902\u0926\u094d\u0930 \u092b\u0921\u0923\u0935\u0940\u0938\nCM AND maharashtra\n"input tax credit", #Chhattisgarh'} />
               <div style={{ color: "var(--ink-3)", fontSize: 12, marginTop: 6 }}>
-                Lines combine as OR. Within one line, <b>AND</b> means every
-                word must appear and <b>OR</b> means any of them will do.
-                Quotes = exact phrase. X search operators pass through.
+                Syntax: <b>comma</b> (or a new line) = <b>OR</b> (match any).
+                Uppercase <b>AND</b> between two words = <b>both required</b>,
+                any order — e.g. <code>Varanasi AND Modi</code>.
+                Also <code>-exclude</code>, <code>"phrase"</code>,
+                <code>#hashtag</code>, <code>@mention</code>.
               </div>
             </div>
           ) : (
@@ -599,7 +601,7 @@ function XDetail({ w, onChanged }) {
           <div className="filters" style={{ marginBottom: 0 }}>
             <input value={adding}
                    placeholder={w.kind === "keywords"
-                     ? "finance AND gst, or gst OR vat — several rules separated by commas"
+                     ? "comma = OR (match any) · Varanasi AND Modi = both required"
                      : "@handle, profile URL, or several separated by spaces"}
                    style={{ flex: 1, minWidth: 200 }}
                    onChange={(e) => setAdding(e.target.value)}
