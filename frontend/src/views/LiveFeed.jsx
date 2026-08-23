@@ -39,16 +39,27 @@ const DUR_LABEL = { "1h": "Last 1 hour", "6h": "Last 6 hours", "12h": "Last 12 h
                     "24h": "Last 24 hours", "48h": "Last 48 hours",
                     "7d": "Last 7 days", "30d": "Last 30 days", all: "All time" };
 
+// The whole pill is the control: the transparent <select> is stretched over
+// the entire block, so a click anywhere on it — the "Source:" label, the
+// current value, the padding — opens the menu. The visible text is drawn by
+// us; the real select stays in the tab order and keeps native keyboard
+// behaviour and the native dropdown on every platform.
 function Pill({ label, value, onChange, options }) {
+  const current = options.find(([v]) => v === value);
   return (
-    <label className="fpill">
+    <div className="fpill fpill-block">
       <span>{label}:</span>
-      <select value={value} onChange={(e) => onChange(e.target.value)}>
+      <span className="fpill-val">{current ? current[1] : value}</span>
+      <svg className="fpill-caret" viewBox="0 0 24 24" aria-hidden="true">
+        <path d="M6 9.5l6 6 6-6" />
+      </svg>
+      <select value={value} aria-label={label}
+              onChange={(e) => onChange(e.target.value)}>
         {options.map(([v, text, disabled]) => (
           <option key={v} value={v} disabled={disabled}>{text}</option>
         ))}
       </select>
-    </label>
+    </div>
   );
 }
 
