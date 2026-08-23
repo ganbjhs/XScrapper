@@ -27,9 +27,27 @@ const INTERVAL_OPTS = [
   ["86400", "24 hours"],
 ];
 
+// Split keyword input into rules on commas and newlines — but NOT on a comma
+// inside quotes. `"Modi, Shah" OR "Fadnavis, Shinde"` used to shatter into
+// three fragments, two rejected for unbalanced quotes and the middle one
+// ('Shah" OR "Fadnavis') silently ACCEPTED and collected against. A field that
+// takes a whole X query has to respect the one piece of X syntax that can
+// legitimately contain a comma.
+const splitKeywordRules = (raw) => {
+  const out = [];
+  let buf = "", quoted = false;
+  for (const ch of String(raw || "")) {
+    if (ch === '"') { quoted = !quoted; buf += ch; continue; }
+    if (!quoted && (ch === "," || ch === "\n")) { out.push(buf); buf = ""; continue; }
+    buf += ch;
+  }
+  out.push(buf);
+  return out.map((s) => s.trim()).filter(Boolean);
+};
+
 const splitAdd = (kind, raw) =>
   kind === "keywords"
-    ? raw.split(/,|\n/).map((s) => s.trim()).filter(Boolean)
+    ? splitKeywordRules(raw)
     : raw.split(/[\s,]+/).filter(Boolean);
 
 // What each platform's watchlist can be — drives the Add modal.

@@ -768,19 +768,31 @@ def normalize_handle(raw) -> str | None:
     return s.lower() if _HANDLE_RE.match(s) else None
 
 
+# X caps a search query at roughly 512 characters, and a rule is not the whole
+# query: the compiler wraps it in parens and appends the watchlist's filter
+# suffix, which is 140 characters with every filter switched on. 350 leaves
+# room for both and still admits a real hand-written X query, which is the
+# point — one field takes shorthand OR a query pasted from X's own advanced
+# search, and 120 was short enough to reject the second.
+MAX_TERM_LEN = 350
+
+
 def normalize_term(raw) -> str | None:
     """
     One keyword-watchlist term, cleaned. None if unusable.
 
     A term is anything X's own search accepts: a word, a "quoted phrase",
-    a #hashtag, an @mention, a -exclusion — or several joined with AND
-    ('finance AND gst' means both words anywhere in the post, any order;
-    that is exactly what a space means to X, so AND compiles to a space).
+    a #hashtag, an @mention, a -exclusion, a from:/lang:/filter: operator —
+    or several joined with AND ('finance AND gst' means both words anywhere
+    in the post, any order; that is exactly what a space means to X, so AND
+    compiles to a space). A COMPLETE X query is a valid term too, and passes
+    through as itself.
+
     Kept nearly raw on purpose: the search syntax is the feature, and
     second-guessing it here would only forbid things X allows.
     """
     s = " ".join(str(raw or "").split())
-    if not s or len(s) > 120:
+    if not s or len(s) > MAX_TERM_LEN:
         return None
     if s.count('"') % 2:            # an unbalanced quote poisons the whole query
         return None
@@ -1523,7 +1535,19 @@ class Store:
             n = norm(h)
             (adds if n else bad).append(n or str(h))
         if bad:
-            return {"error": f"not valid {what}: " + ", ".join(repr(b) for b in bad)}
+            # Name the reason. "not valid search terms: '<380 characters>'" is
+            # the least useful thing to hand back to someone who just pasted a
+            # working X query and is now looking for the typo.
+            def _why(b):
+                t = " ".join(str(b).split())
+                if len(t) > MAX_TERM_LEN and w["kind"] == "keywords":
+                    return (f"{t[:60]!r}… is {len(t)} characters; the limit is "
+                            f"{MAX_TERM_LEN} (X caps a whole query near 512 and "
+                            f"this watchlist's filters take part of that)")
+                if w["kind"] == "keywords" and t.count('"') % 2:
+                    return f"{t!r} has an unclosed quote"
+                return repr(t)
+            return {"error": f"not valid {what}: " + "; ".join(_why(b) for b in bad)}
         removes = [norm(h) for h in (remove or [])]
         removes = [h for h in removes if h]
 
@@ -1580,10 +1604,16 @@ class Store:
             terms = [compile_term(r["handle"]) for r in self.db.execute(
                 "SELECT handle FROM watchlist_members WHERE watchlist_id = ? "
                 "ORDER BY handle", (int(watchlist_id),))]
+            # X caps queries ~512. What ships is "(" + joined + ")" + suffix,
+            # so the budget for `joined` is the cap minus the parens and minus
+            # THIS watchlist's own suffix — measured, not assumed, because a
+            # watchlist with every filter on spends 140 characters before a
+            # single keyword is written.
+            budget = 500 - 2 - len(suffix)
             chunks, cur = [], []
             for t in terms:
                 cand = " OR ".join([*cur, t])
-                if cur and len(cand) > 400:      # X caps queries ~512; stay clear
+                if cur and len(cand) > budget:
                     chunks.append(cur)
                     cur = [t]
                 else:

@@ -2688,6 +2688,28 @@ def test_keywords_and_project_delivery(tmp):
        "two multi-word rules OR-join without either one absorbing the other's "
        "words")
 
+    # One field takes shorthand OR a whole X query pasted from advanced search.
+    # The second is the reason the length cap is not 120: a real query with two
+    # OR groups and a couple of filters clears that before it says anything
+    # interesting, and it was being rejected outright.
+    real_query = ('(Maharashtra OR \u092e\u0939\u093e\u0930\u093e\u0937\u094d\u091f\u094d\u0930 OR Mumbai) '
+                  '(Fadnavis OR "Deva Bhau" OR \u092b\u0921\u0923\u0935\u0940\u0938) '
+                  '(CM OR \u0938\u0940\u090f\u092e OR \u092e\u0941\u0916\u094d\u092f\u092e\u0902\u0924\u094d\u0930\u0940) '
+                  '-filter:replies -filter:retweets lang:mr min_faves:5')
+    ok(len(real_query) > 120, "the sample really is longer than the old cap")
+    ok(nt(real_query) == real_query,
+       "a complete X query survives normalize_term as itself")
+    ok(nt("x" * (store_mod.MAX_TERM_LEN + 1)) is None,
+       "a rule past the cap is still refused — the cap moved, it did not go")
+    # The budget the chunker gets must leave room for the parens AND for this
+    # watchlist's filter suffix, which is 140 characters with everything on.
+    worst = store_mod.filters_suffix(
+        {**{k: True for k in store_mod.WATCHLIST_FILTERS},
+         "lang": "mr", "min_likes": 1, "min_retweets": 1})
+    ok(store_mod.MAX_TERM_LEN + 2 + len(worst) <= 512,
+       "one max-length rule plus parens plus the worst suffix still fits X's "
+       f"~512 cap ({store_mod.MAX_TERM_LEN} + 2 + {len(worst)})")
+
     async def run():
         st = store_mod.Store(db, False)
         await st.open()
