@@ -20,6 +20,7 @@ text column.
 """
 
 import csv
+import itertools
 import json
 import re
 import sqlite3
@@ -812,30 +813,108 @@ def _has_bare_space(s: str) -> bool:
     return False
 
 
+# How many alternatives one rule may expand into. A rule is ANDed groups of
+# ORs, so `(a OR b) AND (c OR d)` is four; past this it is the operator asking
+# for something that belongs in separate rules, and refusing says so.
+MAX_ALTERNATIVES = 16
+
+
+def _split_top_level_or(s: str) -> list[str]:
+    """Split on OR at paren depth 0, outside quotes. Never inside either."""
+    out, buf, depth, quoted = [], "", 0, False
+    i, n = 0, len(s)
+    while i < n:
+        ch = s[i]
+        if ch == '"':
+            quoted = not quoted
+        elif not quoted and ch == "(":
+            depth += 1
+        elif not quoted and ch == ")":
+            depth = max(0, depth - 1)
+        elif not quoted and depth == 0 and s[i:i + 4].upper() == " OR " :
+            out.append(buf)
+            buf = ""
+            i += 4
+            continue
+        buf += ch
+        i += 1
+    out.append(buf)
+    return [p.strip() for p in out if p.strip()]
+
+
+def _alternatives(part: str) -> list[str]:
+    """The OR-alternatives one AND-part stands for, with its wrapper removed."""
+    p = part.strip()
+    if p.startswith("(") and p.endswith(")"):
+        # Strip the wrapper only if it really wraps the WHOLE part —
+        # "(a) b (c)" starts and ends with a paren but is not one group.
+        depth = 0
+        whole = True
+        for i, ch in enumerate(p):
+            if ch == "(":
+                depth += 1
+            elif ch == ")":
+                depth -= 1
+                if depth == 0 and i != len(p) - 1:
+                    whole = False
+                    break
+        if whole:
+            p = p[1:-1].strip()
+    return _split_top_level_or(p)
+
+
+def expand_term(term: str) -> list[str] | None:
+    """
+    One rule -> the flat list of alternatives it stands for. None if it needs
+    more than MAX_ALTERNATIVES.
+
+    'finance AND gst'                    -> ['(finance gst)']
+    'Devendra Fadnavis'                  -> ['(Devendra Fadnavis)']
+    '"Deva Bhau"'                        -> ['"Deva Bhau"']
+    'gst OR vat'                         -> ['gst', 'vat']
+    '(CM OR \u092e\u0941\u0916\u094d\u092f\u092e\u0902\u0924\u094d\u0930\u0940) AND MH' -> ['(CM MH)', '(\u092e\u0941\u0916\u094d\u092f\u092e\u0902\u0924\u094d\u0930\u0940 MH)']
+
+    WHY THIS DISTRIBUTES INSTEAD OF NESTING. The obvious compilation of
+    `(a OR b) AND c` is `((a OR b) c)`, and it is wrong in practice: dropped
+    into the OR list of a compiled watchlist it sits three parens deep, and X
+    does not honour a group that deep — it flattens it, and the stream starts
+    collecting posts that have `a` and nothing else. That was observed live:
+    a rule reading `(\u0938\u0940\u090f\u092e OR \u092e\u0941\u0916\u094d\u092f\u092e\u0902\u0924\u094d\u0930\u0940) AND \u092e\u0939\u093e\u0930\u093e\u0937\u094d\u091f\u094d\u0930` collected a
+    post containing \u092e\u0941\u0916\u094d\u092f\u092e\u0902\u0924\u094d\u0930\u0940 twice and \u092e\u0939\u093e\u0930\u093e\u0937\u094d\u091f\u094d\u0930 not at all.
+
+    Distributing over the OR removes the depth instead of trusting it. Every
+    alternative is one flat conjunction, joined into the watchlist's single
+    OR list, so nothing is ever more than two parens deep. It costs query
+    length — the ANDed term repeats per alternative — which is why the
+    expansion is capped rather than unbounded, and why the chunker measures
+    the result instead of assuming it fits.
+    """
+    parts = [p.strip() for p in re.split(r"\s+AND\s+", term, flags=re.IGNORECASE)
+             if p.strip()]
+    if not parts:
+        return None
+
+    buckets = [_alternatives(p) or [p] for p in parts]
+    total = 1
+    for b in buckets:
+        total *= len(b)
+        if total > MAX_ALTERNATIVES:
+            return None
+
+    out = []
+    for combo in itertools.product(*buckets):
+        joined = " ".join(combo)
+        out.append("(" + joined + ")" if _has_bare_space(joined) else joined)
+    return out
+
+
 def compile_term(term: str) -> str:
-    """
-    One watchlist rule -> one parenthesised group, safe to OR with its siblings.
-
-    'finance AND gst'     -> '(finance gst)'    AND is a space to X
-    'Devendra Fadnavis'   -> '(Devendra Fadnavis)'
-    '"Devendra Fadnavis"' -> '"Devendra Fadnavis"'   already atomic
-    '#Chhattisgarh'       -> '#Chhattisgarh'         single token
-
-    The grouping is the point, not decoration. Rules are OR-joined into one
-    query, and a bare multi-word rule is an implicit AND to X, so without the
-    parens `Devendra Fadnavis OR Deva Bhau` asks X to settle the precedence
-    itself. It happens to bind OR loosest, giving what the operator meant —
-    but a rule's meaning must not depend on a parser detail that no
-    documentation of ours controls and X can change. Stated, not inherited.
-
-    A quoted phrase is already one atom to X and is left alone; so is any
-    single token. Both would only get parens that make the query longer, and
-    the query has a length cap that chunking has to respect.
-    """
-    parts = re.split(r"\s+AND\s+", term, flags=re.IGNORECASE)
-    if len(parts) > 1:
-        return "(" + " ".join(p.strip() for p in parts if p.strip()) + ")"
-    return "(" + term + ")" if _has_bare_space(term) else term
+    """The alternatives of `term` as one OR string. Kept for callers that want
+    a single expression; the compiler itself uses expand_term and flattens."""
+    alts = expand_term(term)
+    if not alts:
+        return term
+    return alts[0] if len(alts) == 1 else "(" + " OR ".join(alts) + ")"
 
 
 # The collection-filter checkboxes and what each compiles to. One honest
@@ -1533,6 +1612,12 @@ class Store:
         adds, bad = [], []
         for h in (add or []):
             n = norm(h)
+            # A keyword rule must also EXPAND. `(a OR b) AND (c OR d) AND ...`
+            # is valid syntax that multiplies out past what belongs in one
+            # rule; refusing here says so, rather than compiling a query so
+            # long the chunker has to shred it across streams.
+            if n and w["kind"] == "keywords" and expand_term(n) is None:
+                n = None
             (adds if n else bad).append(n or str(h))
         if bad:
             # Name the reason. "not valid search terms: '<380 characters>'" is
@@ -1546,6 +1631,10 @@ class Store:
                             f"this watchlist's filters take part of that)")
                 if w["kind"] == "keywords" and t.count('"') % 2:
                     return f"{t!r} has an unclosed quote"
+                if w["kind"] == "keywords" and expand_term(t) is None:
+                    return (f"{t!r} multiplies out to more than "
+                            f"{MAX_ALTERNATIVES} combinations — split it into "
+                            f"separate rules, which OR together anyway")
                 return repr(t)
             return {"error": f"not valid {what}: " + "; ".join(_why(b) for b in bad)}
         removes = [norm(h) for h in (remove or [])]
@@ -1601,9 +1690,14 @@ class Store:
         elif w["kind"] == "keywords":
             # Terms OR-combine; chunking is by QUERY LENGTH, not count — a
             # keyword term can be 120 chars where a handle is at most 15.
-            terms = [compile_term(r["handle"]) for r in self.db.execute(
-                "SELECT handle FROM watchlist_members WHERE watchlist_id = ? "
-                "ORDER BY handle", (int(watchlist_id),))]
+            # FLATTENED, not one group per rule: a rule that expands to several
+            # alternatives contributes each of them to the same OR list, so no
+            # alternative is ever more than two parens deep. See expand_term.
+            terms = []
+            for r in self.db.execute(
+                    "SELECT handle FROM watchlist_members WHERE watchlist_id = ? "
+                    "ORDER BY handle", (int(watchlist_id),)):
+                terms.extend(expand_term(r["handle"]) or [r["handle"]])
             # X caps queries ~512. What ships is "(" + joined + ")" + suffix,
             # so the budget for `joined` is the cap minus the parens and minus
             # THIS watchlist's own suffix — measured, not assumed, because a

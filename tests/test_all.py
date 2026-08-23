@@ -2710,6 +2710,50 @@ def test_keywords_and_project_delivery(tmp):
        "one max-length rule plus parens plus the worst suffix still fits X's "
        f"~512 cap ({store_mod.MAX_TERM_LEN} + 2 + {len(worst)})")
 
+    # ---- AND over an OR group DISTRIBUTES, it does not nest ----------------
+    #
+    # Observed live on 2026-08-23: the nested form put the group three parens
+    # deep inside the watchlist's OR list, X flattened it, and the stream
+    # collected a post with मुख्यमंत्री twice and महाराष्ट्र not at all. Depth is
+    # the thing being tested here, not prettiness.
+    et = store_mod.expand_term
+    ok(et("(CM OR \u092e\u0941\u0916\u094d\u092f\u092e\u0902\u0924\u094d\u0930\u0940) AND MH")
+       == ["(CM MH)", "(\u092e\u0941\u0916\u094d\u092f\u092e\u0902\u0924\u094d\u0930\u0940 MH)"],
+       "AND over an OR group distributes into flat alternatives")
+    ok(et("finance AND gst") == ["(finance gst)"], "a plain AND is unchanged")
+    ok(et("gst OR vat") == ["gst", "vat"],
+       "a top-level OR becomes two alternatives, needing no parens at all")
+    ok(et('"Deva Bhau"') == ['"Deva Bhau"'],
+       "a quoted phrase stays one atom — OR inside quotes is not an operator")
+    ok(et("(a OR b) AND (c OR d)") == ["(a c)", "(a d)", "(b c)", "(b d)"],
+       "two OR groups produce the full product")
+    ok(et(" AND ".join(f"(a{i} OR b{i})" for i in range(5))) is None,
+       f"a rule past {store_mod.MAX_ALTERNATIVES} combinations is refused, not "
+       "silently truncated")
+
+    def _depth(q):
+        d = m = 0
+        quoted = False
+        for ch in q:
+            if ch == '"':
+                quoted = not quoted
+            elif not quoted and ch == "(":
+                d += 1
+                m = max(m, d)
+            elif not quoted and ch == ")":
+                d -= 1
+        return m
+
+    live = ['"Deva Bhau"', '"Devendra Fadnavis"',
+            '(\u0938\u0940\u090f\u092e OR \u092e\u0941\u0916\u094d\u092f\u092e\u0902\u0924\u094d\u0930\u0940) AND \u092e\u0939\u093e\u0930\u093e\u0937\u094d\u091f\u094d\u0930',
+            'CM AND Maharashtra']
+    flat = []
+    for r in sorted(live):
+        flat.extend(et(r))
+    ok(_depth("(" + " OR ".join(flat) + ")") <= 2,
+       "a whole compiled watchlist query never nests deeper than two parens — "
+       "the depth X was observed to flatten was three")
+
     async def run():
         st = store_mod.Store(db, False)
         await st.open()

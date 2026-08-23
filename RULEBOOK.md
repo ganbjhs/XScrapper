@@ -180,6 +180,16 @@ names).
   collects. Quoted phrases and single tokens are already atomic and stay bare —
   parens there only spend query length against the ~512 cap that chunking has
   to respect.
+- **AND over an OR group DISTRIBUTES; it never nests.** `(a OR b) AND c`
+  compiles to `(a c) OR (b c)`, flattened into the watchlist's single OR list —
+  not to `((a OR b) c)`. X does not honour a group three parens deep: it
+  flattens it and starts matching the alternatives on their own. Observed
+  2026-08-23, a rule reading `(सीएम OR मुख्यमंत्री) AND महाराष्ट्र` collected a post
+  containing मुख्यमंत्री twice and महाराष्ट्र not at all. Nothing in a compiled query
+  may exceed two parens deep, and `expand_term` is where that is enforced.
+  Distribution costs query length, so it is capped (`MAX_ALTERNATIVES`) and a
+  rule that multiplies past it is refused with the reason — separate rules OR
+  together anyway.
 - **Labelling is a fetch too, and spends money instead of budget.** Everything
   the two rules above say about going out to a platform applies to going out to
   Grok: explicit (the Classify button, never a timer), serialized behind ONE
