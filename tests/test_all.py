@@ -2671,6 +2671,23 @@ def test_keywords_and_project_delivery(tmp):
     ok(ct("finance and GST") == "(finance GST)", "AND is case-insensitive")
     ok(ct("#Chhattisgarh") == "#Chhattisgarh", "plain terms pass through")
 
+    # A bare multi-word rule is an implicit AND to X, so it must be grouped
+    # before it is OR-joined with its siblings. Ungrouped, the meaning of
+    # `Devendra Fadnavis OR Deva Bhau` is decided by X's operator precedence
+    # rather than by us — it happens to bind OR loosest, which is the answer we
+    # want, but a rule whose meaning rests on an undocumented parser detail is
+    # one upstream change away from silently collecting something else.
+    ok(ct("Devendra Fadnavis") == "(Devendra Fadnavis)",
+       "a bare multi-word rule is grouped, so OR cannot straddle it")
+    ok(ct('"Devendra Fadnavis"') == '"Devendra Fadnavis"',
+       "a quoted phrase is already one atom to X — no parens, no wasted query "
+       "length against the ~512 cap")
+    ok(ct("gst OR vat") == "(gst OR vat)", "an OR rule is grouped too")
+    joined = "(" + " OR ".join(ct(t) for t in ("Devendra Fadnavis", "Deva Bhau")) + ")"
+    ok(joined == "((Devendra Fadnavis) OR (Deva Bhau))",
+       "two multi-word rules OR-join without either one absorbing the other's "
+       "words")
+
     async def run():
         st = store_mod.Store(db, False)
         await st.open()

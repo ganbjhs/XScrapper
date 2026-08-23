@@ -145,8 +145,11 @@ function AddModal({ pid, onDone, onClose }) {
                 Syntax: <b>comma</b> (or a new line) = <b>OR</b> (match any).
                 Uppercase <b>AND</b> between two words = <b>both required</b>,
                 any order — e.g. <code>Varanasi AND Modi</code>.
-                Also <code>-exclude</code>, <code>"phrase"</code>,
-                <code>#hashtag</code>, <code>@mention</code>.
+                Two words with no operator mean both as well, so
+                <code>Devendra Fadnavis</code> also matches “Fadnavis … Devendra”;
+                for the exact phrase, quote it: <code>"Devendra Fadnavis"</code>.
+                Also <code>-exclude</code>, <code>#hashtag</code>,
+                <code>@mention</code>.
               </div>
             </div>
           ) : (

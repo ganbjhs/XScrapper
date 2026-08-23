@@ -169,6 +169,17 @@ names).
   rejected with the reason, not quietly shrunk — a silent clamp still spends
   budget the caller never agreed to. This covers backfill grants too: an absurd
   page count is refused with the ceiling named, never trimmed to fit.
+- **A compiled query states its own precedence.** Watchlist rules are OR-joined
+  into one X query, so every rule that is more than one token is parenthesised
+  before joining — `compile_term`, both for the AND form and for a bare
+  multi-word rule, which is an implicit AND to X. Ungrouped, `Devendra Fadnavis
+  OR Deva Bhau` asks X's parser to decide whether that is two people or one
+  word shared between them. It binds OR loosest and gives the right answer
+  today; that is a detail we do not own and cannot test against, and inheriting
+  it would mean a change at X quietly altering what every keyword watchlist
+  collects. Quoted phrases and single tokens are already atomic and stay bare —
+  parens there only spend query length against the ~512 cap that chunking has
+  to respect.
 - **Labelling is a fetch too, and spends money instead of budget.** Everything
   the two rules above say about going out to a platform applies to going out to
   Grok: explicit (the Classify button, never a timer), serialized behind ONE

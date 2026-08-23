@@ -789,12 +789,41 @@ def normalize_term(raw) -> str | None:
     return s
 
 
+def _has_bare_space(s: str) -> bool:
+    """True if `s` has whitespace OUTSIDE quotes — i.e. it is several terms."""
+    quoted = False
+    for ch in s:
+        if ch == '"':
+            quoted = not quoted
+        elif ch.isspace() and not quoted:
+            return True
+    return False
+
+
 def compile_term(term: str) -> str:
-    """'finance AND gst' -> '(finance gst)'; anything else passes through."""
+    """
+    One watchlist rule -> one parenthesised group, safe to OR with its siblings.
+
+    'finance AND gst'     -> '(finance gst)'    AND is a space to X
+    'Devendra Fadnavis'   -> '(Devendra Fadnavis)'
+    '"Devendra Fadnavis"' -> '"Devendra Fadnavis"'   already atomic
+    '#Chhattisgarh'       -> '#Chhattisgarh'         single token
+
+    The grouping is the point, not decoration. Rules are OR-joined into one
+    query, and a bare multi-word rule is an implicit AND to X, so without the
+    parens `Devendra Fadnavis OR Deva Bhau` asks X to settle the precedence
+    itself. It happens to bind OR loosest, giving what the operator meant —
+    but a rule's meaning must not depend on a parser detail that no
+    documentation of ours controls and X can change. Stated, not inherited.
+
+    A quoted phrase is already one atom to X and is left alone; so is any
+    single token. Both would only get parens that make the query longer, and
+    the query has a length cap that chunking has to respect.
+    """
     parts = re.split(r"\s+AND\s+", term, flags=re.IGNORECASE)
     if len(parts) > 1:
         return "(" + " ".join(p.strip() for p in parts if p.strip()) + ")"
-    return term
+    return "(" + term + ")" if _has_bare_space(term) else term
 
 
 # The collection-filter checkboxes and what each compiles to. One honest
