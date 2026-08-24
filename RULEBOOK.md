@@ -122,6 +122,22 @@ The rules:
   correct to ask unscoped. **Closing a default means finding every caller that
   was relying on it being open** — grep the frontend for the endpoint before
   assuming a refusal is safe.)
+- **A COUNT is built by the same filter as the list it counts — never a second
+  copy of the clause.** `_ig_posts` listed rows through `store_ig.query(...,
+  project_id=pid)` and then counted them with its own hand-written WHERE built
+  inline in `web.py`. The copy carried the window, the source and the username
+  and had no `project_id`, so the Live Feed listed one project and totalled the
+  whole file: "Incoming 2,241 posts" over a project holding 1,855, and a Load
+  more that could never reach its target. Nothing was leaked — no other
+  project's post was ever shown — which is exactly why it survived: **a scoping
+  bug in a number is invisible in a way the same bug in a list is not.** The
+  cure is structural, not one added `project_id`: `query` and `count` now build
+  their WHERE from one `store_ig.Store._post_filter`, so the two cannot say
+  different things about the same rows. Facebook was right by luck
+  (`fw = ["project_id = ?"]` was typed correctly); luck is not the rule.
+  Corollary: `count` refuses `before_pk`. **A cursor is a position in a list,
+  not a narrowing of it** — counting with one shrinks the total every time the
+  reader presses Load more.
 
 ### The three-column source: a PERSON, a HANDLE, an ID — never one string
 

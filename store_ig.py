@@ -400,6 +400,30 @@ class Store:
         schema. The only legitimate unscoped readers are the collector, the
         migration and the tests.
         """
+        where, args = self._post_filter(
+            project_id=project_id, since=since, until=until,
+            source=source, username=username, before_pk=before_pk)
+        sql = "SELECT * FROM posts"
+        if where:
+            sql += " WHERE " + " AND ".join(where)
+        sql += " ORDER BY pk DESC LIMIT ?"
+        args.append(max(1, min(int(limit), 200)))
+        return [dict(r) for r in self.db.execute(sql, args)]
+
+    @staticmethod
+    def _post_filter(*, project_id=None, since=None, until=None, source=None,
+                     username=None, before_pk=None):
+        """
+        The posts WHERE clause, built once for both `query` and `count`.
+
+        This is shared rather than written twice on purpose. It used to be
+        written twice -- the dashboard's feed counted with its own hand-copied
+        clause -- and the copy was missing `project_id`, so the Live Feed
+        headline counted every project's Instagram posts while listing only
+        this project's. A count that does not filter exactly as the list does
+        is a number that describes a different set of rows than the one on
+        screen, so the two share a builder and cannot drift apart again.
+        """
         where, args = [], []
         if project_id is not None:
             where.append("project_id = ?"); args.append(int(project_id))
@@ -413,12 +437,25 @@ class Store:
             where.append("username = ?"); args.append(username.lstrip("@"))
         if before_pk:
             where.append("pk < ?"); args.append(int(before_pk))
-        sql = "SELECT * FROM posts"
+        return where, args
+
+    def count(self, *, since=None, until=None, source=None, username=None,
+              project_id=None) -> int:
+        """
+        How many posts `query` would match, ignoring limit and the cursor.
+
+        Same filters, same builder -- this is the honest total behind a page
+        of results. before_pk is deliberately not accepted: a cursor is a
+        position in a list, not a narrowing of it, and counting with one would
+        shrink the total every time the reader pressed Load more.
+        """
+        where, args = self._post_filter(
+            project_id=project_id, since=since, until=until,
+            source=source, username=username)
+        sql = "SELECT COUNT(*) n FROM posts"
         if where:
             sql += " WHERE " + " AND ".join(where)
-        sql += " ORDER BY pk DESC LIMIT ?"
-        args.append(max(1, min(int(limit), 200)))
-        return [dict(r) for r in self.db.execute(sql, args)]
+        return int(self.db.execute(sql, args).fetchone()["n"])
 
     def stats(self, project_id=None) -> dict:
         """Counts. project_id=None counts every project; pass an id to describe

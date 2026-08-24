@@ -4548,17 +4548,18 @@ def _ig_posts(q):
         posts = [store_ig.to_api(r) for r in rows]
         # TRUE count for the window (not the page) so the UI number is real,
         # independent of how many rows the load-more has pulled so far.
-        tw, ta = [], []
-        if since is not None:
-            tw.append("taken_at >= ?"); ta.append(since)
-        if q.get("source"):
-            tw.append("source_label = ?"); ta.append(q["source"])
-        if q.get("username"):
-            tw.append("username = ?"); ta.append(str(q["username"]).lstrip("@"))
+        #
+        # store_ig.count takes the SAME arguments as the query above and builds
+        # its WHERE with the same helper, which is the point: this used to be a
+        # hand-copied clause here, the copy had no project_id, and the feed's
+        # "Incoming N posts" quietly added every other project's Instagram
+        # posts to this project's list of its own. A total that filters
+        # differently from the list beneath it is not a total.
         try:
-            total = st.db.execute(
-                "SELECT COUNT(*) c FROM posts"
-                + ((" WHERE " + " AND ".join(tw)) if tw else ""), ta).fetchone()["c"]
+            total = st.count(project_id=pid,
+                             since=since,
+                             source=q.get("source") or None,
+                             username=q.get("username") or None)
         except Exception:
             total = len(posts)
     # Same rule as Facebook: the X avatar for the same handle is the profile
