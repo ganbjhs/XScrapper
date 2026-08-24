@@ -7,6 +7,7 @@ import { PageHead, useProject } from "../App.jsx";
 import CollectedChart from "../components/CollectedChart.jsx";
 import CollectionPicker from "../components/CollectionPicker.jsx";
 import PostCard from "../components/PostCard.jsx";
+import { useClassifyButton, useLabelRun } from "../components/Sentiments.jsx";
 import { Empty, ErrorState, Loading } from "../components/ui.jsx";
 
 const normIg = (p) => ({
@@ -131,8 +132,6 @@ export default function LiveFeed({ onMenu }) {
   const [pinTarget, setPinTarget] = useState(null);
   const [fetching, setFetching] = useState(false);
   const [fetchMsg, setFetchMsg] = useState("");
-  const [classifying, setClassifying] = useState(false);
-  const [classMsg, setClassMsg] = useState("");
 
   // Refresh = ask X for the newest posts RIGHT NOW (one page per stream),
   // then the collector's normal cadence carries on. Not just a re-read.
@@ -178,36 +177,21 @@ export default function LiveFeed({ onMenu }) {
       setTimeout(() => setFetchMsg(""), 6000);
     }
   };
-  // Classify = send this project's UNLABELLED posts to Grok, once, on purpose.
-  // It spends money, so it is a button and never a timer, and it reports what
-  // it cost rather than just finishing quietly.
-  const runClassify = async () => {
-    if (!pid || classifying) return;
-    setClassifying(true);
-    setClassMsg("");
-    try {
-      const r = await api.classify(pid);
-      if (r.message) {
-        setClassMsg(`✓ ${r.message}`);
-      } else {
-        const bits = [`${r.labelled} labelled`];
-        if (r.failed) bits.push(`${r.failed} not`);
-        bits.push(`$${Number(r.cost_usd || 0).toFixed(3)}`);
-        if (r.stop_reason === "cap") bits.push("stopped at the monthly cap");
-        if (r.stop_reason === "partial") bits.push("some batches failed");
-        setClassMsg(`✓ ${bits.join(" · ")}`);
-      }
-      feed.reload(true);
-      labels.reload(true);
-    } catch (e) {
-      setClassMsg(`✗ ${String(e.message || e)}`);
-    } finally {
-      setClassifying(false);
-      // Longer than the fetch toast: a cost and a stop-reason are worth
-      // reading twice.
-      setTimeout(() => setClassMsg(""), 12000);
-    }
-  };
+  // Classify = send EVERY unlabelled post in this project to Grok, once, on
+  // purpose. It spends money, so it is a button and never a timer. The run
+  // happens in the background now — the same hook the Collections strip uses
+  // owns the button, the progress and the message, so the two screens cannot
+  // disagree about what is going on.
+  const classify = useClassifyButton({ pid, labels });
+  const run = useLabelRun(labels, () => {
+    // A run just ended: the feed is holding posts whose labels have changed
+    // underneath it.
+    feed.reload(true);
+  });
+  const classMsg = classify.msg
+    || (run?.running
+      ? `Classifying ${fmtN(run.done || 0)} of ${fmtN(run.total || 0)}…`
+      : "");
 
   // Correcting one post by hand. Written as a human label, which is what
   // stops the next run overwriting it.
@@ -379,7 +363,8 @@ export default function LiveFeed({ onMenu }) {
         )}
         {classMsg && (
           <span style={{ fontSize: 12.5, fontWeight: 600 }}
-                className={classMsg.startsWith("✓") ? "st-good" : "st-crit"}>
+                className={classMsg.startsWith("✗") ? "st-crit"
+                  : classMsg.startsWith("✓") ? "st-good" : "st-warn"}>
             {classMsg}
           </span>
         )}
@@ -388,26 +373,10 @@ export default function LiveFeed({ onMenu }) {
             {paused ? "▶ Start collection" : "⏸ Pause collection"}
           </button>
         )}
-        {/* Every state by name: no key, nothing waiting, N waiting, running.
-            A button that just says "Classify" when there is no key on the
-            server would fail on click and teach nothing. */}
-        <button className="btn btn-ghost"
-                disabled={classifying || !labels.data?.key_present
-                          || !labels.data?.unlabelled}
-                title={!labels.data?.key_present
-                  ? "No Grok key on the server — add XAI_API_KEY to .env"
-                  : !labels.data?.unlabelled
-                    ? "Every post in this project already has a label"
-                    : `Send ${labels.data.unlabelled} unlabelled posts to `
-                      + `${labels.data.model} — about `
-                      + `$${(labels.data.unlabelled * 0.00025).toFixed(2)}`}
-                onClick={runClassify}>
-          {classifying ? "Classifying…"
-            : !labels.data ? "Classify"
-              : !labels.data.key_present ? "Classify — no key"
-                : !labels.data.unlabelled ? "All classified"
-                  : `Classify ${fmtN(labels.data.unlabelled)}`}
-        </button>
+        {/* Every state by name: no key, nothing waiting, N waiting, running
+            with a count. A button that just says "Classify" when there is no
+            key on the server would fail on click and teach nothing. */}
+        {classify.node}
         <button className="btn btn-brand" disabled={fetching} onClick={() => refreshNow()}>
           {fetching ? "Fetching from X…" : "Refresh"}
         </button>

@@ -2497,31 +2497,81 @@ def _collection_items_json(q):
     return {"count": len(rows), "pinned": len(pins), "rows": rows}
 
 
-def _collection_export_csv(q):
-    """The board as CSV — the same frozen column set the exporter uses."""
-    try:
-        cid = int(q.get("id") or 0)
-    except (TypeError, ValueError):
-        cid = 0
-    rows = _board_rows(cid)[1] if cid else []
-    import csv as _csv
-    import io as _io
-    buf = _io.StringIO()
-    # FIELDS_BOARD, not FIELDS: a board can hold three platforms now, and a CSV
-    # that puts a Facebook post id under a column headed tweet_id without
-    # saying so is a file that lies to whoever opens it next.
-    w = _csv.DictWriter(buf, fieldnames=store_mod.FIELDS_BOARD,
-                        extrasaction="ignore")
-    w.writeheader()
-    for r in rows:
+def _export_board_rows(cid: int, headers: list) -> list:
+    """One board's posts as plain lists, in the frozen board column order."""
+    out = []
+    for r in _board_rows(cid)[1]:
         rec = dict(r)
         for k in ("hashtags", "mentions", "urls", "media_urls"):
             try:
                 rec[k] = json.loads(rec.get(k) or "[]")
             except (TypeError, ValueError):
                 rec[k] = []
-        w.writerow(store_mod.to_csv_row(rec, store_mod.FIELDS_BOARD))
-    return buf.getvalue()
+        flat = store_mod.to_csv_row(rec, headers)
+        out.append([flat.get(h) for h in headers])
+    return out
+
+
+def _collections_export_xlsx(q) -> bytes:
+    """
+    The whole project as ONE workbook: a summary sheet, then a sheet per board.
+
+    There used to be a Download CSV on every board, which meant handing the desk
+    five files and asking them to remember which was which. A hand-off is one
+    file or it is a filing problem, so this is now the only export the
+    Collections page offers.
+
+    Sheet one is the ledger — every category, how many posts carry it, and how
+    many are still unclassified — because a stack of sheets with no count on the
+    front is a workbook nobody can check against the dashboard. After that, one
+    sheet per board in the order the page shows them: label boards first, then
+    the operator's own.
+
+    FIELDS_BOARD, not FIELDS: a board holds three platforms, and a column headed
+    tweet_id holding a Facebook post id is a file that lies to whoever opens it.
+    """
+    import xlsx_min
+
+    pid = _project_or_none(q)
+    if not pid:
+        return b""
+
+    boards = _with_store(lambda st: st.collections(pid)) or []
+    cats = _with_store(lambda st: st.post_label_categories(pid)) or []
+    labelled = _with_store(lambda st: st.labelled_post_ids(pid)) or set()
+    waiting = (_x_unlabelled(pid, labelled)
+               + _ig_unlabelled(pid, labelled)
+               + _fb_unlabelled(pid, labelled))
+
+    headers = list(store_mod.FIELDS_BOARD)
+    sheets, ledger = [], []
+    seen_keys, total = set(), 0
+
+    for b in boards:
+        cid = int(b.get("collection_id") or 0)
+        if not cid:
+            continue
+        rows = _export_board_rows(cid, headers)
+        total += len(rows)
+        key = b.get("label_key") or ""
+        if key:
+            seen_keys.add(key)
+        ledger.append([b.get("name") or f"Board {cid}",
+                       "label" if b.get("auto") else "manual", key, len(rows)])
+        sheets.append((b.get("name") or f"Board {cid}", headers, rows))
+
+    # A category the labeller has not filled yet has no board, and leaving it
+    # off the ledger would read as "this category does not exist" rather than
+    # "nothing landed in it".
+    for c in cats:
+        if c["key"] not in seen_keys:
+            ledger.append([c["name"], "label", c["key"], 0])
+
+    ledger.append(["Not classified", "waiting", "", int(waiting)])
+    ledger.append(["TOTAL on boards", "", "", total])
+
+    summary = ("Summary", ["Board", "Kind", "Category key", "Posts"], ledger)
+    return xlsx_min.build([summary] + sheets)
 
 
 # --------------------------------------------------------------------------
@@ -2546,35 +2596,107 @@ _CLASSIFY_LOCK = threading.Lock()
 # reports wrongly.
 _CLASSIFY_DEFAULTS = {
     "classify_model": None,          # filled from classify.DEFAULT_MODEL
-    "classify_cap_usd": "10",        # per calendar month, across every project
-    "classify_max_posts": "500",     # per run, so one click cannot drain the cap
 }
 
+# How many batches are in flight at once. Deliberately a constant and not a
+# dashboard switch: it describes how hard we are willing to lean on one
+# provider, which is a property of this code, not a decision an operator should
+# have to make before pressing a button.
+CLASSIFY_FANOUT = 8
 
-def _classify_locked_run(coro, timeout=300):
-    """
-    Run a classify coroutine single-flight.
+# The live state of the one run that may be going. Read by /api/labels/status
+# so the dashboard can show a bar that moves; written only by the runner.
+# `total` is fixed when the run starts, so done/total never walks backwards.
+_CLASSIFY_RUN = {
+    "running": False,
+    "total": 0,
+    "done": 0,
+    "failed": 0,
+    "cost_usd": 0.0,
+    "started_ms": 0,
+    "finished_ms": 0,
+    "stop_reason": "",
+    "error": "",
+    "project_id": 0,
+}
+_CLASSIFY_RUN_LOCK = threading.Lock()
 
-    Lock released by the coroutine's done-callback, not on return — same reason
-    as _fb_locked_run: when the HTTP request times out the run is still going,
-    and releasing here would let a second click start a second run over posts
-    the first has not written yet. Returns (result, err).
+
+def _classify_run_set(**kw):
+    """Publish progress. Locked because the HTTP thread reads what the loop writes."""
+    with _CLASSIFY_RUN_LOCK:
+        _CLASSIFY_RUN.update(kw)
+
+
+def _classify_run_bump(done=0, failed=0, cost=0.0):
+    with _CLASSIFY_RUN_LOCK:
+        _CLASSIFY_RUN["done"] += int(done)
+        _CLASSIFY_RUN["failed"] += int(failed)
+        _CLASSIFY_RUN["cost_usd"] = round(
+            _CLASSIFY_RUN["cost_usd"] + float(cost), 6)
+
+
+def _classify_run_snapshot() -> dict:
+    with _CLASSIFY_RUN_LOCK:
+        return dict(_CLASSIFY_RUN)
+
+
+def _classify_run_for(pid: int) -> dict:
     """
-    import concurrent.futures as _cf
+    This project's run, or an idle block.
+
+    One run goes at a time across the whole server, so a project that is not
+    the one running must be told "nothing is happening here" — a progress bar
+    counting posts on somebody else's screen is worse than no bar. The busy
+    flag is still true, which is what a second project's Classify button needs
+    to explain why it was refused.
+    """
+    snap = _classify_run_snapshot()
+    if int(snap.get("project_id") or 0) == int(pid):
+        return {**snap, "busy_elsewhere": False}
+    return {"running": False, "total": 0, "done": 0, "failed": 0,
+            "cost_usd": 0.0, "started_ms": 0, "finished_ms": 0,
+            "stop_reason": "", "error": "", "project_id": int(pid),
+            "busy_elsewhere": bool(snap.get("running"))}
+
+
+def _classify_launch(coro):
+    """
+    Start the one classify run, single-flight, and return at once.
+
+    The old shape waited on the coroutine for 280s and then apologised. A run
+    that now covers *every* unlabelled post in a project is a job, not a
+    request: it can outlive any sensible HTTP timeout, so the button starts it
+    and /api/labels/status reports how far it has got. The lock is released by
+    the coroutine's done-callback — never here — so a second click cannot start
+    a second run over posts the first has not written yet.
+    """
     if _LOOP is None:
-        return None, {"error": "server not ready"}
+        return {"error": "server not ready"}
     if not _CLASSIFY_LOCK.acquire(blocking=False):
-        return None, {"error": "A classify run is already going — give it a moment."}
-    fut = asyncio.run_coroutine_threadsafe(coro, _LOOP)
-    fut.add_done_callback(lambda f: _CLASSIFY_LOCK.release())
+        return {"error": "A classify run is already going — watch the bar."}
     try:
-        return fut.result(timeout), None
-    except _cf.TimeoutError:
-        return None, {"error": "Classifying is taking a while — it's still "
-                               "running in the background; the labels appear "
-                               "as they land, so reload in a minute."}
+        fut = asyncio.run_coroutine_threadsafe(coro, _LOOP)
     except Exception as e:
-        return None, {"error": f"{type(e).__name__}: {e}"}
+        _CLASSIFY_LOCK.release()
+        return {"error": f"{type(e).__name__}: {e}"}
+
+    def _done(f):
+        # Whatever happened, the run is over and the lock must go back. An
+        # exception that escaped the coroutine is recorded rather than lost to
+        # a future nobody awaits.
+        try:
+            exc = f.exception()
+        except Exception:
+            exc = None
+        if exc is not None:
+            _classify_run_set(running=False, stop_reason="error",
+                              error=f"{type(exc).__name__}: {exc}",
+                              finished_ms=int(time.time() * 1000))
+        _CLASSIFY_LOCK.release()
+
+    fut.add_done_callback(_done)
+    return {}
 
 
 def _month_start_ms() -> int:
@@ -2670,27 +2792,41 @@ def _fb_unlabelled(pid: int, labelled: set, limit: int = 0):
     return out if limit else n
 
 
-def _classify_candidates(pid: int, labelled: set, limit: int) -> list:
-    """The next `limit` unlabelled posts across all three platforms, newest first."""
-    posts = (_x_unlabelled(pid, labelled, limit)
-             + _ig_unlabelled(pid, labelled, limit)
-             + _fb_unlabelled(pid, labelled, limit))
+# The platform helpers read `limit=0` as "count, do not list", so "everything"
+# needs a number. This one is larger than any archive this project will hold
+# and small enough to stay an ordinary SQLite LIMIT.
+_ALL_POSTS = 10_000_000
+
+
+def _classify_candidates(pid: int, labelled: set, limit: int = 0) -> list:
+    """
+    Every unlabelled post in this project, newest first.
+
+    `limit` 0 means all of them, which is now the only caller: the button
+    classifies the whole project-scoped archive rather than a slice of it, so
+    the operator never has to press it twice to finish a job.
+    """
+    n = int(limit) or _ALL_POSTS
+    posts = (_x_unlabelled(pid, labelled, n)
+             + _ig_unlabelled(pid, labelled, n)
+             + _fb_unlabelled(pid, labelled, n))
     # A post with nothing to read cannot be classified, and paying to be told
     # so is money for nothing. Dropped here rather than sent and discarded.
     posts = [p for p in posts if (p.get("text") or "").strip()]
     posts.sort(key=lambda p: p["when"], reverse=True)
-    return posts[:limit]
+    return posts[:n]
 
 
 async def _classify_settings(st) -> dict:
     import classify as cls
     model = await st.setting("classify_model", cls.DEFAULT_MODEL)
+    # No cap and no per-run ceiling any more. They existed to stop one click
+    # draining a metered budget; this deployment is not metered that way, and a
+    # ceiling that silently leaves posts unlabelled is worse than no ceiling.
+    # The prices stay because the run still reports what it spent — a meter is
+    # not a limit.
     return {
         "model": model or cls.DEFAULT_MODEL,
-        "cap_usd": float(await st.setting("classify_cap_usd",
-                                          _CLASSIFY_DEFAULTS["classify_cap_usd"])),
-        "max_posts": int(await st.setting("classify_max_posts",
-                                          _CLASSIFY_DEFAULTS["classify_max_posts"])),
         "price_in": float(await st.setting("classify_price_in",
                                            cls.DEFAULT_PRICE_IN)),
         "price_out": float(await st.setting("classify_price_out",
@@ -2700,9 +2836,10 @@ async def _classify_settings(st) -> dict:
 
 def _labels_status_json(q):
     """
-    Everything the Live Feed button needs to tell the truth before it is
-    pressed: how many posts are waiting, what a run would cost against, whether
-    the key is even there, and how the last run ended.
+    Everything the Classify button needs to tell the truth before it is
+    pressed and while it is running: how many posts carry each label, how many
+    are still waiting, whether the key is even there, how the last run ended,
+    and — under "run" — the live progress of the one that may be going now.
     """
     pid = _project_or_none(q)
     if not pid:
@@ -2729,10 +2866,15 @@ def _labels_status_json(q):
                 # value itself (RULEBOOK §5/§6).
                 "key_present": bool(cls.xai_api_key()),
                 "model": cfg["model"],
-                "cap_usd": cfg["cap_usd"],
-                "max_posts": cfg["max_posts"],
                 "spent_usd": round(spent, 4),
                 "last_run": last,
+                # The run in flight, if any. This is what lets the button
+                # show a bar that moves instead of a spinner that says
+                # nothing. Only ever this project's: one run may be going at a
+                # time across the whole server, and reporting another
+                # project's progress here would be a bar counting posts that
+                # are not on this screen.
+                "run": _classify_run_for(pid),
             }
         return run()
 
@@ -2817,22 +2959,23 @@ def _label_set_post(body):
 
 def _label_settings_post(body):
     """
-    The labelling switches: model, monthly cap, per-run ceiling, prices.
+    What is left of the labelling switches: the model name and the two prices.
 
-    All in the database so the next run reads them without a restart, and none
-    of them is a secret — XAI_API_KEY stays in .env and is never written here
-    (RULEBOOK §6: every operational switch on the dashboard, credentials the
-    one exception).
+    The cap and the per-run ceiling are gone — a run now covers every unlabelled
+    post in the project and stops for nothing but a provider failure. The prices
+    remain because the run still reports what it spent, and a meter is not a
+    limit.
 
-    An empty box clears the row and the default applies again; it does not pin
-    the setting to zero, which would silently mean "cap of $0, refuse
-    everything".
+    There is no UI for any of this; it is kept as an endpoint so a model rename
+    or a price change is still an edit rather than a deploy. All in the database
+    so the next run reads them without a restart, and none of them is a secret —
+    XAI_API_KEY stays in .env and is never written here (RULEBOOK §6).
+
+    An empty box clears the row and the default applies again.
     """
     import classify as cls
     allowed = {
         "model": ("classify_model", str),
-        "cap_usd": ("classify_cap_usd", float),
-        "max_posts": ("classify_max_posts", int),
         "price_in": ("classify_price_in", float),
         "price_out": ("classify_price_out", float),
     }
@@ -2855,9 +2998,6 @@ def _label_settings_post(body):
         # cap would therefore render as "$0.00", telling the operator their
         # ceiling is zero when it is not — so refuse it rather than display a
         # number that lies.
-        if name == "cap_usd" and val < 0.01:
-            return {"error": "the monthly cap must be at least $0.01 — "
-                             "anything smaller cannot be shown honestly"}
         writes[key] = val
     if not writes:
         return {"error": "nothing to change"}
@@ -2875,11 +3015,16 @@ def _label_settings_post(body):
 
 def _classify_post(body):
     """
-    The Classify button. One pass over this project's unlabelled posts.
+    The Classify button. One pass over EVERY unlabelled post in the project.
 
-    Returns what it did and what it cost, always — including when it refused.
-    A run that stops at the cap, or on a 429, says so and names the number,
-    because "nothing happened" is the one answer the dashboard may not give.
+    Starts the run and answers straight away. With no per-run ceiling a project
+    holding tens of thousands of posts takes far longer than any HTTP request
+    should live, so a click gets "started" and /api/labels/status reports how
+    far it has got — a bar that moves rather than a request that times out and
+    apologises for work that is actually still going.
+
+    Nothing here is capped. The only things that end a run early are an auth or
+    quota failure from the provider, and they are reported by name.
     """
     pid = _project_or_none(body)
     if not pid:
@@ -2897,6 +3042,11 @@ def _classify_post(body):
     except (TypeError, ValueError):
         return {"error": "limit must be a number"}
 
+    snap = _classify_run_snapshot()
+    if snap.get("running"):
+        return {"error": "A classify run is already going — watch the bar.",
+                "run": snap}
+
     logs: list = []
     _lg = activity_log.logger("classify", account=None,
                               echo=lambda m: logs.append(str(m)),
@@ -2910,103 +3060,107 @@ def _classify_post(body):
             await st.seed_post_label_categories(pid, cls.DEFAULT_CATEGORIES)
             cats = await st.post_label_categories(pid)
             if not cats:
-                return {"error": "this project has no categories to label with"}
+                _classify_run_set(stop_reason="error",
+                                  error="this project has no categories to "
+                                        "label with")
+                return
             cfg = await _classify_settings(st)
-            limit = min(want or cfg["max_posts"], cfg["max_posts"])
-            if want and want > cfg["max_posts"]:
-                # Refuse, don't silently clamp (RULEBOOK §3): a trimmed request
-                # still spends money the caller never agreed to.
-                return {"error": f"{want} posts is over this project's "
-                                 f"per-run ceiling of {cfg['max_posts']} — "
-                                 f"raise it in the labelling settings or ask "
-                                 f"for fewer."}
+            model = cfg["model"]
 
             labelled = await st.labelled_post_ids(pid)
-            posts = _classify_candidates(pid, labelled, limit)
+            posts = _classify_candidates(pid, labelled, want)
             if not posts:
                 _lg("[classify] nothing left to classify in this project")
-                return {"ok": True, "labelled": 0, "failed": 0, "cost_usd": 0.0,
-                        "stop_reason": "empty", "log": logs,
-                        "message": "Nothing left to classify — every post in "
-                                   "this project already has a label."}
+                _classify_run_set(stop_reason="empty", total=0)
+                return
+            _classify_run_set(total=len(posts))
 
-            spent = await st.label_spend_month(_month_start_ms())
-            est = cls.cost_usd(cls.estimate_tokens(posts, ""), 0,
-                               cfg["price_in"], cfg["price_out"])
-            if spent >= cfg["cap_usd"]:
-                _lg(f"[classify] refused: ${spent:.2f} already spent this month, "
-                    f"cap is ${cfg['cap_usd']:.2f}")
-                return {"error": f"This month's labelling spend is already "
-                                 f"${spent:.2f}, at the ${cfg['cap_usd']:.2f} "
-                                 f"cap. Raise the cap in the labelling settings "
-                                 f"or wait for the month to turn over.",
-                        "log": logs}
-
-            model = cfg["model"]
             run_id = await st.start_label_run(pid, len(posts), model)
             boards = {c["key"]: await st.ensure_label_collection(
                 pid, c["key"], c["name"]) for c in cats}
             _lg(f"[classify] {len(posts)} posts, {len(cats)} categories, "
-                f"model {model} (about ${est:.3f} of input)")
+                f"model {model}, {CLASSIFY_FANOUT} batches at a time")
 
+            batches = list(cls.chunk(posts, cls.BATCH))
             done = failed = tin = tout = 0
             cost = 0.0
-            stop, err_txt = "done", None
+            stop, err_txt, fatal = "done", None, False
+
             async with httpx.AsyncClient() as client:
-                for batch in cls.chunk(posts, cls.BATCH):
-                    if spent + cost >= cfg["cap_usd"]:
-                        stop = "cap"
-                        _lg(f"[classify] stopped at the ${cfg['cap_usd']:.2f} "
-                            f"monthly cap — {done} labelled, "
-                            f"{len(posts) - done - failed} left")
-                        break
-                    labels, usage, err = await cls.label_batch(
-                        client, key, model, batch, cats)
-                    tin += usage.get("in", 0); tout += usage.get("out", 0)
-                    cost += cls.cost_usd(usage.get("in", 0), usage.get("out", 0),
-                                         cfg["price_in"], cfg["price_out"])
-                    if err:
-                        failed += len(batch)
-                        err_txt = err
-                        _lg(f"[classify] batch failed: {err}")
-                        # An auth or quota problem will not fix itself on the
-                        # next batch; stop rather than repeating the same
-                        # failure twenty times and reporting it once.
-                        if any(m in err for m in ("HTTP 401", "HTTP 403",
-                                                  "no XAI_API_KEY")):
-                            stop = "error"
-                            break
-                        stop = "partial"
-                        continue
-                    rows = [(p["platform"], p["id"], labels[p["id"]][0],
-                             labels[p["id"]][1])
-                            for p in batch if p["id"] in labels]
-                    await st.set_post_labels(pid, rows, source="grok",
-                                             model=model,
-                                             prompt_ver=cls.PROMPT_VERSION)
-                    for plat, post_id, lab, _c in rows:
-                        await st.repin_labelled(pid, plat, post_id, lab, boards)
-                    done += len(rows)
-                    failed += len(batch) - len(rows)
+                # A wave at a time. The whole archive through one batch after
+                # another would take hours on a large project; the provider is
+                # happy to be asked several things at once, and the writes
+                # still land one at a time on the single store connection.
+                for i in range(0, len(batches), CLASSIFY_FANOUT):
+                    wave = batches[i:i + CLASSIFY_FANOUT]
+                    replies = await asyncio.gather(*[
+                        cls.label_batch(client, key, model, b, cats)
+                        for b in wave])
+
+                    for b, (labels, usage, err) in zip(wave, replies):
+                        tin += usage.get("in", 0)
+                        tout += usage.get("out", 0)
+                        cost += cls.cost_usd(usage.get("in", 0),
+                                             usage.get("out", 0),
+                                             cfg["price_in"], cfg["price_out"])
+                        if err:
+                            failed += len(b)
+                            err_txt = err
+                            _lg(f"[classify] batch failed: {err}")
+                            # An auth or quota problem will not fix itself on
+                            # the next batch; stop rather than repeating the
+                            # same failure a hundred times.
+                            if any(m in err for m in ("HTTP 401", "HTTP 403",
+                                                      "no XAI_API_KEY")):
+                                fatal = True
+                            else:
+                                stop = "partial"
+                            continue
+                        rows = [(p["platform"], p["id"], labels[p["id"]][0],
+                                 labels[p["id"]][1])
+                                for p in b if p["id"] in labels]
+                        await st.set_post_labels(pid, rows, source="grok",
+                                                 model=model,
+                                                 prompt_ver=cls.PROMPT_VERSION)
+                        for plat, post_id, lab, _c in rows:
+                            await st.repin_labelled(pid, plat, post_id, lab,
+                                                    boards)
+                        done += len(rows)
+                        failed += len(b) - len(rows)
+
+                    _classify_run_set(done=done, failed=failed,
+                                      cost_usd=round(cost, 6))
                     _lg(f"[classify] {done}/{len(posts)} labelled "
-                        f"(${(spent + cost):.3f} this month)")
+                        f"(${cost:.3f} this run)")
+                    if fatal:
+                        stop = "error"
+                        break
 
             await st.finish_label_run(run_id, labelled=done, failed=failed,
                                       in_tokens=tin, out_tokens=tout, cost=cost,
                                       stop_reason=stop, error=err_txt)
-            counts = await st.post_label_counts(pid)
             _lg(f"[classify] finished: {done} labelled, {failed} not, "
                 f"${cost:.4f} spent")
-            return {"ok": True, "labelled": done, "failed": failed,
-                    "cost_usd": round(cost, 4), "stop_reason": stop,
-                    "error_detail": err_txt, "counts": counts, "log": logs}
+            _classify_run_set(done=done, failed=failed,
+                              cost_usd=round(cost, 6), stop_reason=stop,
+                              error=err_txt or "")
         finally:
+            # Whatever happened, the dashboard must stop showing a run that is
+            # not going. stop_reason is left as whoever set it meant it.
+            _classify_run_set(running=False,
+                              finished_ms=int(time.time() * 1000))
             await st.close()
 
-    out, err = _classify_locked_run(run(), timeout=280)
+    _classify_run_set(running=True, total=0, done=0, failed=0, cost_usd=0.0,
+                      started_ms=int(time.time() * 1000), finished_ms=0,
+                      stop_reason="", error="", project_id=int(pid))
+    err = _classify_launch(run())
     if err:
+        _classify_run_set(running=False, stop_reason="error",
+                          error=str(err.get("error") or ""),
+                          finished_ms=int(time.time() * 1000))
         return {**err, "log": logs}
-    return out
+    return {"ok": True, "started": True, "run": _classify_run_snapshot()}
 
 
 def _drop_stream_from_config(label: str) -> bool:
@@ -4952,12 +5106,20 @@ class Handler(BaseHTTPRequestHandler):
             if u.path == "/api/collections/items":
                 return self._send(200, _collection_items_json(q))
             if u.path == "/api/collections/export":
-                name = (q.get("name") or "collection").strip() or "collection"
+                # One workbook for the whole project. `name` is the project's,
+                # only so the file on the desk's disk says which project it
+                # came from.
+                if not _project_or_none(q):
+                    return self._send(400, dict(_NO_PROJECT))
+                name = (q.get("name") or "collections").strip() or "collections"
                 safe = re.sub(r"[^A-Za-z0-9_-]+", "_", name)[:60]
-                return self._send(200, _collection_export_csv(q),
-                                  "text/csv; charset=utf-8",
-                                  {"Content-Disposition":
-                                   f'attachment; filename="{safe}.csv"'})
+                stamp = time.strftime("%Y%m%d-%H%M")
+                return self._send(
+                    200, _collections_export_xlsx(q),
+                    "application/vnd.openxmlformats-officedocument."
+                    "spreadsheetml.sheet",
+                    {"Content-Disposition":
+                     f'attachment; filename="{safe}-labels-{stamp}.xlsx"'})
             if u.path == "/api/activity":
                 return self._send(200, _activity_json(q))
             if u.path == "/api/activity/logs":

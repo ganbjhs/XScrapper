@@ -43,9 +43,10 @@ rule won.)
 
    The boundary, which is the part that must not erode: labelling is never
    automatic, never on a keystroke, never a side effect of collection, and
-   never feeds back into WHAT gets collected. It is a button, it is metered
-   against a hard monthly cap, and a human's correction always outranks the
-   model's. Anything beyond one category per post — scores, summaries,
+   never feeds back into WHAT gets collected. It is a button, it says what it
+   spent, and a human's correction always outranks the model's. (The spend cap
+   and the per-run ceiling were removed on 2026-08-24 — the boundary was never
+   the ceiling, it was the button.) Anything beyond one category per post — scores, summaries,
    sentiment, entity extraction, a second model — is still Watch-Tower's, and
    adding it is a new operator decision, not an extension of this one.
 3. **Media travels as URLs, never bytes.** Photos and videos are stored as
@@ -195,11 +196,22 @@ names).
   Grok: explicit (the Classify button, never a timer), serialized behind ONE
   lock (`_CLASSIFY_LOCK` — two concurrent runs would read the same "unlabelled"
   set and pay twice for the same posts), and it reports what it cost in dollars
-  when it finishes. Month-to-date spend is metered in `label_runs` and checked
-  against `classify_cap_usd` before and between batches; a run that would cross
-  the cap is REFUSED with the ceiling named, never trimmed to fit — the same
-  rule as page counts, for the same reason. Per-run and per-month ceilings both
-  live in the dashboard.
+  when it finishes. Month-to-date spend is still metered in `label_runs` and
+  still shown, but it is a METER and not a limit: as of 2026-08-24 one press
+  covers every unlabelled post in the project, and the only things that end a
+  run early are a provider auth or quota failure, each reported by name.
+
+  The cap and the per-run ceiling are gone on purpose. A ceiling that silently
+  leaves half the archive unlabelled is the same sin as a trimmed page request
+  — the operator asked for the job and got a fraction of it, with the shortfall
+  visible only as a number nobody reads. If a budget ever needs enforcing
+  again, it must refuse the whole run and name the figure, never shorten it.
+
+  Because a whole-archive run outlives any sane HTTP timeout, `/api/classify`
+  starts the job and answers at once; `/api/labels/status` carries a `run`
+  block with total/done/failed/cost, and the dashboard shows a bar. Batches go
+  out `CLASSIFY_FANOUT` at a time; the writes stay serialized on the one store
+  connection.
 - **A post is paid for once.** A run only ever sends posts with no label. A
   re-classification is a separate, deliberate act — never something a changed
   category or a new prompt version triggers on its own, or editing a word in a
@@ -774,9 +786,10 @@ updated, never deleted (the pre-commit hook blocks the deletion).
 
 **Dashboard**
 - Content labelling (`classify.py`, `/api/classify`): the Classify button on
-  the Live Feed, the per-project category editor, the category filter and the
-  card chips, the auto board per category, the human-correction override, and
-  the monthly spend cap with its meter. Added 2026-08-22 as the one named
+  the Collections page (and the Live Feed), the sentiment counts above the
+  tabs, the per-project category editor, the category filter and the card
+  chips, the auto board per category, the human-correction override, and the
+  spend meter. Added 2026-08-22 as the one named
   exception to prime directive 2 — a refactor that "tidies" it away, or that
   quietly makes it automatic, is a rule violation either way.
 - Live Feed: X + IG + FB in one stream, SSE real-time, keyword highlighting,

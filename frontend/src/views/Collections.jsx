@@ -2,13 +2,19 @@
 // the labeller fills on its own, one per category. Boards reference collected
 // posts; deleting a board never touches the archive.
 //
-// Two tabs, the same shape the Watchlists page uses: "Boards" for daily work,
-// "Labelling" for the vocabulary and the spend controls. New controls belong
-// in the settings tab, never scattered across the main surface.
-import React, { useState } from "react";
+// The sentiment counts sit at the top, above everything: "how much of each?"
+// is the question this page is opened with, and it used to take five clicks
+// into five boards to answer. The one Classify button and the one Export
+// button live up there with them.
+//
+// Two tabs below that: "Boards" for daily work, "Labelling" for the vocabulary.
+// There are no spend controls any more — a run covers every unlabelled post in
+// the project and stops for nothing but a provider failure.
+import React, { useEffect, useRef, useState } from "react";
 import { api, fmtAgo, fmtN, useApi } from "../api/client.js";
 import { PageHead, useProject } from "../App.jsx";
 import PostCard from "../components/PostCard.jsx";
+import SentimentStrip from "../components/Sentiments.jsx";
 import { Empty, ErrorState, Loading, Modal } from "../components/ui.jsx";
 
 const keyOf = (t) => `${t.platform || "x"}:${t.tweet_id}`;
@@ -32,8 +38,9 @@ function Board({ c, pid, cats, onBack, onChanged }) {
     onChanged();
   };
 
-  const exportUrl =
-    `/api/collections/export?id=${c.collection_id}&name=${encodeURIComponent(c.name)}`;
+  // No per-board download: the whole project exports as one workbook from the
+  // strip at the top. Five files that each hold a fifth of the answer is a
+  // filing problem, not a hand-off.
   const gone = (data?.pinned || 0) - (data?.count || 0);
 
   return (
@@ -42,9 +49,6 @@ function Board({ c, pid, cats, onBack, onChanged }) {
         <button className="btn btn-ghost btn-sm" onClick={onBack}>← All collections</button>
         <h2>{c.name}</h2>
         {c.auto ? <span className="badge cat">auto</span> : null}
-        <span className="right">
-          <a className="btn btn-brand btn-sm" href={exportUrl}>Download CSV</a>
-        </span>
       </div>
       {c.auto ? (
         <div className="sub" style={{ margin: "0 0 10px" }}>
@@ -64,7 +68,7 @@ function Board({ c, pid, cats, onBack, onChanged }) {
       {data && data.rows.length === 0 && (
         <Empty title="Nothing pinned yet">
           {c.auto
-            ? "No post carries this label yet. Run Classify from the Live Feed."
+            ? "No post carries this label yet. Press Classify at the top of this page."
             : "Use “+ Collection” on any post in the Live Feed or Search."}
         </Empty>
       )}
@@ -150,21 +154,16 @@ function CategoryRow({ pid, cat, onSaved }) {
   );
 }
 
-function Labelling({ pid }) {
-  const st = useApi(() => (pid ? api.labelStatus(pid) : Promise.resolve(null)), [pid]);
+// `st` is the page's own labelling-status handle, passed down rather than
+// fetched again: the strip at the top polls it while a run is going, and two
+// pollers on one endpoint is one poller too many.
+function Labelling({ pid, st }) {
   const cs = useApi(() => (pid ? api.labelCategories(pid) : Promise.resolve(null)), [pid]);
   const [adding, setAdding] = useState(false);
   const [nc, setNc] = useState({ key: "", name: "", description: "", rank: 50 });
   const [err, setErr] = useState("");
-  const [set, setSet] = useState(null);
-  const [setMsg, setSetMsg] = useState("");
 
   const d = st.data;
-  React.useEffect(() => {
-    if (d && set === null) {
-      setSet({ model: d.model, cap_usd: d.cap_usd, max_posts: d.max_posts });
-    }
-  }, [d, set]);
 
   const addCat = async () => {
     setErr("");
@@ -178,23 +177,9 @@ function Labelling({ pid }) {
     }
   };
 
-  const saveSettings = async () => {
-    setSetMsg("");
-    try {
-      await api.saveLabelSettings(pid, set);
-      setSetMsg("✓ saved — the next run uses these");
-      st.reload(true);
-    } catch (e) {
-      setSetMsg(String(e.message || e));
-    }
-    setTimeout(() => setSetMsg(""), 5000);
-  };
-
   if (!pid) return <Empty title="No project selected" />;
   if (st.loading && !d) return <Loading />;
   if (st.error) return <ErrorState error={st.error} retry={st.reload} />;
-
-  const pct = d && d.cap_usd ? Math.min(100, (d.spent_usd / d.cap_usd) * 100) : 0;
 
   return (
     <>
@@ -211,14 +196,7 @@ function Labelling({ pid }) {
           <span><b>{fmtN(d?.labelled || 0)}</b> labelled</span>
           <span><b>{fmtN(d?.unlabelled || 0)}</b> waiting</span>
           <span>model <b>{d?.model}</b></span>
-          <span>
-            ${Number(d?.spent_usd || 0).toFixed(2)} of ${Number(d?.cap_usd || 0).toFixed(2)}
-            {" "}this month
-          </span>
-        </div>
-        <div className="meter" style={{ marginTop: 8 }}>
-          <span style={{ width: `${pct}%` }}
-                className={pct >= 100 ? "crit" : pct >= 80 ? "warn" : ""} />
+          <span>${Number(d?.spent_usd || 0).toFixed(2)} spent this month</span>
         </div>
         <div className="sub" style={{ marginTop: 8 }}>
           {d?.last_run
@@ -226,49 +204,14 @@ function Labelling({ pid }) {
               + `${d.last_run.failed} not, $${Number(d.last_run.cost_usd || 0).toFixed(4)}`
               + (d.last_run.stop_reason && d.last_run.stop_reason !== "done"
                 ? ` (stopped: ${d.last_run.stop_reason})` : "")
-            : "No run yet. Press Classify on the Live Feed."}
+            : "No run yet. Press Classify at the top of this page."}
+        </div>
+        <div className="sub" style={{ marginTop: 6 }}>
+          There is no cap and no per-run ceiling: one press classifies every
+          post in this project that has no label yet. The dollar figure above is
+          a meter, not a limit.
         </div>
       </div>
-
-      {set && (
-        <div className="panel">
-          <div className="phead"><h3>Settings</h3></div>
-          <div className="sub" style={{ marginBottom: 10 }}>
-            Read fresh on every run, so nothing here needs a restart. The API
-            key is the one exception and lives only in <code>.env</code>.
-          </div>
-          <div className="field">
-            <label htmlFor="lmodel">Model</label>
-            <input id="lmodel" value={set.model}
-                   onChange={(e) => setSet({ ...set, model: e.target.value })} />
-          </div>
-          <div className="filters">
-            <label className="fpill">
-              <span>Monthly cap (USD):</span>
-              <input type="number" min="1" step="1" style={{ width: 90 }}
-                     value={set.cap_usd}
-                     onChange={(e) => setSet({ ...set, cap_usd: e.target.value })} />
-            </label>
-            <label className="fpill">
-              <span>Max posts per run:</span>
-              <input type="number" min="1" step="25" style={{ width: 90 }}
-                     value={set.max_posts}
-                     onChange={(e) => setSet({ ...set, max_posts: e.target.value })} />
-            </label>
-            <button className="btn btn-brand btn-sm" onClick={saveSettings}>Save</button>
-            <span style={{ flex: 1 }} />
-            {setMsg && (
-              <span className={setMsg.startsWith("✓") ? "st-good" : "st-crit"}
-                    style={{ fontSize: 12.5, fontWeight: 600 }}>{setMsg}</span>
-            )}
-          </div>
-          <div className="sub" style={{ marginTop: 8 }}>
-            A run that would cross the cap is refused with the number named — it
-            is never trimmed to fit. Roughly $0.25 per 1,000 posts at current
-            prices.
-          </div>
-        </div>
-      )}
 
       <div className="feed-head">
         <h2>Categories</h2>
@@ -334,6 +277,10 @@ export default function Collections({ onMenu }) {
   // The vocabulary, so a board's posts can show their label by name.
   const cats = useApi(
     () => (pid ? api.labelCategories(pid) : Promise.resolve({ categories: [] })), [pid]);
+  // The counts, the waiting pile and the run in flight. Loaded once here and
+  // handed to both the strip and the Labelling tab.
+  const labels = useApi(
+    () => (pid ? api.labelStatus(pid) : Promise.resolve(null)), [pid]);
   const [open, setOpen] = useState(null);
   const [creating, setCreating] = useState(false);
   const [name, setName] = useState("");
@@ -350,6 +297,29 @@ export default function Collections({ onMenu }) {
     } catch (e) {
       setErr(String(e.message || e));
     }
+  };
+
+  // A finished run has just moved posts onto boards, so the board list is a
+  // screen behind until it is asked again. Watching the flag rather than
+  // polling the boards: they only change when a run ends or somebody pins.
+  const wasRunning = useRef(false);
+  const running = !!labels.data?.run?.running;
+  useEffect(() => {
+    if (wasRunning.current && !running) {
+      reload();
+      cats.reload(true);
+    }
+    wasRunning.current = running;
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [running]);
+
+  // A tile at the top opens that category's board, which is the click the
+  // operator was going to make anyway.
+  const openCategory = (cat) => {
+    const b = (data?.collections || []).find(
+      (c) => c.auto && c.label_key === cat.key);
+    if (b) setOpen(b);
+    else setTab("labelling");
   };
 
   if (open) {
@@ -375,10 +345,6 @@ export default function Collections({ onMenu }) {
       </div>
       <div className="filters" style={{ marginBottom: 0, marginTop: 8 }}>
         <button className="btn btn-brand btn-sm" onClick={() => setOpen(c)}>Open</button>
-        <a className="btn btn-ghost btn-sm"
-           href={`/api/collections/export?id=${c.collection_id}&name=${encodeURIComponent(c.name)}`}>
-          Download CSV
-        </a>
         <span style={{ flex: 1 }} />
         <button className="btn btn-danger btn-sm" onClick={() => setConfirming(c)}>Delete</button>
       </div>
@@ -394,6 +360,14 @@ export default function Collections({ onMenu }) {
         )}
       </PageHead>
 
+      {/* Above the tabs on purpose: the counts are the answer to the question
+          this page is opened with, and they are true of the project rather
+          than of either tab. */}
+      {pid ? (
+        <SentimentStrip pid={pid} projectName={project?.name} labels={labels}
+                        onOpen={openCategory} />
+      ) : null}
+
       <div className="tabs">
         <button className={`tab ${tab === "boards" ? "sel" : ""}`}
                 onClick={() => setTab("boards")}>Boards</button>
@@ -401,15 +375,15 @@ export default function Collections({ onMenu }) {
                 onClick={() => setTab("labelling")}>Labelling</button>
       </div>
 
-      {tab === "labelling" ? <Labelling pid={pid} /> : (
+      {tab === "labelling" ? <Labelling pid={pid} st={labels} /> : (
         <>
           {loading && !data && <Loading />}
           {error && <ErrorState error={error} retry={reload} />}
           {data && boards.length === 0 && (
             <Empty title="No collections yet">
               A collection is a board you pin posts onto — “Floods day 2”, “CM
-              statements” — then download as CSV or hand to the desk. Classifying
-              from the Live Feed fills one board per category on its own.
+              statements” — then export with everything else as one Excel file.
+              Classifying fills one board per category on its own.
             </Empty>
           )}
 

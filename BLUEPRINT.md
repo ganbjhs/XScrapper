@@ -64,7 +64,8 @@ FB: fb_state  ->   engine_fb.py     ->   collect_fb.py ->   store_fb.py -> fb_re
                    login breaker)        paused/blocked-aware)
 
   LABELS (classify.py):  Classify button -> Grok -> one category per post,
-                         auto-pinned to that category's board (manual, capped)
+                         auto-pinned to that category's board (manual,
+                         background, whole-project, uncapped)
   DELIVERY (webhook.py): push loop -> webhook + Telegram + Google Sheet + alerts
   SHEETS (sheets.py):    Apps Script web app (default) or service-account JWT;
                          date|link|text|media, header once, append only
@@ -86,8 +87,8 @@ The organizing layer (in `store.py` + `web.py`):
   `(platform, post_id)` so one board holds X, IG and FB posts together. A board
   marked `auto` belongs to a label category and is filled by classify runs.
 - **Label** — one category per post per project, from `classify.py`. Manual
-  only, metered against a monthly cap, and a hand correction outranks the
-  model's answer forever.
+  only, spend metered but not capped, one press covers every unlabelled post in
+  the project, and a hand correction outranks the model's answer forever.
 - **Alert** — pace-surge → Telegram; baseline = trailing 24h ending an hour
   ago; cooldown 30 min; evaluated in the delivery loop.
 
@@ -104,6 +105,7 @@ The organizing layer (in `store.py` + `web.py`):
 | `sheets.py` | Google Sheets transport, two modes: Apps Script web app (no cloud project) or service-account JWT (no new deps); header-once, append-only `date\|link\|text\|media` |
 | `alerts.py` | Velocity-alert decision + tick (pure logic, testable) |
 | `classify.py` | Content labelling: builds the prompt from the project's categories, calls Grok over injectable async httpx, parses and validates the answer, prices it. Pure — no DB, no globals, never raises |
+| `xlsx_min.py` | A .xlsx writer in one file, no dependencies: the Collections export is one workbook with a summary sheet and a sheet per board. Text and numbers, bold frozen header, column widths — nothing more |
 | `guard.py` | Advisory risk findings; never changes state |
 | `activity_log.py` | Persistent account-activity log (`activity.db`); `logger()` wraps every collector's log= |
 | `store_accounts.py` / `accounts_api.py` | Managed account pool (encrypted secrets, TOTP, backup codes, failover) + its API |
@@ -265,10 +267,12 @@ predates FB's and stays).
 
 Content labelling as the one named exception to "analyse in Watch-Tower":
 per-project category vocabulary edited in the dashboard, an
-operator-triggered Grok pass over unlabelled posts across all three platforms,
-a spend meter with a hard monthly cap that refuses rather than trims, chips and
-a category filter on the Live Feed, an auto board per category, and hand
-corrections the model can never overwrite; collection pins made cross-platform
+operator-triggered Grok pass over every unlabelled post across all three
+platforms (background, progress-reported, no cap and no per-run ceiling as of
+2026-08-24), a spend meter that reports rather than limits, sentiment counts at
+the top of Collections, chips and a category filter on the Live Feed, an auto
+board per category, one Excel export of every board (`xlsx_min.py`, no new
+dependency), and hand corrections the model can never overwrite; collection pins made cross-platform
 (`collection_posts`, migrated from `collection_items` on open).
 
 **Parked roadmap** (build when asked): media archiving (local copies so
