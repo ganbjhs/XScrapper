@@ -735,6 +735,25 @@ before changing the engine; nearly every "obvious" idea has been tried.)
   name table, which is the cheap half; the expensive half is remembering that
   the service entrypoint is not covered just because the library under it is
   (2026-08-21).
+- **A name check that is not PER SCOPE is not a name check.** The first
+  `test_no_undefined_names` pooled every name bound anywhere in a file and
+  accepted any load of any of them. `web.py` binds a local `auth =
+  headers.get("Authorization")` in the API-key reader, and that one local
+  vouched for the `auth` MODULE, which `web.py` never imports — so
+  `_xlist_refresh` ("Refresh members" on an X List) raised `NameError: name
+  'auth' is not defined` in production while the suite was green.
+  `_stress_accounts` had the same hole for `auth` and `ig`, inside
+  `except Exception: pass`, so the Stress Test account picker simply showed no
+  X or IG accounts and nobody could tell why. Python resolves names per scope;
+  the test now uses stdlib `symtable` and asks, per function, "does every
+  global-resolving reference have a module-level binding?" — it fails on the
+  old `web.py` naming both modules, and passes on the fixed one. Two rules
+  fall out: (a) `web.py` handlers import their modules locally (`import auth`
+  next to the existing `import guard`/`import stress`), so add the import in
+  the SAME function as the use, not in a sibling; (b) a `try/except
+  Exception: pass` around a handler that returns a list hides a NameError as
+  "empty list" — when a picker shows nothing, suspect the import before the
+  data (2026-08-26).
 - **Offline also means isolated from the WORKING DIRECTORY.** A test may not
   read whatever live state happens to sit next to it. The FB favorites tests
   stubbed `_can_log_in` but not `login_blocked`, which reads `fb_health.json`

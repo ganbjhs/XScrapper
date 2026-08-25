@@ -4659,6 +4659,7 @@ def _xlist_refresh(body):
     list_id = str(body.get("list_id") or "").strip()
     if not list_id.isdigit():
         return {"error": "a numeric X List id is required"}
+    import auth
     import guard
     v = guard.assess(_CFG, action="fetch", cost=3, queue="list")
     if v.blocked:
@@ -4706,6 +4707,8 @@ def _xlist_refresh(body):
 def _stress_accounts(q):
     """Available accounts per platform, plus the registered platform list, so
     the UI can offer a picker and works automatically for any future platform."""
+    import auth
+    import ig
     import stress
     out = {"platforms": stress.platforms(),
            "accounts": {"x": [], "ig": [], "fb": []}}

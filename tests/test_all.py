@@ -3359,7 +3359,8 @@ def test_facebook(tmp):
 
 
 def test_no_undefined_names():
-    """Every module-level name a module LOADS must be one it defines or imports.
+    """Every name a scope LOADS must be bound in that scope, an enclosing
+    scope, the module, or builtins — checked PER SCOPE, not per file.
 
     Paid for on 2026-08-21: `collect_ig.py` used `os.getenv` on the `--loop`
     path without ever importing `os`. It had been that way since the ig_human
@@ -3369,15 +3370,25 @@ def test_no_undefined_names():
     calls `collect_ig.run_once` DIRECTLY (web.py), never through `main()`, so
     Instagram collection appeared to work while the service was dead.
 
-    Two lessons, and this test is the second one:
-      * a path only systemd runs is a path nothing tests. `main()` is code.
-      * an import error is not a subtle bug — it is free to catch, and only
-        stayed alive because nothing ever compiled the file's name table.
+    Paid for AGAIN on 2026-08-26: the first version of this test was
+    scope-blind — it pooled every name bound anywhere in the file and accepted
+    any load of any of them. `web.py` has a local variable `auth = headers.get(
+    "Authorization")` in the API-key reader, and that one local silently
+    vouched for `auth.open_api(...)` (the `auth` MODULE, never imported in
+    web.py) in `_xlist_refresh` — so "Refresh members" on an X List raised
+    `NameError: name 'auth' is not defined` in production while this test was
+    green. `_stress_accounts` had the same hole for `auth` and `ig`, wrapped in
+    `except Exception: pass`, so the Stress Test account picker just showed no
+    accounts. Python resolves names per scope; a checker that does not is
+    not checking. `symtable` (stdlib) is the per-scope name table — a symbol
+    that is referenced and resolves as global in some function must be bound
+    at module level (assigned, imported, def/class, or `global`-declared in a
+    function) or be a builtin.
 
-    A full linter would be better; this is the 20-line version that needs no
-    dependency and catches exactly the failure that bit us.
+    A full linter would be better; this is the stdlib version that needs no
+    dependency and catches exactly the failure that bit us — twice.
     """
-    import ast as _ast, builtins as _bi
+    import symtable as _st, builtins as _bi
 
     MODULES = ["collect_ig.py", "collect_fb.py", "collector.py", "engine_ig.py",
                "engine.py", "engine_fb.py", "store_ig.py", "store_fb.py",
@@ -3390,29 +3401,39 @@ def test_no_undefined_names():
         "__loader__", "__builtins__", "__debug__"}
     root = pathlib.Path(__file__).resolve().parent.parent
 
+    def _bound(sym):
+        return sym.is_assigned() or sym.is_imported() or sym.is_namespace()
+
     for name in MODULES:
         path = root / name
         if not path.exists():
             continue
-        tree = _ast.parse(path.read_text(), str(path))
-        defined = set()
-        for n in _ast.walk(tree):
-            if isinstance(n, (_ast.Import, _ast.ImportFrom)):
-                for a in n.names:
-                    defined.add((a.asname or a.name).split(".")[0])
-            elif isinstance(n, (_ast.FunctionDef, _ast.AsyncFunctionDef, _ast.ClassDef)):
-                defined.add(n.name)
-            elif isinstance(n, _ast.Name) and isinstance(n.ctx, _ast.Store):
-                defined.add(n.id)
-            elif isinstance(n, _ast.arg):
-                defined.add(n.arg)
-            elif isinstance(n, _ast.ExceptHandler) and n.name:
-                defined.add(n.name)
-        missing = sorted({n.id for n in _ast.walk(tree)
-                          if isinstance(n, _ast.Name) and isinstance(n.ctx, _ast.Load)
-                          and n.id not in defined and n.id not in builtin_names})
+        top = _st.symtable(path.read_text(), str(path), "exec")
+        module_bound = {s.get_name() for s in top.get_symbols() if _bound(s)}
+        # `global x` + assignment inside a function binds x at module level.
+        stack = list(top.get_children())
+        while stack:
+            t = stack.pop()
+            module_bound |= {s.get_name() for s in t.get_symbols()
+                             if s.is_declared_global() and s.is_assigned()}
+            stack.extend(t.get_children())
+        missing = set()
+        stack = [top]
+        while stack:
+            t = stack.pop()
+            for s in t.get_symbols():
+                # In a function, a referenced name that is neither local nor
+                # free (closed over) resolves as global; at module level every
+                # unbound reference does.
+                if (s.is_referenced() and not _bound(s)
+                        and (t is top or s.is_global())
+                        and s.get_name() not in module_bound
+                        and s.get_name() not in builtin_names):
+                    missing.add(s.get_name())
+            stack.extend(t.get_children())
+        missing = sorted(missing)
         ok(not missing,
-           f"{name} references no name it never defines"
+           f"{name}: every scope resolves every name it loads"
            + (f" — MISSING: {', '.join(missing)}" if missing else ""))
 
 
