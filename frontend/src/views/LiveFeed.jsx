@@ -40,6 +40,62 @@ const DUR_LABEL = { "1h": "Last 1 hour", "6h": "Last 6 hours", "12h": "Last 12 h
                     "24h": "Last 24 hours", "48h": "Last 48 hours",
                     "7d": "Last 7 days", "30d": "Last 30 days", all: "All time" };
 
+// ---------------------------------------------------------------------------
+// Filter memory.
+//
+// The Live Feed is a route, so leaving it for Watchlists (or anywhere else)
+// UNMOUNTS this component and every useState in it goes back to its default.
+// Somebody who set Source=X, Last 7 days and stepped away to check a watchlist
+// came back to the default screen and had to set it all again. So the filter
+// set is kept in localStorage — the same place App.jsx already keeps the
+// selected project.
+//
+// Keyed BY PROJECT, because Category is project-specific vocabulary: a label
+// saved under one project does not exist in the next one, and restoring it
+// there would show an empty feed with no obvious reason why.
+//
+// Everything read back is validated against the options that actually exist.
+// A stored value from an older build (a duration that was renamed, a platform
+// that was removed) falls back to the default instead of wedging the feed on a
+// filter the UI can no longer clear.
+const FLT_KEY = "collector.feed.filters";
+const DEFAULT_FLT = { source: "all", sort: "latest", dur: "24h", label: "all" };
+const FLT_SOURCES = new Set(["all", "x", "instagram", "facebook"]);
+const FLT_SORTS = new Set(["latest", "oldest", "likes", "views"]);
+const has = (o, k) => Object.prototype.hasOwnProperty.call(o, k);
+
+function readFilters(pid) {
+  if (!pid) return DEFAULT_FLT;
+  try {
+    const saved = JSON.parse(localStorage.getItem(FLT_KEY) || "{}")[pid];
+    if (!saved || typeof saved !== "object") return DEFAULT_FLT;
+    return {
+      source: FLT_SOURCES.has(saved.source) ? saved.source : DEFAULT_FLT.source,
+      sort: FLT_SORTS.has(saved.sort) ? saved.sort : DEFAULT_FLT.sort,
+      dur: has(DUR_LABEL, saved.dur) ? saved.dur : DEFAULT_FLT.dur,
+      // Categories are created and deleted by the operator, so there is no
+      // fixed list to check against here; the Category pill falls back to
+      // "All" on its own when the stored key is no longer offered.
+      label: typeof saved.label === "string" && saved.label
+        ? saved.label : DEFAULT_FLT.label,
+    };
+  } catch {
+    return DEFAULT_FLT;              // unparseable / storage blocked
+  }
+}
+
+function writeFilters(pid, flt) {
+  if (!pid) return;
+  try {
+    const all = JSON.parse(localStorage.getItem(FLT_KEY) || "{}");
+    all[pid] = flt;
+    localStorage.setItem(FLT_KEY, JSON.stringify(all));
+  } catch {
+    // Private browsing or a full quota. Remembering filters is a convenience,
+    // never a reason to break the screen — carry on unremembered.
+  }
+}
+
 // The whole pill is the control: the transparent <select> is stretched over
 // the entire block, so a click anywhere on it — the "Source:" label, the
 // current value, the padding — opens the menu. The visible text is drawn by
@@ -67,8 +123,21 @@ function Pill({ label, value, onChange, options }) {
 export default function LiveFeed({ onMenu }) {
   const { project, projectsError } = useProject();
   const pid = project?.project_id;
-  const [flt, setFlt] = useState({ source: "all", sort: "latest", dur: "24h",
-                                   label: "all" });
+  // The filter set travels with the project it belongs to, so switching
+  // projects swaps filters instead of carrying one project's Category into
+  // another. Adjusted DURING RENDER rather than in an effect: this way the
+  // very first render after a project switch already holds that project's
+  // filters, and the fetch hooks below never fire once with the wrong ones.
+  const [fstate, setFState] = useState(() => ({ pid: pid ?? null,
+                                                flt: readFilters(pid) }));
+  if (pid && fstate.pid !== pid) setFState({ pid, flt: readFilters(pid) });
+  const flt = fstate.flt;
+  const setFlt = (next) => setFState((s) => ({
+    ...s, flt: typeof next === "function" ? next(s.flt) : next,
+  }));
+  useEffect(() => {
+    if (fstate.pid) writeFilters(fstate.pid, fstate.flt);
+  }, [fstate]);
 
   const metrics = useApi(() => api.metrics(pid), [pid], { every: 30_000 });
   const status = useApi(() => api.status(), [], { every: 30_000 });
