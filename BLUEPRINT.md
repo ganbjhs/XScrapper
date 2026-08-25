@@ -126,6 +126,7 @@ The organizing layer (in `store.py` + `web.py`):
 | `CHECKPOINT.md` | Running history of what changed, newest first — the evidence behind each rule's current wording. Protected: append every change, never delete |
 | `tests/` | The offline suite — no network, no budget spent. Run after every change |
 | `tools/ig_probe.py` | Instagram session diagnostic |
+| `tools/diag_project.py` | "Why did this project stop collecting?" — read-only: prints the exact query each stream sends to X, recent polls with stop_reason/rate-limit, and checks every active collection filter against what the stream has actually collected |
 
 Data stores (all git-ignored): `accounts.db`, `results.db` (+ WAL),
 `ig_accounts.db`, `ig_results.db`, `fb_results.db`, `fb_state.json` (FB

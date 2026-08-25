@@ -19,6 +19,49 @@ must respect belongs in the rulebook, not here.
 
 ---
 
+## 2026-08-25 — diag_project.py, for silent collection stalls
+
+**Changed**
+
+- `tools/diag_project.py` — new, read-only. Diagnostic only; no behavior
+  changed, so no rule was added.
+- `BLUEPRINT.md` — file-map row.
+
+**Why**
+
+The iSupportNamo project stopped collecting and the dashboard could not say
+why: Refresh reported "0 new from X", which is the SAME message for "the
+account posted nothing", "every filter excluded it", and "the poll errored".
+Nothing in the UI distinguishes them, so the operator has no next step.
+
+The likely trap this tool is built to expose: a collection filter that is
+individually reasonable and fatal for the account it is applied to.
+`min_faves:N` against a handle whose posts sit at 0 likes, or `lang:en`
+against a handle that posts in Hindi, excludes 100% of its output — and the
+dashboard shows a healthy green "Collecting" the whole time. So the tool
+prints the compiled query beside the language and like distribution of what
+that stream has already collected, which makes the mismatch self-evident.
+
+**Verified**
+
+- Exercised against a seeded database covering both traps: a `min_likes=5`
+  filter on posts that top out at 1 like, and `lang=en` on a stream holding
+  4 Hindi posts to 1 English. Both flagged.
+- `ast.parse` clean, and the f-strings avoid nested same-quotes so it runs on
+  Python 3.10+ (the VPS is not guaranteed to be 3.12).
+- Opens the DB `mode=ro` — safe to run while the collector is writing.
+
+**Still open**
+
+- `_project_fetch` returns a per-stream `polled[]` carrying each stream's
+  `error`, and `refreshNow` in `LiveFeed.jsx` throws it away, printing only
+  `r.new`. A rate-limited or dead account is therefore reported to the
+  operator as "0 new from X". Not fixed yet — it needs a rule (RULEBOOK
+  already says "a missing state IS a state") and an operator decision on how
+  loudly to surface it.
+
+---
+
 ## 2026-08-25 — Live Feed filter memory, modal stacking fix, hook coverage
 
 **Changed**
