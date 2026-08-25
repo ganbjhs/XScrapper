@@ -720,6 +720,53 @@ before changing the engine; nearly every "obvious" idea has been tried.)
   commit `dist/`. New capability = store method → thin `web.py` validator →
   small view in `frontend/src/views/`, with honest loading/empty/error states
   and dark mode from the same tokens.
+- **The living-rulebook hook is a DENY-list, because an allow-list fails
+  silently.** §0's check named behavior files one glob at a time, and the globs
+  quietly lied: `engine_*.py` does not match `engine.py`, `store_*.py` does not
+  match `store.py`, `ig_*.py` does not match `ig.py`. The X engine and the
+  164KB X store — the two files most of this rulebook is ABOUT — were exempt
+  from the rule that keeps the book honest from the day the hook was written,
+  as were `classify.py`, `sheets.py`, `config.py`, `signin.py`, `pool_link.py`,
+  `xlsx_min.py` and `migrate_ig_sources.py`. `frontend/src/` was never listed
+  at all, so the whole dashboard was exempt too — which is how a modal that
+  renders underneath the feed and a filter bar that resets on every visit both
+  landed with no rule written (2026-08-25). The check now treats EVERYTHING as
+  behavior except an explicit list of non-behavior paths (`tests/`, `tools/`,
+  the three FB probe/debug inspectors, and generated `frontend/dist/`). The
+  general form: a guard whose coverage you must remember to extend is a guard
+  that silently stops covering things. Make the default "checked", and name
+  the exceptions.
+- **An overlay is rendered through a PORTAL to `<body>`, never in place.**
+  `z-index` ranks siblings within ONE stacking context, and it cannot lift an
+  element out of the context it was born in. `nav.side` is `position: sticky`,
+  and a sticky element creates a stacking context even at `z-index: auto` — so
+  the "New project" modal, mounted inside the project switcher in the navbar,
+  had its `z-index: 50` scoped to the inside of the navbar. `main.content`
+  follows the navbar in the DOM, so the feed's positioned descendants painted
+  over it: the post media thumbnails (`.thumb` is `position: relative`) sat on
+  top of the dialog AND its scrim, at full brightness, covering the name field
+  the dialog exists to collect (2026-08-25). Raising the z-index cannot fix
+  this — no value inside a trapped context beats a sibling of the context
+  itself. `Modal` in `ui.jsx` portals to `document.body`; any future overlay
+  (lightbox, toast, popover that must escape its column) does the same. The
+  general rule: a component that paints outside its parent's box must not
+  depend on where it was mounted.
+- **Dashboard view state that the operator SET must survive leaving the view.**
+  Every page is a route, so navigating away unmounts it and `useState` returns
+  to its default on return. The Live Feed's filter bar (Source / Sort /
+  Duration / Category) reset every time the operator stepped over to Watchlists
+  and back — the screen said "here is everything" while they had asked for one
+  platform and one week. State the operator chose is persisted (localStorage,
+  the same place `App.jsx` keeps the selected project) and keyed BY PROJECT
+  where the vocabulary is per-project: a Category label saved under one project
+  does not exist in the next, and restoring it there shows an empty feed with
+  no visible cause. Everything read back is validated against the options that
+  currently exist, so a value from an older build falls back to the default
+  instead of wedging the screen on a filter the UI can no longer clear, and
+  both the read and the write tolerate storage being unavailable — remembering
+  is a convenience, never a reason to break the page (2026-08-25). Transient
+  state (a spinner, an open menu, how many pages have been loaded) is NOT
+  persisted; only what the operator deliberately chose.
 - **Every state the dashboard renders must have a writer, and a test that
   proves it writes.** `store_accounts.record_success()` existed from day one
   and nothing ever called it, so every card in the Account Control Panel read
@@ -757,9 +804,13 @@ This registry is STRICT: nothing on it may be removed, disabled by default, or
 quietly degraded without the operator saying so, in their own words, first. A
 refactor that "simplifies away" a listed feature is a rule violation even if
 every test stays green. Adding to this list is normal work; removing from it
-is an operator decision recorded in the commit message. The two documents
-`RULEBOOK.md` and `BLUEPRINT.md` are themselves protected: they may be
-updated, never deleted (the pre-commit hook blocks the deletion).
+is an operator decision recorded in the commit message. The three documents
+`RULEBOOK.md`, `BLUEPRINT.md` and `CHECKPOINT.md` are themselves protected:
+they may be updated, never deleted (the pre-commit hook blocks the deletion).
+`CHECKPOINT.md` is the running log of what actually changed, session by
+session — the rulebook is the law, the blueprint is the map, and the
+checkpoint is the history that explains how the two got to their current
+wording. Every change appends an entry in the same commit (2026-08-25).
 
 **Collection**
 - X watchlists: handles / keywords (AND, quoted phrases) / X Lists, with

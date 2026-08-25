@@ -1,6 +1,7 @@
 // Small shared pieces: states, modal, icons. Everything renders honest
 // loading / empty / error rather than a blank area.
 import React, { useEffect } from "react";
+import { createPortal } from "react-dom";
 
 export function Loading({ label = "Loading…" }) {
   return (
@@ -34,20 +35,39 @@ export function Empty({ title, children }) {
   );
 }
 
+// An overlay is rendered THROUGH A PORTAL to <body>, never in place.
+//
+// z-index only ranks siblings inside the same stacking context, and the modal
+// is usually mounted deep inside whatever component opened it. `nav.side` is
+// `position: sticky`, and a sticky element ALWAYS creates a stacking context
+// even with `z-index: auto` — so the "New project" modal, which lives inside
+// the project switcher in the navbar, had its `z-index: 50` scoped to the
+// inside of the navbar. `main.content` comes after the navbar in the DOM, so
+// every positioned descendant of the feed painted over it: the post media
+// thumbnails (`.thumb` is `position: relative`) sat on top of the dialog and
+// its scrim, un-dimmed, covering the name field (2026-08-25).
+//
+// Raising the z-index would not have fixed it — no value inside a trapped
+// context can beat a sibling of the context itself. The portal is the fix:
+// mounted on <body>, the overlay has no ancestor to be trapped by, and it
+// keeps working wherever a future caller happens to mount it. React events
+// still bubble through the portal to the React parent, so callers are
+// unchanged.
 export function Modal({ title, sub, onClose, children }) {
   useEffect(() => {
     const h = (e) => e.key === "Escape" && onClose();
     addEventListener("keydown", h);
     return () => removeEventListener("keydown", h);
   }, [onClose]);
-  return (
+  return createPortal(
     <div className="modal-back" onMouseDown={(e) => e.target === e.currentTarget && onClose()}>
       <div className="modal" role="dialog" aria-modal="true" aria-label={title}>
         <h3>{title}</h3>
         {sub && <div className="sub">{sub}</div>}
         {children}
       </div>
-    </div>
+    </div>,
+    document.body,
   );
 }
 

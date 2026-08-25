@@ -121,8 +121,9 @@ The organizing layer (in `store.py` + `web.py`):
 | `collect_fb.py` | FB scheduler: per-page cadence or favorites mode; honors pause/block; avatar cache from post data only |
 | `store_fb.py` | `fb_results.db`: posts (two-key dedup), sources (lowercase labels), settings, page_profiles, removed_pages tombstones |
 | `fb_debug.py` / `fb_probe.py` / `fb_data_probe.py` | FB page-structure diagnostics (standalone) |
-| `frontend/` | Vite + React SPA (source `src/`, built `dist/` committed — the server never runs Node) |
+| `frontend/` | Vite + React SPA (source `src/`, built `dist/` committed — the server never runs Node). Shell is a 2-column grid: `nav.side` is `position: sticky` and therefore its own stacking context, so overlays portal to `<body>` rather than trusting z-index |
 | `deploy/` | VPS install: systemd units (`xscraper-web`, `xscraper-watch` X, `xscraper-fb`, `xscraper-ig`), nginx, re-runnable `setup.sh`, pre-commit hook. FB/IG units are enabled but start STOPPED (need a signed-in session; Fetch-now runs a pass on demand meanwhile) |
+| `CHECKPOINT.md` | Running history of what changed, newest first — the evidence behind each rule's current wording. Protected: append every change, never delete |
 | `tests/` | The offline suite — no network, no budget spent. Run after every change |
 | `tools/ig_probe.py` | Instagram session diagnostic |
 
@@ -249,8 +250,11 @@ on the server). Install the pre-commit hook:
   controls go to their platform's detail panel or settings section, never
   scattered on the main surface.
 - Every change: tests stay green offline and grow one for the new behavior;
-  `RULEBOOK.md` (and this file, if the shape changed) update in the SAME
-  commit — the pre-commit hook enforces it.
+  `RULEBOOK.md` and `CHECKPOINT.md` (and this file, if the shape changed)
+  update in the SAME commit — the pre-commit hook enforces it. The hook is a
+  DENY-list: everything counts as behavior except `tests/`, `tools/`, the FB
+  probes and generated `frontend/dist/`. A UI change under `frontend/src/` is
+  a behavior change.
 
 **Done since first blueprint:** Facebook as a full third platform (GraphQL
 capture, favorites mode, per-page cadence, byte cap); keyword watchlists;
@@ -263,7 +267,9 @@ manageable from the dashboard; label canonicalization + removal tombstones;
 living rulebook + protected documents enforced by pre-commit; IG structural
 parity — dashboard pause/cadence re-read per cycle, checkpoint state surfaced
 in the UI with the human recovery steps (the sidecar `checkpoint_at` breaker
-predates FB's and stays).
+predates FB's and stays); dashboard view state that the operator chose now
+survives leaving the view (Live Feed filters persisted per project) and
+overlays portal to `<body>` so no ancestor stacking context can bury them.
 
 Content labelling as the one named exception to "analyse in Watch-Tower":
 per-project category vocabulary edited in the dashboard, an
