@@ -417,6 +417,44 @@ def test_parse():
     ok(page.orphan_ids == [], f"no orphan results: {page.orphan_ids}")
     ok(page.parse_failures == [], f"no parse failures: {page.parse_failures}")
 
+    # The August-2026 X payload change (what twscrape 0.20.0 exists to fix).
+    # X stopped typing the author object embedded in each tweet, so
+    # to_old_rep's `users` map — which is built by collecting every
+    # `__typename: "User"` in the payload — came back EMPTY. On 0.19.2
+    # Tweet.parse then did res["users"][user_id_str] -> KeyError for every
+    # single hit, parse_page filed each as a parse_failure, every result was an
+    # orphan, and the collector stored nothing while reporting healthy polls.
+    # 0.20.0 resolves the author from core.user_results.result instead.
+    import copy
+
+    def _strip_user_typenames(node):
+        if isinstance(node, dict):
+            if node.get("__typename") == "User":
+                node = {k: v for k, v in node.items() if k != "__typename"}
+            return {k: _strip_user_typenames(v) for k, v in node.items()}
+        if isinstance(node, list):
+            return [_strip_user_typenames(x) for x in node]
+        return node
+
+    untyped = _strip_user_typenames(copy.deepcopy(search_payload()))
+    from twscrape.utils import to_old_rep as _to_old_rep
+
+    ok(
+        not _to_old_rep(untyped).get("users"),
+        "fixture reproduces the X change: no typed User objects -> empty users map",
+    )
+    page2 = parse_page(FakeResponse(untyped), 1)
+    ok(
+        page2.parse_failures == [] and page2.orphan_ids == [],
+        f"authors are still resolved from core.user_results (failures={page2.parse_failures}, "
+        f"orphans={page2.orphan_ids})",
+    )
+    ok(
+        page2.result_ids == page.result_ids
+        and all(page2.tweets[i].user.username == page.tweets[i].user.username for i in page.result_ids),
+        "...and every result carries the same author as the typed payload",
+    )
+
 
 async def test_lock_release(tmp):
     """F5: breaking out early must release the account lock immediately."""
@@ -548,6 +586,7 @@ sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent))
 
 from collector import (  # noqa: E402
     JITTER_PINNED,
+    STOP_ERROR,
     STOP_EXHAUSTED,
     STOP_PAGE_BUDGET,
     STOP_STARVED,
@@ -708,6 +747,82 @@ async def run_collector(tmp):
     wm_after = await store.get_watermark(sid)
     ok(wm_after["high_tweet_id"] == wm["high_tweet_id"],
        "the watermark is NOT advanced on a starved poll")
+
+    print()
+    print("== twscrape 0.20.0: an outdated GQL contract is an error, not a process exit ==")
+    # Before 0.20.0 twscrape called exit(1) from inside the request loop when X
+    # answered (336) "features cannot be null" — SystemExit is not an Exception,
+    # so it went straight through poll_once and killed the watcher. Now it is a
+    # real exception. Two things must hold: it is caught like any other error
+    # (the loop survives), and the message names the fix, because otherwise the
+    # dashboard shows the same cryptic class name on every stream forever.
+    from twscrape import GqlFeaturesOutdatedError
+
+    class Outdated:
+        def pages_for(self, stream, **kw):
+            return self.search_pages(stream.query, **kw)
+
+        async def search_pages(self, *a, **kw):
+            raise GqlFeaturesOutdatedError("(336) The following features cannot be null: x")
+            yield  # pragma: no cover
+
+    res = await poll_once(Outdated(), store, stream, sid)
+    ok(res.stop_reason == STOP_ERROR, f"reported as an error (stop={res.stop_reason})")
+    ok("upgrade" in (res.error or "").lower() and "requirements.txt" in (res.error or ""),
+       f"...and the error text says what to do: {res.error!r}")
+    ok((await store.get_watermark(sid))["high_tweet_id"] == wm["high_tweet_id"],
+       "the watermark is NOT advanced on that poll either")
+
+    print()
+    print("== X changes the payload under us: all-orphan pages are an ERROR, not '0 new' ==")
+    # The 2026-08 failure, as the collector saw it: pages walked, entry ids
+    # present, and not one tweet parseable (twscrape 0.19.2 raised KeyError on
+    # every author after X untyped the user object). Before this check the
+    # poll reported healthy, stored nothing, and — worse — advanced the
+    # watermark past the tweets it had just failed to keep, so the fix could
+    # never recover them. Every one of those must now be false.
+    from engine import Page
+
+    class ShapeChanged:
+        def pages_for(self, stream, **kw):
+            return self.search_pages(stream.query, **kw)
+
+        async def search_pages(self, *a, **kw):
+            newer = [id_at(-30_000), id_at(-60_000)]     # newer than the watermark
+            page = Page(page_no=1, received_ts=time.time(), server_ts=None,
+                        account="alice", status=200, rl_limit=50, rl_remaining=40)
+            page.result_ids = newer
+            page.entries_by_id = {i: {"entryId": f"tweet-{i}"} for i in newer}
+            page.parse_failures = [(str(i), "KeyError: '11'") for i in newer]
+            yield page
+
+    res = await poll_once(ShapeChanged(), store, stream, sid)
+    ok(res.results == 2 and res.orphans == 2, f"2 results, 2 orphans (results={res.results} orphans={res.orphans})")
+    ok(res.stop_reason == STOP_ERROR, f"reported as an ERROR (stop={res.stop_reason})")
+    ok("payload shape changed" in (res.error or "") and "KeyError" in (res.error or ""),
+       f"...naming the cause and the first failure: {res.error!r}")
+    ok(res.max_id is None and res.new == 0, "no watermark candidate from tweets that were not stored")
+    ok((await store.get_watermark(sid))["high_tweet_id"] == wm["high_tweet_id"],
+       "the watermark did NOT advance over the orphaned tweets")
+
+    # One orphan among real results is ordinary (a deleted-mid-page tweet),
+    # not a shape change — and the watermark still comes from what was stored.
+    class OneOrphan:
+        def pages_for(self, stream, **kw):
+            return self.search_pages(stream.query, **kw)
+
+        async def search_pages(self, *a, **kw):
+            page = parse_page(FakeResponse(search_payload(ids=[id_at(-20_000), id_at(-40_000)])), 1)
+            ghost = id_at(-10_000)                          # newest entry, unparseable
+            page.result_ids.insert(0, ghost)
+            page.entries_by_id[ghost] = {"entryId": f"tweet-{ghost}"}
+            yield page
+
+    res = await poll_once(OneOrphan(), store, stream, sid)
+    ok(res.stop_reason != STOP_ERROR and res.orphans == 1 and res.new == 2,
+       f"a single orphan among parsed results is not an error (stop={res.stop_reason} new={res.new})")
+    ok(res.max_id == id_at(-20_000),
+       "the watermark candidate is the newest STORED tweet, not the unparseable entry above it")
 
     print()
     print("== embedded context never moves the watermark ==")

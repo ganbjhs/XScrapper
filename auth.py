@@ -8,20 +8,28 @@ Two halves of one job:
                       cost: X gates it behind captcha, device verification and
                       2FA that no scripted HTTP replay clears.
   * session store   — the accounts.db adapter. twscrape owns that schema, but
-                      all three of its obvious entry points are wrong for us.
+                      every one of its obvious entry points is wrong for us.
 
 Why not just use twscrape's own account handling:
 
   * add_account() logs "already exists" and RETURNS EARLY when the row is
-    present (accounts_pool.py:93-97) — which is why editing cookies in .env
+    present (accounts_pool.py:99-104) — which is why editing cookies in .env
     never took effect in the prototype.
+  * add_account_cookies() does upsert since twscrape 0.20.0, but it activates
+    the row with no network call, keeps user_agent at the "@chrome"
+    placeholder and never writes the proxy — three of the four things the
+    harvest exists to record. Still not the primitive we want.
   * relogin() wipes cookies AND resets user_agent to "@chrome"
-    (accounts_pool.py:213-226), destroying exactly what the browser harvested.
-  * login_all() selects WHERE error_msg IS NULL (accounts_pool.py:189-190), so
-    one failed login excludes an account permanently.
+    (accounts_pool.py:228-248), destroying exactly what the browser harvested.
+    Since 0.20.0 it skips rows whose password is "_" (our placeholder), so it
+    would now silently do nothing to our accounts rather than damage them —
+    either way it is not a refresh path for us.
+  * login_all() selects WHERE error_msg IS NULL (accounts_pool.py:211), so
+    one failed login excludes an account permanently; since 0.20.0 it also
+    skips password="_" rows entirely.
   * cookie accounts are marked active with NO network call at all
-    (account.py:16-17 + accounts_pool.py:114-115), so expired cookies report
-    success and fail much later as an unrelated-looking search error.
+    (accounts_pool.py:128-143), so expired cookies report success and fail
+    much later as an unrelated-looking search error.
 
 The correct primitive is pool.save() plus a real authenticated request before
 anything is trusted.
@@ -872,7 +880,7 @@ def open_api(db_path) -> API:
     """
     Build the twscrape API with our pool policy applied.
 
-    _order_by defaults to "username" (accounts_pool.py:34), which makes the
+    _order_by defaults to "username" (accounts_pool.py:37), which makes the
     alphabetically-first account serve every request until it rate-limits —
     concentrating both wear and ban exposure on one account. LRU spreads it.
     SQLite sorts NULLs first, so never-used accounts are picked up first.
@@ -890,7 +898,7 @@ async def validate_http(acc: Account, proxy: str | None = None) -> ValidationRes
     """
     Prove the harvested cookies authenticate OUTSIDE the browser.
 
-    Uses acc.make_client() (account.py:63-75) — the exact client every search
+    Uses acc.make_client() (account.py:73-85) — the exact client every search
     will later use: same user-agent, same cookie jar, same proxy, with the
     bearer token and x-csrf-token already injected. Validating through any
     other client would prove the wrong thing.

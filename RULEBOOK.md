@@ -286,6 +286,27 @@ names).
   the archive ended. A backfill pass that walks zero pages must not decrement
   the operator's budget, advance the cursor, or mark the sweep exhausted —
   otherwise an empty pool silently eats a grant and reports success.
+- **All-orphans is an error, and the watermark only moves over what was
+  STORED.** An orphan is a result whose timeline entry id arrived but whose
+  tweet did not parse. One among real results is ordinary (deleted mid-page,
+  withheld). Every result on a poll being an orphan is the parser no longer
+  understanding X — which is what twscrape 0.19.2 looked like from 2026-08
+  after X changed its payload: pages walked, results counted, `KeyError` per
+  tweet, "0 new". Two things were wrong with how the collector took that.
+  It reported the poll healthy, so the dashboard said "quiet stream" for the
+  same symptom as "engine broken". And `max_id` came from entry ids whether
+  or not they parsed, so the watermark advanced PAST the tweets it had just
+  failed to keep; once the parser was fixed the next poll stopped at that
+  watermark and those tweets were behind it for good. Now:
+  `orphaned_payload_error` makes an all-orphan poll or backfill pass
+  `STOP_ERROR` with the first parse failure and the next step in the message;
+  `min_id`/`max_id` are derived from parsed results only (the stop check still
+  uses the true page minimum, so timeline order is respected); a backfill
+  pass that stored nothing advances no cursor and spends no budget, same as
+  starvation. Tests: `run_collector` "all-orphan pages are an ERROR" and
+  "single orphan is not an error". The general form: a count that exists
+  only in a table nobody reads is not monitoring; a condition that means
+  "broken" must change the stop reason.
 - **A cadence shown in the interface is a promise, and the scheduler keeps it.**
   The Watchlists dropdown wrote only `min_interval_s`, so it was a floor: the
   adaptive controller multiplied a quiet stream's interval by `GROW` on every
@@ -671,6 +692,22 @@ before changing the engine; nearly every "obvious" idea has been tried.)
 - **`python3 tests/test_all.py` stays green, offline, and grows a test for the
   new behavior.** The suite is the contract; it needs no accounts and spends no
   budget. Run it as a script, not under pytest.
+- **Upgrading a pinned scraper: diff the source, not the changelog, and
+  assert every behaviour the upgrade changes that we lean on.** The 0.19.2 →
+  0.20.0 twscrape bump (2026-08-25) touched all eleven modules; the release
+  notes said "fixed pagination loops" and the code said "the generator now
+  RETURNS when X echoes a cursor", which our collector reads as
+  `STOP_EXHAUSTED` — fine, but only because it was checked. Same bump:
+  `exit(1)` inside the request loop became `GqlFeaturesOutdatedError`
+  (previously that killed the watcher outright; `collector.describe_error`
+  now names the fix), and `ConnectError` stopped propagating (a dead proxy is
+  now indistinguishable from starvation except for twscrape's "cooling
+  account for 60s" log line). Each of those is an `engine.check()` assertion
+  now, so the next bump fails loudly if it moves them back. Procedure: `pip
+  download` both wheels, `diff -ru`, grep the project for every changed
+  symbol, run the fixture that reproduces the platform change against BOTH
+  versions (it must fail on the old one, or it proves nothing), bump the pin,
+  `doctor --selftest`, suite, checkpoint entry.
 - **A service must be OBSERVABLE and its restart limiter must actually apply.**
   Two unit-file defects, found together on 2026-08-22, and between them they
   are why a service that had been dead for weeks looked alive:
@@ -794,9 +831,18 @@ before changing the engine; nearly every "obvious" idea has been tried.)
   times). Match on the login first and the label second, normalising case, `@`
   and whitespace — an exact `===` on a display name silently un-matches an
   account and the UI degrades to blank.
-- **Keep the pinned scraper versions and the `doctor`/`guard` asserts.** They
-  turn "the platform changed under us" into a loud failure instead of silent
-  data loss.
+- **Keep the pinned scraper versions and the `doctor`/`guard` asserts — and
+  know what they do NOT catch.** They turn "the *library* changed under us"
+  (an accidental upgrade renaming an internal we reach into) into a loud
+  failure. They are blind to "the *platform* changed under us": on 2026-08 X
+  untyped the author object in every search result, the pin held at 0.19.2,
+  all 24 doctor asserts passed, `Tweet.parse` raised `KeyError` on every
+  tweet, and the collector reported healthy polls while storing nothing for
+  days. The platform-side detector is the all-orphans rule in §3 (a poll whose
+  results all fail to parse is `STOP_ERROR`, and the watermark comes only
+  from stored tweets). The earlier wording of this rule claimed the pin
+  covered both cases; it never did, and believing it is why nobody looked at
+  the `orphans` column the polls table had been filling in all along.
 
 ## 8. Protected features (removal requires the operator's explicit permission)
 

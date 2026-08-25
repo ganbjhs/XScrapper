@@ -33,7 +33,7 @@ CRITICAL — every caller MUST wrap search_pages in `contextlib.aclosing`:
             ...
             break                      # safe
 
-Acquiring an account locks it for 15 minutes (accounts_pool.py:268), and the
+Acquiring an account locks it for 15 minutes (accounts_pool.py:290), and the
 lock is released by QueueClient.__aexit__ — which only runs when the generator
 is CLOSED, not when the caller stops iterating.
 
@@ -71,7 +71,7 @@ from twscrape.utils import find_obj, get_by_path, to_old_rep
 # compatibility — assert the twscrape internals we depend on
 # ==========================================================================
 
-PINNED_VERSION = "0.19.2"
+PINNED_VERSION = "0.20.0"
 
 
 @dataclass
@@ -146,8 +146,18 @@ def check() -> Report:
             "_gql_items retries empty-but-cursored pages (the 3x budget tax on quiet streams)",
             "empty_pages" in src,
         )
-    except (OSError, TypeError):
-        r.check("could read API._gql_items source", False)
+        # 0.20.0: a page whose bottom cursor (or, for SearchTimeline, whose
+        # entry-id set) equals the previous page's ends the walk. Only the
+        # LAST page is compared, so A->B->A is not a stall. Our collector sees
+        # this as the generator finishing on its own (STOP_EXHAUSTED), which is
+        # the right reading: X is echoing, not serving.
+        r.check(
+            "_gql_items stops on a repeated cursor/page instead of looping "
+            "(0.20.0 stall detection; compares against the previous page only)",
+            "_is_stalled" in src and "seen.clear()" in inspect.getsource(API._is_stalled),
+        )
+    except (OSError, TypeError, AttributeError):
+        r.check("could read API._gql_items / _is_stalled source", False)
 
     try:
         src = inspect.getsource(API.search_raw)
@@ -171,12 +181,47 @@ def check() -> Report:
             "rate-limit headers are read from the response (we size our budget from them)",
             "x-rate-limit-remaining" in src,
         )
+        # 0.20.0: an outdated GQL_FEATURES block (X error 336) used to call
+        # exit(1) from inside the request loop, which took the whole watcher
+        # process down. It is now an exception that reaches the collector,
+        # which names it so the fix ("upgrade twscrape") is visible on the
+        # dashboard instead of in a dead systemd unit.
+        r.check(
+            "outdated GQL features raise GqlFeaturesOutdatedError rather than exit(1) "
+            "(the collector reports this as an actionable error)",
+            hasattr(qc, "GqlFeaturesOutdatedError") and "exit(1)" not in src,
+        )
+        # 0.20.0: transport failures retry the same account with backoff, then
+        # cool it for 60s and rotate. Nothing is raised any more, so a dead
+        # proxy now surfaces as pool starvation (zero pages), not as an error.
+        r.check(
+            "transport errors cool the account and rotate instead of raising "
+            "(a bad proxy therefore shows up as STOP_STARVED, not STOP_ERROR)",
+            "cooling account for 60s" in src,
+        )
     except (OSError, TypeError):
         r.check("could read queue_client source", False)
 
     # --- parse path ---
     r.check("to_old_rep() is importable (our parse bypass depends on it)", callable(to_old_rep))
     r.check("Tweet.parse() is importable", callable(getattr(Tweet, "parse", None)))
+    # 0.20.0: X stopped sending the flat `users` map on some search responses.
+    # Tweet.parse used to do res["users"][user_id_str] and raise KeyError,
+    # which in parse_page becomes a parse_failure for EVERY hit — the page
+    # looks like all orphans and nothing is stored. The fix resolves the author
+    # from core.user_results / author_results embedded in the tweet.
+    try:
+        from twscrape import models as _models
+
+        src = inspect.getsource(_models.Tweet.parse)
+        r.check(
+            "Tweet.parse resolves the author when the users map is absent "
+            "(0.20.0 fix for the X payload change that orphaned every result)",
+            "_get_tweet_user_obj" in src
+            and "core.user_results.result" in inspect.getsource(_models._get_tweet_user_obj),
+        )
+    except (OSError, TypeError, AttributeError):
+        r.check("Tweet.parse handles a missing users map", False, "could not inspect models.py")
     try:
         from twscrape.models import _parse_items
 

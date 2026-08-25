@@ -13,7 +13,7 @@ Instagram's private web API: it loads a harvested session, echoes the
 x-ig-www-claim header Instagram demands, carries the device fingerprint, and
 centralises 429/challenge/relogin handling. Re-implementing that by hand is how
 you turn a small task into a big one. We wrap it and pin it, precisely as
-engine.py pins twscrape==0.19.2 and asserts its internals.
+engine.py pins twscrape==0.20.0 and asserts its internals.
 
 HONEST LIMITS — READ BEFORE TRUSTING THIS.
   * NOT YET VERIFIED AGAINST A LIVE ACCOUNT. The call shapes are from

@@ -181,7 +181,7 @@ def _best_variant(variants):
     dict ordering.
 
     The mp4 preference matters because HLS `.m3u8` playlist variants carry no
-    bitrate. twscrape 0.19.2 happens to filter those out upstream
+    bitrate. twscrape 0.20.0 happens to filter those out upstream
     (models.py:384), but this module is engine-agnostic by design and another
     engine will not.
     """

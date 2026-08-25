@@ -4,7 +4,14 @@
 # an accidental upgrade fails loudly instead of silently corrupting results.
 # To upgrade: bump this pin, run `python3 main.py doctor --selftest`, fix what
 # it reports.
-twscrape==0.19.2
+#
+# 0.19.2 -> 0.20.0 (2026-08): X rotated its GraphQL operation ids and started
+# omitting the `users` map from search responses, which made 0.19.2's
+# Tweet.parse raise KeyError on every hit (all results became orphans). 0.20.0
+# carries the new ids, resolves authors from core.user_results, stops on
+# repeated cursors/pages, and raises GqlFeaturesOutdatedError instead of
+# exit(1) when X changes again. See engine.check() for what we verified.
+twscrape==0.20.0
 
 # Instagram's counterpart to twscrape: the free (MIT) private-API library that
 # engine_ig.py wraps. Pinned for the same reason — engine_ig.check() asserts the

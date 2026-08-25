@@ -83,6 +83,61 @@ BACKFILL_LOW_HEADROOM = 10   # rl_remaining below this = slow down
 MAINTAIN_EVERY_S = 300
 
 
+def describe_error(e: BaseException) -> str:
+    """
+    One line for the poll log and the dashboard.
+
+    Most exceptions are just named. The one that gets special treatment is
+    twscrape's GqlFeaturesOutdatedError (0.20.0+): X has changed the GraphQL
+    "features" contract, every request is now structurally invalid, and no
+    amount of retrying or account rotation helps. Before 0.20.0 twscrape
+    called exit(1) here, which killed the whole watcher; now it is an ordinary
+    exception, so without this the symptom would be every stream reporting
+    the same cryptic error forever. Say what to do instead.
+    """
+    try:
+        from twscrape import GqlFeaturesOutdatedError
+    except ImportError:            # older twscrape: no such class, plain path
+        GqlFeaturesOutdatedError = ()  # type: ignore[assignment]
+    if isinstance(e, GqlFeaturesOutdatedError):
+        return (
+            "twscrape is out of date for X's current API (GqlFeaturesOutdatedError) -- "
+            "every request will fail until it is upgraded: bump the pin in "
+            f"requirements.txt, then `python3 main.py doctor --selftest`. Detail: {e}"
+        )
+    return f"{type(e).__name__}: {e}"
+
+
+def orphaned_payload_error(res, first_failure) -> str | None:
+    """
+    The "X changed the payload shape under us" detector.
+
+    A result is an ORPHAN when its timeline entry id is present but no tweet
+    could be parsed for it. One or two on a page happen (deleted mid-page,
+    withheld content). EVERY result on a poll being an orphan does not happen
+    to a healthy engine: it means the parser no longer understands what X is
+    sending, which is precisely what 2026-08 looked like — twscrape 0.19.2
+    raising KeyError on each tweet after X untyped the author object, while
+    the poll itself reported pages walked, results seen, nothing wrong.
+
+    This must be an error, not a quiet count, for two reasons: the watermark
+    must not advance over tweets that were never stored (poll_once now derives
+    it from parsed results only, so an all-orphan poll has no max_id), and the
+    dashboard must show a cause with a next step rather than "0 new". The
+    version pin and the doctor asserts catch a changed LIBRARY; only this
+    catches a changed PLATFORM.
+    """
+    if not res.results or res.orphans < res.results:
+        return None
+    detail = f" First failure: {first_failure[0]} -> {first_failure[1]}." if first_failure else ""
+    return (
+        f"payload shape changed: {res.results} results on {res.pages} page(s), none parseable "
+        f"(all orphans). Nothing was stored and the watermark did not move. twscrape almost "
+        f"certainly needs an upgrade for X's current API -- check for a new release, bump "
+        f"the pin in requirements.txt, run `python3 main.py doctor --selftest`.{detail}"
+    )
+
+
 @dataclass
 class PollResult:
     stream_label: str
@@ -131,6 +186,7 @@ async def poll_once(engine, store, stream, stream_id, *, kind="poll", log=None) 
 
     committed = []
     last_cursor = None
+    first_failure = None
     max_pages = stream.max_pages_per_poll
 
     try:
@@ -156,6 +212,8 @@ async def poll_once(engine, store, stream, stream_id, *, kind="poll", log=None) 
                     res.rl_reset = page.rl_reset
                 last_cursor = page.cursor
                 res.orphans += len(page.orphan_ids)
+                if first_failure is None and page.parse_failures:
+                    first_failure = page.parse_failures[0]
 
                 # Quoted tweets, reply parents and other context. Stored so the
                 # dataset is self-contained, but tagged 'embedded' so they can
@@ -165,19 +223,29 @@ async def poll_once(engine, store, stream, stream_id, *, kind="poll", log=None) 
 
                 if page.result_ids:
                     res.results += len(page.result_ids)
+                    stored_ids = []
                     for tid in page.result_ids:
                         tweet = page.tweets.get(tid)
                         if tweet is None:
                             continue  # orphan, already counted
+                        stored_ids.append(tid)
                         committed.append((tweet, page, "result", page.entries_by_id.get(tid)))
                         if sf.is_snowflake(tid):
                             res.lags.append(sf.lag_ms(tid, page.collected_ms))
 
-                    page_min = page.min_result_id()
-                    page_max = page.max_result_id()
-                    res.min_id = page_min if res.min_id is None else min(res.min_id, page_min)
-                    res.max_id = page_max if res.max_id is None else max(res.max_id, page_max)
+                    # min_id / max_id describe what we HAVE, so they come from
+                    # the results that parsed. An orphan is a tweet X showed us
+                    # and we could not keep; letting it raise the watermark
+                    # would hide it behind "already collected" forever. (The
+                    # stop check below still uses the true page minimum, so an
+                    # unparseable oldest entry cannot make us walk further than
+                    # the timeline order warrants.)
+                    if stored_ids:
+                        lo, hi = min(stored_ids), max(stored_ids)
+                        res.min_id = lo if res.min_id is None else min(res.min_id, lo)
+                        res.max_id = hi if res.max_id is None else max(res.max_id, hi)
 
+                    page_min = page.min_result_id()
                     if stop_id is not None and page_min <= stop_id:
                         res.stop_reason = STOP_WATERMARK
                         break
@@ -189,19 +257,35 @@ async def poll_once(engine, store, stream, stream_id, *, kind="poll", log=None) 
                     res.stop_reason = STOP_PAGE_BUDGET
                     break
             else:
-                # Generator finished on its own: X ran out of results.
+                # Generator finished on its own: X ran out of results -- or,
+                # since twscrape 0.20.0, echoed the previous page/cursor back
+                # (its stall detection returns instead of looping). Both mean
+                # there is nothing further down.
                 res.stop_reason = STOP_EXHAUSTED
     except Exception as e:
         res.stop_reason = STOP_ERROR
-        res.error = f"{type(e).__name__}: {e}"
+        res.error = describe_error(e)
         if log:
             log(f"[{stream.label}] error: {res.error}")
 
     res.elapsed_s = time.time() - started
 
+    # Results that all failed to parse are not "0 new" — they are the engine
+    # no longer understanding X. Say so, loudly, with the next step.
+    if res.stop_reason != STOP_ERROR:
+        shape_error = orphaned_payload_error(res, first_failure)
+        if shape_error:
+            res.stop_reason = STOP_ERROR
+            res.error = shape_error
+            if log:
+                log(f"[{stream.label}] error: {res.error}")
+
     # Zero pages is NOT a quiet stream. twscrape's generator ends silently when
-    # no account can be acquired, so this is the only place that distinction
-    # can be made -- and it must not be treated as "nothing new".
+    # no account can be acquired -- and, since 0.20.0, also after a transport
+    # failure (bad proxy, unreachable host): it cools the account for 60s and
+    # rotates rather than raising, so a dead proxy on the last free account
+    # lands here too. This is the only place that distinction can be made, and
+    # it must not be treated as "nothing new".
     if res.pages == 0 and res.stop_reason != STOP_ERROR:
         res.stop_reason = STOP_STARVED
         await store.finish_poll(
@@ -313,6 +397,7 @@ async def backfill_once(engine, store, stream, stream_id, *,
     committed = []
     cursor = state.get("cursor")
     exhausted = False
+    first_failure = None
 
     try:
         async with aclosing(
@@ -334,6 +419,8 @@ async def backfill_once(engine, store, stream, stream_id, *,
                 if page.rl_reset is not None:
                     res.rl_reset = page.rl_reset
                 res.orphans += len(page.orphan_ids)
+                if first_failure is None and page.parse_failures:
+                    first_failure = page.parse_failures[0]
 
                 # Only advance the resume point when X actually gave us one.
                 # Overwriting a good cursor with None would rewind the sweep to
@@ -347,15 +434,17 @@ async def backfill_once(engine, store, stream, stream_id, *,
 
                 if page.result_ids:
                     res.results += len(page.result_ids)
+                    stored_ids = []
                     for tid in page.result_ids:
                         tweet = page.tweets.get(tid)
                         if tweet is None:
                             continue
+                        stored_ids.append(tid)
                         committed.append((tweet, page, "result", page.entries_by_id.get(tid)))
-                    page_min = page.min_result_id()
-                    page_max = page.max_result_id()
-                    res.min_id = page_min if res.min_id is None else min(res.min_id, page_min)
-                    res.max_id = page_max if res.max_id is None else max(res.max_id, page_max)
+                    if stored_ids:   # what we HAVE, as in poll_once
+                        lo, hi = min(stored_ids), max(stored_ids)
+                        res.min_id = lo if res.min_id is None else min(res.min_id, lo)
+                        res.max_id = hi if res.max_id is None else max(res.max_id, hi)
                 else:
                     # A cursored page with no search hits on it is X saying the
                     # walk is over. Believe it: continuing would spend the rest
@@ -369,7 +458,7 @@ async def backfill_once(engine, store, stream, stream_id, *,
             exhausted = True
     except Exception as e:
         res.stop_reason = STOP_ERROR
-        res.error = f"{type(e).__name__}: {e}"
+        res.error = describe_error(e)
         if log:
             log(f"[{stream.label}] backfill error: {res.error}")
 
@@ -382,6 +471,22 @@ async def backfill_once(engine, store, stream, stream_id, *,
         await store.finish_poll(poll_id, pages=0, stop_reason=res.stop_reason,
                                 account=res.account)
         return res
+
+    # Same rule as starvation, for the same reason: a pass that stored nothing
+    # because nothing would parse must not advance the cursor, spend the grant
+    # or retire the sweep. Otherwise a broken parser digs through the whole
+    # archive at full speed, keeping nothing, and reports the job done.
+    if res.stop_reason != STOP_ERROR:
+        shape_error = orphaned_payload_error(res, first_failure)
+        if shape_error:
+            res.stop_reason = STOP_ERROR
+            res.error = shape_error
+            if log:
+                log(f"[{stream.label}] backfill error: {res.error}")
+            await store.finish_poll(poll_id, pages=res.pages, results=res.results,
+                                    orphans=res.orphans, stop_reason=res.stop_reason,
+                                    account=res.account, error=res.error)
+            return res
 
     counts = await store.upsert_tweets(committed, stream_id, poll_id)
     res.new, res.dup, res.embedded = counts.new, counts.dup, counts.embedded
