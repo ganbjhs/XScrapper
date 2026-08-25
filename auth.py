@@ -53,6 +53,7 @@ from twscrape import API
 from twscrape.account import Account
 from twscrape.utils import utc
 
+import engine  # noqa: F401  — importing it installs the xclid shim (see engine.py)
 from config import PY
 
 

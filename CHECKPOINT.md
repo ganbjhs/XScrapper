@@ -19,6 +19,57 @@ must respect belongs in the rulebook, not here.
 
 ---
 
+## 2026-08-25 (later) — request signing: X's legacy build grew 16-hex chunk hashes
+
+**Changed**
+
+- `engine.py` — `install_xclid_shim()`: replaces
+  `twscrape.xclid.get_scripts_list` with the same logic and a chunk-hash
+  width of 7..64 instead of exactly 7. Installs at import, only while the
+  upstream source still carries `[0-9a-f]{7}`; `XCLID_SHIM` records
+  "installed" / "not-needed" / "skipped". Two new `check()` lines (26 now).
+- `auth.py` — `import engine` at top, so `open_api()` — every process's
+  route to twscrape — has the shim in place.
+- `tools/xclid_probe.py` — new. Fetches https://x.com/tesla the way the
+  signer does and reports what came back; ends with an end-to-end
+  `XClIdGen.create()` as shipped and with the shim.
+- `tests/test_all.py::test_xclid_shim` — the 16-hex shape parses, upstream
+  still fails on it (control), modern build and logged-out detection are
+  untouched.
+- `RULEBOOK.md` §6 — "POOL STARVED on every stream is a signing failure
+  until proven otherwise".
+
+**Why**
+
+After the 0.20.0 deploy the watcher logged, for both accounts and every
+queue, `XClIdParseError: X web scripts not found` followed by
+`stop=no_account_or_abort << POOL STARVED`. The probe showed the cause:
+anonymous fetches get X's modern build (`/x-web/entry-client-logged-out`),
+but logged-in sessions get the legacy webpack build, whose chunk map now
+has 1,025 entries with 16-hex values (`main.3fc0640facfee243a.js`).
+twscrape's legacy fallback regex `(\d+):"([0-9a-f]{7})"` matches none of
+them. Everything else the signer needs (the `ondemand.s` chunk name, the
+`twitter-site-verification` key, the four `loading-x-anim` SVGs) is still in
+the page. Not an IP block: HTTP 200, no challenge title, no logged-out entry.
+
+**Verified**
+
+- Against the real HTML saved from the VPS: upstream 0.20.0 raises the
+  production error; the shim returns 1,023 chunk URLs including
+  `ondemand.s.b7dbcfcff298f890a.js`, and reproduces the page's actual
+  `i18n/en.c085…a.js` link (so the `a` suffix convention still holds).
+- `doctor --selftest` 26/26; suite 731/731; side suites green.
+- Live signing (`XClIdGen.create` on the VPS) is the probe's last line and
+  is what to confirm before restarting the services.
+
+**Open**
+
+- Report upstream (vladkens/twscrape) so the shim can stand down; the
+  guard makes that automatic once their regex changes.
+- The `_to_delete/xclid_*.html` capture on the Mac can go.
+
+---
+
 ## 2026-08-25 — twscrape 0.19.2 → 0.20.0 (X changed its search payload)
 
 **Changed**

@@ -367,6 +367,61 @@ async def run_session(tmp):
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent))
 
 
+def test_xclid_shim():
+    """
+    2026-08-25: X's legacy web build (served to LOGGED-IN sessions) switched
+    from 7-hex to 16-hex chunk hashes. twscrape 0.20.0's fallback parser
+    requires exactly 7, so request signing died on every account with
+    "X web scripts not found", and the collector reported starvation.
+    engine.py shims the one function. This pins both directions: the shim
+    parses the new shape, and twscrape as shipped still does not (when it
+    does, the shim must stand down by itself).
+    """
+    print("== x-client-transaction-id: legacy build with 16-hex chunk hashes ==")
+    import engine
+    import twscrape.xclid as x
+
+    page = (
+        '<html><script src="https://abs.twimg.com/responsive-web/client-web/main.3fc0640facfee243a.js">'
+        '</script><script>(e=>({3:"bundle.Payments",5:"ondemand.s",7:"i18n/ar",9:"loader.Foo"})[e]||e)'
+        '+"."+({3:"cf787fd54a63440c",5:"b7dbcfcff298f890",7:"2322cb6c5c855f73",9:"f28425fe7c4b6176"})'
+        '[e]+"a.js"</script></html>'
+    )
+    want = "https://abs.twimg.com/responsive-web/client-web/ondemand.s.b7dbcfcff298f890a.js"
+
+    ok(engine.XCLID_SHIM in ("installed",) or str(engine.XCLID_SHIM).startswith("not-needed"),
+       f"shim decided at import: {engine.XCLID_SHIM}")
+    urls = x.get_scripts_list(page)
+    ok(want in urls, f"live get_scripts_list finds the ondemand.s signing script ({len(urls)} chunks)")
+    ok("https://abs.twimg.com/responsive-web/client-web/i18n/ar.2322cb6c5c855f73a.js" in urls,
+       "name map still resolves chunk ids to names (i18n/ar)")
+    ok([u for u in urls if x.INDICES_FILE_RE.search(u)] == [want],
+       "twscrape's own INDICES_FILE_RE picks exactly that script, so no chunk scanning is needed")
+
+    if engine.XCLID_SHIM == "installed":
+        try:
+            engine._UPSTREAM_get_scripts_list(page)
+            ok(False, "twscrape as shipped parses 16-hex hashes — the shim guard should have stood down")
+        except x.XClIdParseError as e:
+            ok("scripts not found" in str(e),
+               f"  control: twscrape as shipped still fails on this page ({e}) — shim is earning its keep")
+
+    # The modern (Vite) build and the logged-out shell are untouched by the shim.
+    modern = '<link href="https://abs.twimg.com/x-web/x-web/entry-client-3fc06.js">'
+    ok(x.get_scripts_list(modern) == ["https://abs.twimg.com/x-web/x-web/entry-client-3fc06.js"],
+       "modern x-web build passes straight through")
+    try:
+        x.get_scripts_list('<link href="https://abs.twimg.com/x-web/x-web/entry-client-logged-out-A3q3.js">')
+        ok(False, "logged-out shell should raise XClIdAccountError")
+    except x.XClIdAccountError:
+        ok(True, "logged-out shell still raises XClIdAccountError (dead session is still detected)")
+    try:
+        x.get_scripts_list("<html>nothing here</html>")
+        ok(False, "an unrecognised page should raise")
+    except x.XClIdParseError:
+        ok(True, "an unrecognised page still raises XClIdParseError")
+
+
 def test_parse():
 
     print("== page parsing ==")
@@ -4539,6 +4594,7 @@ def main():
         asyncio.run(run_session(fresh("session")))
 
         section("engine (parsing + account-lock release)")
+        test_xclid_shim()
         test_parse()
         asyncio.run(test_lock_release(fresh("engine")))
 

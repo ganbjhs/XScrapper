@@ -66,6 +66,82 @@ from twscrape.models import Tweet
 from twscrape.utils import find_obj, get_by_path, to_old_rep
 
 
+# ==========================================================================
+# shim — X's legacy web build grew 16-hex chunk hashes (2026-08-25)
+# ==========================================================================
+#
+# Before twscrape can sign any API request it fetches https://x.com/tesla and
+# reads X's script bundle out of the HTML, to compute x-client-transaction-id.
+# X serves LOGGED-IN sessions its legacy webpack build, which embeds a chunk
+# map {id: "hash"} and {id: "name"}. twscrape 0.20.0 expects those hashes to be
+# exactly 7 hex chars; on 2026-08-25 they were 16 (main.3fc0640facfee243a.js),
+# the regex matched nothing, and every request on every account died with
+# `XClIdParseError: X web scripts not found` — which the collector could only
+# report as pool starvation. tools/xclid_probe.py is how that was found.
+#
+# This replaces one function, twscrape.xclid.get_scripts_list, with the same
+# logic and a hash width of 7..64. It installs itself only while the upstream
+# source still carries the 7-char pattern, so a twscrape release that fixes it
+# makes this a no-op rather than a fight. check() reports which happened.
+
+import twscrape.xclid as _xclid
+
+_LEGACY_HEX = r"[0-9a-f]{7,64}"
+_UPSTREAM_get_scripts_list = _xclid.get_scripts_list
+XCLID_SHIM: str | None = None   # "installed" | "not-needed: ..." | "skipped: ..."
+
+
+def _get_scripts_list_shim(text: str) -> list[str]:
+    urls = list(dict.fromkeys(_xclid.ASSET_URL_RE.findall(text)))
+    if urls:
+        if any(_xclid.LOGGED_OUT_ENTRY_RE.search(u) for u in urls):
+            raise _xclid.XClIdAccountError("Logged-out X web app")
+        return urls
+
+    # Legacy webpack build. Hash map values are hex of ANY plausible width;
+    # name map values are everything that is not one of those.
+    hash_map = {
+        m.group(1): m.group(2)
+        for m in re.finditer(r'(\d+):"(' + _LEGACY_HEX + r')"', text)
+    }
+    if not hash_map:
+        raise _xclid.XClIdParseError("X web scripts not found")
+
+    name_map: dict[str, str] = {}
+    for m in re.finditer(r'(\d+):"([^"]+)"', text):
+        if not re.fullmatch(_LEGACY_HEX, m.group(2)):
+            name_map[m.group(1)] = m.group(2)
+
+    return [
+        _xclid.script_url(name_map.get(chunk_id, chunk_id), hash_val + "a")
+        for chunk_id, hash_val in hash_map.items()
+    ]
+
+
+def install_xclid_shim() -> str:
+    """Idempotent. Returns the status string also exposed as XCLID_SHIM."""
+    global XCLID_SHIM
+    if XCLID_SHIM:
+        return XCLID_SHIM
+    for name in ("ASSET_URL_RE", "LOGGED_OUT_ENTRY_RE", "XClIdAccountError",
+                 "XClIdParseError", "script_url", "get_scripts_list"):
+        if not hasattr(_xclid, name):
+            XCLID_SHIM = f"skipped: twscrape.xclid.{name} no longer exists — re-check the shim"
+            return XCLID_SHIM
+    try:
+        src = inspect.getsource(_UPSTREAM_get_scripts_list)
+    except (OSError, TypeError):
+        src = ""
+    if "[0-9a-f]{7}" not in src:
+        XCLID_SHIM = "not-needed: twscrape no longer requires 7-hex chunk hashes"
+        return XCLID_SHIM
+    _xclid.get_scripts_list = _get_scripts_list_shim
+    XCLID_SHIM = "installed"
+    return XCLID_SHIM
+
+
+install_xclid_shim()
+
 
 # ==========================================================================
 # compatibility — assert the twscrape internals we depend on
@@ -235,6 +311,30 @@ def check() -> Report:
         )
     except (OSError, TypeError, ImportError):
         r.lines.append("note   could not inspect _parse_items (non-fatal)")
+
+    # --- request signing (x-client-transaction-id) ---
+    status = install_xclid_shim()
+    r.check(
+        f"xclid shim status is known ({status})",
+        status == "installed" or status.startswith("not-needed"),
+        "the shim could not decide whether twscrape's script parser needs it",
+    )
+    # Exercise whichever get_scripts_list is live against the 2026-08-25
+    # legacy-build shape: 16-hex chunk hashes. Upstream 0.20.0 raises here.
+    fake = (
+        '({3:"cf787fd54a63440c",5:"b7dbcfcff298f890",7:"2322cb6c5c855f73"})[e]||e)+"."'
+        '+({3:"bundle.Payments",5:"ondemand.s",7:"i18n/ar"})'
+    )
+    try:
+        got = _xclid.get_scripts_list(fake)
+        signing = [u for u in got if _xclid.INDICES_FILE_RE.search(u)]
+        r.check(
+            "legacy X build with 16-hex chunk hashes yields the ondemand.s signing script",
+            signing == ["https://abs.twimg.com/responsive-web/client-web/ondemand.s.b7dbcfcff298f890a.js"],
+            f"got {signing}",
+        )
+    except Exception as e:
+        r.check("legacy X build with 16-hex chunk hashes parses", False, f"{type(e).__name__}: {e}")
 
     # --- endpoint constants ---
     r.check(

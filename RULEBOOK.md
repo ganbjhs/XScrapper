@@ -843,6 +843,24 @@ before changing the engine; nearly every "obvious" idea has been tried.)
   from stored tweets). The earlier wording of this rule claimed the pin
   covered both cases; it never did, and believing it is why nobody looked at
   the `orphans` column the polls table had been filling in all along.
+- **"POOL STARVED" on every stream with accounts active is a signing
+  failure until proven otherwise — read the twscrape ERROR line above it.**
+  Since twscrape 0.20.0 a request that dies before reaching X's API (proxy,
+  transport, or the `x-client-transaction-id` signer) is not raised; the
+  account is cooled and rotated, the generator yields nothing, and the
+  collector can only say "no account". The tell is the loguru line just
+  before: `XClIdParseError: X web scripts not found; username=…` on
+  2026-08-25. That one meant X's legacy web build — the one LOGGED-IN
+  sessions get — had moved from 7-hex to 16-hex chunk hashes, and
+  twscrape's fallback parser requires exactly 7. `engine.py` shims
+  `twscrape.xclid.get_scripts_list` (hash width 7..64), installs only while
+  upstream still carries the 7-char pattern, and `doctor --selftest` reports
+  which. `tools/xclid_probe.py` is the diagnostic: it fetches x.com the way
+  the signer does — anonymous, then per account with twscrape's `@chrome` UA
+  and with the stored real UA — prints title / asset links / markers, saves
+  the HTML, and finally runs `XClIdGen.create()` as shipped and with the
+  shim. Run it BEFORE touching accounts or proxies: the same symptom from an
+  IP block looks different there (challenge title, 403, logged-out entry).
 
 ## 8. Protected features (removal requires the operator's explicit permission)
 
