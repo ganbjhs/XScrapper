@@ -2146,6 +2146,143 @@ def test_collections(tmp):
        "deleting a whole board leaves every collected tweet in place")
 
 
+def test_delete_project(tmp):
+    """
+    delete_project: what only this project owns goes; anything another
+    project also uses survives with just this project's tag removed.
+      - stream shared with another project: kept, tag removed
+      - stream only here: destroyed, but a tweet another surviving stream
+        also matched is kept (forget_stream's EXCEPT rule)
+      - config.toml streams: detached + paused, never destroyed
+      - project-owned rows (watchlists, collections, labels, targets, alerts)
+        and the 'dt:<id>' delivery cursor go with it
+      - the plan is a dry run; the last project can never be deleted;
+        rename honours the UNIQUE name
+    """
+    import store as store_mod
+
+    db = pathlib.Path(tmp) / "results.db"
+
+    async def run():
+        st = store_mod.Store(db, False)
+        await st.open()
+        a = (await st.create_project("Test A"))["project_id"]
+        b = (await st.create_project("Real B"))["project_id"]
+        default = st.db.execute(
+            "SELECT project_id FROM projects WHERE name = 'Default'").fetchone()
+        # Fresh DBs get the migration's 'Default' project; remove it so the
+        # last-project guard is exercised against A and B only.
+        if default:
+            st.db.execute("DELETE FROM projects WHERE project_id = ?",
+                          (default["project_id"],))
+            st.db.execute("DELETE FROM project_streams WHERE project_id = ?",
+                          (default["project_id"],))
+
+        only_a = await st.ensure_stream("wl:1:0", "q1", "Latest", True)
+        shared = await st.ensure_stream("wl:2:0", "q2", "Latest", True)
+        b_only = await st.ensure_stream("wl:3:0", "q3", "Latest", True)
+        cfg = await st.ensure_stream("acct_a", "q4", "Latest", True)
+        for sid in (only_a, shared, cfg):
+            await st.attach_stream(a, sid)
+        for sid in (shared, b_only):
+            await st.attach_stream(b, sid)
+
+        info = list(st.db.execute("PRAGMA table_info(tweets)"))
+        required = [x[1] for x in info if x[3] and x[4] is None and not x[5]]
+        text_cols = {x[1] for x in info if "TEXT" in (x[2] or "").upper()}
+
+        def add_tweet(tid, stream_ids):
+            row = {c: ("" if c in text_cols else 0) for c in required}
+            row.update(tweet_id=tid, created_ms=tid, collected_ms=tid, source="result")
+            st.db.execute(
+                f"INSERT INTO tweets({','.join(row)}) VALUES({','.join('?' * len(row))})",
+                list(row.values()))
+            st.db.execute("INSERT INTO tweet_raw(tweet_id, raw_json) VALUES(?, ?)",
+                          (tid, '{"id":"%d"}' % tid))
+            for s in stream_ids:
+                st.db.execute(
+                    "INSERT INTO tweet_hits(stream_id, tweet_id, first_seen_ms) "
+                    "VALUES(?,?,?)", (s, tid, tid))
+
+        add_tweet(301, [only_a])            # doomed
+        add_tweet(302, [only_a, b_only])    # matched by B's own stream too: kept
+        add_tweet(303, [shared])            # shared stream: kept untouched
+        add_tweet(304, [cfg])               # config stream: kept
+        add_tweet(305, [b_only])            # B's: untouched
+
+        now = "2026-01-01T00:00:00Z"
+        st.db.execute("INSERT INTO watchlists(project_id, name, created_at) VALUES(?,?,?)",
+                      (a, "wl", now))
+        wid = st.db.execute("SELECT watchlist_id FROM watchlists").fetchone()[0]
+        st.db.execute("INSERT INTO watchlist_members(watchlist_id, handle, added_at) "
+                      "VALUES(?,?,?)", (wid, "someone", now))
+        st.db.execute("INSERT INTO collections(project_id, name, created_at) VALUES(?,?,?)",
+                      (a, "board", now))
+        cid = st.db.execute("SELECT collection_id FROM collections").fetchone()[0]
+        st.db.execute("INSERT INTO collection_posts(collection_id, platform, post_id, added_ms) "
+                      "VALUES(?,?,?,?)", (cid, "x", "301", 1))
+        st.db.execute("INSERT INTO post_labels(project_id, platform, post_id, label, labelled_ms) "
+                      "VALUES(?,?,?,?,?)", (a, "x", "303", "news", 1))
+        st.db.execute("INSERT INTO alerts(project_id, created_at) VALUES(?,?)", (a, now))
+        st.db.execute("INSERT INTO delivery_targets(project_id, kind, name, created_at) "
+                      "VALUES(?,?,?,?)", (a, "webhook", "wt", now))
+        tid = st.db.execute("SELECT target_id FROM delivery_targets").fetchone()[0]
+        st.db.execute("INSERT INTO webhook_state(label) VALUES(?)", (f"dt:{tid}",))
+        st.db.execute("INSERT INTO webhook_state(label) VALUES('global-hook')")
+
+        plan = await st.project_delete_plan(a, protected_labels={"acct_a"})
+        before = st.db.execute("SELECT COUNT(*) FROM tweets").fetchone()[0]
+        dup = await st.rename_project(b, "Test A")
+        ok_rename = await st.rename_project(b, "Real B2")
+        res = await st.delete_project(a, protected_labels={"acct_a"})
+        last = await st.project_delete_plan(b)
+
+        def rows(sql, *args):
+            return [tuple(r) for r in st.db.execute(sql, args)]
+
+        out = {
+            "plan": plan, "before": before, "dup": dup, "ok_rename": ok_rename,
+            "res": res, "last": last,
+            "tweets": {r[0] for r in rows("SELECT tweet_id FROM tweets")},
+            "raw": {r[0] for r in rows("SELECT tweet_id FROM tweet_raw")},
+            "streams": {r[0]: r[1] for r in rows("SELECT label, paused FROM streams")},
+            "tags": rows("SELECT project_id, stream_id FROM project_streams ORDER BY 1,2"),
+            "projects": rows("SELECT name FROM projects"),
+            "owned": {t: rows(f"SELECT COUNT(*) FROM {t}")[0][0] for t in (
+                "watchlists", "watchlist_members", "collections", "collection_posts",
+                "post_labels", "alerts", "delivery_targets")},
+            "hooks": {r[0] for r in rows("SELECT label FROM webhook_state")},
+        }
+        await st.close()
+        return out
+
+    r = asyncio.run(run())
+    plan = r["plan"]
+    ok(plan["streams_purged"] == ["wl:1:0"], "plan: only the unshared stream is purged")
+    ok([s["label"] for s in plan["streams_shared"]] == ["wl:2:0"], "plan: shared stream listed")
+    ok(plan["streams_shared"][0]["also_in"] == ["Real B"], "plan: names the other project")
+    ok(plan["streams_kept_config"] == ["acct_a"], "plan: config.toml stream is protected")
+    ok(plan["posts_deleted"] == 1 and plan["posts_kept_shared"] == 1,
+       "plan: 1 post goes (301), 1 shared post stays (302)")
+    ok(plan["watchlists"] == 1 and plan["collections"] == 1 and plan["labels"] == 1
+       and plan["delivery_targets"] == 1 and plan["alerts"] == 1, "plan counts owned rows")
+    ok(r["before"] == 5, "the plan is a dry run — nothing deleted yet")
+    ok("already exists" in (r["dup"].get("error") or ""), "rename refuses a taken name")
+    ok(r["ok_rename"].get("ok") and r["ok_rename"]["name"] == "Real B2", "rename works")
+    ok(r["res"].get("deleted") and r["res"]["posts_deleted"] == 1, "delete reports what it did")
+    ok(r["tweets"] == {302, 303, 304, 305}, "only 301 is gone; shared/config/other posts stay")
+    ok(r["raw"] == {302, 303, 304, 305}, "tweet_raw purged in step")
+    ok(set(r["streams"]) == {"wl:2:0", "wl:3:0", "acct_a"}, "only wl:1:0 stream row removed")
+    ok(r["streams"]["acct_a"] == 1 and r["streams"]["wl:2:0"] == 0,
+       "orphaned config stream paused; shared stream untouched")
+    ok(all(p != 1 for p, _ in r["tags"]) and len(r["tags"]) == 2,
+       "A's tags gone; B still tagged on its two streams")
+    ok(r["projects"] == [("Real B2",)], "project row removed")
+    ok(all(v == 0 for v in r["owned"].values()), f"owned rows all gone: {r['owned']}")
+    ok(r["hooks"] == {"global-hook"}, "delivery cursor dropped, global webhook cursor kept")
+    ok("last project" in (r["last"].get("error") or ""), "the last project cannot be deleted")
+
+
 def test_forget_stream_purges_raw(tmp):
     """
     forget_stream(delete_tweets=True) must not orphan the externalized raw
@@ -4658,6 +4795,9 @@ def main():
 
         section("forget stream (delete_tweets purges externalized raw)")
         test_forget_stream_purges_raw(fresh("forget"))
+
+        section("delete project (shared data survives, owned data goes)")
+        test_delete_project(fresh("delproj"))
 
         section("facebook (store, cap, collect loop)")
         test_facebook(fresh("facebook"))

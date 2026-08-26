@@ -18,10 +18,148 @@ import StressTest from "./views/StressTest.jsx";
 const ProjectCtx = createContext(null);
 export const useProject = () => useContext(ProjectCtx);
 
+// Rename / archive / delete, for every project including archived ones.
+// Delete is two steps: the server's dry-run plan is shown first (what goes,
+// what is shared and therefore kept), then the operator types the name.
+function ManageProjects({ onClose }) {
+  const { reload, setProjectId, project } = useProject();
+  const { data, reload: reloadAll } = useApi(() => api.projects(), []);
+  const all = data?.projects || [];
+  const [editing, setEditing] = useState(null);      // project_id being renamed
+  const [draft, setDraft] = useState("");
+  const [deleting, setDeleting] = useState(null);    // { project, plan }
+  const [typed, setTyped] = useState("");
+  const [err, setErr] = useState("");
+  const [busy, setBusy] = useState(false);
+
+  const refresh = async () => { await reloadAll(); await reload(); };
+
+  const rename = async (p) => {
+    if (!draft.trim() || draft.trim() === p.name) { setEditing(null); return; }
+    setBusy(true); setErr("");
+    try { await api.renameProject(p.project_id, draft); setEditing(null); await refresh(); }
+    catch (e) { setErr(String(e.message || e)); }
+    finally { setBusy(false); }
+  };
+
+  const archive = async (p) => {
+    setBusy(true); setErr("");
+    try { await api.archiveProject(p.project_id, !p.archived); await refresh(); }
+    catch (e) { setErr(String(e.message || e)); }
+    finally { setBusy(false); }
+  };
+
+  const planDelete = async (p) => {
+    setBusy(true); setErr(""); setTyped("");
+    try { setDeleting({ project: p, plan: await api.projectDeletePlan(p.project_id) }); }
+    catch (e) { setErr(String(e.message || e)); }
+    finally { setBusy(false); }
+  };
+
+  const doDelete = async () => {
+    const p = deleting.project;
+    setBusy(true); setErr("");
+    try {
+      await api.deleteProject(p.project_id, typed);
+      setDeleting(null);
+      await refresh();
+      if (project?.project_id === p.project_id) setProjectId(null);
+    } catch (e) { setErr(String(e.message || e)); }
+    finally { setBusy(false); }
+  };
+
+  if (deleting) {
+    const { project: p, plan } = deleting;
+    const n = (k) => plan[k] || 0;
+    const ig = plan.platforms?.instagram || {};
+    const fb = plan.platforms?.facebook || {};
+    return (
+      <Modal title={`Delete “${p.name}”?`}
+             sub="This cannot be undone. X only reaches back about a week, so purged posts older than that can never be collected again."
+             onClose={() => setDeleting(null)}>
+        <div className="plan">
+          <div className="plan-h">Will be deleted</div>
+          <ul>
+            <li><b>{n("posts_deleted").toLocaleString()}</b> X posts that no other project's stream also matched</li>
+            <li><b>{plan.streams_purged.length}</b> stream(s) only this project used
+              {plan.streams_purged.length > 0 && <span className="mono"> — {plan.streams_purged.join(", ")}</span>}</li>
+            <li><b>{n("watchlists")}</b> watchlist(s), <b>{n("collections")}</b> collection(s), <b>{n("labels")}</b> label(s)</li>
+            <li><b>{n("delivery_targets")}</b> delivery target(s), <b>{n("alerts")}</b> alert(s)</li>
+            {(ig.posts || ig.sources || fb.posts || fb.sources) ? (
+              <li>Instagram: <b>{ig.sources || 0}</b> source(s), <b>{ig.posts || 0}</b> post(s) ·
+                  Facebook: <b>{fb.sources || 0}</b> page(s), <b>{fb.posts || 0}</b> post(s)</li>
+            ) : null}
+          </ul>
+          <div className="plan-h">Kept — shared with another project</div>
+          <ul>
+            <li><b>{n("posts_kept_shared").toLocaleString()}</b> X posts also matched by a surviving stream</li>
+            {plan.streams_shared.length > 0 ? plan.streams_shared.map((s) => (
+              <li key={s.stream_id}><span className="mono">{s.label}</span> — only this project's tag is removed; still in {s.also_in.join(", ")}</li>
+            )) : <li>no shared streams</li>}
+            {plan.streams_kept_config.length > 0 && (
+              <li>Declared in config.toml, paused not deleted: <span className="mono">{plan.streams_kept_config.join(", ")}</span></li>
+            )}
+          </ul>
+        </div>
+        <div className="field">
+          <label htmlFor="pdel">Type the project name to confirm</label>
+          <input id="pdel" value={typed} autoFocus placeholder={p.name}
+                 onChange={(e) => setTyped(e.target.value)}
+                 onKeyDown={(e) => e.key === "Enter" && typed.trim() === p.name && doDelete()} />
+        </div>
+        {err && <div className="err">{err}</div>}
+        <div className="row">
+          <button className="btn btn-ghost" onClick={() => setDeleting(null)}>Cancel</button>
+          <button className="btn btn-danger" disabled={busy || typed.trim() !== p.name} onClick={doDelete}>
+            Delete project and its data
+          </button>
+        </div>
+      </Modal>
+    );
+  }
+
+  return (
+    <Modal title="Manage projects" sub="Rename, archive (hide but keep), or delete a project and the data only it owns."
+           onClose={onClose}>
+      <div className="proj-manage">
+        {all.map((p) => (
+          <div key={p.project_id} className={`proj-row${p.archived ? " archived" : ""}`}>
+            {editing === p.project_id ? (
+              <input value={draft} autoFocus onChange={(e) => setDraft(e.target.value)}
+                     onKeyDown={(e) => { if (e.key === "Enter") rename(p); if (e.key === "Escape") setEditing(null); }}
+                     onBlur={() => rename(p)} />
+            ) : (
+              <div className="name">
+                <b>{p.name}</b>
+                <small>#{p.project_id} · {p.watchlists} watchlist(s) · {p.streams} stream(s){p.archived ? " · archived" : ""}</small>
+              </div>
+            )}
+            <div className="acts">
+              <button className="btn btn-ghost btn-sm" disabled={busy}
+                      onClick={() => { setEditing(p.project_id); setDraft(p.name); }}>Rename</button>
+              <button className="btn btn-ghost btn-sm" disabled={busy} onClick={() => archive(p)}>
+                {p.archived ? "Unarchive" : "Archive"}
+              </button>
+              <button className="btn btn-danger btn-sm" disabled={busy || all.length < 2}
+                      title={all.length < 2 ? "Create another project first" : ""}
+                      onClick={() => planDelete(p)}>Delete…</button>
+            </div>
+          </div>
+        ))}
+      </div>
+      {err && <div className="err">{err}</div>}
+      <div className="row">
+        <button className="btn btn-ghost" onClick={onClose}>Close</button>
+      </div>
+    </Modal>
+  );
+}
+
 function ProjectSwitcher() {
   const { projects, project, setProjectId, reload } = useProject();
   const [open, setOpen] = useState(false);
   const [creating, setCreating] = useState(false);
+  const [managing, setManaging] = useState(false);
   const [name, setName] = useState("");
   const [err, setErr] = useState("");
   const [busy, setBusy] = useState(false);
@@ -61,8 +199,12 @@ function ProjectSwitcher() {
           <button className="new" onClick={() => { setOpen(false); setCreating(true); }}>
             + New project
           </button>
+          <button className="new" onClick={() => { setOpen(false); setManaging(true); }}>
+            Manage projects…
+          </button>
         </div>
       )}
+      {managing && <ManageProjects onClose={() => setManaging(false)} />}
       {creating && (
         <Modal title="New project" sub="A project groups watchlists, feeds and delivery."
                onClose={() => setCreating(false)}>

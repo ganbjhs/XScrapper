@@ -318,6 +318,25 @@ names).
   clears both and hands the cadence back to the adaptive controller, which is
   still the right default for a busy live stream. General form: if a control
   states a number, either honour that number or do not state it.
+- **Deleting a project deletes only what the project OWNS; shared data
+  loses a tag, never a row.** A project is a view over streams
+  (`project_streams` is many-to-many), and a tweet can be matched by several
+  streams (`tweet_hits`). So `Store.delete_project` removes this project's
+  tags; a stream another project still uses is untouched; a stream left with
+  NO project is destroyed through `forget_stream(delete_tweets=True)`, whose
+  EXCEPT rule keeps every tweet a surviving stream also matched (and purges
+  `tweet_raw` with the rest). Rows that are project-owned by definition —
+  watchlists, collections and pins, labels, delivery targets and their
+  `dt:<id>` cursors, alerts, IG/FB sources and posts — go with it. Streams
+  declared in `config.toml` are the collector's, not a project's: they are
+  detached and paused, never deleted, because the watcher would recreate
+  them on the next poll. Three guards: `project_delete_plan` is a dry run
+  the dialog shows BEFORE asking (X reaches back ~a week, so a purged post
+  older than that is gone for good — the operator sees the number, not
+  "are you sure"); the confirmation is the project name typed exactly, as
+  for `forget_stream`; the last project cannot be deleted. Dashboard-only —
+  the API-key allowlist is unchanged, so a consumer's key cannot reach
+  `/api/projects/delete`. Test: `test_delete_project`.
 
 ## 4. Delivery rules
 

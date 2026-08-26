@@ -1454,6 +1454,169 @@ class Store:
             (int(bool(archived)), int(project_id)))
         return cur.rowcount > 0
 
+    async def rename_project(self, project_id: int, name: str) -> dict:
+        name = (name or "").strip()
+        if not name:
+            return {"error": "a project needs a name"}
+        try:
+            cur = self.db.execute(
+                "UPDATE projects SET name = ? WHERE project_id = ?",
+                (name, int(project_id)))
+        except sqlite3.IntegrityError:
+            return {"error": f"a project called {name!r} already exists"}
+        if not cur.rowcount:
+            return {"error": f"no project {project_id}"}
+        return {"ok": True, "project_id": int(project_id), "name": name}
+
+    # ----------------------------------------------------------------------
+    # deleting a project
+    #
+    # A project is a VIEW over streams (see the schema note above), so
+    # deleting one has two halves that must not be confused:
+    #
+    #   1. Rows that belong to this project and nobody else — watchlists,
+    #      collections, labels, delivery targets, alerts, and the
+    #      project_streams "tags" — simply go.
+    #   2. Streams and tweets are SHARED. A stream still tagged by another
+    #      project is that project's data too, so only the tag is removed. A
+    #      stream left with no project at all is destroyed through
+    #      forget_stream(delete_tweets=True), whose EXCEPT rule already keeps
+    #      any tweet that another surviving stream also matched.
+    #
+    # Streams declared in config.toml are the collector's, not a project's:
+    # the watcher would recreate them on the next poll, so they are detached
+    # and kept, never destroyed here. The caller passes their labels in.
+    #
+    # project_delete_plan() computes exactly what delete_project() would do,
+    # so the dashboard can show the blast radius before asking for a typed
+    # confirmation — X's index reaches back ~a week, so purged posts older
+    # than that are gone for good.
+    # ----------------------------------------------------------------------
+
+    def _orphan_streams_after(self, project_id: int) -> list:
+        """Streams that would have NO project once `project_id` lets go."""
+        return [dict(r) for r in self.db.execute(
+            "SELECT s.stream_id, s.label FROM streams s "
+            "JOIN project_streams ps ON ps.stream_id = s.stream_id "
+            "WHERE ps.project_id = ? AND NOT EXISTS ("
+            "  SELECT 1 FROM project_streams o "
+            "  WHERE o.stream_id = s.stream_id AND o.project_id != ?)",
+            (int(project_id), int(project_id)))]
+
+    async def project_delete_plan(self, project_id: int,
+                                  protected_labels=()) -> dict:
+        pid = int(project_id)
+        p = self.db.execute("SELECT * FROM projects WHERE project_id = ?",
+                            (pid,)).fetchone()
+        if not p:
+            return {"error": f"no project {project_id}"}
+        total = self.db.execute("SELECT COUNT(*) c FROM projects").fetchone()["c"]
+        if total <= 1:
+            return {"error": "cannot delete the last project — create another first"}
+
+        protected = {str(l) for l in (protected_labels or ())}
+        orphans = self._orphan_streams_after(pid)
+        purge = [s for s in orphans if s["label"] not in protected]
+        kept_cfg = [s for s in orphans if s["label"] in protected]
+        shared = [dict(r) for r in self.db.execute(
+            "SELECT s.stream_id, s.label, GROUP_CONCAT(o.project_id) AS also_in "
+            "FROM streams s "
+            "JOIN project_streams ps ON ps.stream_id = s.stream_id AND ps.project_id = ? "
+            "JOIN project_streams o  ON o.stream_id = s.stream_id AND o.project_id != ? "
+            "GROUP BY s.stream_id", (pid, pid))]
+        names = {r["project_id"]: r["name"] for r in
+                 self.db.execute("SELECT project_id, name FROM projects")}
+        for s in shared:
+            s["also_in"] = [names.get(int(x), f"#{x}")
+                            for x in str(s["also_in"]).split(",") if x]
+
+        purge_ids = [s["stream_id"] for s in purge]
+        posts_deleted = posts_kept = 0
+        if purge_ids:
+            q = ",".join("?" * len(purge_ids))
+            # Purged = hit by a doomed stream and by NO surviving stream.
+            posts_deleted = self.db.execute(
+                f"SELECT COUNT(*) c FROM tweets WHERE source = 'result' AND tweet_id IN ("
+                f"  SELECT tweet_id FROM tweet_hits WHERE stream_id IN ({q})"
+                f"  EXCEPT SELECT tweet_id FROM tweet_hits WHERE stream_id NOT IN ({q}))",
+                purge_ids + purge_ids).fetchone()["c"]
+            posts_kept = self.db.execute(
+                f"SELECT COUNT(DISTINCT tweet_id) c FROM tweet_hits "
+                f"WHERE stream_id IN ({q}) AND tweet_id IN ("
+                f"  SELECT tweet_id FROM tweet_hits WHERE stream_id NOT IN ({q}))",
+                purge_ids + purge_ids).fetchone()["c"]
+
+        def count(sql, *args):
+            return self.db.execute(sql, args).fetchone()["c"]
+
+        return {
+            "project_id": pid, "name": p["name"],
+            "streams_purged": [s["label"] for s in purge],
+            "streams_shared": shared,
+            "streams_kept_config": [s["label"] for s in kept_cfg],
+            "posts_deleted": posts_deleted,
+            "posts_kept_shared": posts_kept,
+            "watchlists": count("SELECT COUNT(*) c FROM watchlists WHERE project_id = ?", pid),
+            "collections": count("SELECT COUNT(*) c FROM collections WHERE project_id = ?", pid),
+            "labels": count("SELECT COUNT(*) c FROM post_labels WHERE project_id = ?", pid),
+            "delivery_targets": count(
+                "SELECT COUNT(*) c FROM delivery_targets WHERE project_id = ?", pid),
+            "alerts": count("SELECT COUNT(*) c FROM alerts WHERE project_id = ?", pid),
+        }
+
+    async def delete_project(self, project_id: int, protected_labels=()) -> dict:
+        """
+        Destroy a project. One transaction: either everything in the plan
+        happens or nothing does. Returns the plan it executed, plus `deleted`.
+        """
+        plan = await self.project_delete_plan(project_id, protected_labels)
+        if plan.get("error"):
+            return plan
+        pid = plan["project_id"]
+
+        self.db.execute("BEGIN IMMEDIATE")
+        try:
+            # Project-owned rows: nothing else references them.
+            self.db.execute(
+                "DELETE FROM watchlist_members WHERE watchlist_id IN "
+                "(SELECT watchlist_id FROM watchlists WHERE project_id = ?)", (pid,))
+            self.db.execute("DELETE FROM watchlists WHERE project_id = ?", (pid,))
+            for t in ("collection_items", "collection_posts"):
+                self.db.execute(
+                    f"DELETE FROM {t} WHERE collection_id IN "
+                    "(SELECT collection_id FROM collections WHERE project_id = ?)", (pid,))
+            self.db.execute("DELETE FROM collections WHERE project_id = ?", (pid,))
+            for t in ("post_labels", "label_categories", "label_runs", "alerts"):
+                self.db.execute(f"DELETE FROM {t} WHERE project_id = ?", (pid,))
+            # Delivery cursors live in webhook_state keyed 'dt:<target_id>'.
+            self.db.execute(
+                "DELETE FROM webhook_state WHERE label IN "
+                "(SELECT 'dt:' || target_id FROM delivery_targets WHERE project_id = ?)",
+                (pid,))
+            self.db.execute("DELETE FROM delivery_targets WHERE project_id = ?", (pid,))
+
+            # The tags. Shared streams lose only this one.
+            self.db.execute("DELETE FROM project_streams WHERE project_id = ?", (pid,))
+
+            # Orphans: destroy, keeping tweets another stream also matched.
+            purged_posts = 0
+            for label in plan["streams_purged"]:
+                r = await self.forget_stream(label, delete_tweets=True)
+                purged_posts += int(r.get("tweets_deleted") or 0)
+            # config.toml streams stay collectable; make sure they are not
+            # left silently running for nobody.
+            for label in plan["streams_kept_config"]:
+                self.db.execute("UPDATE streams SET paused = 1 WHERE label = ?", (label,))
+
+            self.db.execute("DELETE FROM projects WHERE project_id = ?", (pid,))
+            self.db.execute("COMMIT")
+        except Exception:
+            self.db.execute("ROLLBACK")
+            raise
+        plan["deleted"] = True
+        plan["posts_deleted"] = purged_posts
+        return plan
+
     async def project_stream_ids(self, project_id: int) -> list:
         return [r["stream_id"] for r in self.db.execute(
             "SELECT stream_id FROM project_streams WHERE project_id = ?",

@@ -137,6 +137,12 @@ export const api = {
   createProject: (name) => request("/api/projects", { method: "POST", body: { name } }),
   archiveProject: (project_id, archived) =>
     request("/api/projects", { method: "POST", body: { project_id, archived } }),
+  renameProject: (project_id, name) =>
+    request("/api/projects", { method: "POST", body: { project_id, name } }),
+  projectDeletePlan: (project_id) =>
+    request("/api/projects/delete-plan", { method: "POST", body: { project_id } }),
+  deleteProject: (project_id, confirm) =>
+    request("/api/projects/delete", { method: "POST", body: { project_id, confirm } }),
 
   watchlists: (project) => request(`/api/watchlists${qs({ project })}`),
   createWatchlist: (body) => request("/api/watchlists", { method: "POST", body }),

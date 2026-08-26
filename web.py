@@ -1697,7 +1697,109 @@ def _project_post(body):
             return {"error": "project_id must be a number"}
         ok = _with_store(lambda st: st.set_project_archived(pid, body["archived"]))
         return {"ok": True} if ok else {"error": f"no project {pid}"}
+    if body.get("project_id"):
+        # {project_id, name} renames; {name} alone creates.
+        try:
+            pid = int(body.get("project_id") or 0)
+        except (TypeError, ValueError):
+            return {"error": "project_id must be a number"}
+        return _with_store(lambda st: st.rename_project(pid, body.get("name") or ""))
     return _with_store(lambda st: st.create_project(body.get("name") or ""))
+
+
+# --------------------------------------------------------------------------
+# deleting a project — dashboard (cookie) only; an API key can never reach
+# these paths (see API_KEY_WRITE_PATHS), so Watch-Tower's key cannot delete.
+# --------------------------------------------------------------------------
+
+def _config_stream_labels() -> set:
+    """Streams declared in config.toml belong to the collector, not a project."""
+    try:
+        return {s.label for s in (_CFG.streams or [])}
+    except Exception:
+        return set()
+
+
+def _project_id_of(body):
+    try:
+        return int(body.get("project_id") or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
+def _project_other_platforms(pid: int, do_delete: bool) -> dict:
+    """
+    Instagram and Facebook keep their own databases, with sources and posts
+    owned by exactly one project_id (0 = unassigned, never shared). So for
+    them the rule is simple: what this project owns goes with it.
+    """
+    out = {}
+    for key, fn in (("instagram", "ig_results.db"), ("facebook", "fb_results.db")):
+        rp = _CFG.root / fn
+        if not rp.exists():
+            out[key] = {"sources": 0, "posts": 0}
+            continue
+        db = sqlite3.connect(rp)
+        try:
+            db.execute("PRAGMA busy_timeout = 5000")
+            n_src = db.execute(
+                "SELECT COUNT(*) FROM sources WHERE project_id = ?", (pid,)).fetchone()[0]
+            n_posts = db.execute(
+                "SELECT COUNT(*) FROM posts WHERE project_id = ?", (pid,)).fetchone()[0]
+            if do_delete:
+                db.execute("DELETE FROM posts WHERE project_id = ?", (pid,))
+                db.execute("DELETE FROM sources WHERE project_id = ?", (pid,))
+                db.commit()
+            out[key] = {"sources": n_src, "posts": n_posts}
+        except sqlite3.OperationalError:
+            # A database from before scoping has no project_id column.
+            out[key] = {"sources": 0, "posts": 0}
+        finally:
+            db.close()
+    return out
+
+
+def _project_delete_plan(body):
+    pid = _project_id_of(body)
+    if not pid:
+        return {"error": "project_id is required"}
+    labels = _config_stream_labels()
+    plan = _with_store(lambda st: st.project_delete_plan(pid, labels))
+    if plan.get("error"):
+        return plan
+    plan["platforms"] = _project_other_platforms(pid, do_delete=False)
+    return plan
+
+
+def _project_delete(body):
+    pid = _project_id_of(body)
+    if not pid:
+        return {"error": "project_id is required"}
+    labels = _config_stream_labels()
+    plan = _with_store(lambda st: st.project_delete_plan(pid, labels))
+    if plan.get("error"):
+        return plan
+    # Destroying data needs the operator to have typed the name. A misclick
+    # cannot produce this, and X's ~7-day window means it cannot be undone.
+    if (body.get("confirm") or "").strip() != plan["name"]:
+        return {"error": f"To delete this project and its data, type its name "
+                         f"exactly: {plan['name']}"}
+    res = _with_store(lambda st: st.delete_project(pid, labels))
+    if res.get("error"):
+        return res
+    res["platforms"] = _project_other_platforms(pid, do_delete=True)
+    try:
+        import activity_log
+        activity_log.log_event(
+            "x", f"[projects] {res['name']!r} DELETED by operator: "
+            f"{len(res['streams_purged'])} stream(s) purged, "
+            f"{res['posts_deleted']} post(s) deleted, "
+            f"{len(res['streams_shared'])} shared stream(s) kept, "
+            f"{res['watchlists']} watchlist(s), {res['collections']} collection(s)",
+            db=str(_CFG.root / "activity.db"))
+    except Exception:
+        pass
+    return res
 
 
 def _watchlists_json(q):
@@ -5198,6 +5300,10 @@ class Handler(BaseHTTPRequestHandler):
                 return self._send(200, _login_cancel())
             if u.path == "/api/projects":
                 return self._send(200, _project_post(body))
+            if u.path == "/api/projects/delete-plan":
+                return self._send(200, _project_delete_plan(body))
+            if u.path == "/api/projects/delete":
+                return self._send(200, _project_delete(body))
             if u.path == "/api/watchlists":
                 return self._send(200, _watchlist_post(body))
             if u.path == "/api/watchlists/members":
