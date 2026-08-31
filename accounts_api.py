@@ -39,6 +39,7 @@ def _acct_json(a) -> dict:
         "label": a.label,
         "login": a.login,
         "proxy_id": a.proxy_id,
+        "notes": a.notes,
         "status": a.status,
         "health": a.health,
         "last_success_at": a.last_success_at,

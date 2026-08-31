@@ -111,8 +111,9 @@ function AddModal({ initial, onDone, onClose }) {
 function EditModal({ a, onDone, onClose }) {
   const [f, setF] = useState({
     label: a.label, login: a.login, password: "", totp_secret: "",
-    proxy_id: a.proxy_id || "", notes: "",
+    proxy_id: a.proxy_id || "", proxy_url: "", notes: a.notes || "",
   });
+  const [dropProxy, setDropProxy] = useState(false);
   const [err, setErr] = useState("");
   const [busy, setBusy] = useState(false);
   const set = (k) => (e) => setF({ ...f, [k]: e.target.value });
@@ -121,9 +122,16 @@ function EditModal({ a, onDone, onClose }) {
     setBusy(true); setErr("");
     try {
       const body = { account_id: a.account_id, label: f.label, login: f.login,
-                     proxy_id: f.proxy_id || null };
+                     proxy_id: f.proxy_id || null, notes: f.notes };
       if (f.password) body.password = f.password;          // blank = keep
       if (f.totp_secret) body.totp_secret = f.totp_secret; // blank = keep
+      // The proxy URL is WRITE-ONLY: it is encrypted at rest and never sent back
+      // to this page, so a blank box has to mean KEEP, exactly like password and
+      // TOTP. Clearing it must be said out loud — otherwise a label rename would
+      // silently drop the account back onto the server IP, which is the
+      // sign-in/collect fingerprint mismatch ACCOUNTS.md 7 exists to prevent.
+      if (dropProxy) body.proxy_url = "";
+      else if (f.proxy_url.trim()) body.proxy_url = f.proxy_url.trim();
       await api.poolUpdate(body);
       onDone(); onClose();
     } catch (e) { setErr(String(e.message || e)); } finally { setBusy(false); }
@@ -131,7 +139,7 @@ function EditModal({ a, onDone, onClose }) {
 
   return (
     <Modal title={`Edit ${a.label}`} onClose={onClose}
-           sub="Leave password / TOTP blank to keep the current one.">
+           sub="Leave password / TOTP / proxy URL blank to keep the current one.">
       <div className="field"><label>Label</label>
         <input value={f.label} onChange={set("label")} /></div>
       <div className="field"><label>Login</label>
@@ -140,8 +148,39 @@ function EditModal({ a, onDone, onClose }) {
         <input type="password" value={f.password} onChange={set("password")} /></div>
       <div className="field"><label>New TOTP secret (blank = keep)</label>
         <input value={f.totp_secret} onChange={set("totp_secret")} /></div>
-      <div className="field"><label>Proxy / IP id</label>
-        <input value={f.proxy_id} onChange={set("proxy_id")} placeholder="none" /></div>
+      <div className="field"><label>Proxy / IP id (a label, optional)</label>
+        <input value={f.proxy_id} onChange={set("proxy_id")} placeholder="e.g. resi-in-01" /></div>
+      <div className="field">
+        <label>
+          Residential proxy URL — username &amp; password go INLINE
+          {a.has_proxy ? " (blank = keep the one on file)" : ""}
+        </label>
+        <input value={f.proxy_url} onChange={set("proxy_url")} disabled={dropProxy}
+               placeholder={a.has_proxy
+                 ? "a proxy is on file — type a new URL to replace it"
+                 : "http://user:pass@gateway.host:port"} />
+        <div style={{ color: "var(--ink-3)", fontSize: 12, marginTop: 5, lineHeight: 1.5 }}>
+          {a.has_proxy
+            ? "A proxy is stored for this account. It is encrypted and never sent back to this page, so it cannot be shown — type a new URL to replace it."
+            : "No proxy: this account signs in and collects from the SERVER IP. Two accounts sharing one address correlate to a single operator, so a ban on one raises suspicion on the other."}
+          {" "}The whole credential is one URL — both username and password sit
+          inside it. For a sticky IP, use your provider's session-suffixed
+          username (e.g. <code>user-session-x1</code>). It takes effect on this
+          account's NEXT sign-in, which is what writes it through to the
+          collector.
+        </div>
+        {a.has_proxy && (
+          <label style={{ display: "flex", alignItems: "center", gap: 7, marginTop: 8,
+                          fontSize: 12, color: "var(--ink-3)" }}>
+            <input type="checkbox" checked={dropProxy}
+                   onChange={(e) => setDropProxy(e.target.checked)} />
+            Remove the stored proxy — this account goes back to the server IP
+          </label>
+        )}
+      </div>
+      <div className="field"><label>Notes</label>
+        <textarea rows="2" value={f.notes} onChange={set("notes")}
+                  placeholder="e.g. bought 2026-08-14 · warm since 2026-08-20" /></div>
       {err && <div className="err">{err}</div>}
       <div className="row">
         <button className="btn btn-ghost" onClick={onClose}>Cancel</button>

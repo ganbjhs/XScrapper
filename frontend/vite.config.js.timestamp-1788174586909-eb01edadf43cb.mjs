@@ -1,0 +1,22 @@
+// vite.config.js
+import { defineConfig } from "file:///sessions/rcw-01kxv3qzatphwm3a3dmqnipz/mnt/VedicScraper/frontend/node_modules/vite/dist/node/index.js";
+import react from "file:///sessions/rcw-01kxv3qzatphwm3a3dmqnipz/mnt/VedicScraper/frontend/node_modules/@vitejs/plugin-react/dist/index.js";
+var vite_config_default = defineConfig({
+  plugins: [react()],
+  base: "/app/",
+  server: {
+    port: 5173,
+    // Dev only: the Python API keeps running on its own port; the browser
+    // talks to Vite, Vite forwards anything API-shaped.
+    proxy: {
+      "/api": "http://127.0.0.1:8765",
+      "/v1": "http://127.0.0.1:8765",
+      "/login": "http://127.0.0.1:8765"
+    }
+  },
+  build: { outDir: "dist", sourcemap: false }
+});
+export {
+  vite_config_default as default
+};
+//# sourceMappingURL=data:application/json;base64,ewogICJ2ZXJzaW9uIjogMywKICAic291cmNlcyI6IFsidml0ZS5jb25maWcuanMiXSwKICAic291cmNlc0NvbnRlbnQiOiBbImNvbnN0IF9fdml0ZV9pbmplY3RlZF9vcmlnaW5hbF9kaXJuYW1lID0gXCIvc2Vzc2lvbnMvcmN3LTAxa3h2M3F6YXRwaHdtM2EzZG1xbmlwei9tbnQvVmVkaWNTY3JhcGVyL2Zyb250ZW5kXCI7Y29uc3QgX192aXRlX2luamVjdGVkX29yaWdpbmFsX2ZpbGVuYW1lID0gXCIvc2Vzc2lvbnMvcmN3LTAxa3h2M3F6YXRwaHdtM2EzZG1xbmlwei9tbnQvVmVkaWNTY3JhcGVyL2Zyb250ZW5kL3ZpdGUuY29uZmlnLmpzXCI7Y29uc3QgX192aXRlX2luamVjdGVkX29yaWdpbmFsX2ltcG9ydF9tZXRhX3VybCA9IFwiZmlsZTovLy9zZXNzaW9ucy9yY3ctMDFreHYzcXphdHBod20zYTNkbXFuaXB6L21udC9WZWRpY1NjcmFwZXIvZnJvbnRlbmQvdml0ZS5jb25maWcuanNcIjtpbXBvcnQgeyBkZWZpbmVDb25maWcgfSBmcm9tIFwidml0ZVwiO1xuaW1wb3J0IHJlYWN0IGZyb20gXCJAdml0ZWpzL3BsdWdpbi1yZWFjdFwiO1xuXG4vLyBTZXJ2ZWQgYnkgdGhlIFB5dGhvbiBzZXJ2ZXIgKG9yIG5naW54KSB1bmRlciAvYXBwIFx1MjAxNCBuZXZlciBhdCB0aGUgZG9tYWluXG4vLyByb290LCBzbyBldmVyeSBhc3NldCBVUkwgbXVzdCBiZSByZWxhdGl2ZSB0byB0aGF0IGJhc2UuXG5leHBvcnQgZGVmYXVsdCBkZWZpbmVDb25maWcoe1xuICBwbHVnaW5zOiBbcmVhY3QoKV0sXG4gIGJhc2U6IFwiL2FwcC9cIixcbiAgc2VydmVyOiB7XG4gICAgcG9ydDogNTE3MyxcbiAgICAvLyBEZXYgb25seTogdGhlIFB5dGhvbiBBUEkga2VlcHMgcnVubmluZyBvbiBpdHMgb3duIHBvcnQ7IHRoZSBicm93c2VyXG4gICAgLy8gdGFsa3MgdG8gVml0ZSwgVml0ZSBmb3J3YXJkcyBhbnl0aGluZyBBUEktc2hhcGVkLlxuICAgIHByb3h5OiB7XG4gICAgICBcIi9hcGlcIjogXCJodHRwOi8vMTI3LjAuMC4xOjg3NjVcIixcbiAgICAgIFwiL3YxXCI6IFwiaHR0cDovLzEyNy4wLjAuMTo4NzY1XCIsXG4gICAgICBcIi9sb2dpblwiOiBcImh0dHA6Ly8xMjcuMC4wLjE6ODc2NVwiLFxuICAgIH0sXG4gIH0sXG4gIGJ1aWxkOiB7IG91dERpcjogXCJkaXN0XCIsIHNvdXJjZW1hcDogZmFsc2UgfSxcbn0pO1xuIl0sCiAgIm1hcHBpbmdzIjogIjtBQUFrWCxTQUFTLG9CQUFvQjtBQUMvWSxPQUFPLFdBQVc7QUFJbEIsSUFBTyxzQkFBUSxhQUFhO0FBQUEsRUFDMUIsU0FBUyxDQUFDLE1BQU0sQ0FBQztBQUFBLEVBQ2pCLE1BQU07QUFBQSxFQUNOLFFBQVE7QUFBQSxJQUNOLE1BQU07QUFBQTtBQUFBO0FBQUEsSUFHTixPQUFPO0FBQUEsTUFDTCxRQUFRO0FBQUEsTUFDUixPQUFPO0FBQUEsTUFDUCxVQUFVO0FBQUEsSUFDWjtBQUFBLEVBQ0Y7QUFBQSxFQUNBLE9BQU8sRUFBRSxRQUFRLFFBQVEsV0FBVyxNQUFNO0FBQzVDLENBQUM7IiwKICAibmFtZXMiOiBbXQp9Cg==

@@ -19,6 +19,51 @@ must respect belongs in the rulebook, not here.
 
 ---
 
+## 2026-08-31 — the account Edit form could not set a proxy
+
+**Changed**
+
+- `frontend/src/views/Accounts.jsx` — `EditModal` gains **Residential proxy
+  URL** and **Notes**. The proxy box is write-only, mirroring password/TOTP:
+  blank keeps what is on file, a new URL replaces it, and a separate
+  "Remove the stored proxy" checkbox (shown only when one exists) is the only
+  way to clear it. The helper line says whether a proxy is on file, and that it
+  lands on the account's next sign-in.
+- `accounts_api.py` — `_acct_json` now returns `notes`. The column existed on
+  `Account` and `/update` already accepted it; nothing ever sent it to the
+  panel, so a Notes box would have been editing blind.
+- `RULEBOOK.md` §5 — "a write-only secret's blank box means KEEP, never CLEAR".
+
+**Why**
+
+`AddModal` has taken `proxy_url` since the pool landed; `EditModal` only ever
+took `proxy_id` — a human label like `resi-in-01`, which nothing dials. So the
+three X accounts already in the pool could not be given a proxy at all without
+deleting and re-adding them, while `guard` was warning that two of them share
+one IP. The store (`update(proxy_url=...)`, `enc_proxy`) and the API route
+already did the work; only the form was missing.
+
+**Verified**
+
+- `_Cipher.encrypt("")` returns `""`, so `proxy_url: ""` really clears
+  `enc_proxy` and flips `has_proxy` to false — the remove checkbox works rather
+  than storing an encrypted empty string.
+- Chain confirmed end to end for X: `enc_proxy` -> `get_proxy()` ->
+  `_pool_account_cfg` -> `AccountCfg.proxy` -> `auth` login -> `pool.save(acc)`
+  -> the `proxy` column in `accounts.db` -> twscrape collects through it.
+  Setting a proxy therefore requires a re-sign-in to take effect.
+
+**Open**
+
+- The panel still cannot bench an account for real: promote/demote writes
+  `pool.db`, while the watcher reads `accounts.db` and `collect_ig` reads
+  `ig_accounts.db`, and nothing syncs downward (`pool_link` is one-way by
+  design). Until that exists, benching is a manual `UPDATE ... SET active=0`.
+- Nothing calls `failover()` automatically; the X watcher never reports health
+  into the pool at all, so there is no signal to trigger it on.
+
+---
+
 ## 2026-08-25 (later) — request signing: X's legacy build grew 16-hex chunk hashes
 
 **Changed**

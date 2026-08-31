@@ -481,6 +481,14 @@ names).
 - **One account, one steady IP.** Hopping IPs, or hammering a fresh account, is
   what gets accounts checkpointed. FB runs from the server IP; IG uses the
   residential pool; don't cross them.
+- **A write-only secret's blank box means KEEP, never CLEAR.** The panel is
+  never sent a stored password, TOTP secret or proxy URL back — they are
+  encrypted at rest and `_acct_json` deliberately omits them. So an edit form
+  cannot round-trip them, and a field that submits its empty value wipes the
+  secret the operator never saw. Blank = keep; clearing is a separate, explicit
+  control. The proxy is the one that bites hardest: silently dropping it puts
+  the account back on the server IP, which is the sign-in/collect fingerprint
+  mismatch the residential pool exists to avoid (`ACCOUNTS.md` §7).
 
 ## 6. Per-platform hard rules
 
