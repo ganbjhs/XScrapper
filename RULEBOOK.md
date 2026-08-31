@@ -586,6 +586,16 @@ single request. These are hard rules, not tuning:
 - **One relogin attempt per pass, never into a checkpoint.** The `checkpoint_at`
   breaker is absolute — retrying a locked account is the fastest way to kill
   it permanently.
+- **Exactly one active row, enforced on write.** `ig.Store.save()` and
+  `set_active()` demote every other row when they activate one. They did not
+  until 2026-08-31, and all three Instagram accounts were live at once on the
+  server as a result. Nothing collected twice — `_active_account()` takes
+  `rows[0]` of `ORDER BY active DESC, username` — and that is exactly the
+  danger: WHICH account collects was being settled by ALPHABETICAL ORDER, so
+  removing or renaming the first one silently moves collection to whoever
+  sorts next, on an IP bound to a different account, with nothing logged.
+  Any store that has a "the active one" concept owes the same invariant on
+  write; a read that picks `rows[0]` is not a substitute for it.
 - **The numeric pk beats the @name for FETCHING — but the source still stores
   the name.** (CORRECTED 2026-08-21. The old rule said "use the numeric pk for
   user sources", which was read as *put the number in the source*, and that is

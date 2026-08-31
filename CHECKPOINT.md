@@ -19,6 +19,53 @@ must respect belongs in the rulebook, not here.
 
 ---
 
+## 2026-08-31 (later) — all three Instagram accounts were active at once
+
+**Changed**
+
+- `ig.py` — new `Store._demote_others()`; `save()` and `set_active()` call it
+  whenever they activate a row, so the table holds exactly one active account.
+  Deactivating still promotes nobody, and `save(active=False)` leaves the
+  current active row alone.
+- `RULEBOOK.md` §6 — "exactly one active row, enforced on write".
+
+**Why**
+
+On the server, `SELECT username,active FROM accounts` returned `active=1` for
+all three of sanaakhtar221, shoaibakhtar4915 and youssefnasser168. `save()` has
+always written `active=excluded.active` and demoted nobody, so every import
+after the first simply added another active row.
+
+Nothing was collecting twice: `collect_ig._active_account()` filters to active
+rows and takes `rows[0]`, and `Store.all()` orders by `active DESC, username`.
+The bug is subtler and worse — the collecting account was being chosen by
+ALPHABETICAL ORDER. `sanaakhtar221` sorts first, so it collected; remove or
+rename it and collection moves to `shoaibakhtar4915` with no decision taken,
+nothing logged, and the residential proxy still labelled for the account that
+is no longer running. The panel compounded it: `web.py` reports every
+`active=1` row as a live session, so the board showed three.
+
+**Verified**
+
+- Store exercised directly against a temp DB: three consecutive
+  `save(active=True)` leave one active row (the last writer); `set_active(x,
+  True)` moves it; `set_active(x, False)` leaves zero active rather than
+  auto-promoting; `save(other, active=False)` does not disturb the active row.
+
+**Open**
+
+- The existing rows still need fixing by hand — the invariant is enforced on
+  write, and nothing rewrites history. One `UPDATE` on the server.
+- `ig_accounts.db.last_used` is written NULL on insert and never updated by
+  anything; the column is dead and the panel cannot show a real per-account
+  last-use for Instagram.
+- Still unaddressed: the pool cannot bench an IG account. `pool.db` status and
+  `ig_accounts.db.active` are independent, so the panel's Active badge and the
+  collecting account can disagree — as they did here (panel: Youssef active,
+  reality: Sana collecting).
+
+---
+
 ## 2026-08-31 — the account Edit form could not set a proxy
 
 **Changed**

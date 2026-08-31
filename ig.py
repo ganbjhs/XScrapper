@@ -147,12 +147,38 @@ class Store:
             "  error_msg=excluded.error_msg, updated_at=excluded.updated_at",
             (sess.username, sess.user_id, label, json.dumps(sess.cookies),
              sess.user_agent, proxy or None, int(active), error or None, now, now))
+        if active:
+            self._demote_others(sess.username)
         self.db.commit()
+
+    def _demote_others(self, keep: str) -> None:
+        """Exactly one active row, enforced in code.
+
+        This table has no platform column and sqlite cannot express the
+        invariant as a constraint, so it is maintained here — the same move
+        store_accounts.promote() makes for the pool.
+
+        Before this, save() and set_active() wrote active=1 and demoted nobody.
+        A second import left TWO active rows and a third left three; observed
+        live on 2026-08-31 with all three Instagram accounts active at once.
+        Nothing collected twice — collect_ig._active_account() takes rows[0] of
+        an 'ORDER BY active DESC, username' scan — but that is the whole
+        problem: WHICH account collects was being decided by ALPHABETICAL
+        ORDER. Remove or rename the first one and collection silently moves to
+        whoever sorts next, from an IP bound to a different account, with no
+        decision made and no line in any log.
+        """
+        self.db.execute(
+            "UPDATE accounts SET active=0, updated_at=? "
+            "WHERE username != ? AND active != 0",
+            (_now(), keep))
 
     def set_active(self, username: str, active: bool, error: str = "") -> None:
         self.db.execute(
             "UPDATE accounts SET active=?, error_msg=?, updated_at=? WHERE username=?",
             (int(active), error or None, _now(), username))
+        if active:
+            self._demote_others(username)
         self.db.commit()
 
     def all(self) -> list:
