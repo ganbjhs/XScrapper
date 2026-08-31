@@ -48,6 +48,10 @@ venv/
 # by `git pull` and runs no Node at all, so the built app must travel in git.
 # Rebuild before committing UI changes: cd frontend && npm run build
 frontend/node_modules/
+# Vite writes a transpiled copy of vite.config.js next to it during a build and
+# normally unlinks it afterwards. A build run over the desktop bridge cannot
+# unlink, so they survive — and two got committed. They are build scratch.
+frontend/vite.config.js.timestamp-*
 
 # OS
 .DS_Store
