@@ -171,6 +171,37 @@ Paid for on 2026-08-20 (see §6, Instagram). Implemented for Instagram;
 yet) and X (whose `watchlist_members` already has all three, under other
 names).
 
+### An X List records WHOSE it is, and blank is an answer
+
+A `kind='xlist'` watchlist carries `owner_handle`: the X account the List was
+made on. It changes no query and collects no post — it exists because a List
+lives on **x.com**, where only its owner can add or remove members, and the
+pool now holds more than one or two accounts. Without it, "put this handle in
+the Cabinet list" starts with signing in to accounts until one of them can.
+
+Three rules, and they are all about not printing a guess as a fact:
+
+- **It is a note, never a permission.** Nothing in this codebase checks it, and
+  nothing could — X is the only authority on who may edit a List. Code that
+  starts *enforcing* this column is code that will one day refuse a legitimate
+  edit because someone typed the wrong handle a month ago.
+- **Blank means NOT RECORDED, and stays blank.** Every List that existed before
+  the column did has an owner nobody wrote down. Filling those in with the
+  active account — the obvious "helpful" default — would turn "we don't know"
+  into "we know, and it is this one", which is worse than the empty field.
+- **Only an X List has one.** A handle or keyword watchlist is compiled here
+  out of ordinary streams; no account anywhere owns it, so the store refuses
+  the field rather than storing something untrue.
+
+It is free text, deliberately, and not a pick-list of signed-in accounts: a
+List is often made on an account outside the pool (a client's own handle, or
+one signed in from someone's laptop), and a dropdown could not say so. It
+travels out on `GET /api/watchlists`, which is already in the API-key read
+allowlist — so Watch-Tower reads the same answer the dashboard shows, with no
+change to the delivery contract. The write endpoint
+(`POST /api/watchlists/owner`) is cookie-only: a read integration does not get
+to restamp ownership.
+
 ## 3. Collection rules
 
 - **Watermark, newest-first, stop at the first already-seen post.** Every poll

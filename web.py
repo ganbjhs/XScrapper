@@ -1830,7 +1830,9 @@ def _watchlist_post(body):
             return {"error": str(e)}
 
     async def go(st):
-        made = await st.create_watchlist(pid, body.get("name") or "", kind, raw_list)
+        made = await st.create_watchlist(pid, body.get("name") or "", kind,
+                                         raw_list,
+                                         body.get("owner_handle") or "")
         if "error" in made:
             return made
         handles = body.get("handles") or []
@@ -1844,6 +1846,23 @@ def _watchlist_post(body):
                 made.update(upd)
         return made
     return _with_store(go)
+
+
+def _watchlist_owner(body):
+    """Stamp (or clear) the X account that owns an X List.
+
+    Free text, not a pick-list of signed-in accounts: a List is often made on
+    an account that is not in the pool at all — a client's own handle, or one
+    signed in from someone's laptop — and a dropdown of pool accounts would
+    have no way to say so. The store validates the shape and refuses the
+    field on a watchlist that has no owner to record.
+    """
+    try:
+        wid = int(body.get("watchlist_id") or 0)
+    except (TypeError, ValueError):
+        return {"error": "watchlist_id must be a number"}
+    return _with_store(lambda st: st.set_watchlist_owner(
+        wid, body.get("owner_handle")))
 
 
 def _watchlist_members(body):
@@ -5308,6 +5327,8 @@ class Handler(BaseHTTPRequestHandler):
                 return self._send(200, _watchlist_post(body))
             if u.path == "/api/watchlists/members":
                 return self._send(200, _watchlist_members(body))
+            if u.path == "/api/watchlists/owner":
+                return self._send(200, _watchlist_owner(body))
             if u.path == "/api/watchlists/filters":
                 return self._send(200, _watchlist_filters(body))
             if u.path == "/api/watchlists/interval":

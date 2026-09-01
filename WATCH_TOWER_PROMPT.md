@@ -98,6 +98,14 @@ News is project_id 8. Discover the rest yourself with GET /api/projects —
 it returns all 12 with ids and names. GET /api/watchlists?project=8 returns
 the watchlist, its stream labels and current post totals.
 
+Each watchlist of `"kind": "xlist"` also carries `"owner_handle"` — the X
+account the List was made on, and therefore the only account that can add or
+remove its members. It is a recorded note, not a permission: `null` means we
+have not written it down for that list, not that the list has no owner. It is
+absent on `"query"` and `"keywords"` watchlists, which are built in our
+dashboard and belong to no account. Read-only for you; it changes nothing
+about `/api/tweets` or the delivery payload.
+
 - `project=8` returns everything every stream in that project collected,
   deduplicated across streams, and tracks membership automatically: a member
   added on X flows through with zero change on your side. This is what the

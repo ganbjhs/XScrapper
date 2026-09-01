@@ -148,6 +148,9 @@ export const api = {
   createWatchlist: (body) => request("/api/watchlists", { method: "POST", body }),
   watchlistMembers: (watchlist_id, add, remove) =>
     request("/api/watchlists/members", { method: "POST", body: { watchlist_id, add, remove } }),
+  // Which X account owns an X List. "" clears it back to not-recorded.
+  watchlistOwner: (watchlist_id, owner_handle) =>
+    request("/api/watchlists/owner", { method: "POST", body: { watchlist_id, owner_handle } }),
   removeWatchlist: (watchlist_id) =>
     request("/api/watchlists/remove", { method: "POST", body: { watchlist_id } }),
   watchlistFilters: (watchlist_id, filters) =>

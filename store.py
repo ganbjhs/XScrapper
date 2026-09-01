@@ -509,6 +509,13 @@ CREATE INDEX IF NOT EXISTS ix_tweets_delivery ON tweets(collected_ms, tweet_id);
 --                     handles (X's query length caps a chunk at ~20)
 --   kind='xlist'  ->  one list_id stream (an X List, external or promoted)
 --
+-- An X List watchlist also records WHOSE list it is (`owner_handle`). A List
+-- lives on x.com, and only the account that made it can add or remove its
+-- members -- so with several scraper accounts in the pool, "which of ours can
+-- edit this one" is a fact about the list that nothing else here holds. It is
+-- a stamped note, never a permission: nothing in this codebase checks it, and
+-- nothing could, because X is the only authority on who may edit a list.
+--
 -- Compiled streams are named 'wl:<watchlist_id>:<n>' and carry watched=1 so
 -- the watcher picks them up without a config.toml entry (same mechanism as
 -- tg_enabled). project_streams maps EVERY stream a project sees — compiled
@@ -527,6 +534,9 @@ CREATE TABLE IF NOT EXISTS watchlists (
   name         TEXT NOT NULL,
   kind         TEXT NOT NULL DEFAULT 'query',   -- 'query' | 'xlist'
   list_id      TEXT,                            -- when kind='xlist'
+  owner_handle TEXT,                            -- when kind='xlist': the X
+                                                -- account that owns it on
+                                                -- x.com, NULL = not recorded
   created_at   TEXT NOT NULL,
   UNIQUE(project_id, name)
 );
@@ -767,6 +777,32 @@ def normalize_handle(raw) -> str | None:
         s = s.split("/", 1)[0].split("?", 1)[0]
     s = s.lstrip("@").strip()
     return s.lower() if _HANDLE_RE.match(s) else None
+
+
+def _owner_handle(kind: str, raw) -> tuple[str | None, str | None]:
+    """Validate the owning-account handle for a watchlist -> (value, error).
+
+    Only an X List has one. A handle or keyword watchlist is built in this
+    dashboard and compiled into ordinary streams — there is no account
+    anywhere that owns it, so accepting a handle for one would record a fact
+    that is not true rather than leaving a field blank.
+
+    Empty is always allowed and means NOT RECORDED. That is deliberate: every
+    list that existed before this column did has an owner nobody wrote down,
+    and inventing one — the active account, say — would be a guess printed as
+    a fact.
+    """
+    s = str(raw or "").strip()
+    if not s:
+        return None, None
+    if kind != "xlist":
+        return None, ("only an X List has an owning account — a handle or "
+                      "keyword watchlist is built here and anyone with the "
+                      "dashboard can edit it")
+    h = normalize_handle(s)
+    if not h:
+        return None, f"{s!r} is not a valid X handle"
+    return h, None
 
 
 # X caps a search query at roughly 512 characters, and a rule is not the whole
@@ -1061,7 +1097,11 @@ class Store:
                   # Collection filters, as JSON — checkboxes in the UI that
                   # compile into X advanced-search operators on every one of
                   # the watchlist's streams. See WATCHLIST_FILTERS.
-                  "watchlists": {"filters": "TEXT"},
+                  # Which X account owns an X List (see the watchlists
+                  # table comment). NULL on every pre-existing row, which
+                  # reads as "not recorded" -- the honest answer for a list
+                  # added before anyone was asked.
+                  "watchlists": {"filters": "TEXT", "owner_handle": "TEXT"},
                   "streams": {"list_id": "TEXT",
                               # "The watcher should poll this even though
                               # config.toml never heard of it." Watchlist-
@@ -1731,7 +1771,8 @@ class Store:
         return {"watchlist_id": int(watchlist_id), "filters": clean, **compiled}
 
     async def create_watchlist(self, project_id: int, name: str,
-                               kind: str = "query", list_id: str = "") -> dict:
+                               kind: str = "query", list_id: str = "",
+                               owner_handle: str = "") -> dict:
         name = (name or "").strip()
         if not name:
             return {"error": "a watchlist needs a name"}
@@ -1739,21 +1780,47 @@ class Store:
             return {"error": "kind must be 'query', 'keywords' or 'xlist'"}
         if kind == "xlist" and not (list_id or "").strip():
             return {"error": "an xlist watchlist needs the X List id"}
+        owner, err = _owner_handle(kind, owner_handle)
+        if err:
+            return {"error": err}
         if not self.db.execute("SELECT 1 FROM projects WHERE project_id = ?",
                                (int(project_id),)).fetchone():
             return {"error": f"no project {project_id}"}
         try:
             cur = self.db.execute(
-                "INSERT INTO watchlists(project_id, name, kind, list_id, created_at) "
-                "VALUES(?,?,?,?,?)",
+                "INSERT INTO watchlists(project_id, name, kind, list_id, "
+                "owner_handle, created_at) VALUES(?,?,?,?,?,?)",
                 (int(project_id), name, kind, (list_id or "").strip() or None,
-                 _iso_ms(int(time.time() * 1000))))
+                 owner, _iso_ms(int(time.time() * 1000))))
         except sqlite3.IntegrityError:
             return {"error": f"this project already has a watchlist called {name!r}"}
         wid = cur.lastrowid
         if kind == "xlist":
             await self.compile_watchlist(wid)
-        return {"watchlist_id": wid, "name": name, "kind": kind}
+        return {"watchlist_id": wid, "name": name, "kind": kind,
+                "owner_handle": owner}
+
+    async def set_watchlist_owner(self, watchlist_id: int, handle) -> dict:
+        """
+        Record which X account owns this List — or clear it, with "".
+
+        Nothing recompiles: the owner changes no query and collects no post.
+        It answers the one question the dashboard could not answer once the
+        pool held more than one or two accounts — "if this list needs another
+        handle in it, which of ours do I sign in as?" — and it travels out on
+        /api/watchlists so Watch-Tower reads the same answer.
+        """
+        w = self.db.execute("SELECT * FROM watchlists WHERE watchlist_id = ?",
+                            (int(watchlist_id),)).fetchone()
+        if not w:
+            return {"error": f"no watchlist {watchlist_id}"}
+        owner, err = _owner_handle(w["kind"], handle)
+        if err:
+            return {"error": err}
+        self.db.execute(
+            "UPDATE watchlists SET owner_handle = ? WHERE watchlist_id = ?",
+            (owner, int(watchlist_id)))
+        return {"watchlist_id": int(watchlist_id), "owner_handle": owner}
 
     async def set_watchlist_members(self, watchlist_id: int,
                                     add: list | None = None,

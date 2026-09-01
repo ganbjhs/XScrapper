@@ -1972,8 +1972,17 @@ def test_projects_watchlists(tmp):
         # Shrink to 5 members -> 1 live chunk, the other two retired.
         out["shrunk"] = await st.set_watchlist_members(
             wid, remove=[f"user{i:03d}" for i in range(40)])
-        # An xlist watchlist compiles to a single list-backed stream.
-        out["xl"] = await st.create_watchlist(pid, "Big permanent", "xlist", "777")
+        # An xlist watchlist compiles to a single list-backed stream, and
+        # records WHICH X account owns the list on x.com.
+        out["xl"] = await st.create_watchlist(pid, "Big permanent", "xlist",
+                                              "777", "https://x.com/@Our_Bot")
+        out["owner_bad"] = await st.set_watchlist_owner(
+            out["xl"]["watchlist_id"], "not a handle")
+        out["owner_wrong_kind"] = await st.set_watchlist_owner(wid, "our_bot")
+        out["owner_cleared"] = await st.set_watchlist_owner(
+            out["xl"]["watchlist_id"], "  ")
+        out["owner_set"] = await st.set_watchlist_owner(
+            out["xl"]["watchlist_id"], "@Second_Bot")
         out["wls2"] = await st.watchlists(pid)
         out["gone"] = await st.delete_watchlist(wid)
         out["wls3"] = await st.watchlists(pid)
@@ -2019,6 +2028,17 @@ def test_projects_watchlists(tmp):
                      (f"wl:{xl_label}:0",)).fetchone()
     ok(xl["list_id"] == "777" and xl["watched"] == 1,
        "an xlist watchlist compiles to one watched list-backed stream")
+
+    ok(r["xl"]["owner_handle"] == "our_bot",
+       "an X List records its owning account, normalized from a profile URL")
+    ok("error" in r["owner_bad"], "a malformed owner handle is refused")
+    ok("error" in r["owner_wrong_kind"],
+       "a handle watchlist has no owning account — setting one is refused")
+    ok(r["owner_cleared"]["owner_handle"] is None,
+       "blank clears the owner back to not-recorded")
+    xl_row = next(w for w in r["wls2"] if w["watchlist_id"] == xl_label)
+    ok(xl_row["owner_handle"] == "second_bot",
+       "the owner travels out on the watchlists API — what Watch-Tower reads")
 
     ok(r["gone"]["removed"] and not any(w["watchlist_id"] == r["wid"] for w in r["wls3"]),
        "deleting a watchlist removes it from the dashboard")

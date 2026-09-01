@@ -77,6 +77,7 @@ function AddModal({ pid, onDone, onClose }) {
   const [kind, setKind] = useState("query");
   const [name, setName] = useState("");
   const [listId, setListId] = useState("");
+  const [owner, setOwner] = useState("");
   const [handles, setHandles] = useState("");
   const [igValue, setIgValue] = useState("");
   const [err, setErr] = useState("");
@@ -89,7 +90,7 @@ function AddModal({ pid, onDone, onClose }) {
     try {
       if (platform === "x") {
         const body = { project: pid, name, kind };
-        if (kind === "xlist") body.list_id = listId;
+        if (kind === "xlist") { body.list_id = listId; body.owner_handle = owner; }
         else if (kind === "keywords")
           body.handles = handles.split(/\n+/).map((s) => s.trim()).filter(Boolean);
         else body.handles = handles.split(/[\s,]+/).filter(Boolean);
@@ -149,11 +150,24 @@ function AddModal({ pid, onDone, onClose }) {
                    placeholder="e.g. Cabinet" />
           </div>
           {kind === "xlist" ? (
-            <div className="field">
-              <label>X List URL or id</label>
-              <input value={listId} onChange={(e) => setListId(e.target.value)}
-                     placeholder="https://x.com/i/lists/1234567890123456789" />
-            </div>
+            <>
+              <div className="field">
+                <label>X List URL or id</label>
+                <input value={listId} onChange={(e) => setListId(e.target.value)}
+                       placeholder="https://x.com/i/lists/1234567890123456789" />
+              </div>
+              <div className="field">
+                <label>Owned by — the X account this list was made on (optional)</label>
+                <input value={owner} onChange={(e) => setOwner(e.target.value)}
+                       placeholder="@our_scraper_2" />
+                <div style={{ color: "var(--ink-3)", fontSize: 12, marginTop: 6 }}>
+                  A list lives on x.com and only its owner can add or remove
+                  members. Writing the handle down here is how anyone later
+                  knows which account to sign in as — leave it blank if you
+                  do not know.
+                </div>
+              </div>
+            </>
           ) : kind === "keywords" ? (
             <div className="field">
               <label>Keywords — one rule per line, or separated by commas</label>
@@ -307,6 +321,66 @@ function FiltersPanel({ w, onChanged }) {
           </div>
         </div>
       )}
+    </div>
+  );
+}
+
+// Who owns this X List. A List is editable only by the account that made it,
+// so with several accounts in the pool this is the difference between "add a
+// handle to the Cabinet list" and half an hour of signing in to find out which
+// account can. Free text, and blank is a legitimate answer — a list added
+// before anyone was asked has an owner nobody wrote down, and guessing one
+// would print a guess as a fact.
+function OwnerLine({ w, onChanged }) {
+  const [editing, setEditing] = useState(false);
+  const [val, setVal] = useState(w.owner_handle || "");
+  const [busy, setBusy] = useState(false);
+  const [err, setErr] = useState("");
+
+  const save = async () => {
+    setBusy(true); setErr("");
+    try {
+      const r = await api.watchlistOwner(w.watchlist_id, val.trim());
+      if (r && r.error) { setErr(r.error); return; }
+      setEditing(false);
+      onChanged();
+    } catch (e) { setErr(String(e.message || e)); }
+    finally { setBusy(false); }
+  };
+
+  if (!editing) {
+    return (
+      <div style={{ color: "var(--ink-3)", fontSize: 12.5, marginTop: 4 }}>
+        {w.owner_handle ? (
+          <>
+            Owned by{" "}
+            <a href={`https://x.com/${w.owner_handle}`} target="_blank" rel="noreferrer"
+               style={{ color: "var(--ink-2)", fontWeight: 600 }}>@{w.owner_handle}</a>
+            {" "}— only that account can edit its members.
+          </>
+        ) : (
+          <>Owner not recorded — nobody knows which account can edit this list.</>
+        )}
+        <button className="btn btn-ghost btn-sm" style={{ marginLeft: 8 }}
+                onClick={() => { setVal(w.owner_handle || ""); setEditing(true); }}>
+          {w.owner_handle ? "Change" : "Set owner"}
+        </button>
+      </div>
+    );
+  }
+
+  return (
+    <div className="filters" style={{ margin: "6px 0 0" }}>
+      <input value={val} autoFocus placeholder="@handle, or blank to clear"
+             style={{ flex: 1, minWidth: 180 }}
+             onChange={(e) => setVal(e.target.value)}
+             onKeyDown={(e) => e.key === "Enter" && save()} />
+      <button className="btn btn-brand btn-sm" disabled={busy} onClick={save}>
+        {busy ? "…" : "Save"}
+      </button>
+      <button className="btn btn-ghost btn-sm" disabled={busy}
+              onClick={() => { setEditing(false); setErr(""); }}>Cancel</button>
+      {err && <span style={{ color: "var(--critical)", fontSize: 12.5 }}>{err}</span>}
     </div>
   );
 }
@@ -585,6 +659,7 @@ function XDetail({ w, onChanged }) {
           ? `Collected through X List ${w.list_id} — members are managed on x.com.`
           : `${w.members.length} ${w.kind === "keywords" ? "keyword rule" : "handle"}${w.members.length === 1 ? "" : "s"} → ${live.length} live stream${live.length === 1 ? "" : "s"}`}
       </div>
+      {w.kind === "xlist" && <OwnerLine w={w} onChanged={onChanged} />}
 
       <DepthRow w={w} onChanged={onChanged} />
 
@@ -1332,7 +1407,8 @@ export default function Watchlists({ onMenu }) {
   const items = useMemo(() => {
     const out = xLists.map((w) => ({
       id: `x:${w.watchlist_id}`, platform: "x", name: w.name,
-      sub: w.kind === "xlist" ? "X List"
+      sub: w.kind === "xlist"
+        ? `X List${w.owner_handle ? ` \u00b7 @${w.owner_handle}` : ""}`
         : `${w.members.length} ${w.kind === "keywords" ? "keywords" : "handles"}`,
       live: w.streams.some((s) => !s.paused), w,
     }));
