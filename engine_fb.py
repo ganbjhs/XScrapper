@@ -24,6 +24,7 @@ The extractor is one function (`_EXTRACT_JS`) — the piece most likely to need 
 small tune after the first real run; everything else is stable.
 """
 
+import datetime
 import json
 import os
 import random
@@ -55,7 +56,7 @@ BLOCK = {"image", "media", "font"}
 #      shape shifts — so a Facebook change degrades us to the old behaviour
 #      instead of to zero.
 _EXTRACT_JS = r"""
-() => {
+async () => {
   // A stable id from a permalink. FB uses several shapes:
   //   /reel/<num>, /posts/pfbid<...>, story_fbid=<num|pfbid>, /videos/<num>,
   //   /permalink/<num>, fbid=<num>. pfbid tokens are letters+digits.
@@ -162,20 +163,86 @@ _EXTRACT_JS = r"""
   }
 
   // ---- 2) DOM fallback ----
+  //
+  // Deliberately rich, not minimal. The Favorites feed lands HERE whenever the
+  // graphql capture comes back empty, and the first 160 posts collected that
+  // way carried no time, no counts, no author name and a body cut at "See
+  // more" — a post stripped of when, who and how big is barely a post. Every
+  // field below is read from the SAME article node the text came from.
+
+  // True for an avatar, a reaction glyph or a UI sprite — NOT post media.
+  // Facebook declares the rendered box in the stp/ctp/cstp params
+  // (s960x960, p180x540 …); anything whose largest declared box is <= 100px is
+  // chrome. Images with no declared box (full-size originals) are kept.
+  const isJunkImg = (s) => {
+    if (!s || !/scontent|fbcdn/.test(s)) return true;
+    if (/static\.xx\.fbcdn\.net|\/emoji\.php\/|\/rsrc\.php|safe_image\.php/.test(s)) return true;
+    const boxes = (s.match(/[?&](?:stp|ctp|cstp)=[^&]*/g) || []).join('&');
+    const dims = boxes.match(/[sp](\d{2,4})x(\d{2,4})/g) || [];
+    if (dims.length === 0) return false;
+    return !dims.some((b) => { const d = b.match(/(\d{2,4})x(\d{2,4})/);
+                               return d && Math.max(+d[1], +d[2]) > 100; });
+  };
+  // Facebook draws some images as <image> inside an <svg>, not <img>.
+  const imgSrc = (el) => el.tagName === 'IMG'
+    ? el.src
+    : (el.getAttribute('xlink:href') || el.getAttribute('href') || '');
+
+  // "See more" hides most of a long caption behind a local text toggle — no
+  // navigation, no write, nothing posted. Expand every one, then read.
+  for (const b of document.querySelectorAll('div[role="button"], span[role="button"]')) {
+    const t = (b.innerText || '').trim();
+    if (/^(see more|see more\.\.\.|और देखें|अधिक देखें)$/i.test(t)) {
+      try { b.click(); } catch (e) {}
+    }
+  }
+  await new Promise((r) => setTimeout(r, 700));
+
   const out = [];
   for (const a of document.querySelectorAll('[role="article"]')) {
     if (a.closest('[role="dialog"]')) continue;   // skip comment/reel popovers
-    const links = [...a.querySelectorAll('a[href]')].map(l => l.href);
-    const perma = links.find(isPerma) || null;
-    const head = a.querySelector('h2 a, h3 a, h4 a, strong a, a[aria-label]');
-    const author = head ? head.innerText.trim() : null;
+    const anchors = [...a.querySelectorAll('a[href]')];
+    const permaEl = anchors.find((l) => isPerma(l.href)) || null;
+    const perma = permaEl ? permaEl.href : null;
+    // Author. profile_name is Facebook's OWN label for the byline (it uses it
+    // for ad rendering), so it survives the CSS reshuffles that break heading
+    // selectors; the headings are kept behind it.
+    const head = a.querySelector('[data-ad-rendering-role="profile_name"] a')
+      || a.querySelector('h2 a, h3 a, h4 a, strong a')
+      || a.querySelector('a[aria-label]');
+    let author = head ? (head.innerText || '').trim().split('\n')[0] : null;
+    if (author && author.length > 90) author = author.slice(0, 90);
     const author_url = head ? head.href : null;
+    // The avatar is precisely the image isJunkImg rejects as too small.
+    const avatarEl = [...a.querySelectorAll('img, image')]
+      .find((e) => { const s = imgSrc(e);
+                     return s && /scontent|fbcdn/.test(s) && isJunkImg(s); });
+    const author_avatar = avatarEl ? imgSrc(avatarEl) : null;
+    // Posted time. The permalink anchor carries it three ways depending on the
+    // layout: an aria-label ("2 August at 10:31"), its own text ("5h"), or a
+    // legacy [data-utime] epoch. Send all of them; Python decides.
+    const utimeEl = a.querySelector('[data-utime]');
+    const time_text = (permaEl && (permaEl.getAttribute('aria-label')
+      || (permaEl.innerText || '').trim())) || null;
+    const utime = utimeEl ? +utimeEl.getAttribute('data-utime') : null;
     const bodies = [...a.querySelectorAll('div[dir="auto"]')]
-      .map(d => d.innerText.trim()).filter(Boolean);
-    const text = bodies.sort((x, y) => y.length - x.length)[0] || "";
-    const imgs = [...a.querySelectorAll('img')].map(i => i.src)
-      .filter(s => /scontent|fbcdn/.test(s) && !/s32x32|s40x40|p32x32|p24x24/.test(s));
-    out.push({ id: idFrom(perma), author, author_url, permalink: perma,
+      .map((d) => (d.innerText || '').trim()).filter(Boolean);
+    let text = bodies.sort((x, y) => y.length - x.length)[0] || "";
+    text = text.replace(/[\s.…]*See more\s*$/i, '').replace(/[\s.…]*और देखें\s*$/, '');
+    // Counts, as the reader sees them. The reaction total is an aria-label
+    // ("1.2K reactions"); comments and shares are plain text in the bar.
+    const atxt = (a.innerText || '');
+    const grab = (re) => { const m = atxt.match(re); return m ? m[1] : null; };
+    const reactEl = a.querySelector('[aria-label*="eaction"]');
+    const counts_raw = {
+      reactions: reactEl ? reactEl.getAttribute('aria-label') : null,
+      comments: grab(/([\d.,]+\s*[KMkm]?)\s*comments?/i),
+      shares: grab(/([\d.,]+\s*[KMkm]?)\s*shares?/i),
+    };
+    const imgs = [...a.querySelectorAll('img, image')].map(imgSrc)
+      .filter((s) => s && !isJunkImg(s));
+    out.push({ id: idFrom(perma), author, author_url, author_avatar,
+               permalink: perma, time_text, utime, counts_raw,
                text: text.slice(0, 2000), media: [...new Set(imgs)].slice(0, 6) });
   }
   // Diagnostics gathered from the SAME render, so if extraction returns nothing
@@ -268,6 +335,163 @@ def _handle_from_url(u):
     return seg or None
 
 
+# --------------------------------------------------------------------------
+# Reading what the DOM shows — numbers, times, and which images are real
+# --------------------------------------------------------------------------
+#
+# The DOM fallback returns strings a human would read ("1.2K", "5h",
+# "2 August at 10:31"), not machine fields. These three functions turn them
+# into the record shape, and they are pure so the tests can pin them.
+
+_REL_RE = re.compile(
+    r"^\s*(?:about\s+)?(\d+)\s*"
+    r"(s|m|h|d|w|y|sec|secs|second|seconds|min|mins|minute|minutes|"
+    r"hr|hrs|hour|hours|day|days|week|weeks|yr|yrs|year|years)\b", re.I)
+_REL_MS = {
+    "s": 1_000, "sec": 1_000, "secs": 1_000, "second": 1_000, "seconds": 1_000,
+    "m": 60_000, "min": 60_000, "mins": 60_000, "minute": 60_000,
+    "minutes": 60_000,
+    "h": 3_600_000, "hr": 3_600_000, "hrs": 3_600_000, "hour": 3_600_000,
+    "hours": 3_600_000,
+    "d": 86_400_000, "day": 86_400_000, "days": 86_400_000,
+    "w": 604_800_000, "week": 604_800_000, "weeks": 604_800_000,
+    "y": 31_536_000_000, "yr": 31_536_000_000, "yrs": 31_536_000_000,
+    "year": 31_536_000_000, "years": 31_536_000_000,
+}
+_MONTHS = {m: i for i, m in enumerate(
+    ["jan", "feb", "mar", "apr", "may", "jun",
+     "jul", "aug", "sep", "oct", "nov", "dec"], 1)}
+
+
+def _time_ms(text, utime=None, now_ms=None):
+    """Posted time in epoch ms from whatever the post's timestamp link showed.
+
+    Order of trust: an exact [data-utime] epoch, then a relative age ("5h"),
+    then "Yesterday", then an absolute date ("2 August at 10:31"). The absolute
+    branch has NO timezone — the browser renders in the account's, and we
+    cannot know it here — so its result is honest to the day and approximate
+    within it. Everything is clamped to `now`: a post cannot have been made
+    after it was collected, and a future created_ms would poison lag_ms.
+    Unreadable input returns None, which stays None. A missing time is a
+    state; a guessed one is a lie."""
+    now = int(now_ms if now_ms is not None else time.time() * 1000)
+    if utime:
+        try:
+            u = int(utime)
+            ms = u * 1000 if u < 10_000_000_000 else u
+            return min(ms, now)
+        except (TypeError, ValueError):
+            pass
+    if not text:
+        return None
+    t = str(text).strip()
+    if re.search(r"just now|abhi", t, re.I):
+        return now
+    m = _REL_RE.match(t)
+    if m:
+        step = _REL_MS.get(m.group(2).lower())
+        if step:
+            return min(now - int(m.group(1)) * step, now)
+
+    tm = re.search(r"(\d{1,2}):(\d{2})", t)
+    hh, mi = (int(tm.group(1)), int(tm.group(2))) if tm else (12, 0)
+    if tm and re.search(r"\bp\.?\s?m\.?", t, re.I) and hh < 12:
+        hh += 12
+    if tm and re.search(r"\ba\.?\s?m\.?", t, re.I) and hh == 12:
+        hh = 0
+    base = datetime.datetime.utcfromtimestamp(now / 1000)
+    if re.search(r"yesterday", t, re.I):
+        d = base - datetime.timedelta(days=1)
+        return min(int(datetime.datetime(d.year, d.month, d.day, hh, mi)
+                       .replace(tzinfo=datetime.timezone.utc).timestamp() * 1000), now)
+    if re.search(r"\btoday\b", t, re.I):
+        return min(int(datetime.datetime(base.year, base.month, base.day, hh, mi)
+                       .replace(tzinfo=datetime.timezone.utc).timestamp() * 1000), now)
+    dm = re.search(r"(\d{1,2})\s+([A-Za-z]{3,})|([A-Za-z]{3,})\s+(\d{1,2})", t)
+    if not dm:
+        return None
+    day = int(dm.group(1) or dm.group(4))
+    mon = _MONTHS.get((dm.group(2) or dm.group(3) or "")[:3].lower())
+    if not mon or not (1 <= day <= 31):
+        return None
+    ym = re.search(r"\b(20\d{2})\b", t)
+    year = int(ym.group(1)) if ym else base.year
+    try:
+        dt = datetime.datetime(year, mon, day, hh, mi,
+                               tzinfo=datetime.timezone.utc)
+    except ValueError:
+        return None
+    ms = int(dt.timestamp() * 1000)
+    # No year shown and the date reads as future => it belongs to last year.
+    if not ym and ms > now + 2 * 86_400_000:
+        try:
+            ms = int(dt.replace(year=year - 1).timestamp() * 1000)
+        except ValueError:
+            return None
+    return min(ms, now)
+
+
+_JUNK_IMG = re.compile(
+    r"static\.xx\.fbcdn\.net|/emoji\.php/|/rsrc\.php|safe_image\.php")
+_BOX_PARAM = re.compile(r"[?&](?:stp|ctp|cstp)=[^&]*")
+_BOX_DIM = re.compile(r"[sp](\d{2,4})x(\d{2,4})")
+_VIDEO_PERMA = re.compile(r"/reel/|/videos/|/watch")
+
+
+def _is_post_image(u) -> bool:
+    """Is this URL the post's OWN picture, or page chrome?
+
+    Facebook declares the rendered box in the stp/ctp/cstp params. An avatar is
+    p32x32, a reaction glyph is s16x16, the post photo is s960x960 — so the
+    largest declared box separates them without a network call. The emoji
+    sprite that turned up as a 'photo' in the first 160 posts
+    (static.xx.fbcdn.net/images/emoji.php/...) is excluded by host."""
+    if not u or not isinstance(u, str):
+        return False
+    if not re.search(r"scontent|fbcdn", u):
+        return False
+    if _JUNK_IMG.search(u):
+        return False
+    dims = _BOX_DIM.findall("".join(_BOX_PARAM.findall(u)))
+    if not dims:
+        return True                       # no declared box = a full original
+    return any(max(int(a), int(b)) > 100 for a, b in dims)
+
+
+def _clean_media(media, permalink=None, avatar=None, limit=6):
+    """Normalize to [{type,url,thumb}], dropping chrome and duplicates.
+
+    Accepts both shapes the extractor produces: {type,url,thumb} dicts from the
+    JSON/graphql paths and bare URL strings from the DOM path. A post whose
+    permalink is a reel or a video is a VIDEO however its thumbnail was found —
+    the old code labelled those 'photo', so the feed offered a still and called
+    it the post."""
+    is_video = bool(permalink and _VIDEO_PERMA.search(permalink))
+    out, seen = [], set()
+    for m in (media or []):
+        if isinstance(m, str):
+            m = {"type": "photo", "url": m, "thumb": m}
+        if not isinstance(m, dict):
+            continue
+        url = (m.get("url") or m.get("thumb") or "").strip()
+        if not url or url in seen:
+            continue
+        kind = m.get("type") or "photo"
+        if kind == "photo":
+            if not _is_post_image(url) or (avatar and url == avatar):
+                continue
+            if is_video:
+                kind = "video"
+        seen.add(url)
+        item = {"type": kind, "url": url, "thumb": m.get("thumb") or url}
+        if m.get("duration"):
+            item["duration"] = m["duration"]
+        out.append(item)
+        if len(out) >= limit:
+            break
+    return out
+
+
 def _iter_json_objects(blob: str):
     """Facebook streams graphql as one JSON object, or several concatenated /
     newline-delimited. Yield every object we can parse out of the blob."""
@@ -326,6 +550,7 @@ def _deep_all(o, pred, acc=None, depth=0):
 
 
 _ABBREV_RE = re.compile(r"^\s*([\d.]+)\s*([KkMmBb]?)\s*$")
+_LOOSE_NUM_RE = re.compile(r"([\d][\d,]*(?:\.\d+)?)\s*([KkMmBb]?)")
 
 # Any of these keys on a node marks it as feedback-ish (carrying engagement
 # counts). Facebook ships the counts under several names depending on which
@@ -345,9 +570,15 @@ def _num(v):
     if isinstance(v, str):
         s = v.replace(",", "").replace(" ", "")
         m = _ABBREV_RE.match(s)
+        if not m:
+            # Not the whole string. The DOM path reads counts as a person sees
+            # them — "1.2K reactions", "All reactions: 47", "83 comments" — so
+            # fall back to the first number IN the label rather than dropping a
+            # count Facebook plainly displayed.
+            m = _LOOSE_NUM_RE.search(v)
         if m:
             try:
-                return int(float(m.group(1)) *
+                return int(float(m.group(1).replace(",", "")) *
                            {"k": 1e3, "m": 1e6, "b": 1e9}.get(m.group(2).lower(), 1))
             except ValueError:
                 return None
@@ -501,7 +732,8 @@ def _story_to_post(st: dict):
     return {"id": str(pid) if pid else _fallback_id(perma), "author": author,
             "author_handle": author_handle, "author_avatar": avatar,
             "permalink": perma, "text": text[:2000],
-            "created_ms": created_ms, "media": media,
+            "created_ms": created_ms,
+            "media": _clean_media(media, perma, avatar),
             "like_count": likes, "comment_count": comments, "share_count": shares,
             "feedback_ids": fb_ids}
 
@@ -909,7 +1141,7 @@ class FacebookEngine:
                 "like_count": r.get("like_count"),
                 "comment_count": r.get("comment_count"),
                 "share_count": r.get("share_count"),
-                "media": r.get("media") or [],
+                "media": _clean_media(r.get("media"), url, r.get("author_avatar")),
             })
         return posts
 
@@ -919,32 +1151,37 @@ class FacebookEngine:
         arrived as {type,url,thumb} dicts (JSON paths) or bare url strings (DOM)."""
         posts = []
         for r in items:
-            h = r.get("author_handle") or _handle_from_url(r.get("author_url"))
+            # A post whose byline link is missing is still attributable — its
+            # own permalink names the page. Dropping it was silent data loss.
+            h = (r.get("author_handle")
+                 or _handle_from_url(r.get("author_url"))
+                 or _handle_from_url(r.get("permalink")))
             if not h:
                 continue
             h = h.lower()      # canonical, case-insensitive (matches _build_from_json)
             pid = r.get("id") or (r.get("permalink") and _fallback_id(r["permalink"]))
             if not pid:
                 continue
-            media = []
-            for m in (r.get("media") or []):
-                if isinstance(m, str):
-                    media.append({"type": "photo", "url": m, "thumb": m})
-                elif isinstance(m, dict):
-                    media.append(m)
             url = r.get("permalink") or f"https://www.facebook.com/{h}/posts/{pid}"
+            # The DOM path reaches here too (Favorites falls back to it), so
+            # read its human-shaped fields when the JSON fields are absent.
+            counts = r.get("counts_raw") or {}
             posts.append({
                 "post_id": f"{h}:{pid}",
                 "page": h,
                 "url": url,
-                "created_ms": r.get("created_ms"),
+                "created_ms": r.get("created_ms")
+                or _time_ms(r.get("time_text"), r.get("utime")),
                 "author_name": r.get("author"),
                 "author_avatar": r.get("author_avatar"),
                 "text": r.get("text") or "",
-                "like_count": r.get("like_count"),
-                "comment_count": r.get("comment_count"),
-                "share_count": r.get("share_count"),
-                "media": media[:6],
+                "like_count": r.get("like_count")
+                if r.get("like_count") is not None else _num(counts.get("reactions")),
+                "comment_count": r.get("comment_count")
+                if r.get("comment_count") is not None else _num(counts.get("comments")),
+                "share_count": r.get("share_count")
+                if r.get("share_count") is not None else _num(counts.get("shares")),
+                "media": _clean_media(r.get("media"), url, r.get("author_avatar")),
             })
         return posts
 
@@ -957,16 +1194,23 @@ class FacebookEngine:
             pid = r.get("id") or _fallback_id(r["permalink"])
             if not pid:
                 continue
+            counts = r.get("counts_raw") or {}
             posts.append({
                 "post_id": f"{handle}:{pid}",
                 "page": handle,
                 "url": r["permalink"],
-                "created_ms": None,          # DOM hides exact time
+                # The DOM shows the time as a human reads it ("5h",
+                # "2 August at 10:31") — approximate, but a real fact, and the
+                # feed sorts and ages on it.
+                "created_ms": _time_ms(r.get("time_text"), r.get("utime")),
                 "author_name": r.get("author"),
-                "author_avatar": None,
+                "author_avatar": r.get("author_avatar"),
                 "text": r.get("text") or "",
-                "like_count": None, "comment_count": None, "share_count": None,
-                "media": [{"type": "photo", "url": u, "thumb": u} for u in r.get("media", [])],
+                "like_count": _num(counts.get("reactions")),
+                "comment_count": _num(counts.get("comments")),
+                "share_count": _num(counts.get("shares")),
+                "media": _clean_media(r.get("media"), r["permalink"],
+                                      r.get("author_avatar")),
             })
         return posts
 

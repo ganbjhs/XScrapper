@@ -11,7 +11,89 @@ const pfpColor = (s) => {
   return PFP_COLORS[h % PFP_COLORS.length];
 };
 
-function Media({ media }) {
+// ---------------------------------------------------------------------------
+// Facebook media: why it is a frame, and how we know before we ask
+//
+// Facebook SIGNS every fbcdn image URL and writes the expiry into the URL
+// itself — `oe=<hex epoch>`, about a week out. Past that moment the identical
+// URL answers "URL signature expired", which is why saved Facebook posts here
+// showed empty media boxes: the link in the database had died. No <img>, no
+// proxy and no cache-buster can revive it — only Facebook can mint a new one.
+//
+// We store no bytes, so the durable thing we hold is the PERMALINK. Facebook's
+// own post embed renders that permalink live and mints fresh image URLs on
+// every view, so an expired post is shown by framing the post itself.
+//
+// Reading `oe` (rather than waiting for onError) is what keeps this quiet: the
+// expiry is IN the link, so we know a thumbnail is dead before we request it
+// and the operator never sees a broken image flash. onError stays as the
+// backstop for links that die for some other reason.
+const fbExpiryMs = (u) => {
+  const m = /[?&]oe=([0-9A-Fa-f]+)/.exec(String(u || ""));
+  if (!m) return null;
+  const secs = parseInt(m[1], 16);
+  return Number.isFinite(secs) ? secs * 1000 : null;
+};
+// Unsigned links (no oe=) are NOT assumed dead — absence of an expiry is not
+// an expiry.
+const fbLinkDead = (u) => {
+  const exp = fbExpiryMs(u);
+  return exp == null ? false : exp < Date.now();
+};
+// The stored permalink carries Facebook's click-tracking payload
+// (__cft__[0]=..., __tn__=...). The embed plugin wants the bare post URL; the
+// story/video ids are the only query keys that identify the post.
+const fbEmbedHref = (u) => {
+  try {
+    const url = new URL(u);
+    const keep = new URLSearchParams();
+    for (const k of ["story_fbid", "id", "v"]) {
+      const v = url.searchParams.get(k);
+      if (v) keep.set(k, v);
+    }
+    const q = keep.toString();
+    return `${url.origin}${url.pathname}${q ? `?${q}` : ""}`;
+  } catch {
+    return String(u || "");
+  }
+};
+const FB_EMBED_W = 348;
+const fbEmbedSrc = (u) =>
+  "https://www.facebook.com/plugins/post.php?href=" +
+  encodeURIComponent(fbEmbedHref(u)) +
+  `&show_text=false&width=${FB_EMBED_W}`;
+
+// One framed post. Deliberately lazy: a feed page holds many cards and each
+// frame is a real Facebook page load, so a frame is only mounted once its slot
+// is near the viewport. Cards the operator never scrolls to cost nothing.
+function FbEmbed({ url, tall }) {
+  const slot = React.useRef(null);
+  const [show, setShow] = React.useState(false);
+  React.useEffect(() => {
+    if (show) return undefined;
+    const el = slot.current;
+    if (!el || typeof IntersectionObserver !== "function") { setShow(true); return undefined; }
+    const io = new IntersectionObserver((entries) => {
+      if (entries.some((e) => e.isIntersecting)) { setShow(true); io.disconnect(); }
+    }, { rootMargin: "400px" });
+    io.observe(el);
+    return () => io.disconnect();
+  }, [show]);
+  return (
+    <div className={`fb-embed${tall ? " tall" : ""}`} ref={slot}
+         title="The stored image links for this post have expired — this is the live post, from Facebook">
+      {show ? (
+        <iframe src={fbEmbedSrc(url)} title="Facebook post" loading="lazy"
+                scrolling="no" allowFullScreen
+                allow="autoplay; clipboard-write; encrypted-media; picture-in-picture; web-share" />
+      ) : (
+        <span className="fb-embed-wait">Facebook post</span>
+      )}
+    </div>
+  );
+}
+
+function Media({ media, onDead }) {
   if (!media?.length) return null;
   const shown = media.slice(0, 2);
   const extra = media.length - shown.length;
@@ -21,7 +103,10 @@ function Media({ media }) {
         <a key={i} className="thumb" href={m.url || m.thumb} target="_blank" rel="noreferrer">
           {(m.thumb || m.url) && (
             <img src={m.thumb || m.url} alt={m.type} loading="lazy"
-                 onError={(e) => { e.currentTarget.style.display = "none"; }} />
+                 onError={(e) => {
+                   if (onDead) onDead();
+                   else e.currentTarget.style.display = "none";
+                 }} />
           )}
           {m.type !== "photo" && <span className="play" aria-label="video" />}
           {m.type !== "photo" && <span className="kind">{m.type}</span>}
@@ -127,8 +212,15 @@ function LabelPicker({ t, cats, onLabel }) {
 export default function PostCard({ t, onPin, onUnpin, terms, cats, onLabel }) {
   const name = t.author_display_name || t.author_username || "unknown";
   const media = t.media || [];
+  // A stored link that died some other way still flips the card to the frame.
+  const [imgDead, setImgDead] = React.useState(false);
+  const isFb = t.platform === "facebook" && !!t.url;
+  const fbFrame = isFb && media.length > 0
+    && (imgDead || fbLinkDead(media[0].thumb || media[0].url));
+  const tallFrame = /\/reel\/|\/videos\//.test(String(t.url || ""));
   return (
-    <article className={`card${media.length ? "" : " nomedia"}`}>
+    <article className={`card${media.length ? "" : " nomedia"}`
+                        + (fbFrame ? " fbframe" : "")}>
       <div>
         <div className="chead">
           <Pfp t={t} name={name} />
@@ -169,14 +261,18 @@ export default function PostCard({ t, onPin, onUnpin, terms, cats, onLabel }) {
           {onPin && <button onClick={() => onPin(t)}>+ Collection</button>}
           {onUnpin && <button onClick={() => onUnpin(t)}>Unpin</button>}
           {onLabel && <LabelPicker t={t} cats={cats} onLabel={onLabel} />}
-          {media.length > 0 && (
+          {/* Not offered when the links have expired: a download that can
+              only return "URL signature expired" is worse than no button. */}
+          {media.length > 0 && !fbFrame && (
             <a href={media[0].url || media[0].thumb} target="_blank" rel="noreferrer" download>
               Download media
             </a>
           )}
         </div>
       </div>
-      <Media media={media} />
+      {fbFrame
+        ? <FbEmbed url={t.url} tall={tallFrame} />
+        : <Media media={media} onDead={isFb ? () => setImgDead(true) : null} />}
     </article>
   );
 }

@@ -731,6 +731,53 @@ before changing the engine; nearly every "obvious" idea has been tried.)
   that page). This is the Facebook analogue of an X List, and it works only
   because we hold the account. It needs the pages added to the account's
   Favorites once (max 30).
+- **Favorites mode needs NO page rows — never gate its button on them.**
+  Favorites reads the collector account's own feed and attributes each post to
+  whichever page wrote it; the page list lives in that Facebook account, not in
+  the watchlist. The dashboard had "Fetch Favorites feed" disabled whenever the
+  watchlist held zero pages, which is exactly the state a favorites-mode
+  project is in — so the one button that works without pages was the one the
+  UI switched off (paid for: `fb_pages`, 160 posts collected, 0 pages, both
+  fetch buttons dead, 2026-09-02). "Fetch now" is per-page and IS correctly
+  gated; the two buttons do not share a condition.
+- **A saved fbcdn link is perishable; the PERMALINK is the durable one.**
+  Every Facebook image URL is signed and carries its own expiry in the query
+  string as `oe=<hex epoch>` — about five days out. After that the identical
+  URL returns "URL signature expired", so a stored thumbnail dies where it
+  sits, and no proxy, referer or cache-buster revives it: only Facebook can
+  mint a new signature. We deliberately store no image bytes (the engine blocks
+  image/media/font to stay inside the byte cap), which leaves the permalink as
+  the only durable handle on a post's pictures. So an expired post is displayed
+  by FRAMING it: `plugins/post.php?href=<permalink>`, Facebook's own embed,
+  which renders live and mints fresh URLs on every view. The card decides which
+  to show by READING `oe` — an expiry that is in the link needs no request to
+  check — and falls back to the frame on `onError` too. Two consequences that
+  must not be "simplified" away: the permalink is stripped of its `__cft__` /
+  `__tn__` click-tracking payload before it reaches the plugin, and the frames
+  are mounted lazily (IntersectionObserver), because each one is a real
+  Facebook page load and a feed holds many cards.
+- **The DOM path must still carry the post's FACTS.** The Favorites feed lands
+  on the DOM fallback whenever the graphql capture comes back empty, so "the
+  DOM can't give us that" is not an acceptable shape for the data the operator
+  reads. It reads the timestamp from the permalink anchor (`aria-label`, its
+  own text, or a legacy `[data-utime]`), the counts from the reaction
+  `aria-label` and the comment/share text, the byline from
+  `[data-ad-rendering-role="profile_name"]` (Facebook's own label for it), and
+  it expands every "See more" before reading the body — a local text toggle,
+  not a navigation or a write. An unreadable time stays **None**: a missing
+  state is a state, and a guessed timestamp would poison `lag_ms`. Times parsed
+  from a date with no timezone are clamped to never exceed the collection time.
+  (Paid for: the first 160 favorites posts stored no time, no counts, no author
+  name and a body cut at "See more", 2026-09-02.)
+- **Post media is what the post shows, not what the page renders.** Facebook
+  declares each image's rendered box in the URL (`stp`/`ctp`/`cstp`, e.g.
+  `s960x960`, `p32x32`), so anything whose largest declared box is <= 100px is
+  an avatar or a reaction glyph and is NOT media; `static.xx.fbcdn.net`,
+  `emoji.php`, `rsrc.php` and `safe_image.php` are chrome by host or path. An
+  image with no declared box is a full-size original and is kept. A post whose
+  permalink is a reel or a video is typed **video** however its thumbnail was
+  found — the old code labelled those `photo`, which offered a still frame and
+  called it the post. (Paid for: an emoji sprite stored as a photo, 2026-09-02.)
 - **Use a DESKTOP user-agent. Never switch it to mobile.** A mobile UA makes
   Facebook serve the "WebLite/Bloks" shell — post text and images render, but
   there is no post JSON and no `role="article"`, so BOTH extraction paths get

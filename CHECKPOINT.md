@@ -19,6 +19,93 @@ must respect belongs in the rulebook, not here.
 
 ---
 
+## 2026-09-02 — Facebook: expired media, a DOM path that dropped the facts, and a dead Favorites button
+
+**Changed**
+
+- `frontend/src/components/PostCard.jsx` — reads the `oe=` expiry out of a
+  stored fbcdn URL and, when it has passed (or the image errors), renders
+  Facebook's own post embed for that post's permalink instead of a dead
+  thumbnail. Frames mount lazily via `IntersectionObserver`; the permalink is
+  stripped of `__cft__`/`__tn__`; "Download media" is hidden on framed cards.
+- `frontend/src/styles.css` — `.card.fbframe` widens the media track to 348px
+  for framed cards; `.fb-embed` (420px, 620px for reels/videos), both collapsed
+  to one column on narrow screens.
+- `frontend/src/views/Watchlists.jsx` — "Fetch Favorites feed" is no longer
+  disabled when the watchlist holds zero pages.
+- `engine_fb.py` — the DOM fallback now returns `author_avatar`, `time_text`,
+  `utime` and `counts_raw`, and expands every "See more" before reading the
+  body. New pure helpers `_time_ms`, `_is_post_image`, `_clean_media`; the
+  existing `_num` gained a loose fallback so it can read a count out of a label
+  ("1.2K reactions"). All three build paths run media through `_clean_media`,
+  and `_build_feed` attributes a post from its permalink when the byline link
+  is missing rather than dropping it.
+- `RULEBOOK.md` §6 — four Facebook rules: favorites needs no page rows, the
+  fbcdn link is perishable while the permalink is durable, the DOM path carries
+  the facts, and post media is what the post shows.
+
+**Why**
+
+Images had stopped rendering on saved Facebook posts. The cause is not our
+markup: Facebook signs every fbcdn URL with an expiry inside the URL, and the
+sampled post from `fb_pages` (collected 13 Aug) carried `oe=6A842163` =
+18 Aug 09:09 UTC. Opening it returns the plain text "URL signature expired".
+So the links in the database were already dead and nothing on the render side
+could have fixed them — the only durable handle we hold on a post's pictures is
+its permalink, which is what the embed frame renders. We store no bytes by
+choice (the engine blocks image/media/font under the byte cap), so framing is
+the whole answer rather than a fallback.
+
+Reading the same API response showed the rest: `created_at`, `like_count`,
+`reply_count` and `retweet_count` were null on every one of the four sampled
+posts, `author_display_name` was the handle, text ended at "… See more", and
+one "photo" was a Facebook emoji sprite. That is the DOM fallback's output —
+the Favorites feed had been landing there — and it had been written as a
+last-resort shape that stored almost nothing.
+
+And the operator could not re-fetch to test any of it: both fetch buttons were
+disabled because the watchlist holds 0 pages, though favorites mode reads the
+account's own feed and needs none.
+
+**Verified**
+
+- The expiry claim, from the source: the stored URL opened in a browser returns
+  "URL signature expired", and `fbExpiryMs` decodes its `oe` to
+  2026-08-18T09:09:55Z — 5 days after collection.
+- The embed renders what the dead link cannot: `plugins/post.php` on the
+  Fadnavis permalink (collected 13 Aug) shows the byline, the text and all five
+  photographs; the Amit Shah `/reel/` permalink plays.
+- `_num` / `_time_ms` / `_is_post_image` / `_clean_media` — 21/21 against
+  labels, relative and absolute times, `data-utime`, junk input, avatars, the
+  emoji sprite, a full-size original, reel typing and dedupe. `_time_ms` was
+  checked to never return a future time.
+- `fbExpiryMs` / `fbLinkDead` / `fbEmbedHref` — 10/10 from the shipped
+  PostCard.jsx source, including the real expired URL, an unsigned URL (NOT
+  dead), a garbage `oe`, and `__cft__` stripping on post, reel and story URLs.
+- `node --check` on the extractor JS; `ast.parse` on `engine_fb.py`;
+  `frontend/dist` rebuilt (`index-TTHc9DVQ.js`, `index-CyR8QxWa.css`).
+- The frame was measured in place, not assumed: a mock card at the real grid
+  (`minmax(0,1fr) 348px`) with the live embed showed the plugin renders the
+  byline and caption above the pictures — it ignores `show_text=false` for
+  photo posts — so 420px cut a five-photo grid in half. `.fb-embed` is 540px
+  because that is what fit.
+
+**Still open**
+
+- Not run against live Facebook: the extractor changes need one `Fetch
+  Favorites feed` on the server to confirm time/counts/author actually land.
+  Until then the DOM path's new fields are verified only offline.
+- The 160 posts already collected keep their dead links; they render through
+  the frame, but their stored `created_ms`/counts stay null — a re-fetch does
+  not revisit them (dedup refuses them by id and signature).
+- `frontend/dist/assets/` still holds the two previous bundle files: the remote
+  bridge can create and overwrite but not delete. Remove
+  `index-BlhS2xKy.css`, `index-DQop_0GD.js`, `index-BN-YsL7z.js` and
+  `index-De-hU1zQ.css` locally when convenient; `index.html` points at the
+  current pair.
+
+---
+
 ## 2026-08-31 (later) — all three Instagram accounts were active at once
 
 **Changed**

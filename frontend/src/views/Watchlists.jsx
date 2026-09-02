@@ -825,10 +825,16 @@ function FbDetail({ pid, data, reload, gotoSettings }) {
                 onClick={run(api.fbFetch)}>
           {fetching ? "Fetching…" : "Fetch now"}
         </button>
+        {/* NOT gated on sources.length. Favorites mode reads the collector
+            account's OWN Favorites feed on Facebook and attributes each post to
+            whichever page wrote it — the pages live in that account, not in this
+            watchlist. Requiring a page row here disabled the one button that
+            works without page rows, which is how a project in favorites mode
+            with 0 pages ended up unable to fetch at all. */}
         <button className="btn btn-ghost btn-sm"
-                disabled={fetching || paused || sources.length === 0}
+                disabled={fetching || paused}
                 onClick={run(api.fbFavorites, true)}
-                title="Read the account's Favorites feed once — richer data, one pass">
+                title="Read the account's Favorites feed once — richer data, one pass. Needs no pages here.">
           {fetching ? "…" : "Fetch Favorites feed"}
         </button>
         <span className="grow" />
