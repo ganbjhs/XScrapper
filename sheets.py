@@ -45,6 +45,8 @@ SETUP, ONCE
 
 import base64
 import json
+
+import fb_media
 import os
 import time
 
@@ -262,7 +264,9 @@ def fmt_media(row: dict) -> str:
         media = json.loads(row.get("media_json") or "[]")
     except (TypeError, ValueError):
         media = []
-    urls = [m.get("url") for m in media
+    # Absolutized: a Facebook picture now lives on our own host under a
+    # relative path, and a relative path in a spreadsheet cell is not a link.
+    urls = [m.get("url") for m in fb_media.absolutize(media)
             if isinstance(m, dict) and m.get("url")]
     if not urls:
         try:

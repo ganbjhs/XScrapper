@@ -40,6 +40,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import unquote
 
+import fb_media
 import store as store_mod
 
 # --------------------------------------------------------------------------
@@ -1172,6 +1173,23 @@ def _add_account(body):
 # --------------------------------------------------------------------------
 # stream settings, removal, and Telegram
 # --------------------------------------------------------------------------
+
+_FB_MEDIA = None
+
+
+def _fb_media_store():
+    """The Facebook media store, opened once per process.
+
+    Returns None if it cannot be opened — a dashboard that cannot serve stored
+    pictures must still serve everything else."""
+    global _FB_MEDIA
+    if _FB_MEDIA is None:
+        try:
+            _FB_MEDIA = fb_media.MediaStore(_CFG.root)
+        except Exception:
+            return None
+    return _FB_MEDIA
+
 
 def _with_store(fn):
     """Run one coroutine against a writable Store. The read path stays read-only."""
@@ -5132,6 +5150,38 @@ class Handler(BaseHTTPRequestHandler):
         ctype = _STATIC_TYPES.get(target.suffix.lower(), "application/octet-stream")
         return self._send(200, target.read_bytes(), ctype)
 
+    def _serve_fb_media(self, path: str):
+        """Stored Facebook picture bytes. No session required, on purpose.
+
+        Facebook signs its image URLs with a ~5-day expiry, so the collector
+        keeps the bytes (`fb_media.py`) and everything downstream points here
+        instead. The readers are exactly the parties that do NOT hold our
+        cookie: Watch-Tower rendering a delivered post, the Sheets export, an
+        email preview. Gating this on the dashboard session would break all
+        three, and gating it on the API key would stop a plain <img> from
+        working at all.
+
+        What protects it is the URL: a 64-hex content hash that cannot be
+        guessed, nothing lists the directory, and the bytes are a picture from
+        a public Facebook post. Operator's decision, 2026-09-02.
+
+        `store.resolve` accepts ONLY the exact shape we mint, so no request
+        here can name a file we did not put there."""
+        try:
+            store = _fb_media_store()
+            f = store.resolve(path[len("/media/fb/"):]) if store else None
+        except Exception:
+            f = None
+        if f is None:
+            return self._send(404, {"error": "not found"})
+        ctype = {"jpg": "image/jpeg", "png": "image/png",
+                 "webp": "image/webp", "gif": "image/gif"}.get(
+                     f.suffix.lstrip("."), "application/octet-stream")
+        # Content-addressed: the bytes under this name can never change, so it
+        # is cacheable forever and a repeat view costs nothing.
+        return self._send(200, f.read_bytes(), ctype,
+                          extra={"Cache-Control": "public, max-age=31536000, immutable"})
+
     def _send(self, code, body, ctype="application/json; charset=utf-8", extra=None):
         if isinstance(body, (dict, list)):
             body = json.dumps(body, ensure_ascii=False)
@@ -5141,7 +5191,12 @@ class Handler(BaseHTTPRequestHandler):
         # Content-Length still describes the body a GET would return; that is
         # what HEAD is for. Only the bytes are withheld.
         self.send_header("Content-Length", str(len(data)))
-        self.send_header("Cache-Control", "no-store")
+        # no-store is right for everything this server answers EXCEPT the
+        # content-addressed media route, whose bytes can never change. Sending
+        # both headers would leave the browser to pick, so a caller that names
+        # its own Cache-Control replaces this one rather than fighting it.
+        if not any(k.lower() == "cache-control" for k in (extra or {})):
+            self.send_header("Cache-Control", "no-store")
         for k, v in (extra or {}).items():
             self.send_header(k, v)
         self.end_headers()
@@ -5173,6 +5228,9 @@ class Handler(BaseHTTPRequestHandler):
                 return self._send(200, self._login_html(), "text/html; charset=utf-8")
             if u.path == "/logout":
                 return self._do_logout()
+            # BEFORE the auth gate, deliberately — see _serve_fb_media.
+            if u.path.startswith("/media/fb/"):
+                return self._serve_fb_media(u.path)
             if not self._require_auth():
                 return
             # The React app (frontend/dist, served under /app) IS the dashboard

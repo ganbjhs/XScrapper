@@ -740,22 +740,48 @@ before changing the engine; nearly every "obvious" idea has been tried.)
   UI switched off (paid for: `fb_pages`, 160 posts collected, 0 pages, both
   fetch buttons dead, 2026-09-02). "Fetch now" is per-page and IS correctly
   gated; the two buttons do not share a condition.
-- **A saved fbcdn link is perishable; the PERMALINK is the durable one.**
-  Every Facebook image URL is signed and carries its own expiry in the query
-  string as `oe=<hex epoch>` — about five days out. After that the identical
-  URL returns "URL signature expired", so a stored thumbnail dies where it
-  sits, and no proxy, referer or cache-buster revives it: only Facebook can
-  mint a new signature. We deliberately store no image bytes (the engine blocks
-  image/media/font to stay inside the byte cap), which leaves the permalink as
-  the only durable handle on a post's pictures. So an expired post is displayed
-  by FRAMING it: `plugins/post.php?href=<permalink>`, Facebook's own embed,
-  which renders live and mints fresh URLs on every view. The card decides which
-  to show by READING `oe` — an expiry that is in the link needs no request to
-  check — and falls back to the frame on `onError` too. Two consequences that
-  must not be "simplified" away: the permalink is stripped of its `__cft__` /
-  `__tn__` click-tracking payload before it reaches the plugin, and the frames
-  are mounted lazily (IntersectionObserver), because each one is a real
-  Facebook page load and a feed holds many cards.
+- **A saved fbcdn link is perishable — KEEP THE BYTES, not the link.** Every
+  Facebook image URL is signed and carries its own expiry in the query string
+  as `oe=<hex epoch>`, about five days out; after that the identical URL
+  returns "URL signature expired", and no proxy, referer or cache-buster
+  revives it. This is not only a rendering problem: `webhook.py` and
+  `sheets.py` both ship `media[].url` verbatim, so every delivery was handing
+  Watch-Tower links that rot in its hands a few days later. So the collector
+  downloads each picture ONCE, inside the run that found the post, through the
+  browser context's own `request` (cookies shared, route-blocking bypassed,
+  bytes added to `self._bytes` so the monthly cap still governs), stores it
+  under the sha256 of its content, and rewrites `media[].url`/`thumb` to
+  `/media/fb/<aa>/<hash>.<ext>` BEFORE the post is stored. Every consumer —
+  feed, webhook, Sheets, Watch-Tower — then holds a URL that cannot expire,
+  and none of them changed to get it. The original link is kept as `src`: it
+  is provenance, not a fallback.
+- **The media route is public by URL, and that is deliberate.**
+  `/media/fb/...` answers before the auth gate because the parties that render
+  it — Watch-Tower, a Sheets cell, an email preview — hold neither our cookie
+  nor our API key, and an `<img>` cannot send one. What protects it is a
+  64-hex content hash nobody can guess, no directory listing, and content that
+  was already public on Facebook (operator's decision, 2026-09-02).
+  `MediaStore.resolve` accepts ONLY the exact shape we mint — 2-char shard,
+  64 hex, known extension, shard matching the hash — so a request can never
+  name a file we did not put there. Set `PUBLIC_BASE_URL`: deliveries leave
+  this machine, and a relative path is unfetchable to a receiver; unset, they
+  degrade to Facebook's expiring links.
+- **Eviction is implemented and OFF.** `FB_MEDIA_CAP_GB` is unset by default
+  (operator's decision, 2026-09-02: the disk is ample). When set, `sweep()`
+  evicts oldest-first after every run. Turning it on is a variable, never a
+  code change.
+- **The embed frame is the FALLBACK, not the design.** A post whose bytes we
+  never held — collected before the store existed, or evicted — is shown by
+  framing `plugins/post.php?href=<permalink>`, which renders live and mints
+  fresh URLs. Two consequences that must not be "simplified" away: the
+  permalink is stripped of its `__cft__`/`__tn__` click-tracking payload
+  before it reaches the plugin, and frames mount lazily
+  (IntersectionObserver), because each is a real Facebook page load and a feed
+  holds many cards. Do NOT extend the frame to new posts: it is Facebook's
+  card inside ours (it breaks the one post shape, §2) and it delivers nothing
+  downstream — an iframe has no URL to send. `tools/fb_media_backfill.py`
+  re-harvests old posts through that same public embed so they end up in the
+  store like everything else.
 - **The DOM path must still carry the post's FACTS.** The Favorites feed lands
   on the DOM fallback whenever the graphql capture comes back empty, so "the
   DOM can't give us that" is not an acceptable shape for the data the operator

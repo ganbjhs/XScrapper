@@ -31,6 +31,8 @@ import asyncio
 import hashlib
 import hmac
 import json
+
+import fb_media
 import os
 import time
 
@@ -114,8 +116,12 @@ def _tweet_json(row: dict, labels: list) -> dict:
     # meant the receiver could never show an image or a video still without
     # re-deriving it, which Watch-Tower rightly does not do. Same degrade-to-[]
     # rule as the other JSON columns: a malformed row must not stop delivery.
+    # Facebook media is served from OUR host now (the fbcdn links Facebook
+    # signs expire in about five days, so a receiver was being handed rot).
+    # Those paths are relative, and a relative path means nothing on Watch-
+    # Tower's machine — absolutize before it leaves the building.
     try:
-        out["media"] = json.loads(row.get("media_json") or "[]")
+        out["media"] = fb_media.absolutize(json.loads(row.get("media_json") or "[]"))
     except (TypeError, ValueError):
         out["media"] = []
     for k in ("is_retweet", "is_reply", "is_quote"):

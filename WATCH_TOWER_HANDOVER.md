@@ -61,7 +61,18 @@ Notes on the shape:
   parsing them as numbers silently corrupts them.
 - **`media`** is the structured view — `type` is `photo | video | gif`;
   videos carry both the mp4 (`url`) and a lightweight still (`thumb`).
-  Render the thumb, lazy-load the mp4. All URLs are X's own CDN.
+  Render the thumb, lazy-load the mp4.
+- **Where those URLs point depends on the platform, and one of them is ours.**
+  X and Instagram media are those platforms' own CDNs. **Facebook media is
+  served from the Collector**, e.g.
+  `https://scraper.vedictech.in/media/fb/3f/<64-hex>.jpg` — because Facebook
+  signs its image URLs with a ~5-day expiry, so a link we forwarded would have
+  died in your hands within the week. We download the bytes at collection time
+  and serve our own copy: no session, no key, cacheable forever (the name is
+  the hash of the content, so it can never change). A Facebook item may also
+  carry `src`, the original Facebook URL the bytes came from — provenance
+  only, and expired by the time you read it. If you mirror media on your side,
+  mirror ours the same way you would any CDN.
 - `media_urls` is a legacy flat list; prefer `media`.
 
 ## Headers, and how to verify a delivery

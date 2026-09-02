@@ -19,6 +19,72 @@ must respect belongs in the rulebook, not here.
 
 ---
 
+## 2026-09-02 (later) — Facebook media is stored, not linked; delivery stops rotting
+
+**Changed**
+
+- `fb_media.py` (new) — a content-addressed byte store: `put()` dedupes on
+  sha256 and returns `/media/fb/<aa>/<hash>.<ext>`, `resolve()` accepts only
+  that exact shape, `sweep()` evicts oldest-first under `FB_MEDIA_CAP_GB`
+  (unset = no limit), `absolutize()` rewrites our paths for delivery.
+- `engine_fb.py` — `_cache_media()` / `_fetch_image()`, called at the end of
+  both `fetch_page` and `fetch_favorites`: each picture is downloaded through
+  `self._ctx.request` (browser cookies, bypasses the image-blocking route),
+  counted into `self._bytes`, stored, and the item rewritten to our path with
+  the Facebook URL kept as `src`. Failure never fails the run.
+- `web.py` — `/media/fb/...` served BEFORE the auth gate, immutable cache
+  headers; `_send` no longer forces `no-store` when a caller names its own
+  `Cache-Control`.
+- `webhook.py`, `sheets.py` — media absolutized against `PUBLIC_BASE_URL` on
+  the way out.
+- `tools/fb_media_backfill.py` (new) — re-harvests posts collected before the
+  store existed through Facebook's PUBLIC embed page, which mints fresh image
+  URLs, and rewrites their rows.
+- `tests/test_fb_media.py` (new), `.env.example`, `RULEBOOK.md` §6.
+
+**Why**
+
+The embed frame shipped earlier the same day made the dashboard show pictures
+again, but the operator named its two real faults: it is Facebook's card
+inside ours (it breaks the one post shape, §2), and it carries nothing to
+Watch-Tower — an iframe has no URL to deliver. Checking the delivery path
+confirmed the second point was already a live defect rather than a new one:
+`webhook.py` sends `media[].url` verbatim and `sheets.py` writes the same URLs
+into the media column, so every Facebook delivery had been handing receivers
+links that expire in about five days. Only holding the bytes fixes both.
+
+**Verified**
+
+- `tests/test_fb_media.py` — **48/48**: chrome vs post media (emoji sprite,
+  avatar, full-size original), reel typing, dedupe and the six-item cap, count
+  and time parsing, store dedupe/refusals, seven malformed media paths refused
+  by `resolve` (traversal, wrong shard, unknown extension, `.php`), eviction
+  order, and delivery absolutization including the no-base fallback and other
+  platforms passing through untouched.
+- The backfill's premise was tested against the live embed before the tool was
+  written: the public `plugins/post.php` page for the Fadnavis post (whose
+  stored links are dead) carries 7 fbcdn images, 6 freshly signed, the post
+  photos at 500-850px — big enough for the card and a lightbox.
+- `embed_href` on real stored URLs strips `__cft__`/`__tn__` from post, reel
+  and `story.php` shapes while keeping `story_fbid`/`id`.
+- `ast.parse` on all five changed modules; `python3 tests/test_fb_media.py`
+  runs on 3.10 (imports neither `config` nor playwright).
+
+**Still open**
+
+- Nothing here has run against live Facebook: `_cache_media` needs one fetch
+  on the server, and the backfill needs `--dry-run` then a small `--limit`
+  before the full pass.
+- `PUBLIC_BASE_URL` was set in `.env` to `https://scraper.vedictech.in`.
+  If the dashboard ever moves, delivered media URLs move with it — old
+  deliveries keep pointing at the old host.
+- nginx proxies `/media/fb/` to the app like everything else. Serving it from
+  disk with an `alias` would be faster; not done, because `nginx-app.conf` is
+  rewritten by `setup.sh` and the install path is not knowable from here.
+- Videos store the still only; playback stays on the permalink.
+
+---
+
 ## 2026-09-02 — Facebook: expired media, a DOM path that dropped the facts, and a dead Favorites button
 
 **Changed**

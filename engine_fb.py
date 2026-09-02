@@ -31,6 +31,9 @@ import random
 import re
 import sqlite3
 import time
+from pathlib import Path
+
+import fb_media
 
 # A DESKTOP user-agent, deliberately. A mobile UA makes Facebook serve the
 # "WebLite/Bloks" shell — content renders, but every post is a tap-to-open
@@ -874,6 +877,10 @@ class FacebookEngine:
         self.email = os.getenv("FB_EMAIL", "").strip()
         self.password = os.getenv("FB_PASSWORD", "")
         self.on_favorites = False   # set by fetch_favorites: did we reach the feed
+        # The media store sits beside the meter db — same install directory,
+        # no new configuration to get wrong. FB_MEDIA=0 turns caching off.
+        self.media_root = Path(self.meter_db).resolve().parent
+        self.cache_media = os.getenv("FB_MEDIA", "1") != "0"
         self._pw = self._browser = self._ctx = self._page = None
 
     async def __aenter__(self):
@@ -1117,6 +1124,73 @@ class FacebookEngine:
         self.log("[fb] logged in with password; session saved")
         return True
 
+    async def _cache_media(self, posts):
+        """Download each post's pictures NOW, while their signatures are alive.
+
+        This is the whole answer to expiring media, and it has to happen here —
+        inside the run that found the post — because an fbcdn URL is signed and
+        dies about five days later (`oe=<hex epoch>` in the URL says exactly
+        when). Fetching later means fetching nothing.
+
+        The bytes come through `self._ctx.request`, which shares the browser's
+        cookies but bypasses the route handler that blocks image loading during
+        the page render — so the page stays cheap and only the pictures we
+        actually keep are paid for. Every byte is added to `self._bytes`, which
+        is what the monthly cap counts, so this cannot escape the cap.
+
+        Each item keeps `src`: the original Facebook URL the bytes came from.
+        It is dead within the week, and that is fine — it is provenance, not a
+        fallback. A video keeps its `url` (the playable stream) and gets a
+        cached `thumb`; a photo has both rewritten to the stored copy.
+
+        A failure here NEVER fails the run: the post is still worth having with
+        an expiring link, which is what it had before this existed."""
+        if not posts or not self.cache_media:
+            return posts
+        try:
+            store = fb_media.MediaStore(self.media_root)
+        except Exception as e:
+            self.log(f"[fb] media store unavailable ({type(e).__name__}: {e}) — "
+                     f"keeping Facebook's own links")
+            return posts
+        got = missed = 0
+        for post in posts:
+            for m in (post.get("media") or []):
+                is_video = m.get("type") == "video"
+                src = (m.get("thumb") if is_video
+                       else (m.get("url") or m.get("thumb"))) or ""
+                if not src.startswith("http") or fb_media.URL_PREFIX in src:
+                    continue
+                local = await self._fetch_image(store, src)
+                if not local:
+                    missed += 1
+                    continue
+                m["src"] = src
+                m["thumb"] = local
+                if not is_video:
+                    m["url"] = local
+                got += 1
+        if got or missed:
+            self.log(f"[fb] media cached: {got} stored, {missed} failed, "
+                     f"{store.total_bytes()//1024} KB held")
+        evicted = store.sweep()
+        if evicted:
+            self.log(f"[fb] media sweep: evicted {evicted} oldest files "
+                     f"(FB_MEDIA_CAP_GB={os.getenv('FB_MEDIA_CAP_GB')})")
+        return posts
+
+    async def _fetch_image(self, store, url):
+        """One image, or None. Never raises — see _cache_media."""
+        try:
+            resp = await self._ctx.request.get(url, timeout=20000)
+            if not resp.ok:
+                return None
+            body = await resp.body()
+            self._bytes += len(body)
+            return store.put(body, resp.headers.get("content-type", ""), url)
+        except Exception:
+            return None
+
     def _build_from_json(self, handle, items):
         """Records from the JSON path — a real post_id is enough (no permalink
         needed); synthesize a URL if Facebook didn't give one."""
@@ -1280,6 +1354,7 @@ class FacebookEngine:
         except Exception as e:
             self.log(f"[fb] fetch {handle} failed: {type(e).__name__}: {e}")
 
+        posts = await self._cache_media(posts)
         _record_bytes(self.meter_db, self._bytes)
         await self._save_state()
 
@@ -1375,6 +1450,7 @@ class FacebookEngine:
         except Exception as e:
             self.log(f"[fb] favorites failed: {type(e).__name__}: {e}")
 
+        posts = await self._cache_media(posts)
         _record_bytes(self.meter_db, self._bytes)
         await self._save_state()
         authors = sorted({p["page"] for p in posts})
