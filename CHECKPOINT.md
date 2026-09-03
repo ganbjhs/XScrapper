@@ -82,6 +82,37 @@ belt-and-braces to X's hints.
 
 ---
 
+## 2026-09-03 (III) — one refusal ends the asking: the lookup breaker
+
+**Changed**
+
+- `decider.py` — rule `lookup_throttled` (scope `account/lookups`, action
+  HOLD 6h→12h→24h, admin told on the 2nd consecutive refusal, actions
+  `retry` / `resolve`); `Decider.fold()` closes per-handle cards a broader
+  condition now covers.
+- `collect_ig.py` — `_decide_exc` maps a `ResolveError` with `why` in
+  (`rate_limited`, `blocked`) to the account condition (pending handles in
+  meta); the pass stops asking for the remaining handles; while the hold is
+  open no lookup is made from that account (following list included);
+  a lookup that works again (`resolve_from_following` hit, or a previously
+  unresolved source collecting) closes it.
+- `web.py` — `POST /api/decider {action: retry}` (resolve; next pass probes
+  once). `Accounts.jsx` — "Name lookups refused — held" card, pending list,
+  "Retry lookups now". `frontend/dist` → `index-DzUuAiCd.js`.
+- `tests/test_all.py` — 12 checks in `test_pager` (861 pass; `test_facebook`
+  still the pre-existing red). `RULEBOOK.md` §6.
+
+**Why**
+
+The Fix panel showed eight identical "Handle needs its numeric id" cards on
+@youssefnasser168, opened one to two minutes apart — one per handle, each
+"seen 1×", each a 429. The refusal was the session's, not the handle's, so
+every ask was wasted and prolonged the throttle. The operator's rule, now
+the decider's: the same refusal twice with no move left means stop and
+wait for a human, not knock again.
+
+---
+
 ## 2026-09-03 (II) — the pager: ping with a link, otherwise fix it yourself
 
 **Changed**

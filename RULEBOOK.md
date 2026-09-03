@@ -710,6 +710,25 @@ single request. These are hard rules, not tuning:
   untouched, §2). A clean collect of that source later closes it. Note that
   name lookup is the permission a restricted session loses first, so the
   cure is often a cleaner account, not a hand-typed id.
+- **A refused lookup is the SESSION's condition, and the first refusal
+  ends the asking (`lookup_throttled`, 2026-09-03 evening).** Eight sources
+  on one account produced eight "handle needs its id" cards in thirteen
+  minutes, one per human-paced gap — the 429 was per session, every next
+  handle got the same answer, and every ask extended the throttle. Now a
+  `ResolveError` with `why` in (`rate_limited`, `blocked`) opens ONE
+  condition on `account/lookups` (`Decision.kind == "lookup_throttled"`),
+  the pass stops asking for the remaining handles, per-handle 429 cards are
+  folded into it (`Decider.fold`), and while it is open no lookup at all is
+  made from that account — not the following list either. Sources that
+  already have an id collect as usual. It is probed once after 6h, 12h,
+  then daily; the admin is told on the second consecutive refusal, and from
+  then on it is one request a day until Instagram relents, the proxy is set,
+  or the operator presses "Retry lookups now" (resolve; the next pass probes
+  once, the count restarts). A 404 (`not_found`) stays per handle — that is
+  the handle being wrong. The general form, which is the operator's rule:
+  when the same refusal comes back and the decider has no move left, it
+  STOPS and waits for a human; it does not keep knocking. Test: `test_pager`
+  ("lookups refused once").
 - **A refused name lookup is never asked again on the next pass.** The id
   behind a handle is PERMANENT — it survives renames — so resolving it is a
   one-time cost, and a lookup that failed a few minutes ago will fail again

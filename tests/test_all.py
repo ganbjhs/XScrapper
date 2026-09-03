@@ -3914,6 +3914,50 @@ def test_pager(tmp):
         ok(d.action == "skip" and d.cond_id.endswith("/Bhajanlal Sharma:unresolved_source"),
            "_decide_exc files a resolve failure under the source")
 
+        # the account-level breaker: a 429 on ONE handle holds every lookup on
+        # the account, folds the per-handle cards into one, and stops the pass
+        # from asking for the rest
+        print()
+        print("== lookups refused once → one account condition, no more asking ==")
+        import engine_ig
+        class S2:
+            def __init__(self, label, value, pid=""):
+                self.label, self.value, self.platform_id, self.type = label, value, pid, "user"
+        grp = [S2("A", "a_news"), S2("B", "b_news"), S2("C", "c_news", pid="99")]
+        lines.clear(); sent.clear()
+        dec3 = decider.Decider("instagram", log=lines.append, db=None, notify=rec, now=now)
+        # two per-handle 429 cards already open (what the old code left behind)
+        for lab, val in (("A", "a_news"), ("B", "b_news")):
+            dec3.on("unresolved_source", "yn", detail=val, source=lab, meta={"label": lab, "why": "rate_limited"})
+        ok(len(dec3.open_conditions()) == 2, "two per-handle cards to start with")
+        e = engine_ig.ResolveError("could not resolve the username 'a_news' to a numeric id. Instagram is throttling name lookups from this session (429).", why="rate_limited")
+        d = collect_ig._decide_exc(dec3, "yn", grp, e, fallback="pass_error", log=lines.append, src=grp[0])
+        ok(d.kind == "lookup_throttled" and d.action == "hold" and d.wait_s == 6 * 3600,
+           "one refusal → HOLD on the account for 6h")
+        oc = dec3.open_conditions()
+        ok([c["kind"] for c in oc] == ["lookup_throttled"], f"the two per-handle cards folded into one account card: {[c['kind'] for c in oc]}")
+        ok(oc[0]["meta"]["pending"] == ["A", "B"] and oc[0]["source"] == "lookups",
+           "the account card lists the handles still waiting; C (has an id) is not among them")
+        ok(any("folded into 'lookup_throttled'" in l for l in lines), "the fold is logged once")
+        ok(dec3.holdoff("yn", "lookups") > 0 and dec3.holdoff("yn", "C") == 0,
+           "holdoff answers for the account's lookups, not for sources that have ids")
+        ok(sent == [], "first refusal does not page")
+        d = collect_ig._decide_exc(dec3, "yn", grp, e, fallback="pass_error", log=lines.append, src=grp[1])
+        ok(d.wait_s == 12 * 3600 and len(sent) == 1 and "probed once a day" in sent[0]
+           and "?fix=instagram:yn/lookups:lookup_throttled" in sent[0],
+           "second refusal in a row: 12h hold and the admin is told, with a link")
+        d = collect_ig._decide_exc(dec3, "yn", grp, e, fallback="pass_error", log=lines.append, src=grp[1])
+        ok(d.wait_s == 24 * 3600 and len(sent) == 1, "then a 24h ceiling — one probe a day, no second page")
+        n = len(lines); dec3.on("lookup_throttled", "yn", source="lookups")
+        ok(len(lines) == n, "a repeat inside the reminder window says nothing")
+        sent.clear(); dec3.ok("yn", source="lookups")
+        ok(len(sent) == 1 and "recovered" in sent[0] and dec3.open_conditions() == [],
+           "a lookup that works again closes it and tells the admin")
+        e2 = engine_ig.ResolveError("could not resolve the username 'zz' to a numeric id. 404 — no such user.", why="not_found")
+        d = collect_ig._decide_exc(dec3, "yn", grp, e2, fallback="pass_error", log=lines.append, src=S2("Z", "zz"))
+        ok(d.kind == "unresolved_source" and dec3.open_conditions()[0]["source"] == "Z",
+           "a 404 stays a per-handle condition (the handle is wrong, not the session)")
+
         # a non-checkpoint exception does not fail over
         with ig.Store("ig_accounts.db") as st:
             st.set_active("locked", True, error="")

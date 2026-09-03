@@ -206,6 +206,39 @@ RULES = {
         "rest", 1 * H, level="info",
         human="",           # by design; a person doesn't open the app 500×/day
     ),
+    "lookup_throttled": Rule(
+        # ONE condition per ACCOUNT (scope account/lookups), not one per
+        # handle. A 429 or a login-bounce on the lookup endpoints is the
+        # SESSION's state: the next handle gets the same answer, and asking
+        # extends the throttle. So the first refusal in a pass stops every
+        # further lookup on that account, the sources that already have ids
+        # keep collecting, and the account is probed again once — after 6h,
+        # then 12h, then daily. The admin is told on the second consecutive
+        # refusal; after that it is one request a day until Instagram
+        # relents, a proxy is set, or the ids are pasted.
+        "hold", 6 * H, max_wait_s=24 * H, escalate_after_n=2, level="warn",
+        loop_wait=False,
+        human="name lookups from @{account} are refused ({detail}) — "
+              "{count} probes in a row. {extra} Sources that already have an "
+              "id keep collecting; the rest wait. The account is probed once "
+              "a day now, no more. Paste ids on the Fix panel for the ones "
+              "you need today, or put the account behind its residential "
+              "proxy so lookups stop being refused.",
+        fix=("Instagram is refusing to translate handles into ids from this "
+             "account's session — a throttle (429) or a login-bounce, which "
+             "is what a datacenter IP gets. Every extra attempt makes it "
+             "last longer, so the collector has stopped asking: at most one "
+             "probe a day from here on.",
+             "Fix the cause: on this account's card, set its residential "
+             "proxy URL (Edit → proxy). Lookups from a residential IP are "
+             "the path that works on restricted sessions.",
+             "Fix the symptom for a handle you need now: open "
+             "https://www.instagram.com/<handle>/ in a browser, view source, "
+             "search \"profile_id\", and Save id on that handle's own card "
+             "(they appear below when a handle is refused on its own)."),
+        actions=("retry", "resolve"),
+        needs_human=True,
+    ),
     "unresolved_source": Rule(
         "skip", 1 * H, max_wait_s=24 * H, escalate_after_n=3, level="warn",
         loop_wait=False,
@@ -836,6 +869,24 @@ class Decider:
 
     def ok(self, account="", source="") -> Decision:
         return self.on("ok", account, source=source)
+
+    def fold(self, account: str, kind: str, into: str, keep=lambda meta: True) -> list:
+        """Close every open per-source `kind` condition on `account` whose meta
+        satisfies `keep`, quietly (one log line), because a broader condition
+        `into` now covers them. This is what turns eight "handle needs its
+        id" cards that all say 429 into one "lookups throttled" card."""
+        gone = []
+        for c in self.open_conditions():
+            if c["account"] != account or c["kind"] != kind or not c["source"]:
+                continue
+            if not keep(c.get("meta") or {}):
+                continue
+            self.state.clear(f"{self.platform}:{_who(account, c['source'])}")
+            gone.append(c["source"])
+        if gone:
+            self._log(f"[{self.platform}@{account}] {len(gone)} '{kind}' "
+                      f"condition(s) folded into '{into}': {', '.join(sorted(gone))}")
+        return gone
 
     def open_conditions(self) -> list:
         return open_conditions(self.platform, state=self.state,

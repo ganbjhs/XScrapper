@@ -4617,6 +4617,12 @@ def _decider_post(body):
     if action == "resolve":
         return decider.resolve(cid, db=adb, who="operator (dashboard)", log=log)
 
+    if action == "retry":
+        # Clears the hold so the next pass probes once. If Instagram still
+        # refuses, the condition reopens — count restarts at 1, so the hold
+        # is 6h again, not the 24h it had climbed to.
+        return decider.resolve(cid, db=adb, who="operator (retry now)", log=log)
+
     if action == "reenable_sources":
         try:
             plat, acct, kind = decider.parse_cond_id(cid)
@@ -4673,7 +4679,7 @@ def _decider_post(body):
         r = decider.resolve(cid, db=adb, who="operator (id pasted)", log=log)
         return {"ok": True, "label": label, "platform_id": pk, **r}
 
-    return {"error": "action must be snooze, resolve, reenable_sources, "
+    return {"error": "action must be snooze, resolve, retry, reenable_sources, "
                      "resume or set_id"}
 
 

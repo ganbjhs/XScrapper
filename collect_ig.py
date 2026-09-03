@@ -155,6 +155,19 @@ def _decide_exc(dec, acct, group, e, *, fallback, log=print, src=None):
         # the Fix panel and the ping as the note.
         first = str(e).split("\n", 1)[0]
         advice = first.split("numeric id. ", 1)[-1] if "numeric id. " in first else ""
+        if why in ("rate_limited", "blocked"):
+            # The SESSION is refusing lookups, not this handle. One
+            # account-level condition, and the caller stops asking for the
+            # rest of the pass (Decision.kind == 'lookup_throttled').
+            pending = sorted(x.label for x in group
+                             if x.type == "user" and not x.platform_id
+                             and not str(x.value).isdigit())
+            dec.fold(acct, "unresolved_source", "lookup_throttled",
+                     keep=lambda m: m.get("why") in ("rate_limited", "blocked"))
+            return dec.on("lookup_throttled", acct, source="lookups",
+                          detail={"rate_limited": "429, throttled",
+                                  "blocked": "bounced to login / 401 — datacenter IP"}[why],
+                          meta={"why": why, "pending": pending, "note": advice})
         return dec.on(kind, acct, detail=src.value or src.label, source=src.label,
                       meta={"label": src.label, "handle": src.value, "why": why,
                             "note": advice})
@@ -312,15 +325,27 @@ async def run_once(store_path="ig_results.db", account_override="", *,
             #      path that always works (engine_ig.resolve_from_following).
             held = set()
             pending = []
-            for s in group:
-                if s.type != "user" or s.platform_id or str(s.value).isdigit():
+            unresolved = [s for s in group
+                          if s.type == "user" and not s.platform_id
+                          and not str(s.value).isdigit()]
+            # The account-level breaker first: while lookups from this
+            # session are refused, NO handle is asked about — not the
+            # following list either. Sources with ids collect as usual.
+            acct_hold = dec.holdoff(acct, "lookups")
+            if acct_hold and unresolved:
+                held.update(s.label for s in unresolved)
+                log(f"  {len(held)} source(s) wait for ids — lookups from @{acct} "
+                    f"are held for {acct_hold // 3600}h {(acct_hold % 3600) // 60:02d}m "
+                    f"more (refused earlier)")
+            for s in unresolved:
+                if s.label in held:
                     continue
                 h = dec.holdoff(acct, s.label)
                 if h > 0:
                     held.add(s.label)
                 else:
                     pending.append(s.value)
-            if held:
+            if held and not acct_hold:
                 log(f"  leaving {len(held)} unresolved source(s) alone this pass "
                     f"({', '.join(sorted(held))}) — hold-off after a refused lookup")
             if pending:
@@ -329,6 +354,8 @@ async def run_once(store_path="ig_results.db", account_override="", *,
                 except Exception as e:
                     got = {}
                     log(f"  following-list lookup failed: {type(e).__name__}: {e}")
+                if got:
+                    dec.ok(acct, source="lookups")      # the session answers again
                 for name, pk in got.items():
                     log(f"  resolved @{name} -> {pk} from @{acct}'s following list")
                     for s in group:
@@ -354,6 +381,8 @@ async def run_once(store_path="ig_results.db", account_override="", *,
                     total += await collect_source(engine, store, s, page_size=page_size,
                                               max_pages=max_pages, log=log)
                     acct_ok = True
+                    if s.label in {x.label for x in unresolved}:
+                        dec.ok(acct, source="lookups")     # a lookup just worked
                     dec.ok(acct, source=s.label)   # closes an unresolved_source, if open
                     if _DAY.remaining(acct, budget) <= 0:
                         log(f"  @{acct}: daily budget reached mid-pass — stopping")
@@ -371,6 +400,15 @@ async def run_once(store_path="ig_results.db", account_override="", *,
                     # account. The decider names it and, when the answer is
                     # "stop touching this account", the pass does.
                     d = _decide_exc(dec, acct, group, e, fallback="pass_error", log=log, src=s)
+                    if d.kind == "lookup_throttled":
+                        rest = [x.label for x in unresolved if x.label not in held
+                                and x.label != s.label]
+                        held.update(rest)
+                        if rest:
+                            log(f"  lookups from @{acct} refused — not asking for the "
+                                f"remaining {len(rest)} handle(s) this pass: "
+                                f"{', '.join(rest)}")
+                        continue
                     if d.stop_account:
                         log(f"  @{acct}: {d.action} — leaving the remaining "
                             f"{len(group) - i - 1} source(s) for the next pass")

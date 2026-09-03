@@ -624,6 +624,7 @@ const KIND_TXT = {
   session_missing: "No saved session",
   session_rejected: "Session rejected",
   unresolved_source: "Handle needs its numeric id",
+  lookup_throttled: "Name lookups refused — held",
   rate_limited: "Rate-limited — backing off by itself",
   pass_error: "Collector crashing",
   paused: "Paused from the dashboard",
@@ -662,7 +663,7 @@ function FixCard({ c, focus, accounts, onAdopt, onChanged, onSignin }) {
            onClick={() => setOpen(!open)}>
         <b>{KIND_TXT[c.kind] || c.kind}</b>
         {c.account && <span className="chip warn">@{c.account}</span>}
-        {c.source && <span className="chip">{c.source}</span>}
+        {c.source && c.source !== "lookups" && <span className="chip">{c.source}</span>}
         <span style={{ color: "var(--ink-3)", fontSize: 12.5 }}>
           open {fmtAgo(c.since_ms)} · seen {c.count}× · {c.needs_human ? "needs you" : "self-healing"}
           {c.notified_ms ? " · pinged" : ""}{snoozed ? " · snoozed" : ""}
@@ -683,6 +684,11 @@ function FixCard({ c, focus, accounts, onAdopt, onChanged, onSignin }) {
           {sources.length > 0 && (
             <div style={{ fontSize: 12.5, color: "var(--ink-3)", marginBottom: 8 }}>
               Sources on this account: {sources.join(", ")}
+            </div>
+          )}
+          {(c.meta?.pending || []).length > 0 && (
+            <div style={{ fontSize: 12.5, color: "var(--ink-3)", marginBottom: 8 }}>
+              Waiting for an id: {c.meta.pending.join(", ")}
             </div>
           )}
 
@@ -716,6 +722,12 @@ function FixCard({ c, focus, accounts, onAdopt, onChanged, onSignin }) {
                   Save id
                 </button>
               </>
+            )}
+            {c.actions.includes("retry") && (
+              <button className="btn btn-sm" disabled={busy}
+                      onClick={() => run({ action: "retry" }, () => "hold cleared — the next pass probes once")}>
+                Retry lookups now
+              </button>
             )}
             {c.actions.includes("resume") && (
               <button className="btn btn-sm" disabled={busy} onClick={() => run({ action: "resume" }, () => "resumed")}>Resume collection</button>
