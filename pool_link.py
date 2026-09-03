@@ -70,7 +70,8 @@ def _norm(s) -> str:
 # have been silent: SecretError, caught below, "no pool", cards blank forever.
 # Nothing here ever needs a secret, so nothing here ever asks for one.
 _COLS = ("account_id", "platform", "label", "login", "status", "health",
-         "last_success_at")
+         "last_success_at", "proxy_id")     # proxy_id is the human LABEL
+                                            # ('resi-in-32'), never the URL
 
 
 class _Row:

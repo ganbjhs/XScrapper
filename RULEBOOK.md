@@ -751,6 +751,44 @@ single request. These are hard rules, not tuning:
   account and ids resolve themselves without touching a lookup endpoint.
   `users/search/` is a fourth door between usernameinfo and the web calls.
   Test: `test_resolve`.
+- **A request that never REACHED Instagram is the PROXY's condition — not
+  the handle's, not the session's (`proxy_broken`, 2026-09-03 night).**
+  Eight "handle needs its numeric id" cards on @shoaibakhtar4915, all
+  `why: unknown`, and the operator pasted an id by hand and got the same
+  card back. The hidden `tried —` line said it: `ClientConnectionError`
+  on the app endpoints, `SSLError` on the web ones — no status code, no
+  answer from Instagram at all. `curl -k -v` through that account's proxy
+  showed the certificate for `*.instagram.com` issued by **Sophos SSL CA**:
+  the residential exit behind webshare session `IN-32` sits behind a
+  firewall that re-signs HTTPS, and the server rightly refuses the forged
+  certificate. Two lessons, both now code. (1) *Classify the pipe before
+  the answer.* `engine_ig.network_why` reads "certificate verify failed" /
+  `SSLError` as `tls_intercepted` and a refused/reset/unreachable
+  connection as `network` BEFORE any 429/401/404 test runs; `resolve_user`
+  stops at the first such failure (the next three doors are the same dead
+  pipe) and its message says a pasted id would NOT help, because the post
+  read leaves through the same proxy. In the decider it is ONE
+  account-level condition, `proxy_broken` (error; `stop_account`; backoff
+  30m→4h; the admin paged at once; Fix steps = the `curl -x` test, what a
+  Sophos/ISP issuer means, change the session number in the proxy
+  username, verify without `-k`, then Retry). `collect_ig._proxy_broken`
+  folds every per-handle card on that account into it — including the
+  `unknown` ones an older collector left — and names the proxy label
+  (`pool_link` now carries `proxy_id`). A `RetryError` that says
+  "too many 429" stays `rate_limited`: that IS an answer. (2) *A silent
+  empty page is a lie.* instagrapi's `user_medias_paginated_v1` catches
+  every non-`PrivateError` exception, logs it to its own logger, and
+  returns `([], None)` — so a dead proxy looked like a quiet account:
+  `new=0 (had watermark=no)` on every pass for sources that HAD ids, and
+  `record_success` stamped "last success 33m ago" on an account that had
+  not stored a post in days. `IGEngine._user_feed_page` now makes the same
+  `feed/user/<pk>/` request directly, so a connection or TLS failure RAISES
+  (`ClientConnectionError` → `proxy_broken`) and "last success" means a
+  request got through. General form: a library that turns an exception
+  into an empty result must not sit under a health signal; and when many
+  cards on one account say the same thing, look for the one cause above
+  them before fixing them one by one. Tests: `test_resolve` ("a dead
+  pipe"), `test_pager` ("a proxy that intercepts TLS").
 - **Exactly one active row, enforced on write.** `ig.Store.save()` and
   `set_active()` demote every other row when they activate one. They did not
   until 2026-08-31, and all three Instagram accounts were live at once on the

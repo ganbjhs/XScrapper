@@ -134,6 +134,40 @@ def ig_failover(quarantined: str, reason: str, *, store_path="ig_accounts.db",
     return ""
 
 
+def _proxy_broken(dec, acct, group, e, why, *, log=print):
+    """One 'proxy_broken' condition on the ACCOUNT, naming the proxy.
+
+    `why` is 'tls_intercepted' (the exit re-signs HTTPS — a Sophos/ISP
+    firewall; the server rightly refuses the forged certificate) or
+    'network' (the connection died before any reply). Every per-handle
+    'unresolved_source' card on this account is folded in — including the
+    ones filed as 'unknown' by a collector that predates this rule, because
+    on an account whose pipe is dead they were all this. If the proxy is
+    fixed and a handle still will not resolve, its own card comes back.
+    """
+    from engine_ig import NETWORK_ADVICE
+    pid = ""
+    try:
+        row = pool_link.find("ig", acct)
+        pid = (getattr(row, "proxy_id", "") or "") if row else ""
+    except Exception:
+        pid = ""
+    where = f"proxy {pid}" if pid else "its proxy"
+    if why == "tls_intercepted":
+        detail = (f"TLS verification failed through {where} — the exit "
+                  f"intercepts HTTPS (\"unable to get local issuer certificate\")")
+    else:
+        detail = f"connection dies through {where} before Instagram answers ({type(e).__name__})"
+    pending = sorted(x.label for x in group
+                     if x.type == "user" and not x.platform_id
+                     and not str(x.value).isdigit())
+    dec.fold(acct, "unresolved_source", "proxy_broken",
+             keep=lambda m: m.get("why") in ("tls_intercepted", "network", "unknown", None))
+    return dec.on("proxy_broken", acct, detail=detail,
+                  meta={"why": why, "proxy": pid, "pending": pending,
+                        "note": NETWORK_ADVICE.get(why, "")})
+
+
 def _decide_exc(dec, acct, group, e, *, fallback, log=print, src=None):
     """Every exception an account throws goes through here, so a checkpoint
     is handled ONE way wherever it surfaces: quarantine in the pool, record
@@ -148,6 +182,19 @@ def _decide_exc(dec, acct, group, e, *, fallback, log=print, src=None):
     kind = decider.classify_exception(e)
     if kind == "pass_error":
         kind = fallback
+    # The request never reached Instagram. Whether it surfaced as a resolve
+    # failure (the lookup was the first request through the dead pipe) or as
+    # a raw connection/TLS error from a post read, it is ONE account
+    # condition — the proxy — and never a per-handle one.
+    net = ""
+    if kind == "unresolved_source":
+        if getattr(e, "why", "") in ("tls_intercepted", "network"):
+            net = e.why
+    elif kind == "proxy_broken":
+        from engine_ig import network_why
+        net = network_why(e) or "network"
+    if net:
+        return _proxy_broken(dec, acct, group, e, net, log=log)
     if kind == "unresolved_source" and src is not None:
         why = getattr(e, "why", "unknown")
         # first line of the engine's message = the advice for THIS kind of

@@ -3958,6 +3958,39 @@ def test_pager(tmp):
         ok(d.kind == "unresolved_source" and dec3.open_conditions()[0]["source"] == "Z",
            "a 404 stays a per-handle condition (the handle is wrong, not the session)")
 
+        print()
+        print("== a proxy that intercepts TLS → ONE account card, the pass stops, the admin is told now ==")
+        lines.clear(); sent.clear()
+        dec4 = decider.Decider("instagram", log=lines.append, db=None, notify=rec, now=now)
+        # what the pre-fix collector left behind: per-handle cards that all say 'unknown'
+        for lab, val in (("A", "a_news"), ("B", "b_news")):
+            dec4.on("unresolved_source", "yn", detail=val, source=lab, meta={"label": lab, "why": "unknown"})
+        e3 = engine_ig.ResolveError("could not resolve the username 'a_news' to a numeric id. Nothing from this account reaches Instagram: ...", why="tls_intercepted")
+        d = collect_ig._decide_exc(dec4, "yn", grp, e3, fallback="pass_error", log=lines.append, src=grp[0])
+        ok(d.kind == "proxy_broken" and d.action == "backoff" and d.wait_s == 30 * 60,
+           f"a resolve failure through a dead pipe is the ACCOUNT's proxy condition: {d.kind} {d.action} {d.wait_s}")
+        ok(d.stop_account, "and the pass stops touching this account — every request is the same dead pipe")
+        oc = dec4.open_conditions()
+        ok([c["kind"] for c in oc] == ["proxy_broken"] and oc[0]["source"] == "",
+           f"the old 'unknown' per-handle cards folded into one account card: {[(c['kind'], c['source']) for c in oc]}")
+        ok(oc[0]["meta"]["why"] == "tls_intercepted" and oc[0]["meta"]["pending"] == ["A", "B"],
+           "the card says why and lists the handles that will resolve once the proxy works")
+        ok("intercepts HTTPS" in oc[0]["detail"] and "TLS" in oc[0]["detail"], f"the detail names the cause: {oc[0]['detail']}")
+        ok(any("curl -x" in st for st in oc[0]["steps"]) and any("Sophos" in st for st in oc[0]["steps"]),
+           "the Fix steps carry the curl test and what an intercepting exit looks like")
+        ok("set_id" not in oc[0]["actions"] and "retry" in oc[0]["actions"], "no 'paste an id' button — it would not help; Retry is offered")
+        ok(len(sent) == 1 and "reaches Instagram" in sent[0] and "?fix=instagram:yn:proxy_broken" in sent[0],
+           f"the admin is told at once, with a link: {sent[:1]}")
+        # a raw connection error from a POST READ (the engine no longer swallows it) lands in the same place
+        from instagrapi.exceptions import ClientConnectionError
+        d = collect_ig._decide_exc(dec4, "yn", grp, ClientConnectionError("ConnectionError: Max retries exceeded (Caused by ProxyError(...))"),
+                                   fallback="pass_error", log=lines.append, src=grp[2])
+        ok(d.kind == "proxy_broken" and d.count == 2 and d.wait_s == 60 * 60,
+           f"a post-read connection error is the same condition, doubling: {d.kind} #{d.count} {d.wait_s}s")
+        sent.clear(); dec4.ok("yn")
+        ok(dec4.open_conditions() == [] and len(sent) == 1 and "recovered" in sent[0],
+           "a pass that gets through closes it and tells the admin")
+
         # a non-checkpoint exception does not fail over
         with ig.Store("ig_accounts.db") as st:
             st.set_active("locked", True, error="")
@@ -4042,6 +4075,43 @@ def test_resolve(tmp):
             ok(e.why == "blocked" and "residential proxy" in str(e), f"blocked → proxy advice ({e.why})")
             ok("HTTPError 401" in str(e) and "TooManyRedirects" in str(e), "attempts carry the status codes")
         ok(calls == ["usernameinfo", "search", "web", "html"], "all four paths tried when none is a 429/404")
+
+        print()
+        print("== a dead pipe (2026-09-03: Sophos MITM on the proxy exit) is named, once ==")
+        # The live failure: instagrapi wraps the TLS verification error as
+        # ClientConnectionError with the SSL text inside; the web paths raise
+        # requests' SSLError. Eight handles, four endpoints each, and every one
+        # was the same forged certificate. It must be read as the proxy, not as
+        # 'unknown' per handle, and it must not knock on the other three doors.
+        calls.clear()
+        from instagrapi.exceptions import ClientConnectionError
+        mitm = ClientConnectionError(
+            "SSLError HTTPSConnectionPool(host='i.instagram.com', port=443): Max retries "
+            "exceeded with url: /api/v1/users/x/usernameinfo/ (Caused by SSLError("
+            "SSLCertVerificationError(1, '[SSL: CERTIFICATE_VERIFY_FAILED] certificate "
+            "verify failed: unable to get local issuer certificate (_ssl.c:1006)')))")
+        ok(engine_ig.network_why(mitm) == "tls_intercepted", "verify-failed inside ClientConnectionError → tls_intercepted")
+        ok(engine_ig.network_why(requests.exceptions.SSLError("bad handshake")) == "tls_intercepted", "requests SSLError → tls_intercepted")
+        ok(engine_ig.network_why(requests.exceptions.ProxyError("Cannot connect to proxy")) == "network", "ProxyError → network")
+        ok(engine_ig.network_why(ClientConnectionError("ConnectionError HTTPSConnectionPool: Max retries exceeded (Caused by NewConnectionError(...))")) == "network",
+           "connection-level ClientConnectionError → network")
+        ok(engine_ig.network_why(http(429)) == "" and engine_ig.network_why(http(401)) == "", "an HTTP answer is not a network failure")
+        ok(engine_ig._why(mitm) == "tls_intercepted", "_why puts the pipe before the status tests")
+        try:
+            engine_ig.IGEngine(FakeCl(first=mitm)).resolve_user("awaj.news"); ok(False, "raises")
+        except engine_ig.ResolveError as e:
+            ok(e.why == "tls_intercepted", f"named tls_intercepted, not unknown ({e.why})")
+            ok("intercepting TLS" in str(e) and "curl -x" in str(e), "the advice names the proxy exit and gives the curl to prove it")
+            ok("would NOT help" in str(e) and "view source" not in str(e),
+               "it does NOT send the operator to paste ids — the post read uses the same pipe")
+        ok(calls == ["usernameinfo"], f"no further doors knocked on through a dead pipe: {calls}")
+        ok(decider.classify_exception(mitm) == "proxy_broken", "a raw ClientConnectionError from a post read → proxy_broken")
+        ok(decider.classify_exception(requests.exceptions.SSLError("x")) == "proxy_broken", "SSLError → proxy_broken")
+        ok(decider.classify_exception(RuntimeError("certificate verify failed: unable to get local issuer certificate")) == "proxy_broken",
+           "the verify-failed text alone is enough")
+        ok(decider.classify_exception(requests.exceptions.RetryError(
+               "Max retries exceeded with url: /x (Caused by ResponseError('too many 429 error responses'))")) == "rate_limited",
+           "three 429s from a post read stay rate_limited — an answer, not a dead pipe")
 
         print()
         print("== 404 is an answer, not an outage ==")

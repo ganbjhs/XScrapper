@@ -63,6 +63,12 @@ What each rule decides, and why — this table IS the decider:
                      response is to wait longer each time.
     budget_spent     rest until tomorrow (the caller knows when tomorrow is;
                      the decision says 1h and the loop re-asks). Say once.
+    proxy_broken     the request never reached Instagram (TLS verification
+                     failed = the proxy exit intercepts HTTPS; or the
+                     connection died first). Stop the pass for this account,
+                     back off 30m doubling to 4h, tell the operator at once,
+                     and fold any per-handle "needs its id" cards into it —
+                     they were all this. Only a proxy change fixes it.
     pass_error       back off 10m, doubling to 1h; tell the operator on the
                      third consecutive occurrence. One exception is weather;
                      three in a row is a broken engine.
@@ -259,6 +265,46 @@ RULES = {
         actions=("set_id", "resolve"),
         needs_human=True,
     ),
+    "proxy_broken": Rule(
+        # ONE condition per ACCOUNT. The request never reached Instagram —
+        # the TLS handshake failed verification (a Sophos/ISP firewall on
+        # the proxy's residential exit re-signing HTTPS) or the connection
+        # died before any reply. This is not a handle problem, not a throttle
+        # and not a checkpoint, and it is the same for EVERY request from the
+        # account (lookups AND post reads), so: stop the pass on this account
+        # at once, fold any per-handle "needs its id" cards into this one,
+        # tell the operator now, and re-probe with one request every 30m,
+        # doubling to 4h. Nothing here self-heals; a person changes the
+        # proxy exit. (Discovered 2026-09-03: eight "handle needs its numeric
+        # id" cards on @shoaibakhtar4915 that were one Sophos MITM on
+        # webshare session IN-32.)
+        "backoff", 30 * 60, max_wait_s=4 * H, escalate_after_s=0,
+        level="error",
+        human="nothing from @{account} reaches Instagram — {detail}.{extra} "
+              "Every source on this account is skipped (ids or not) until "
+              "the proxy is fixed; one probe every 30m, doubling to 4h.",
+        fix=("Every request from @{account} dies on the way to Instagram, "
+             "before Instagram answers: {detail}. So this is NOT a handle "
+             "problem, not a throttle and not a checkpoint — it is the "
+             "proxy. Pasting numeric ids would not help; post reads leave "
+             "through the same pipe.",
+             "Test it on the server exactly as the collector does: "
+             "curl -x '<this account's proxy URL>' -sS -o /dev/null "
+             "-w '%{{http_code}}\\n' https://www.instagram.com/ — you want "
+             "200 or 302.",
+             "\"SSL certificate problem: unable to get local issuer "
+             "certificate\" = that proxy EXIT intercepts HTTPS. Confirm with "
+             "the same curl plus -k -v and read the issuer: line (a Sophos / "
+             "ISP firewall signs it instead of DigiCert). Connection refused "
+             "or 407 = the endpoint or its credentials are dead.",
+             "Fix: Accounts & Sessions → @{account} → Edit → proxy: a "
+             "different exit (change the session number in the proxy "
+             "username, e.g. -IN-32 → -IN-35), re-run the curl until it "
+             "passes without -k, then click Retry. The handles resolve by "
+             "themselves on the next pass."),
+        actions=("retry", "resolve"),
+        needs_human=True,
+    ),
     "pass_error": Rule(
         "backoff", 10 * 60, max_wait_s=1 * H, escalate_after_n=3,
         level="error",
@@ -288,6 +334,18 @@ _EXC_KIND = {
     "ClientThrottledError": "rate_limited",
     "LoginRequired": "session_rejected",
     "ClientLoginRequired": "session_rejected",
+    # The request never reached Instagram (see RULES['proxy_broken']).
+    # instagrapi wraps requests.ConnectionError — which includes SSLError and
+    # ProxyError — as ClientConnectionError; the bare names cover the web
+    # paths in engine_ig that use requests directly.
+    "ClientConnectionError": "proxy_broken",
+    "SSLError": "proxy_broken",
+    "SSLCertVerificationError": "proxy_broken",
+    "ProxyError": "proxy_broken",
+    "ConnectionError": "proxy_broken",
+    "ConnectTimeout": "proxy_broken",
+    "NewConnectionError": "proxy_broken",
+    "MaxRetryError": "proxy_broken",
 }
 
 
@@ -310,6 +368,15 @@ def classify_exception(e: BaseException) -> str:
         return "rate_limited"
     if "login_required" in text or "login required" in text:
         return "session_rejected"
+    if "too many 429" in text:
+        # requests.RetryError after urllib3 re-sent a 429 three times: an
+        # answer from Instagram, not a dead pipe.
+        return "rate_limited"
+    if ("certificate verify failed" in text or "unable to get local issuer" in text
+            or "caused by newconnectionerror" in text or "caused by proxyerror" in text
+            or "caused by connecttimeouterror" in text or "connection refused" in text
+            or "tunnel connection failed" in text or "cannot connect to proxy" in text):
+        return "proxy_broken"
     return "pass_error"
 
 
@@ -363,10 +430,11 @@ class Decision:
         """Should the pass stop touching this account right now?
 
         Quarantine, rest and a rate limit all mean "one more request makes it
-        worse"; a generic pass_error does not, so the next source still runs.
+        worse"; a broken proxy means "one more request is the same dead
+        pipe"; a generic pass_error is neither, so the next source still runs.
         """
         return (self.action in ("quarantine", "relogin", "rest")
-                or self.kind == "rate_limited")
+                or self.kind in ("rate_limited", "proxy_broken"))
 
 
 def _fmt_dur(s: float) -> str:

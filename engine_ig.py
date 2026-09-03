@@ -380,13 +380,98 @@ class ResolveError(RuntimeError):
                        handle problem.
         not_found      404 — the handle does not exist (typo, renamed, banned).
                        No retry will ever help; a human fixes the handle.
+        tls_intercepted
+                       the TLS handshake to instagram.com failed certificate
+                       verification — "unable to get local issuer certificate".
+                       Instagram never answered; something BETWEEN us and it
+                       (a Sophos/ISP firewall on the proxy's residential exit)
+                       is re-signing HTTPS. The PROXY EXIT is unusable, for
+                       every request from this account, not just lookups.
+        network        the connection died before any HTTP reply (proxy
+                       refused / unreachable / reset / connect timeout). Same
+                       conclusion: nothing from this session reaches
+                       Instagram, so no handle can ever resolve until the
+                       proxy is fixed.
         unknown        everything else.
+
+    tls_intercepted and network are ACCOUNT conditions wearing a per-handle
+    error: the collector folds them into one 'proxy_broken' card instead of
+    N "handle needs its numeric id" cards that all say the same thing.
     """
 
     def __init__(self, msg: str, why: str = "unknown", attempts=()):
         super().__init__(msg)
         self.why = why
         self.attempts = list(attempts)
+
+
+# Exception class names that mean "the request never reached Instagram" —
+# requests', urllib3's and instagrapi's names for a dead pipe. Matched by NAME
+# so decider.py (which has the same list) never needs these libraries
+# importable.
+_NETWORK_EXC = frozenset((
+    "ClientConnectionError",     # instagrapi's wrapper around requests.ConnectionError
+    "ConnectionError", "ProxyError", "ConnectTimeout", "ConnectTimeoutError",
+    "NewConnectionError", "MaxRetryError", "ProtocolError",
+    "RemoteDisconnected", "ConnectionResetError", "ConnectionRefusedError",
+))
+_TLS_EXC = frozenset(("SSLError", "SSLCertVerificationError", "CertificateError"))
+
+
+def network_why(e) -> str:
+    """'tls_intercepted', 'network', or '' when `e` is an actual HTTP answer.
+
+    Text first, then the class name: instagrapi wraps a certificate failure
+    as ClientConnectionError("SSLError HTTPSConnectionPool(...) certificate
+    verify failed: unable to get local issuer certificate"), so the class
+    alone would file a MITM'd proxy under plain 'network' and lose the one
+    detail that tells the operator what to do."""
+    text = str(e).lower()
+    if ("certificate verify failed" in text or "unable to get local issuer" in text
+            or "self signed certificate" in text or "self-signed certificate" in text
+            or "certificate_verify_failed" in text
+            or "hostname mismatch" in text):
+        return "tls_intercepted"
+    name = type(e).__name__
+    if name in _TLS_EXC or "sslerror" in text or "ssl: " in text:
+        return "tls_intercepted"
+    if name in _NETWORK_EXC:
+        return "network"
+    # Text, for wrapped exceptions (instagrapi's ClientConnectionError carries
+    # the urllib3 cause in its message). NOT "max retries exceeded" on its own:
+    # requests.RetryError says that too, and that one is three 429s — an
+    # answer from Instagram, not a dead pipe.
+    if ("caused by newconnectionerror" in text or "caused by proxyerror" in text
+            or "caused by connecttimeouterror" in text or "caused by protocolerror" in text
+            or "connection refused" in text or "connection reset" in text
+            or "tunnel connection failed" in text or "cannot connect to proxy" in text
+            or "name or service not known" in text or "connection aborted" in text
+            or "remote end closed connection" in text):
+        return "network"
+    return ""
+
+
+# The advice the operator sees for each network `why` — on the Fix panel, in
+# the Telegram ping, and in the exception text. One place, so all three agree.
+NETWORK_ADVICE = {
+    "tls_intercepted": (
+        "Nothing from this account reaches Instagram: the HTTPS handshake "
+        "fails certificate verification (\"unable to get local issuer "
+        "certificate\"). That is the proxy EXIT intercepting TLS — a Sophos / "
+        "ISP firewall on that residential IP re-signs every connection, and "
+        "the server rightly refuses the forged certificate. Not a handle "
+        "problem, not a throttle: change the proxy exit (Accounts & Sessions "
+        "→ Edit → proxy, another session number) and verify with "
+        "`curl -x '<proxy url>' -sS -o /dev/null -w '%{http_code}\\n' "
+        "https://www.instagram.com/` — it must print 200 or 302 without -k."),
+    "network": (
+        "Nothing from this account reaches Instagram: the connection dies "
+        "before any reply (proxy refused / unreachable / reset). Not a handle "
+        "problem — check the proxy URL, its credentials and that the provider "
+        "still lists that endpoint (Accounts & Sessions → Edit → proxy), then "
+        "verify with `curl -x '<proxy url>' -sS -o /dev/null -w "
+        "'%{http_code}\\n' https://www.instagram.com/`."),
+}
 
 
 def _status_of(e) -> int:
@@ -408,6 +493,12 @@ def _why(e) -> str:
     name = type(e).__name__
     text = str(e).lower()
     code = _status_of(e)
+    # A dead pipe first: no status code, no Instagram answer, so none of the
+    # HTTP-shaped tests below can apply. (A verify-failed TLS handshake
+    # inside a RetryError/ConnectionError must not be read as a 429.)
+    net = network_why(e)
+    if net and not code:
+        return net
     if name == "RetryError" or code == 429 or "please wait" in text \
             or "too many requests" in text:
         # requests.RetryError is urllib3 giving up after instagrapi's adapter
@@ -609,10 +700,13 @@ class IGEngine:
                     attempts.append(f"{how}: {type(e).__name__}"
                                     + (f" {code}" if code else ""))
                     whys.append(why)
-                    if why in ("rate_limited", "not_found"):
+                    if why in ("rate_limited", "not_found",
+                               "tls_intercepted", "network"):
                         # A 429 on one lookup endpoint is a 429 on the next —
-                        # they share the limiter. And a 404 is an answer, not
-                        # an outage. Either way: stop knocking.
+                        # they share the limiter. A 404 is an answer, not an
+                        # outage. And a pipe that cannot complete a TLS
+                        # handshake (or connect at all) is the same pipe for
+                        # the next three endpoints. Either way: stop knocking.
                         break
                     continue
                 if got and str(got).isdigit():
@@ -622,11 +716,14 @@ class IGEngine:
                 whys.append("unknown")
 
         if pk is None:
-            why = ("rate_limited" if "rate_limited" in whys
+            why = ("tls_intercepted" if "tls_intercepted" in whys
+                   else "network" if "network" in whys
+                   else "rate_limited" if "rate_limited" in whys
                    else "not_found" if "not_found" in whys
                    else "blocked" if whys and all(w == "blocked" for w in whys)
                    else "unknown")
             advice = {
+                **NETWORK_ADVICE,
                 "rate_limited": (
                     "Instagram is throttling name lookups from this session "
                     "(429). It clears by itself if left alone for hours; asking "
@@ -643,16 +740,24 @@ class IGEngine:
                     "Instagram gates name lookup separately from media reads, "
                     "so this can fail on a session that fetches fine."),
             }[why]
+            if why in NETWORK_ADVICE:
+                # Pasting an id would not help: the media fetch leaves through
+                # the same dead pipe. Say so instead of sending the operator
+                # to view-source for eight handles.
+                tail = ("  A pasted id would NOT help — post reads go through "
+                        "the same proxy. Fix the proxy, then Retry.")
+            else:
+                tail = (f"  Fix by hand, ONCE (the id never changes): open "
+                        f"https://www.instagram.com/{name}/ , view source, search for "
+                        f"\"profile_id\", paste it on the Fix panel or run "
+                        f"`python3 collect_ig.py set-id --label <label> --id <numeric_id>`. "
+                        f"Or follow @{name} from the collecting account — the next pass "
+                        f"reads the id off the following list, no lookup needed.")
             raise ResolveError(
                 f"could not resolve the username '{name}' to a numeric id. "
                 f"{advice}\n"
                 f"  tried — {'; '.join(attempts)}\n"
-                f"  Fix by hand, ONCE (the id never changes): open "
-                f"https://www.instagram.com/{name}/ , view source, search for "
-                f"\"profile_id\", paste it on the Fix panel or run "
-                f"`python3 collect_ig.py set-id --label <label> --id <numeric_id>`. "
-                f"Or follow @{name} from the collecting account — the next pass "
-                f"reads the id off the following list, no lookup needed.",
+                f"{tail}",
                 why=why, attempts=attempts)
 
         self._pk_cache[name] = pk
@@ -706,6 +811,38 @@ class IGEngine:
         return found
 
     # -- one target account -------------------------------------------------
+    def _user_feed_page(self, user_id: str, count: int, max_id: str = ""):
+        """One page of feed/user/<pk>/ — what instagrapi's
+        user_medias_paginated_v1 does, minus its `except Exception: return
+        [], None`.
+
+        That swallow is why a dead proxy used to look like a quiet account:
+        every pass logged `new=0 (had watermark=no)`, the pool stamped "last
+        success" on an account that had not stored a post in days, and the
+        only visible symptom was eight per-handle "needs its numeric id"
+        cards. A connection that never reaches Instagram is an ERROR and is
+        raised as one (ClientConnectionError), so the collector can name the
+        proxy and stop the pass. Instagram's own refusals (PrivateError
+        subclasses: login_required, checkpoint, please wait) came through
+        before and still do.
+
+        A client without private_request (the test fakes) falls back to the
+        library call unchanged.
+        """
+        pr = getattr(self.cl, "private_request", None)
+        if not callable(pr):
+            return self.cl.user_medias_paginated_v1(str(user_id), count, max_id)
+        from instagrapi.extractors import extract_media_v1
+        data = pr(f"feed/user/{int(user_id)}/",
+                  params={"max_id": max_id or "", "count": int(count),
+                          "min_timestamp": None,
+                          "rank_token": self.cl.rank_token,
+                          "ranked_content": "true"})
+        items = (data or {}).get("items") or []
+        next_max_id = (getattr(self.cl, "last_json", None) or {}).get("next_max_id", "") \
+            or (data or {}).get("next_max_id", "")
+        return [extract_media_v1(m) for m in items], next_max_id
+
     async def user_pages(self, user_id, *, page_size: int = 12,
                          max_pages: int = 0, cursor: str | None = None):
         """
@@ -722,7 +859,7 @@ class IGEngine:
         while True:
             page_no += 1
             medias, end_cursor = await asyncio.to_thread(
-                self.cl.user_medias_paginated_v1, str(user_id), page_size, end_cursor)
+                self._user_feed_page, str(user_id), page_size, end_cursor)
             yield _page_from_media(medias, page_no, end_cursor, self.account)
             if not medias or not end_cursor:
                 return

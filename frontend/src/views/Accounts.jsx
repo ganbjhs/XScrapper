@@ -625,6 +625,7 @@ const KIND_TXT = {
   session_rejected: "Session rejected",
   unresolved_source: "Handle needs its numeric id",
   lookup_throttled: "Name lookups refused — held",
+  proxy_broken: "Proxy broken — nothing reaches Instagram",
   rate_limited: "Rate-limited — backing off by itself",
   pass_error: "Collector crashing",
   paused: "Paused from the dashboard",
@@ -686,9 +687,14 @@ function FixCard({ c, focus, accounts, onAdopt, onChanged, onSignin }) {
               Sources on this account: {sources.join(", ")}
             </div>
           )}
+          {c.meta?.proxy && (
+            <div style={{ fontSize: 12.5, color: "var(--ink-3)", marginBottom: 8 }}>
+              Proxy on this account: <b>{c.meta.proxy}</b>
+            </div>
+          )}
           {(c.meta?.pending || []).length > 0 && (
             <div style={{ fontSize: 12.5, color: "var(--ink-3)", marginBottom: 8 }}>
-              Waiting for an id: {c.meta.pending.join(", ")}
+              {c.kind === "proxy_broken" ? "Handles that will resolve once the proxy works" : "Waiting for an id"}: {c.meta.pending.join(", ")}
             </div>
           )}
 
@@ -726,7 +732,7 @@ function FixCard({ c, focus, accounts, onAdopt, onChanged, onSignin }) {
             {c.actions.includes("retry") && (
               <button className="btn btn-sm" disabled={busy}
                       onClick={() => run({ action: "retry" }, () => "hold cleared — the next pass probes once")}>
-                Retry lookups now
+                {c.kind === "proxy_broken" ? "Proxy fixed — retry now" : "Retry lookups now"}
               </button>
             )}
             {c.actions.includes("resume") && (
