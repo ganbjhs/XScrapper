@@ -539,28 +539,56 @@ to restamp ownership.
 
 ## 6. Per-platform hard rules
 
-**Sign-in is IMPORT-FIRST, on every platform, and it is never a browser.**
-Instagram reached this wall first — "the streamed-browser IG login is dead" —
-but the reason generalises: the login form is the most-scrutinised page these
-sites have, and it is where every automation signal is checked at once (the
-WebDriver flag, CDP artefacts, headless quirks, a profile with no history, a
-datacenter IP that has never seen the account). Solving the captcha cannot
-help, because the distrust is about the browser, not the answer. So the server
-does not log in. `signin.py` has exactly two mechanisms, in this order:
+**Sign-in is IMPORT-FIRST on every platform; on Instagram the server has
+three doors, and a browser is the last of them, not none of them
+(amended 2026-09-04 — the operator's decision).** The old wording — "sign-in
+is never a browser", "the streamed-browser IG login is dead" — was true of
+the browser we had: a desktop headless Chrome, on the datacenter IP, with a
+config.toml locale, on a profile with no history, driving the login form.
+That is every automation signal at once, and no captcha answer can fix it
+because the distrust is about the browser. What it was NOT is a verdict on
+browsers as such. The X window still uses the desktop shape; Instagram's
+window is now the account's OWN PHONE (`ig.InteractiveLogin._phone`: the
+same handset, locale, time zone and Chrome major as the app client will
+present, through the account's own residential proxy, on a persistent
+per-account profile, with Client Hints set over CDP so the browser's hints
+agree with its user-agent). `signin.py` and the panel offer, in this order:
 
 1. **Import** (all three platforms). The operator pastes cookies from a
    browser they are already signed into, on their own IP, on a device the
    platform has trusted for months. No login event reaches the platform from
-   this server at all — there is nothing to fingerprint and no captcha to
-   lose. `parse_cookies` accepts whatever DevTools produced, because a parser
-   that only takes one shape sends the operator back to the browser login.
-2. **Background login** (Instagram only). instagrapi's app API with a pinned
-   device — not a browser, which is why it works where the window never did.
-   It costs one real login event, so it is second, but it is the only path
-   that can re-login by itself when a session dies. X has none (twscrape's
-   HTTP password login is unusable for the four reasons in `auth.py`'s
-   docstring); Facebook's only non-cookie path is a headless browser at the
-   login form, i.e. the thing this rule forbids.
+   this server at all. `parse_cookies` accepts whatever DevTools produced.
+   On Instagram the WHOLE jar is carried into the app client
+   (`signin.IG_JAR`: csrftoken, mid, ig_did, rur, datr…), not `sessionid`
+   alone — a session with no device cookies behind it is a login with no
+   phone.
+2. **Background login** (Instagram only). instagrapi's app API on the
+   pinned phone. It costs one real login event, so it is second, but it is
+   the only path that can re-login by itself when a session dies. Since
+   2026-09-04 it can FINISH: Instagram's one-time code is collected by the
+   panel (`signin.CodeRelay` blocks the sign-in thread; `POST /api/login/code`
+   feeds it; five minutes). Before that the handler returned `None`, so the
+   moment a code was sent the attempt was declared failed — the whole reason
+   "a complete sign-in from the server" never worked. Before ANY login is
+   spent, the proxy exit is proven (`ig_session.proxy_check`: exit IP,
+   country, instagram.com answers, certificate trusted); a dead, MITM'd or
+   refused exit ends the attempt as `needs=proxy` with the exact reason, and
+   the exit IP is written into the sidecar (`meta.exit`) so "one steady IP"
+   finally has a number to check against.
+3. **This account's browser** (Instagram only) — for the walls only a
+   browser clears: a native checkpoint, a Bloks/auth-platform flow, a
+   captcha (`Outcome.needs == "browser"`). `POST /api/login/start` opens it,
+   the panel streams it (`BrowserLoginModal`), the operator clicks and
+   types, and when the page is signed in the jar is adopted by the app
+   client on the same phone (`signin.ig_browser_adopt`) and persisted like
+   any other sign-in. It is the third door because it is the noisiest: a
+   fresh browser on a residential IP is still a new device to Instagram,
+   just a coherent one.
+
+X has no background login (twscrape's HTTP password login is unusable for
+the four reasons in `auth.py`'s docstring); Facebook's only non-cookie path
+is a headless browser at the login form on the server IP, which stays
+forbidden. For both, IMPORT is the path.
 
 **Carry the WHOLE cookie jar, and the operator's real user-agent.** `kdt` (X)
 and `datr` (Facebook) are device-trust tokens — the browser saying "this is
@@ -593,11 +621,12 @@ feed pages stay slim. This rule was paid for: `web.py` kept reading
 `t.raw_json` after the move and every X profile picture silently vanished from
 the Live Feed (2026-08-14).
 
-**Instagram.** Fights automation hard: checkpoints only a human clears (then
-import a fresh `sessionid` from that browser), `LoginRequired` on fingerprint
-drift (pin the device file), `PleaseWaitFewMinutes` punishes retries — back off
-hours. `user_medias` wants the numeric pk; validate sessions against the *feed*
-endpoint. The streamed-browser IG login is dead; cookie/password paths work.
+**Instagram.** Fights automation hard: checkpoints only a human clears (from
+this account's own browser in the panel, or import a fresh `sessionid` from
+a trusted one), `LoginRequired` on fingerprint drift (pin the device file),
+`PleaseWaitFewMinutes` punishes retries — back off hours. `user_medias` wants
+the numeric pk; validate sessions against the *feed* endpoint. The DESKTOP
+streamed login is dead; the phone-shaped one (above) is the third door.
 - **The IG circuit breaker is the sidecar's `checkpoint_at`** — once recorded,
   `ig_session.refresh()` refuses every automatic relogin until a human imports
   a fresh sessionid (which clears it). Relogin is attempted at most ONCE per
@@ -623,10 +652,64 @@ single request. These are hard rules, not tuning:
   daily request budget, and a warm-up ramp for young accounts. The loop may
   never fire at a fixed machine tick. Removing or bypassing `ig_human` pacing
   is a rule violation (it is on the §8 protected list).
-- **One account : one steady residential IP, forever.** IG runs through the
-  account's own residential proxy (`http://user:pass@host:port`, stored
-  encrypted in the pool), never the datacenter server IP, never a
-  rapidly-rotating exit. Prefer sticky sessions; hopping IPs is itself a flag.
+- **One account : one coherent phone, minted once (`ig_identity.py`,
+  2026-09-04).** Every device seed this project had ever minted was
+  instagrapi's default — a US-locale Pixel 8 Pro, US Eastern time — on three
+  accounts behind Indian residential exits, born from a desktop-browser
+  cookie. That is not a person, and Instagram treated it as a script: every
+  lookup 429 on sight, `PleaseWaitFewMinutes` on the first feed read, a
+  checkpoint the same evening, zero posts ever stored. Now a label's phone is
+  drawn from an Indian-market catalogue (Samsung / Redmi / POCO / realme /
+  OnePlus / vivo / OPPO with real resolution, dpi and Android release), an
+  app build instagrapi itself ships (`APP_SETTINGS` — version_code and bloks
+  id agree; nothing invented), `en_IN` / IN / +91 / Asia/Kolkata, fresh
+  UUIDs, and a matching mobile-Chrome web user-agent on the major this
+  server's Chromium really is. No two labels get the same handset while the
+  catalogue lasts. The phone changes ONLY at a sign-in (`ig_session.reseed`
+  — a legacy seed is replaced then, because the login is being paid for
+  anyway; the operator can ask for a new one from the card), never in a
+  collection pass; the previous seed is kept as `.bak`. The web calls
+  (`engine_ig._browser_session`) leave as that phone's Chrome with matching
+  Client Hints — before, they left as desktop Chrome on a Mac from an
+  Android app session and instagram.com bounced every one to the login
+  page. Test: `test_ig_identity`.
+- **One account : one steady residential IP, forever — and now it is
+  checked.** IG runs through the account's own residential proxy
+  (`http://user:pass@host:port`, stored encrypted in the pool), never the
+  datacenter server IP, never a rapidly-rotating exit. Prefer sticky
+  sessions; hopping IPs is itself a flag. `proxy_check` runs before every
+  sign-in and records the exit IP and country in the sidecar; the diag
+  endpoint shows it. An exit in another country is said, not refused (geo
+  databases are approximate); a dead or intercepting one is refused.
+- **N accounts collect in PARALLEL, and every source has exactly one owner
+  (2026-09-04).** `ig_accounts.db.active` is a roster, not a crown: every
+  active login with a session and no checkpoint is a collector, and
+  `collect_ig.run_once` runs one asyncio task per account — its own phone,
+  its own proxy, its own `ig_human` rhythm shifted by a stable per-account
+  hour (`ig_identity.stable_offset`), its own daily budget, staggered starts
+  (`STAGGER_S`). Sources are shared out by `store_ig.assign_sources`: a human
+  pin (`sources.account`) wins and WAITS if its account is out; an auto
+  source keeps its owner while that owner is a collector (sticky — moving a
+  profile between phones is the shape of a shared session); only a source
+  with no owner goes to the least-loaded account, tie broken by a stable
+  hash. Every move is logged and written to `sources.assigned_account`. A
+  RESTING account (rate limit, dead proxy, budget — `Decider.account_wait`)
+  keeps its sources and skips the pass; only a BENCHED one (inactive, no
+  session, checkpoint) loses them. A rate limit on one phone never idles the
+  others: the loop sleeps on `Decider.platform_wait_s()` (paused, no
+  sources, a pass that blew up), not on any account's backoff. A checkpoint
+  benches the account; if nobody else is collecting, the first clean warm
+  backup is woken (the old promotion, now the last resort). Promote in the
+  pool ADDS a collector and demotes nobody; Bench / Collect on the card
+  (`POST /api/ig/account`) is the roster switch. Tests: `test_ig_parallel`,
+  `tests/test_accounts_api.py::test_promote_moves_ig_collection`.
+- **One pass at a time on a machine, whichever process asks.** The service
+  loop and the dashboard's Fetch-now both call `run_once`; a second caller
+  while the first holds `profiles/.ig_pass.lock` (`collect_ig.PassLock`,
+  fcntl) is told "a pass is already running (pid, who, since)" and does
+  nothing. Paid for 2026-09-03: a loop pass on @youssef in a 604 s human
+  break, a Fetch-now on @sana two minutes later over the same sources, and a
+  `ChallengeRequired` two minutes after that.
 - **Cold starts stay small.** `max_pages` default 2; raise only once an
   account is warm. A fresh session opening with five back-to-back requests
   earns a `PleaseWaitFewMinutes`.
@@ -789,16 +872,18 @@ single request. These are hard rules, not tuning:
   cards on one account say the same thing, look for the one cause above
   them before fixing them one by one. Tests: `test_resolve` ("a dead
   pipe"), `test_pager` ("a proxy that intercepts TLS").
-- **Exactly one active row, enforced on write.** `ig.Store.save()` and
-  `set_active()` demote every other row when they activate one. They did not
-  until 2026-08-31, and all three Instagram accounts were live at once on the
-  server as a result. Nothing collected twice — `_active_account()` takes
-  `rows[0]` of `ORDER BY active DESC, username` — and that is exactly the
-  danger: WHICH account collects was being settled by ALPHABETICAL ORDER, so
-  removing or renaming the first one silently moves collection to whoever
-  sorts next, on an IP bound to a different account, with nothing logged.
-  Any store that has a "the active one" concept owes the same invariant on
-  write; a read that picks `rows[0]` is not a substitute for it.
+- **No sort order ever decides who collects (was: "exactly one active row,
+  enforced on write", 2026-08-31 → 2026-09-04).** For four days
+  `ig.Store.save()` / `set_active()` demoted every other row on activation,
+  because with a single collector the alternative was WHICH account collects
+  being settled by alphabetical order (`rows[0]` of `ORDER BY active DESC,
+  username`) — remove or rename the first and collection silently moved to
+  whoever sorted next, on an IP bound to a different account. The parallel
+  model answers the same danger differently: `active` is a roster, and every
+  source's owner is an explicit, written, logged assignment
+  (`assigned_account`). The invariant that survives: a read that picks
+  `rows[0]` to decide anything is a bug; `_active_account()` remains only
+  for the one-login CLI paths (`resolve-ids` without `--account`).
 - **The numeric pk beats the @name for FETCHING — but the source still stores
   the name.** (CORRECTED 2026-08-21. The old rule said "use the numeric pk for
   user sources", which was read as *put the number in the source*, and that is
@@ -1246,7 +1331,20 @@ wording. Every change appends an entry in the same commit (2026-08-25).
 - FB login circuit breaker: ONE automatic attempt, cause recorded
   (checkpoint vs credentials), human clears it from the dashboard. Never loop.
 - IG checkpoint breaker (`checkpoint_at`): no auto-relogin into a locked
-  account; human imports a fresh sessionid to clear it.
+  account; a human clears it from the account's own browser in the panel or
+  imports a fresh sessionid.
+- IG identity (`ig_identity.py`): one coherent Indian-market phone per
+  account, minted once, replaced only at a sign-in; the exit check before
+  every sign-in; the legacy-seed replacement. Reintroducing a bare
+  `Client()` default device, or a device change inside a collection pass, is
+  a regression.
+- IG parallel collection (`collect_ig.run_once` per-account tasks,
+  `store_ig.assign_sources` sticky ownership, `PassLock`, per-account
+  waking hours and rests). Collapsing back to one account, or letting two
+  passes overlap, is a regression.
+- IG sign-in doors in the panel: the one-time code prompt (`CodeRelay`,
+  `/api/login/code`) and this account's streamed browser (`/api/login/*`,
+  `BrowserLoginModal`, `ig_browser_adopt`).
 - Account activity log (`activity.db`): every collector/engine line,
   timestamped, browsable per platform in the dashboard.
 - The decider (`decider.py`): one rule-based decision per collector

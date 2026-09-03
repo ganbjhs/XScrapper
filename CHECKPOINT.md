@@ -19,6 +19,131 @@ must respect belongs in the rulebook, not here.
 
 ---
 
+## 2026-09-04 — Instagram in parallel: one coherent phone per account, three sign-in doors, N collectors
+
+**Changed**
+
+- `ig_identity.py` (new) — the phone catalogue and the minting rule. An
+  identity is an Indian-market handset (Samsung / Redmi / POCO / realme /
+  OnePlus / vivo / OPPO with real resolution, dpi, Android release), an app
+  build read from instagrapi's own `APP_SETTINGS` (version_code and bloks
+  id agree — nothing invented), `en_IN` / IN / +91 / Asia/Kolkata, fresh
+  UUIDs, and a matching mobile-Chrome web UA on the Chrome major this
+  server's Chromium really is (`chrome_major`, probed in a child process so
+  it works from inside the web server's loop). `is_legacy` recognises the
+  old library default; `summary`/`describe` feed the card; `web_headers`,
+  `playwright_kwargs`, `cdp_user_agent_metadata` make the requests session
+  and the streamed window BE the same phone; `stable_offset` shifts each
+  account's waking hours.
+- `ig_session.py` — `ensure_device` mints through `ig_identity`
+  (never `Client().get_settings()`); `reseed` (only ever from a sign-in;
+  keeps the old seed as `.bak`); `taken_models`; `DEVICE_KEYS` carries
+  `web_user_agent` / `identity`; `persist` splices them back into the
+  sidecar and records `meta.exit`; `proxy_check` (exit IP via ipify,
+  country via ipapi, instagram.com status, TLS) + `redact_proxy`.
+- `signin.py` — `CodeRelay` (the handler BLOCKS the sign-in thread until
+  `POST /api/login/code`, five minutes; status via `relay_status`);
+  `_check_exit` before any login; `_fresh_phone_if_legacy`; `_needs_browser`
+  → `Outcome.needs == "browser"`; `IG_JAR` + `_carry_jar` (the whole browser
+  jar into the app client); `ig_browser_adopt` (the browser door's last
+  step). A code that never arrives is NOT a checkpoint (no tombstone).
+- `ig.py` — `InteractiveLogin` is the account's phone: `_phone()` mints /
+  reseeds via `ig_session`, `auth._launch(extra=…)` gets Playwright's
+  mobile emulation, `_client_hints()` sets UA metadata over CDP, frames are
+  `scale="css"` so clicks map 1:1; `COOKIE_NAMES` gains `datr` and friends.
+  `ig.Store`: `active` is a roster — `_demote_others` removed,
+  `active_accounts()` added.
+- `auth.py` — `_launch(..., extra=None)`; `config.AccountCfg.ig_label`.
+- `store_ig.py` — `sources.assigned_account` (additive migration),
+  `Source.assigned_account` / `.collector`, `assign_sources` (pin wins and
+  waits; sticky; least-loaded + stable hash for the rest; every move
+  logged), `assignment_counts`; the connection is `check_same_thread=False`
+  with a write lock, because `on_resolved` runs inside `asyncio.to_thread`
+  and the id write was raising `ProgrammingError` — swallowed by
+  `resolve_user` — so resolved ids were NOT reaching the DB from the live
+  path.
+- `collect_ig.py` — `collectors()` (owners + benched with reasons),
+  `PassLock` (fcntl, `profiles/.ig_pass.lock`), `heartbeat`
+  (`profiles/ig_loop.json`), `_collect_account` (the per-account body),
+  `run_once` runs the accounts as parallel tasks with `STAGGER_S`, honours
+  `dec.account_wait` (resting keeps its sources) and an `awake` set (the
+  loop's per-account active-hours draw); the loop sleeps on
+  `dec.platform_wait_s()`; `ig_failover` moves sources to the remaining
+  collectors and wakes a warm backup only when nobody is left.
+- `decider.py` — `account_wait(account)`, `platform_wait_s()`.
+- `engine_ig.py` — `_browser_session` sends the identity's mobile Chrome UA
+  and Client Hints (was: desktop Chrome on a Mac).
+- `accounts_api.py` — promote ADDS a collector ("alongside @…").
+- `web.py` — `_pool_account_cfg` sets `ig_label`; `_login_start` returns the
+  phone's viewport; `_login_capture` adopts through `signin.ig_browser_adopt`
+  and runs `_decider_after_signin`; `_signin_status` carries `waiting_for`;
+  `POST /api/login/code`; `GET /api/ig/diag` (git rev, services, heartbeat,
+  pass lock, per-account phone / sidecar facts / pool / open conditions —
+  cookie NAMES only, no URLs, no UUIDs); `POST /api/ig/account` (bench /
+  collect); `POST /api/ig/reseed` (new phone); `/api/ig/status` accounts
+  gain `identity`, `exit`, `owns`, sources gain `collector`; Fetch-now
+  passes `root` / `who` and reports "a pass is already running".
+- `frontend/src/views/Accounts.jsx` — `BrowserLoginModal` (the streamed
+  window: frame polling, scaled clicks, type / keys / scroll / reload,
+  adoption result); `SignInModal` gets the one-time-code box and the
+  "Open this account's browser" door; the IG card shows the phone, "owns
+  N", the sign-in exit, and Bench / Collect / New phone. `Watchlists.jsx`
+  shows each source's collector and the checkpoint banner points at the
+  browser door. `src/api/client.js`: `loginCode`, `loginStart`, `loginAct`,
+  `loginCancel`, `igDiag`, `igAccount`, `igReseed`. `frontend/dist` →
+  `index-DUzEGdNn.js`.
+- `tests/test_all.py` — `test_ig_identity` (coherence, uniqueness, legacy
+  detection, reseed, the client and the web session ARE the phone),
+  `test_ig_signin` (the relay end to end, `proxy_check` on six exits, exit
+  refusal before any login, legacy reseed only at a sign-in, `needs=browser`,
+  `ig_browser_adopt` carrying the jar and the exit), `test_ig_parallel`
+  (assignment rules, `collectors()`, two phones interleaving in one pass,
+  resting vs benched, the awake set, a checkpoint moving sources, the
+  dashboard endpoints against a temp root, `PassLock` across callers); the
+  undefined-names sweep covers `ig_identity`, `ig_session`, `signin`, `ig`;
+  `test_pager` / `test_accounts_api` reworded for the roster. 1,010 checks.
+- `RULEBOOK.md` §6 (the three doors; one coherent phone; the exit check;
+  N collectors + one owner per source; one pass per machine; "no sort
+  order decides"), §8; `BLUEPRINT.md`; `README.md`; `.env.example`.
+
+**Why**
+
+Instagram had stored zero posts, ever. The 2026-09-03 log, IST: @youssef —
+`usernameinfo` 429 three times on every pass, then `PleaseWaitFewMinutes`
+on the one feed read it could make; the web fallbacks bounced to the login
+page. @sana — `ChallengeRequired` at 23:49, two minutes after a Fetch-now
+started a second pass on top of the loop's. @shoaib — `ClientConnectionError`
+on every lookup through `resi-in-35`. And the device seeds on disk: `ig_a`
+and `ig_b`, minted a day apart, byte-for-byte instagrapi's default Pixel 8
+Pro, en_US, US Eastern — three accounts, one phone, three Indian exits, born
+from a Mac's cookie. The server-side sign-in could not finish by design:
+`challenge_code_handler = lambda: None`. The operator asked for accounts
+that look like people, sign in from the server, and run in parallel.
+
+**Verified**
+
+- `tests/test_all.py` — **All checks passed** (1,010) on Python 3.11.15 with
+  the pinned deps, in the cloud workspace; `test_signin` 11, `test_pool_link`
+  7, `test_accounts_api`, `test_accounts` 13, `test_fb_media` 60 all green.
+- `ig_identity.chrome_major()` reads 141 off the workspace's Chromium in
+  0.5 s from a child process.
+- `frontend` builds clean (vite 5, 50 modules).
+- NOT yet run against live Instagram: the three doors, the exit check and
+  the parallel pass go live with the deploy that follows this commit; each
+  existing account needs ONE fresh sign-in (its legacy phone is replaced
+  then). @sanaakhtar221's checkpoint must be cleared through her browser
+  door or on a trusted phone first.
+
+**Still open**
+
+- `resolve-ids` (CLI) still uses one login (`_active_account`) unless
+  `--account` is given.
+- The pool's "one active per platform" summary line is X/FB's model; for
+  Instagram the card's "collecting · owns N" is the truth.
+- Facebook and X conditions still do not route through the decider.
+
+---
+
 ## 2026-09-03 (III) — collection filters now hold on X List watchlists
 
 **Changed**

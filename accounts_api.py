@@ -109,8 +109,15 @@ def _activate_collector(a) -> dict:
                                 f"on the current account until you sign it in "
                                 f"(Sign in on this card)."}
             ist.set_active(hit["username"], True, error="")
+            others = [r["username"] for r in rows
+                      if r.get("active") and r["username"] != hit["username"]]
+            # N accounts collect in parallel (2026-09-04): promoting adds a
+            # collector, it demotes nobody. Sources are shared out on the
+            # next pass (store_ig.assign_sources).
             return {"note": f"@{hit['username']} is now the collecting "
-                            f"Instagram account (from the next pass)."}
+                            f"Instagram account (from the next pass)"
+                            + (f", alongside {', '.join('@' + u for u in others)}"
+                               if others else "") + "."}
     except Exception as e:
         return {"note": f"promoted in the pool, but the collector's account "
                         f"store could not be updated: {type(e).__name__}: {e}"}

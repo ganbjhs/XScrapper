@@ -42,7 +42,8 @@ WEB_APP_ID = "936619743392459"
 # `sessionid` is the one that authenticates. The rest are carried because
 # dropping them makes the HTTP client look like a different device than the
 # browser that logged in — the same reasoning as auth.COOKIE_DOMAINS.
-COOKIE_NAMES = ("sessionid", "ds_user_id", "csrftoken", "mid", "ig_did", "rur")
+COOKIE_NAMES = ("sessionid", "ds_user_id", "csrftoken", "mid", "ig_did", "rur",
+                "datr", "ig_nrcb", "ps_l", "ps_n")
 REQUIRED_COOKIES = ("sessionid", "ds_user_id")
 
 LOGGED_IN = auth.LOGGED_IN
@@ -147,39 +148,28 @@ class Store:
             "  error_msg=excluded.error_msg, updated_at=excluded.updated_at",
             (sess.username, sess.user_id, label, json.dumps(sess.cookies),
              sess.user_agent, proxy or None, int(active), error or None, now, now))
-        if active:
-            self._demote_others(sess.username)
         self.db.commit()
 
-    def _demote_others(self, keep: str) -> None:
-        """Exactly one active row, enforced in code.
-
-        This table has no platform column and sqlite cannot express the
-        invariant as a constraint, so it is maintained here — the same move
-        store_accounts.promote() makes for the pool.
-
-        Before this, save() and set_active() wrote active=1 and demoted nobody.
-        A second import left TWO active rows and a third left three; observed
-        live on 2026-08-31 with all three Instagram accounts active at once.
-        Nothing collected twice — collect_ig._active_account() takes rows[0] of
-        an 'ORDER BY active DESC, username' scan — but that is the whole
-        problem: WHICH account collects was being decided by ALPHABETICAL
-        ORDER. Remove or rename the first one and collection silently moves to
-        whoever sorts next, from an IP bound to a different account, with no
-        decision made and no line in any log.
-        """
-        self.db.execute(
-            "UPDATE accounts SET active=0, updated_at=? "
-            "WHERE username != ? AND active != 0",
-            (_now(), keep))
+    # `active` now means "one of the phones that collects", not "THE phone".
+    #
+    # From 2026-08-31 to 2026-09-04 this store enforced exactly one active
+    # row on write (_demote_others), because with a single collector the
+    # alternative was WHICH account collects being settled by alphabetical
+    # order. That reasoning still holds — and it is answered differently now:
+    # every source is OWNED by exactly one account (store_ig.assign_sources,
+    # sticky, balanced, logged), so N accounts collect in parallel and no
+    # sort order ever chooses. Activating a row no longer demotes the others;
+    # deactivating one moves its sources on the next pass (collect_ig).
 
     def set_active(self, username: str, active: bool, error: str = "") -> None:
         self.db.execute(
             "UPDATE accounts SET active=?, error_msg=?, updated_at=? WHERE username=?",
             (int(active), error or None, _now(), username))
-        if active:
-            self._demote_others(username)
         self.db.commit()
+
+    def active_accounts(self) -> list:
+        """Usernames of every row that participates in collection."""
+        return [r["username"] for r in self.all() if r.get("active")]
 
     def all(self) -> list:
         if self.db is None:
@@ -319,14 +309,60 @@ class InteractiveLogin:
         self.state = UNKNOWN
         self.screen_name = ""
         self.error = ""
+        self.viewport = dict(LOGIN_VIEWPORT)
+        self.device = {}
+        self.ig_label = getattr(acct, "ig_label", "") or acct.label
+
+    @property
+    def root(self):
+        # profile_path is <root>/profiles/<dir>; the device files sit beside it.
+        return Path(self.acct.profile_path).parent.parent
+
+    def _phone(self, log):
+        """The window must BE this account's phone: same handset, same locale,
+        same time zone, a mobile Chrome of the same major — the identity the
+        app client will present afterwards (ig_identity). A legacy (library
+        default) seed is replaced here, because this IS a sign-in."""
+        import ig_identity
+        import ig_session
+        dev = ig_session.ensure_device(self.ig_label, self.root,
+                                       username=self.acct.username, log=log)
+        if ig_identity.is_legacy(dev):
+            dev = ig_session.reseed(self.ig_label, self.root,
+                                    why="legacy default phone; the browser "
+                                        "sign-in mints the real one", log=log)
+        self.device = dev
+        kw = ig_identity.playwright_kwargs(dev)
+        self.viewport = dict(kw["viewport"])
+        log(f"window is {ig_identity.describe(dev)}")
+        return kw
+
+    async def _client_hints(self, log):
+        """Playwright sets only the UA string; Chromium's own Client Hints
+        would still say platform=Linux under an Android UA. CDP fixes the
+        hints to match. Best effort — a browser without CDP keeps the UA."""
+        import ig_identity
+        try:
+            cdp = await self.ctx.new_cdp_session(self.page)
+            await cdp.send("Emulation.setUserAgentOverride", {
+                "userAgent": ig_identity.playwright_kwargs(self.device)["user_agent"],
+                "acceptLanguage": (self.device.get("identity") or {}).get(
+                    "accept_language", "en-IN,en;q=0.9"),
+                "platform": "Linux armv8l",
+                "userAgentMetadata": ig_identity.cdp_user_agent_metadata(self.device),
+            })
+        except Exception as e:
+            log(f"client hints not set ({type(e).__name__}); the UA alone is in force")
 
     async def start(self, log=lambda m: None):
         from playwright.async_api import async_playwright
 
+        extra = self._phone(log)
         self.pw = await async_playwright().start()
-        self.ctx = await auth._launch(self.pw, self.acct, True, log)
+        self.ctx = await auth._launch(self.pw, self.acct, True, log, extra=extra)
         self.page = self.ctx.pages[0] if self.ctx.pages else await self.ctx.new_page()
-        await self.page.set_viewport_size(LOGIN_VIEWPORT)
+        await self._client_hints(log)
+        await self.page.set_viewport_size(self.viewport)
         try:
             await self.page.goto(HOME_URL, wait_until="domcontentloaded", timeout=45000)
             await self.page.wait_for_timeout(2000)
@@ -374,7 +410,10 @@ class InteractiveLogin:
 
     async def frame(self) -> bytes:
         self._alive()
-        return await self.page.screenshot(type="jpeg", quality=68)
+        # scale="css": one image pixel per CSS pixel, whatever the phone's
+        # device_scale_factor, so a click on the frame maps 1:1 onto the
+        # viewport and a 2.6× screen does not ship a 1071×2379 JPEG per poll.
+        return await self.page.screenshot(type="jpeg", quality=68, scale="css")
 
     def url(self) -> str:
         return (self.page.url or "") if self.page else ""

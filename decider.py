@@ -888,14 +888,23 @@ class Decider:
         self.notify = notify or _default_notify
         self.now = now
         self._pass_wait = 0
+        self._platform_wait = 0
         self._said_nowhere = False
 
     def begin_pass(self):
         self._pass_wait = 0
+        self._platform_wait = 0
 
     def wait_s(self, default=0) -> int:
         """The longest wait a decision in this pass asked for (0 = none)."""
         return self._pass_wait or int(default)
+
+    def platform_wait_s(self, default=0) -> int:
+        """The longest wait a PLATFORM-level decision (paused, no sources, a
+        pass that blew up) asked for this pass. The parallel loop sleeps on
+        this one; an account's own backoff is served by account_wait() and
+        must not idle its neighbours."""
+        return self._platform_wait or int(default)
 
     def on(self, kind, account="", detail="", exc=None, meta=None,
            source="") -> Decision:
@@ -917,6 +926,8 @@ class Decider:
                 self._log(f"[{self.platform}] operator NOT told — {err}")
         if RULES[ev.kind].loop_wait:
             self._pass_wait = max(self._pass_wait, d.wait_s)
+            if not ev.account:
+                self._platform_wait = max(self._platform_wait, d.wait_s)
         return d
 
     def holdoff(self, account="", source="") -> int:
@@ -934,6 +945,28 @@ class Decider:
         now = self.now() if self.now else int(time.time() * 1000)
         until = int(row["last_ms"]) + _wait_for(rule, int(row["count"])) * 1000
         return max(0, int((until - now) / 1000))
+
+    def account_wait(self, account: str) -> int:
+        """Seconds @account should still REST because of an open condition of
+        its own (rate limit, proxy, session, checkpoint, budget) — the
+        per-account form of wait_s(), for a loop that runs accounts in
+        parallel: one account backing off must not idle the others, and an
+        account that was told to wait 4h must not be woken by a neighbour's
+        pass. 0 when it may run now. Platform-wide conditions (paused, no
+        sources) are not counted here — the loop asks wait_s() for those."""
+        best = 0
+        for row in self.state.open_for_platform(self.platform):
+            scope = row.get("scope") or ""
+            who = scope.split(":", 1)[1] if ":" in scope else ""
+            if _split_who(who)[0] != account or _split_who(who)[1]:
+                continue
+            rule = RULES.get(row["kind"])
+            if rule is None or not rule.loop_wait or rule.wait_s <= 0:
+                continue
+            now = self.now() if self.now else int(time.time() * 1000)
+            until = int(row["last_ms"]) + _wait_for(rule, int(row["count"])) * 1000
+            best = max(best, int((until - now) / 1000))
+        return max(0, best)
 
     def ok(self, account="", source="") -> Decision:
         return self.on("ok", account, source=source)

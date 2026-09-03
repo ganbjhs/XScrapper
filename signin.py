@@ -78,7 +78,13 @@ silently).
     ""          nothing, it worked
     "paste"     the automated path is exhausted; import a cookie instead
     "totp"      a 2FA code is required and none was on file
-    "proxy"     refused: this platform may not run on the server IP
+    "proxy"     refused: this platform may not run on the server IP, or its
+                proxy exit is dead / intercepting TLS / unwelcome
+    "browser"   Instagram wants a browser it recognises (a native checkpoint,
+                a Bloks/auth-platform flow): open this account's own streamed
+                browser from the panel — its phone, its proxy — and clear it
+    "code"      transient, only while a sign-in is RUNNING: Instagram sent a
+                one-time code and the panel must collect it (CodeRelay)
 """
 
 from __future__ import annotations
@@ -90,6 +96,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 __all__ = ["Outcome", "parse_cookies", "ig_password", "ig_cookie",
+           "ig_browser_adopt", "CodeRelay", "submit_code", "relay_status",
            "x_cookie", "fb_cookie", "PLATFORM_HELP"]
 
 
@@ -249,6 +256,146 @@ def _missing(platform: str, cookies: dict) -> list:
 
 
 # ---------------------------------------------------------------------------
+# The code relay — the piece that made "sign in from the server" impossible
+# ---------------------------------------------------------------------------
+#
+# instagrapi drives an email/SMS code challenge through `challenge_code_handler
+# (username, choice)`, and its contract is blunt: the FIRST call must return
+# the code, or a falsy value ends the login with ChallengeRequired on the
+# spot (challenge_code_or_raised). The server used to install
+# `lambda u, c: None` — so the moment Instagram sent a six-digit code, the
+# attempt was declared failed and the operator was told to paste a cookie.
+# That is the whole reason a complete sign-in never worked from here.
+#
+# The relay is the missing half: the handler BLOCKS the sign-in thread until
+# the dashboard posts the code (POST /api/login/code), and the panel learns
+# it is wanted from relay_status() (`waiting_for`). One relay at a time,
+# because web.py runs one sign-in at a time.
+
+import threading
+
+CODE_WAIT_S = 300          # five minutes to read an email and type six digits
+
+_RELAY_LOCK = threading.Lock()
+_RELAY = {"relay": None}
+
+
+class CodeRelay:
+    def __init__(self, timeout_s: int = CODE_WAIT_S, clock=time.time):
+        self.timeout_s = timeout_s
+        self.clock = clock
+        self._ev = threading.Event()
+        self.code = ""
+        self.waiting = None         # {"choice", "hint", "since"} while asked
+        self.asked = 0
+        self.timed_out = False
+
+    def handler(self, cl=None, log=lambda m: None):
+        """The function to install as cl.challenge_code_handler."""
+        def _handler(username, choice):
+            name = getattr(choice, "name", str(choice)).lower()
+            hint = ""
+            try:
+                sd = (getattr(cl, "last_json", None) or {}).get("step_data") or {}
+                hint = sd.get("contact_point") or sd.get("email") \
+                    or sd.get("phone_number") or ""
+            except Exception:
+                hint = ""
+            self.asked += 1
+            self._ev.clear()
+            self.code = ""
+            self.waiting = {"choice": name, "hint": hint, "since": self.clock()}
+            log(f"Instagram sent a one-time code to your {name}"
+                + (f" ({hint})" if hint else "")
+                + f" — type it in the panel within {self.timeout_s // 60} min")
+            got = self._ev.wait(self.timeout_s)
+            self.waiting = None
+            if not got or not self.code:
+                self.timed_out = True
+                log("no code was entered in time")
+                return ""
+            log("code received — sending it to Instagram")
+            return self.code
+        return _handler
+
+    def submit(self, code: str) -> bool:
+        code = re.sub(r"\D", "", str(code or ""))
+        if not code:
+            return False
+        self.code = code
+        self._ev.set()
+        return True
+
+    def status(self) -> dict:
+        w = self.waiting
+        return {"waiting_for": dict(w) if w else None, "asked": self.asked}
+
+
+def _install_relay(relay) -> None:
+    with _RELAY_LOCK:
+        _RELAY["relay"] = relay
+
+
+def submit_code(code: str) -> dict:
+    """POST /api/login/code lands here. Says plainly when nobody is asking."""
+    with _RELAY_LOCK:
+        r = _RELAY["relay"]
+    if r is None or not r.waiting:
+        return {"error": "No sign-in is waiting for a code right now."}
+    if not r.submit(code):
+        return {"error": "That does not look like a code — digits only."}
+    return {"ok": True}
+
+
+def relay_status() -> dict:
+    with _RELAY_LOCK:
+        r = _RELAY["relay"]
+    return r.status() if r else {"waiting_for": None, "asked": 0}
+
+
+def _needs_browser(exc) -> bool:
+    """A ChallengeRequired that no code can answer: Instagram wants to see a
+    browser (native flow, Bloks redirect, auth platform)."""
+    t = str(exc).lower()
+    return ("native challenge" in t or "bloks" in t or "auth platform" in t
+            or "trusted device" in t)
+
+
+def _check_exit(proxy: str, o: Outcome, log) -> dict | None:
+    """Prove the exit before spending a login through it. A dead or
+    intercepting exit is a `proxy` refusal with the exact reason; a
+    country mismatch is said, not refused (geo databases are approximate)."""
+    import ig_identity
+    import ig_session
+    chk = ig_session.proxy_check(proxy, expect_country=ig_identity.MARKET["country"])
+    if not chk["ok"]:
+        from engine_ig import NETWORK_ADVICE
+        o.detail = (f"This account's proxy exit is not usable: {chk['detail']}. "
+                    + NETWORK_ADVICE.get(chk["why"], ""))
+        o.needs = "proxy"
+        log(o.detail)
+        return None
+    log(f"proxy exit OK — {chk['detail']}")
+    if chk.get("warn"):
+        log(f"warning: {chk['warn']}")
+    return chk
+
+
+def _fresh_phone_if_legacy(label: str, root, log) -> None:
+    """A sign-in is the one moment a device may change (it is being paid for
+    anyway). A seed that is still the library's default handset is replaced
+    here; a real one is kept — the account has earned trust on it."""
+    import ig_identity
+    import ig_session
+    dev = ig_session.load_device(label, root)
+    if dev and ig_identity.is_legacy(dev):
+        ig_session.reseed(label, root, why="the seed was instagrapi's default "
+                                            "US Pixel; a sign-in is the one "
+                                            "time a new phone costs nothing "
+                                            "extra", log=log)
+
+
+# ---------------------------------------------------------------------------
 # Instagram
 # ---------------------------------------------------------------------------
 
@@ -288,15 +435,25 @@ def ig_password(login: str, password: str, *, totp_secret: str = "",
         o.needs = "paste"
         return o
 
+    import ig_identity
     import ig_session
     from instagrapi.exceptions import (ChallengeRequired, ClientError,
                                        TwoFactorRequired)
 
-    log(f"signing in as @{login} through {_redact(proxy)}")
-    cl = ig_session.new_client(label, proxy=proxy, username=login, log=log)
+    chk = _check_exit(proxy, o, log)
+    if chk is None:
+        return o
+    _fresh_phone_if_legacy(label, root, log)
 
-    # The interactive handler would block a request thread on input() forever.
-    cl.challenge_code_handler = lambda username, choice: None
+    log(f"signing in as @{login} through {_redact(proxy)}")
+    cl = ig_session.new_client(label, proxy=proxy, username=login, root=root, log=log)
+    log(f"as {ig_identity.describe(ig_session.load_device(label, root))}")
+
+    # A code challenge is answered by the OPERATOR through the panel: the
+    # relay blocks this thread until the code arrives (or five minutes pass).
+    relay = CodeRelay()
+    _install_relay(relay)
+    cl.challenge_code_handler = relay.handler(cl, log)
 
     code = ""
     if totp_secret:
@@ -315,16 +472,32 @@ def ig_password(login: str, password: str, *, totp_secret: str = "",
         o.needs = "totp"
         return o
     except ChallengeRequired as e:
+        if relay.timed_out or relay.asked and not relay.code:
+            # Not a wall — the operator did not type the code in time. No
+            # tombstone: the account is fine, the attempt simply lapsed.
+            o.detail = ("Instagram sent a one-time code and none was entered "
+                        "within five minutes. Sign in again and type the code "
+                        "when the panel asks for it.")
+            o.needs = "paste"
+            return o
         # Write the tombstone so nothing auto-relogins into a locked account.
         try:
             ig_session._note_checkpoint(login, root, log=log)
         except Exception:
             pass
-        o.detail = ("Instagram raised a checkpoint — it wants to see a browser "
-                    "it recognises, which this server is not. Sign in normally "
-                    "in your own browser, clear whatever it asks for, then "
-                    f"import the cookie here. ({type(e).__name__})")
-        o.needs = "paste"
+        if _needs_browser(e):
+            o.detail = ("Instagram raised a checkpoint that only a browser it "
+                        "recognises can clear. Open this account's own browser "
+                        "from the panel (same phone, same proxy), clear the "
+                        f"prompt there, and the session is adopted for you. "
+                        f"({type(e).__name__})")
+            o.needs = "browser"
+            return o
+        o.detail = ("Instagram raised a challenge this path could not answer: "
+                    f"{str(e)[:200]}. Open this account's browser from the "
+                    "panel, or import cookies from a browser you are signed "
+                    "into.")
+        o.needs = "browser"
         return o
     except ClientError as e:
         o.detail = f"Instagram rejected the login: {type(e).__name__}: {e}"
@@ -342,7 +515,7 @@ def ig_password(login: str, password: str, *, totp_secret: str = "",
         return o
 
     return _ig_persist(cl, login, label=label, proxy=proxy, root=root,
-                       store=store, o=o, log=log,
+                       store=store, o=o, log=log, exit=chk,
                        password_env=f"IG_PASSWORD_{label.upper()}")
 
 
@@ -363,13 +536,20 @@ def ig_cookie(blob: str, *, proxy: str = "", label: str = "ig_a", root=".",
         o.needs = "paste"
         return o
 
+    import ig_identity
     import ig_session
     from instagrapi.exceptions import ClientError
+
+    chk = _check_exit(proxy, o, log)
+    if chk is None:
+        return o
+    _fresh_phone_if_legacy(label, root, log)
 
     # Through new_client so the cookie is adopted BY THE ACCOUNT'S PINNED
     # DEVICE. Importing on one device and collecting on another is what was
     # invalidating these sessions.
-    cl = ig_session.new_client(label, proxy=proxy, log=log)
+    cl = ig_session.new_client(label, proxy=proxy, root=root, log=log)
+    log(f"as {ig_identity.describe(ig_session.load_device(label, root))}")
     log(f"validating the pasted session through {_redact(proxy)}")
     try:
         if not cl.login_by_sessionid(sessionid):
@@ -397,18 +577,115 @@ def ig_cookie(blob: str, *, proxy: str = "", label: str = "ig_a", root=".",
     if not username:
         username = "user_" + str(getattr(cl, "user_id", "") or "")
 
+    _carry_jar(cl, cookies, log)
+
     # No password_env: an imported cookie cannot auto-relogin when it dies.
     return _ig_persist(cl, username, label=label, proxy=proxy, root=root,
-                       store=store, o=o, log=log, password_env="")
+                       store=store, o=o, log=log, password_env="", exit=chk)
+
+
+# The cookies that are the BROWSER's identity rather than the login's. A
+# session carrying only `sessionid` is a login with no device behind it; these
+# are what make the same session look like the same machine next time.
+IG_JAR = ("csrftoken", "mid", "ig_did", "rur", "datr", "ig_nrcb", "ps_l", "ps_n")
+
+
+def _carry_jar(cl, cookies: dict, log=lambda m: None) -> int:
+    """Put the rest of the browser's jar into the app client. login_by_sessionid
+    keeps only sessionid; the others ride along so the web calls
+    (engine_ig._browser_session) present the same device tokens the browser
+    did. Never raises — a cookie that will not set is a cookie not carried."""
+    n = 0
+    jar = getattr(getattr(cl, "private", None), "cookies", None)
+    if jar is None:
+        return 0
+    for name in IG_JAR:
+        val = (cookies or {}).get(name)
+        if not val:
+            continue
+        try:
+            jar.set(name, val, domain=".instagram.com", path="/")
+            n += 1
+        except Exception:
+            continue
+    if n:
+        log(f"carried {n} device cookie(s) from the browser: "
+            f"{', '.join(k for k in IG_JAR if (cookies or {}).get(k))}")
+    return n
+
+
+def ig_browser_adopt(cookies: dict, *, proxy: str = "", label: str = "ig_a",
+                     root=".", store: str = "ig_accounts.db",
+                     username_hint: str = "", browser_ua: str = "") -> Outcome:
+    """
+    The streamed browser door's last step: the account's OWN Chromium (its
+    phone, its proxy — ig.InteractiveLogin) has just signed in, and the jar it
+    holds is adopted by the app client on the pinned device and persisted
+    exactly as a paste would be. No proxy guard here: the browser already ran
+    through the account's proxy, and the check ran when it launched.
+    """
+    o = Outcome()
+    log = _Log(o, label)
+    sessionid = (cookies or {}).get("sessionid") or ""
+    if not sessionid or not re.match(r"^\d+(:|%3A)", sessionid):
+        o.detail = ("The browser is signed in but has no sessionid cookie yet — "
+                    "give it a moment and finish again.")
+        o.needs = "browser"
+        return o
+
+    import ig_identity
+    import ig_session
+    from instagrapi.exceptions import ClientError
+
+    cl = ig_session.new_client(label, proxy=proxy, root=root, log=log)
+    log(f"adopting the browser's session on "
+        f"{ig_identity.describe(ig_session.load_device(label, root))}")
+    try:
+        if not cl.login_by_sessionid(sessionid):
+            o.detail = "Instagram rejected the browser's sessionid."
+            o.needs = "browser"
+            return o
+    except ClientError as e:
+        o.detail = f"Instagram rejected the browser's session ({type(e).__name__}: {e})."
+        o.needs = "browser"
+        return o
+    except Exception as e:
+        o.detail = f"Could not validate the browser's session: {type(e).__name__}: {e}"
+        o.needs = "browser"
+        return o
+    _carry_jar(cl, cookies, log)
+    if browser_ua and "Mozilla" in browser_ua:
+        try:
+            cl.settings["web_user_agent"] = browser_ua
+        except Exception:
+            pass
+
+    username = getattr(cl, "username", "") or username_hint or ""
+    if not username:
+        try:
+            username = cl.account_info().username or ""
+        except Exception:
+            username = ""
+    if not username:
+        username = "user_" + str(getattr(cl, "user_id", "") or "")
+
+    chk = None
+    try:
+        chk = ig_session.proxy_check(proxy, expect_country=ig_identity.MARKET["country"]) \
+            if proxy else None
+    except Exception:
+        chk = None
+    return _ig_persist(cl, username, label=label, proxy=proxy, root=root,
+                       store=store, o=o, log=log, password_env="", exit=chk)
 
 
 def _ig_persist(cl, username, *, label, proxy, root, store, o, log,
-                password_env) -> Outcome:
+                password_env, exit=None) -> Outcome:
     try:
         import ig_session
         ig_session.persist(cl, username, label=label, proxy=proxy,
                            password_env=password_env, store_path=store,
-                           root=root, log=log)
+                           root=root, exit=exit, log=log)
     except Exception as e:
         o.detail = f"Signed in, but could not save the session: {type(e).__name__}: {e}"
         return o

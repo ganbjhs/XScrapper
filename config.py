@@ -92,6 +92,10 @@ class AccountCfg:
     locale: str = "en-US"
     timezone: str = "UTC"
     enabled: bool = True
+    # Instagram only: the instagrapi device label (profiles/ig_device_<x>.json)
+    # this account's phone lives under. web._pool_account_cfg fills it for a
+    # pool account; blank means "use `label`".
+    ig_label: str = ""
 
     # Resolved absolute path; filled in by Config.
     profile_path: Path = field(default=Path("."), repr=False)

@@ -22,10 +22,12 @@ ends (read before touching the FB engine).
 ## 1. The principles everything follows
 
 1. **Browser for login and rendering only; HTTP for collection.** A real
-   browser obtains sessions (captcha/OTP is a human step). X and IG polling is
-   cheap authenticated HTTP. Facebook is the one rendered surface (its data is
-   only reachable through a logged-in page), and even there the browser reads
-   structured GraphQL data, never pixels.
+   browser obtains sessions (captcha/OTP is a human step) — on Instagram it
+   is the account's OWN phone-shaped browser through its own proxy, and the
+   last of three doors (RULEBOOK §6). X and IG polling is cheap authenticated
+   HTTP. Facebook is the one rendered surface (its data is only reachable
+   through a logged-in page), and even there the browser reads structured
+   GraphQL data, never pixels.
 2. **Freshness-first watermark polling.** Each poll walks a timeline from the
    newest item and stops at the first already-seen one, so a normal poll costs
    one request. Dedup is the backstop, never the mechanism.
@@ -113,8 +115,10 @@ The organizing layer (in `store.py` + `web.py`):
 | `config.py` / `config.toml` | What to watch + accounts; passwords live in `.env` by name |
 | `web.py` | THE server: JSON API, SSE live stream, auth, serves `frontend/dist` at `/app` |
 | `api.py` | API-key service (hash-stored keys) serving Instagram posts to Watch-Tower. A key carries its `project_id` — the key IS the scope; an unscoped key reads nothing |
-| `ig.py`, `ig_import.py`, `ig_login.py`, `ig_session.py` | Instagram session acquisition/persistence (cookie or password; device pinned) |
-| `engine_ig.py`, `collect_ig.py`, `store_ig.py` | Instagram engine / poll loop (+ human pacing) / store (`ig_results.db`, settings). Sources are three columns: `label` person, `value` handle, `platform_id` numeric id |
+| `ig.py`, `ig_import.py`, `ig_login.py`, `ig_session.py` | Instagram session acquisition/persistence (cookie, password, or this account's streamed phone-shaped browser; device pinned; `proxy_check` proves the exit before a login is spent) |
+| `ig_identity.py` | One coherent phone per account: an Indian-market device catalogue, instagrapi's own app builds, en_IN / Asia/Kolkata, a matching mobile-Chrome web UA + Client Hints, Playwright kwargs for the streamed window, per-account waking-hour shift. Minted once, replaced only at a sign-in |
+| `signin.py` | The three sign-in doors behind `/api/pool/signin` and `/api/login/*`: import (whole jar), background app login with the one-time-code relay (`CodeRelay`, `/api/login/code`), and the browser door's adoption step (`ig_browser_adopt`) |
+| `engine_ig.py`, `collect_ig.py`, `store_ig.py` | Instagram engine / poll loop / store (`ig_results.db`, settings). `collect_ig.run_once` runs every collecting account IN PARALLEL (one task per phone, own proxy and rhythm, `PassLock` = one pass per machine, `profiles/ig_loop.json` heartbeat); `store_ig.assign_sources` gives every source one sticky owner (`assigned_account`; a human pin in `account` wins). Sources are three columns: `label` person, `value` handle, `platform_id` numeric id |
 | `migrate_ig_sources.py` | One-time, manual, idempotent: moves an old `ig_results.db` onto the three-column source model. Backs up first; never writes `label` |
 | `IDENTITY_MODEL.md` | The label/handle/id contract — why it exists, how IG implements it, the migration order for FB and X |
 | `ig_human.py` | Human-behavior pacing: active-hours, humanized gaps, long breaks, daily budget, warm-up — makes IG move like a person (pure, testable) |
@@ -158,8 +162,11 @@ bytes), `activity.db` (account log), `api_keys.db` (hashes only),
 **Cookie-authed JSON (the SPA).** Status/metrics/delivery/activity (+
 `/api/activity/logs`), tweets with rich filters + two cursors, SSE `/api/live`,
 CRUD for projects/watchlists/collections/alerts, `/api/fb/*` (status, posts,
-source, fetch, favorites, control, health, settings), `/api/ig/*` (status,
-posts, source), account pool `/api/pool*`, and labelling `/api/classify` +
+source, fetch, favorites, control, health, settings), `/api/ig/*` (status —
+with each account's phone, exit and what it owns —, posts, source, diag,
+account = bench/collect, reseed = new phone), `/api/login/*` (the streamed
+window: start / frame / act / cancel, and `code` for the one-time code),
+account pool `/api/pool*`, and labelling `/api/classify` +
 `/api/labels/{status,categories,set,settings}`. `/api/classify` is deliberately
 NOT in `API_KEY_PATHS`: it spends money, and a machine key may only read.
 
@@ -200,7 +207,9 @@ Node on the server). Install the pre-commit hook:
 1. Browser only for login/rendering; the X/IG collectors never open one.
 2. Watermark stop = one request per quiet poll. Never fetch date ranges.
 3. Pin the scraping libs and assert their internals at startup.
-4. One stable device + one steady IP per account, forever.
+4. One stable, COHERENT phone + one steady IP per account, forever — the
+   phone from `ig_identity`, changed only at a sign-in; the exit IP checked
+   and written down at every sign-in.
 5. Extract here, analyse in Watch-Tower — except the one content label per
    post, which is manual, metered and travels with the post so there is one
    answer rather than two.
@@ -222,9 +231,13 @@ Node on the server). Install the pre-commit hook:
 
 ## 8. Hard realities (do not underestimate)
 
-- **Instagram fights automation.** Checkpoints only a human clears; pin the
-  device file; `PleaseWaitFewMinutes` punishes retries — back off hours.
-  `user_medias` wants the numeric pk; validate sessions against the feed.
+- **Instagram fights automation.** Checkpoints only a human clears (this
+  account's browser in the panel, or a pasted session); pin the device file;
+  `PleaseWaitFewMinutes` punishes retries — back off hours. `user_medias`
+  wants the numeric pk; validate sessions against the feed. An INCOHERENT
+  identity is punished before the first request is answered: the library's
+  default US Pixel behind Indian exits got three accounts throttled and
+  checkpointed with zero posts collected (2026-09-03).
 - **X Lists poll ~10× faster than query watchlists** (500 vs 50 req/15min).
 - **No scraper is ban-proof.** `doctor`, `guard`, pinned versions make
   breakage loud.
@@ -269,7 +282,11 @@ Node on the server). Install the pre-commit hook:
   probes and generated `frontend/dist/`. A UI change under `frontend/src/` is
   a behavior change.
 
-**Done since first blueprint:** Facebook as a full third platform (GraphQL
+**Done since first blueprint:** Instagram in parallel — one coherent phone
+per account (`ig_identity`), N collectors with sticky per-source ownership,
+per-account rhythm and rests, one pass per machine, the three sign-in doors
+(import / background login with the code relay / this account's streamed
+browser), the exit check, `/api/ig/diag` (2026-09-04); Facebook as a full third platform (GraphQL
 capture, favorites mode, per-page cadence, byte cap); keyword watchlists;
 account pool with failover/TOTP; `tweet_raw` split + FTS5; persistent account
 activity log + Activity Log page; FB login circuit breaker with dashboard

@@ -245,10 +245,133 @@ function CodesModal({ a, onDone, onClose }) {
 // different problems and a lone red X cannot tell them apart.
 
 const NEEDS_HINT = {
-  proxy: "Add the residential proxy on this card first (Edit → proxy URL).",
+  proxy: "The residential proxy is missing or its exit is unusable. Fix it on this card (Edit → proxy URL — another session number if the exit is dead), then sign in again.",
   totp: "Add the account's TOTP secret on this card (Edit → TOTP secret), or paste a session instead.",
   paste: "Paste a session from a browser you are already signed into.",
+  browser: "Open this account's own browser below (its phone, its proxy), clear what Instagram asks, and the session is adopted for you.",
 };
+
+// ---------------------------------------------------------------------------
+// The streamed browser window — the account's OWN Chromium on the server
+// ---------------------------------------------------------------------------
+//
+// Instagram sometimes wants to see a browser it recognises (a native
+// checkpoint, a Bloks flow, a captcha). The server opens one per account:
+// shaped like the account's phone (ig_identity), through the account's own
+// proxy, on a persistent profile — and streams it here. The operator clicks
+// and types; when the page is signed in, the session is adopted by the app
+// client on the same phone (signin.ig_browser_adopt) and the window closes.
+function BrowserLoginModal({ a, onDone, onClose }) {
+  const [win, setWin] = useState(null);       // {width,height,phone,...}
+  const [state, setState] = useState("");
+  const [name, setName] = useState("");
+  const [url, setUrl] = useState("");
+  const [tick, setTick] = useState(0);
+  const [text, setText] = useState("");
+  const [err, setErr] = useState("");
+  const [busy, setBusy] = useState(true);
+  const [done, setDone] = useState(null);
+  const imgRef = React.useRef(null);
+
+  useEffect(() => {
+    let alive = true;
+    api.loginStart(a.account_id).then((r) => {
+      if (!alive) return;
+      setWin(r); setState(r.state); setName(r.screen_name || ""); setUrl(r.url || "");
+      setBusy(false);
+      if (r.warning) setErr(r.warning);
+    }).catch((e) => { if (alive) { setErr(String(e.message || e)); setBusy(false); } });
+    const t = setInterval(() => setTick((n) => n + 1), 1200);
+    return () => { alive = false; clearInterval(t); api.loginCancel().catch(() => {}); };
+  }, [a.account_id]);
+
+  const act = async (body) => {
+    if (busy) return;
+    setBusy(true); setErr("");
+    try {
+      const r = await api.loginAct(body);
+      setState(r.state); setName(r.screen_name || ""); setUrl(r.url || "");
+      if (r.captured) { setDone(r); onDone(); }
+      else if (r.closed) setErr("The window closed.");
+    } catch (e) { setErr(String(e.message || e)); }
+    setBusy(false);
+  };
+
+  const click = (ev) => {
+    if (!win || !imgRef.current) return;
+    const box = imgRef.current.getBoundingClientRect();
+    const x = Math.round((ev.clientX - box.left) * (win.width / box.width));
+    const y = Math.round((ev.clientY - box.top) * (win.height / box.height));
+    act({ act: "click", x, y });
+  };
+
+  const sub = win
+    ? `${win.phone ? win.phone + " · " : ""}${win.width}×${win.height} · through this account's proxy`
+    : "opening the account's browser on the server…";
+
+  return (
+    <Modal title={`${a.label} — this account's browser`} onClose={onClose} sub={sub}>
+      <div style={{ display: "flex", gap: 14, alignItems: "flex-start", flexWrap: "wrap" }}>
+        <div style={{ flex: "0 0 auto", border: "1px solid var(--line)", borderRadius: 10,
+                      overflow: "hidden", background: "#000",
+                      width: win ? Math.min(win.width, 380) : 380 }}>
+          {win ? (
+            <img ref={imgRef} src={`/api/login/frame?t=${tick}`} alt="the sign-in window"
+                 onClick={click} draggable={false}
+                 style={{ display: "block", width: "100%", cursor: busy ? "progress" : "pointer",
+                          aspectRatio: `${win.width} / ${win.height}` }} />
+          ) : (
+            <div style={{ padding: 40, color: "#bbb", fontSize: 13 }}>
+              {err || "starting Chromium as this phone…"}
+            </div>
+          )}
+        </div>
+        <div style={{ flex: "1 1 260px", minWidth: 240 }}>
+          <div className="kv"><span>state</span>
+            <b className={state === "logged_in" ? "st-good" : state === "challenge" ? "st-crit" : ""}>
+              {state || "…"}{name ? ` · @${name}` : ""}
+            </b>
+          </div>
+          {url && <div className="kv"><span>page</span><b style={{ fontWeight: 400, wordBreak: "break-all" }}>{url}</b></div>}
+          <div className="field" style={{ marginTop: 8 }}>
+            <label>Type into the page</label>
+            <div style={{ display: "flex", gap: 6 }}>
+              <input value={text} onChange={(e) => setText(e.target.value)}
+                     placeholder="click a field in the frame first, then type here"
+                     onKeyDown={(e) => { if (e.key === "Enter") { act({ act: "type", text }); setText(""); } }} />
+              <button className="btn" disabled={busy || !text}
+                      onClick={() => { act({ act: "type", text }); setText(""); }}>Type</button>
+            </div>
+          </div>
+          <div className="cactions" style={{ marginTop: 6 }}>
+            <button disabled={busy} onClick={() => act({ act: "key", key: "Enter" })}>Enter</button>
+            <button disabled={busy} onClick={() => act({ act: "key", key: "Tab" })}>Tab</button>
+            <button disabled={busy} onClick={() => act({ act: "key", key: "Backspace" })}>⌫</button>
+            <button disabled={busy} onClick={() => act({ act: "scroll", dy: 400 })}>Scroll ↓</button>
+            <button disabled={busy} onClick={() => act({ act: "scroll", dy: -400 })}>Scroll ↑</button>
+            <button disabled={busy} onClick={() => act({ act: "reload" })}>Reload</button>
+            <button disabled={busy} onClick={() => act({ act: "noop" })}>Check state</button>
+          </div>
+          <div style={{ color: "var(--ink-3)", fontSize: 12.5, lineHeight: 1.55, marginTop: 10 }}>
+            Sign in as you would on a phone. Whatever Instagram asks — a code, a captcha,
+            "confirm it's you" — answer it here. The moment the page is signed in, the
+            session is adopted by the collector on this same phone and this window closes.
+          </div>
+          {done && (
+            <div className={done.active ? "banner-ok" : "banner-crit"} style={{ marginTop: 10 }}>
+              <b>{done.active ? "Signed in and adopted." : "Signed in, but not adopted."}</b>{" "}
+              {done.username ? `@${done.username}. ` : ""}{done.detail}
+            </div>
+          )}
+          {err && <div className="err" style={{ marginTop: 8 }}>{err}</div>}
+        </div>
+      </div>
+      <div className="row">
+        <button className="btn btn-ghost" onClick={onClose}>{done ? "Done" : "Close window"}</button>
+      </div>
+    </Modal>
+  );
+}
 
 function SignInModal({ a, onDone, onClose }) {
   const [help, setHelp] = useState(null);
@@ -257,9 +380,17 @@ function SignInModal({ a, onDone, onClose }) {
   const [lines, setLines] = useState([]);
   const [result, setResult] = useState(null);
   const [err, setErr] = useState("");
+  const [waiting, setWaiting] = useState(null);   // {choice, hint} while a code is wanted
+  const [code, setCode] = useState("");
+  const [browser, setBrowser] = useState(false);
 
   const canBackground = a.platform === "ig";
   const h = help?.[a.platform];
+
+  const sendCode = async () => {
+    try { await api.loginCode(code); setCode(""); setWaiting(null); }
+    catch (e) { setErr(String(e.message || e)); }
+  };
 
   useEffect(() => {
     api.poolSigninHelp().then((r) => setHelp(r.platforms)).catch(() => {});
@@ -272,8 +403,10 @@ function SignInModal({ a, onDone, onClose }) {
       try {
         const r = await api.poolSigninStatus();
         setLines(r.lines || []);
+        setWaiting(r.waiting_for || null);
         if (!r.running) {
           setBusy(false);
+          setWaiting(null);
           if (r.result) setResult(r.result);
           onDone();
           return;
@@ -308,6 +441,37 @@ function SignInModal({ a, onDone, onClose }) {
                   onClick={() => start("auto")}>
             {busy ? "Signing in…" : "Sign in in the background"}
           </button>
+          {waiting && (
+            <div className="banner-warn" style={{ marginTop: 10 }}>
+              <b>Instagram sent a one-time code to your {waiting.choice}{waiting.hint ? ` (${waiting.hint})` : ""}.</b>
+              <div style={{ display: "flex", gap: 6, marginTop: 8 }}>
+                <input value={code} onChange={(e) => setCode(e.target.value)} placeholder="6-digit code"
+                       inputMode="numeric" autoFocus
+                       onKeyDown={(e) => { if (e.key === "Enter" && code.trim()) sendCode(); }} />
+                <button className="btn btn-brand" disabled={!code.trim()} onClick={sendCode}>Send code</button>
+              </div>
+              <div style={{ color: "var(--ink-3)", fontSize: 12, marginTop: 6 }}>
+                Five minutes before the attempt lapses. This is the whole reason a sign-in
+                from the server used to fail: the code had nowhere to go.
+              </div>
+            </div>
+          )}
+        </div>
+      )}
+
+      {canBackground && (
+        <div className="field">
+          <label>…or open this account's browser</label>
+          <div style={{ color: "var(--ink-3)", fontSize: 12.5, lineHeight: 1.55, marginBottom: 8 }}>
+            A real Chromium on the server, shaped like this account's phone, through its
+            own proxy, streamed here. For the walls only a browser can clear — a captcha,
+            "confirm it's you", a native checkpoint. The session it earns is adopted by
+            the collector on the same phone.
+          </div>
+          <button className="btn" disabled={busy} onClick={() => setBrowser(true)}>
+            Open this account's browser
+          </button>
+          {browser && <BrowserLoginModal a={a} onDone={onDone} onClose={() => setBrowser(false)} />}
         </div>
       )}
 
@@ -464,6 +628,17 @@ function AccountCard({ a, live, onChanged }) {
     try { const r = await api.poolTotp(a.account_id); setMsg(r.code ? `TOTP now: ${r.code}` : "no TOTP set"); }
     catch (e) { setMsg(String(e.message || e)); }
   };
+  // Instagram: N accounts collect in parallel. "Bench" takes this one off
+  // the roster (its unpinned sources move to the others on the next pass);
+  // "Collect" puts it back. "New phone" mints a fresh identity — the session
+  // dies with the old phone, so it benches the account until a sign-in.
+  const isIg = a.platform === "ig";
+  const bench = () => act(() => api.igAccount(live.username, false), "benched — its sources move on the next pass");
+  const collect = () => act(() => api.igAccount(live.username, true), "collecting again from the next pass");
+  const newPhone = () => {
+    if (!confirm(`Mint a NEW phone for ${a.label}? The current session dies with the old phone; you will sign in again on the new one.`)) return;
+    act(() => api.igReseed(live.username), "new phone minted — sign in again");
+  };
 
   return (
     <div className="panel">
@@ -482,6 +657,25 @@ function AccountCard({ a, live, onChanged }) {
       <div className="kv"><span>login</span><b>{a.login}</b></div>
       <div className="kv"><span>proxy / IP</span><b>{a.proxy_id || "none (server IP)"}</b></div>
       <SessionRow a={a} live={live} />
+      {isIg && live && (
+        <>
+          <div className="kv"><span>phone</span>
+            <b className={live.identity?.legacy ? "st-warn" : ""} style={{ fontWeight: live.identity ? 500 : 400 }}>
+              {live.identity ? live.identity.text : "no phone minted yet — the first sign-in mints one"}
+            </b>
+          </div>
+          <div className="kv"><span>collecting</span>
+            <b className={live.active && !live.checkpoint_at ? "st-good" : "st-warn"}>
+              {live.active ? `yes · owns ${live.owns ?? 0} source(s)` : "benched"}
+              {live.exit?.exit_ip ? (
+                <span style={{ color: "var(--ink-3)", fontWeight: 400 }}>
+                  {` · signed in via ${live.exit.exit_ip}${live.exit.country ? ` (${live.exit.country})` : ""}`}
+                </span>
+              ) : null}
+            </b>
+          </div>
+        </>
+      )}
       <div className="kv"><span>last success</span>
         <b>{a.last_success_at ? fmtAgo(a.last_success_at) : "never"}</b></div>
       {a.health && <div className="kv"><span>health</span><b className="st-warn">{a.health}</b></div>}
@@ -493,6 +687,10 @@ function AccountCard({ a, live, onChanged }) {
         <button onClick={showCode}>Show TOTP</button>
         <button onClick={() => setModal("edit")}>Edit</button>
         <button onClick={() => setModal("codes")}>Codes ({a.backup_codes_left})</button>
+        {isIg && live && (live.active
+          ? <button onClick={bench}>Bench</button>
+          : <button onClick={collect}>Collect</button>)}
+        {isIg && live && <button onClick={newPhone}>New phone</button>}
         {a.status !== "quarantined" && a.status !== "dead"
           ? <button onClick={quarantine}>Quarantine</button>
           : <button onClick={revive}>Return to pool</button>}
@@ -556,6 +754,7 @@ function PlatformSection({ platform, title, summary, accounts, orphans, liveFor,
   };
 
   const nothing = accounts.length === 0 && orphans.length === 0;
+  const parallel = platform === "ig";
 
   return (
     <>
@@ -571,6 +770,14 @@ function PlatformSection({ platform, title, summary, accounts, orphans, liveFor,
           )}
         </span>
       </div>
+
+      {parallel && accounts.length > 0 && (
+        <div style={{ color: "var(--ink-3)", fontSize: 12.5, margin: "-6px 0 10px", lineHeight: 1.5 }}>
+          Instagram accounts collect <b>in parallel</b>: every card marked “collecting” owns a
+          share of the sources on its own phone, through its own proxy. Promote adds a
+          collector; Bench takes one off without losing its session.
+        </div>
+      )}
 
       {summary.low && accounts.length > 0 && (
         <div className="banner-crit" style={{ borderLeftColor: "var(--warning)" }}>

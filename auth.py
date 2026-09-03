@@ -412,8 +412,13 @@ def _proxy_kwargs(url: str) -> dict:
     return out
 
 
-async def _launch(pw, acct, headless: bool, log):
-    """Launch the persistent context, preferring real Chrome over bundled Chromium."""
+async def _launch(pw, acct, headless: bool, log, extra: dict | None = None):
+    """Launch the persistent context, preferring real Chrome over bundled Chromium.
+
+    `extra` is merged over the launch kwargs LAST — it is how ig.py makes the
+    window BE the account's phone (user_agent, viewport, device_scale_factor,
+    is_mobile, has_touch, locale, timezone_id). X's window passes nothing and
+    gets the desktop defaults below."""
     profile_dir = Path(acct.profile_path)
     profile_dir.mkdir(parents=True, exist_ok=True)
     clear_stale_locks(profile_dir, log)
@@ -450,6 +455,9 @@ async def _launch(pw, acct, headless: bool, log):
 
     if acct.proxy_or_none:
         kwargs["proxy"] = _proxy_kwargs(acct.proxy_or_none)
+    if extra:
+        kwargs.pop("no_viewport", None)
+        kwargs.update(extra)
 
     # Tried in order, most faithful first.
     #

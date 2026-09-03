@@ -3543,6 +3543,10 @@ def _pool_account_cfg(account_id: int):
         proxy=proxy,
     )
     cfg.profile_path = _CFG.profiles_dir / f"pool_{acct.account_id}"
+    if platform == "instagram":
+        # The instagrapi device label this account's phone lives under — the
+        # streamed window must be THAT phone (ig.InteractiveLogin._phone).
+        cfg.ig_label = _ig_label_for(acct.login, acct.account_id)
     return cfg, acct
 
 
@@ -3651,8 +3655,12 @@ def _login_start(label="", account_id=None):
                 "state": sess.state, "screen_name": sess.screen_name,
                 "url": sess.url(), "took_s": round(took, 1), "trace": trace,
                 "warning": (getattr(sess, "error", "") or "") or proxy_warning,
-                "width": mod.LOGIN_VIEWPORT["width"],
-                "height": mod.LOGIN_VIEWPORT["height"]}
+                # An Instagram window is the account's PHONE, so its size is
+                # the phone's (ig.InteractiveLogin.viewport); X keeps the
+                # desktop constant.
+                "width": (getattr(sess, "viewport", None) or mod.LOGIN_VIEWPORT)["width"],
+                "height": (getattr(sess, "viewport", None) or mod.LOGIN_VIEWPORT)["height"],
+                "phone": (getattr(sess, "device", None) or {}).get("identity", {}).get("name", "")}
 
 
 def _login_act(body):
@@ -3726,10 +3734,29 @@ def _login_capture():
                              "yet. Give it a moment and it will finish."}
 
         if platform == "instagram":
-            import ig
-            with ig.Store(_ig_store_path()) as st:
-                active, detail = ig.capture(st, harvest, cfg)
-            username = harvest.username
+            # The browser was the account's own phone through its own proxy;
+            # its jar is adopted by the app client on the pinned device and
+            # persisted like any other sign-in (sidecar + ig_accounts.db),
+            # so collection can reuse it and refresh it.
+            import signin
+            o = signin.ig_browser_adopt(
+                dict(harvest.cookies), proxy=cfg.proxy or "",
+                label=getattr(cfg, "ig_label", "") or cfg.label,
+                root=str(_CFG.root), store=str(_ig_store_path()),
+                username_hint=harvest.username, browser_ua=harvest.user_agent)
+            for line in o.lines:
+                print(f"[signin:{label}] {line}", flush=True)
+            active, detail = o.ok, ("" if o.ok else o.detail)
+            username = o.identity or harvest.username
+            if not o.ok:
+                # Keep what the browser held so the operator can see the row;
+                # not active, with the reason on it.
+                import ig
+                with ig.Store(_ig_store_path()) as st:
+                    st.save(harvest, label=getattr(cfg, "ig_label", "") or cfg.label,
+                            proxy=cfg.proxy or "", active=False, error=o.detail[:300])
+            else:
+                _decider_after_signin(cfg.username or username, username)
         else:
             import auth
             async def save():
@@ -3958,6 +3985,7 @@ def _decider_after_signin(login: str, identity: str):
 
 
 def _signin_status():
+    import signin
     o = _SIGNIN["outcome"]
     running = _signin_busy()
     out = {"running": running, "account_id": _SIGNIN["account_id"],
@@ -3965,9 +3993,19 @@ def _signin_status():
            "lines": list(o.lines) if o else list(_SIGNIN["lines"]),
            "elapsed_s": round(time.time() - _SIGNIN["started"], 1)
                         if _SIGNIN["started"] else 0}
+    # While a sign-in waits for a one-time code, say so: the panel shows the
+    # box and POST /api/login/code feeds the relay (signin.CodeRelay).
+    out.update(signin.relay_status() if running else {"waiting_for": None})
     if o is not None and not running:
         out["result"] = o.as_json()
     return out
+
+
+def _signin_code(body):
+    """The operator typed the code Instagram sent. Digits only; refused
+    plainly when no sign-in is waiting."""
+    import signin
+    return signin.submit_code(str(body.get("code") or ""))
 
 
 def _signin_help():
@@ -4494,13 +4532,28 @@ def _ig_status(q=None):
                 # The checkpoint tombstone lives in the account's session
                 # sidecar — surface it so the dashboard can say "a human must
                 # act" instead of the collector failing quietly (RULEBOOK §6).
+                # The exit the session was minted through rides along too.
                 try:
                     sc = root / "profiles" / f"ig_{r['username']}.json"
                     if sc.exists():
                         meta = (json.loads(sc.read_text()) or {}).get("meta", {})
                         acct["checkpoint_at"] = meta.get("checkpoint_at") or None
+                        ex = meta.get("exit") or {}
+                        if ex:
+                            acct["exit"] = {k: ex.get(k) for k in
+                                            ("exit_ip", "country", "checked", "ok")}
+                        acct["session_updated"] = meta.get("updated")
                 except Exception:
                     pass
+                # WHICH PHONE this account is (ig_identity) — the card shows
+                # it, and says when it is still the legacy default handset.
+                try:
+                    import ig_identity
+                    import ig_session
+                    dev = ig_session.load_device(r["label"] or "ig_a", root)
+                    acct["identity"] = ig_identity.summary(dev) if dev else None
+                except Exception:
+                    acct["identity"] = None
                 out["accounts"].append(acct)
             con.close()
         except Exception as e:
@@ -4533,8 +4586,11 @@ def _ig_status(q=None):
                 # a human reads and the thing that maps to the other platforms.
                 out["sources"] = [dict(r) for r in st.db.execute(
                     "SELECT label, type, value, platform_id, project_id, account, "
-                    "enabled FROM sources WHERE project_id = ? ORDER BY label",
+                    "assigned_account, enabled FROM sources WHERE project_id = ? "
+                    "ORDER BY label",
                     (pid,))]
+                for row in out["sources"]:
+                    row["collector"] = row.get("account") or row.get("assigned_account") or ""
                 out["totals"] = st.stats(project_id=pid)
         except Exception as e:
             out["sources_error"] = f"{type(e).__name__}: {e}"
@@ -4543,7 +4599,207 @@ def _ig_status(q=None):
         "interval_s": int(settings.get("ig_interval_s")
                           or os.getenv("IG_INTERVAL_S", "120")),
     }
+    # How the enabled sources are spread over the collecting accounts (all
+    # projects — the accounts are global), so the card can say "owns 4".
+    if rp.exists():
+        try:
+            import store_ig
+            with store_ig.Store(rp) as st:
+                counts = st.assignment_counts()
+            for a in out["accounts"]:
+                a["owns"] = counts.get(a["username"], 0)
+            out["unassigned"] = counts.get("", 0)
+        except Exception:
+            pass
     return out
+
+
+def _ig_diag():
+    """Everything an operator (or the engineer behind them, with no shell)
+    needs to know about the Instagram side of THIS server, in one JSON:
+    what code is running, whether the services are up, what the loop last
+    did, and per account which phone it is, which exit it signed in
+    through and what it owns. Secrets never: no cookies, no proxy URLs, no
+    UUIDs — names of cookies present and the proxy's label only."""
+    import subprocess
+    import sys
+    root = _CFG.root
+    out = {"now": time.time(), "python": sys.version.split()[0]}
+    # the code
+    try:
+        head = (root / ".git" / "HEAD").read_text().strip()
+        rev = head
+        if head.startswith("ref:"):
+            ref = head.split(" ", 1)[1].strip()
+            rp = root / ".git" / ref
+            if rp.exists():
+                rev = rp.read_text().strip()
+            else:
+                for line in (root / ".git" / "packed-refs").read_text().splitlines():
+                    if line.endswith(" " + ref):
+                        rev = line.split()[0]
+        out["git"] = {"rev": rev[:12], "ref": head}
+    except Exception as e:
+        out["git"] = {"error": f"{type(e).__name__}: {e}"}
+    try:
+        from importlib.metadata import version as _v
+        out["instagrapi"] = _v("instagrapi")
+    except Exception:
+        out["instagrapi"] = "?"
+    # the services
+    svc = {}
+    for unit in ("xscraper-web", "xscraper-ig", "xscraper-watch", "xscraper-fb"):
+        try:
+            r = subprocess.run(["systemctl", "is-active", unit], capture_output=True,
+                               text=True, timeout=5)
+            svc[unit] = (r.stdout or r.stderr or "").strip() or "unknown"
+        except Exception as e:
+            svc[unit] = f"unknown ({type(e).__name__})"
+    out["services"] = svc
+    # the loop
+    try:
+        hb = root / "profiles" / "ig_loop.json"
+        out["loop"] = json.loads(hb.read_text()) if hb.exists() else None
+    except Exception as e:
+        out["loop"] = {"error": f"{type(e).__name__}: {e}"}
+    try:
+        import collect_ig
+        lk = collect_ig.PassLock(str(root))
+        out["pass_running"] = lk.holder() if not lk.acquire("diag") else None
+        lk.release()
+    except Exception:
+        out["pass_running"] = None
+    # the accounts
+    accounts = []
+    try:
+        import decider
+        import ig
+        import ig_identity
+        import ig_session
+        import pool_link
+        adb = str(root / "activity.db")
+        conds = decider.open_conditions("instagram", db=adb)
+        rows = []
+        ap = root / "ig_accounts.db"
+        if ap.exists():
+            with ig.Store(ap) as st:
+                rows = st.all()
+        for r in rows:
+            u = r["username"]
+            a = {"username": u, "label": r["label"], "active": bool(r["active"]),
+                 "error": r["error_msg"], "updated": r["updated_at"]}
+            dev = ig_session.load_device(r["label"] or "ig_a", root)
+            a["identity"] = ig_identity.summary(dev) if dev else None
+            sc = ig_session.sidecar_path(u, root)
+            if sc.exists():
+                try:
+                    d = json.loads(sc.read_text())
+                    meta = d.get("meta") or {}
+                    cookies = (d.get("settings") or {}).get("cookies") or {}
+                    a["sidecar"] = {"updated": meta.get("updated"),
+                                    "checkpoint_at": meta.get("checkpoint_at"),
+                                    "has_password_env": bool(meta.get("password_env")),
+                                    "exit": meta.get("exit"),
+                                    "cookies": sorted(cookies.keys()),
+                                    "proxy": ig_session.redact_proxy(meta.get("proxy") or "")}
+                except Exception as e:
+                    a["sidecar"] = {"error": f"{type(e).__name__}: {e}"}
+            else:
+                a["sidecar"] = None
+            try:
+                prow = pool_link.find("ig", u)
+                a["pool"] = {"proxy_id": getattr(prow, "proxy_id", "") or "",
+                             "status": getattr(prow, "status", ""),
+                             "health": getattr(prow, "health", ""),
+                             "last_success_at": getattr(prow, "last_success_at", None)} \
+                    if prow else None
+            except Exception:
+                a["pool"] = None
+            a["conditions"] = [{"kind": c["kind"], "source": c.get("source", ""),
+                                "since_ms": c.get("since_ms"), "count": c.get("count"),
+                                "detail": c.get("detail")}
+                               for c in conds if c["account"].lower() == u.lower()]
+            accounts.append(a)
+        out["accounts"] = accounts
+        out["devices"] = sorted(p.name for p in (root / "profiles").glob("ig_device_*.json")) \
+            if (root / "profiles").exists() else []
+    except Exception as e:
+        out["accounts_error"] = f"{type(e).__name__}: {e}"
+    try:
+        import store_ig
+        with store_ig.Store(root / "ig_results.db") as st:
+            out["assignment"] = st.assignment_counts()
+            out["sources"] = [{"label": x.label, "collector": x.collector,
+                               "pinned": x.account, "resolved": x.resolved,
+                               "project": x.project_id}
+                              for x in st.sources(only_enabled=True)]
+    except Exception as e:
+        out["assignment_error"] = f"{type(e).__name__}: {e}"
+    return out
+
+
+def _ig_account_post(body):
+    """Bench one Instagram account (stop it collecting, keep its session) or
+    put it back. `active` in ig_accounts.db is the collector's roster; a
+    benched account's unpinned sources move to the others on the next pass,
+    a returning one gets a share back. Never touches the pool row."""
+    username = (body.get("username") or "").strip().lstrip("@")
+    if not username:
+        return {"error": "username is required"}
+    active = body.get("active")
+    if active is None:
+        return {"error": "active (true/false) is required"}
+    import activity_log
+    import ig
+    with ig.Store(_CFG.root / "ig_accounts.db") as st:
+        row = st.get(username)
+        if not row:
+            return {"error": f"no Instagram session row for @{username}"}
+        st.set_active(username, bool(active), error="" if active else (row["error_msg"] or ""))
+        roster = st.active_accounts()
+    activity_log.log_event(
+        "instagram",
+        f"@{username} {'is collecting again' if active else 'benched'} by operator "
+        f"from the dashboard — collectors now: "
+        + (", ".join("@" + u for u in roster) if roster else "none"),
+        db=str(_CFG.root / "activity.db"))
+    return {"ok": True, "username": username, "active": bool(active), "collectors": roster}
+
+
+def _ig_reseed(body):
+    """Give one account a NEW phone, on the operator's say-so. Its session
+    dies with the old phone (Instagram would read the swap as a stolen
+    session), so the row is deactivated and marked for sign-in — the next
+    sign-in from the panel runs on the new handset."""
+    label = (body.get("label") or "").strip()
+    username = (body.get("username") or "").strip().lstrip("@")
+    if not label and not username:
+        return {"error": "label or username is required"}
+    import activity_log
+    import ig
+    import ig_identity
+    import ig_session
+    root = _CFG.root
+    lines = []
+    if not label:
+        with ig.Store(root / "ig_accounts.db") as st:
+            row = st.get(username)
+            label = (row or {}).get("label") or ""
+        if not label:
+            return {"error": f"no Instagram session row for @{username}"}
+    dev = ig_session.reseed(label, root, why="operator asked for a new phone",
+                            log=lines.append)
+    with ig.Store(root / "ig_accounts.db") as st:
+        for r in st.all():
+            if (r["label"] or "") == label:
+                st.set_active(r["username"], False,
+                              error="new phone minted — sign in again to use it")
+    activity_log.log_event("instagram",
+                           f"[{label}] new phone minted by operator: "
+                           f"{ig_identity.describe(dev)} — sign in again",
+                           db=str(root / "activity.db"))
+    return {"ok": True, "label": label, "identity": ig_identity.summary(dev),
+            "lines": lines}
 
 
 def _ig_control(body):
@@ -4765,9 +5021,15 @@ def _ig_fetch(body):
     _lg = activity_log.logger("instagram",
                               echo=lambda m: logs.append(str(m)),
                               db=str(_CFG.root / "activity.db"))
-    n, err = _ig_locked_run(run_once(str(rp), log=_lg), timeout=180)
+    n, err = _ig_locked_run(run_once(str(rp), log=_lg, root=str(_CFG.root),
+                                     accounts_path=str(_CFG.root / "ig_accounts.db"),
+                                     who="fetch-now"), timeout=180)
     if err:
         return {**err, "log": logs}
+    busy = next((l for l in logs if "a pass is already running" in l), "")
+    if busy:
+        return {"error": busy + " — the running pass covers this project.",
+                "log": logs}
     return {"ok": True, "new": n, "sources": len(srcs), "log": logs}
 
 
@@ -5493,6 +5755,8 @@ class Handler(BaseHTTPRequestHandler):
                 return self._send(200, _stress_accounts(q))
             if u.path == "/api/ig/status":
                 return self._send(200, _ig_status(q))
+            if u.path == "/api/ig/diag":
+                return self._send(200, _ig_diag())
             if u.path == "/api/ig/posts":
                 return self._send(200, _ig_posts(q))
             if u.path == "/api/fb/status":
@@ -5542,6 +5806,12 @@ class Handler(BaseHTTPRequestHandler):
                 return self._send(200, _login_act(body))
             if u.path == "/api/login/cancel":
                 return self._send(200, _login_cancel())
+            if u.path == "/api/login/code":
+                return self._send(200, _signin_code(body))
+            if u.path == "/api/ig/reseed":
+                return self._send(200, _ig_reseed(body))
+            if u.path == "/api/ig/account":
+                return self._send(200, _ig_account_post(body))
             if u.path == "/api/projects":
                 return self._send(200, _project_post(body))
             if u.path == "/api/projects/delete-plan":

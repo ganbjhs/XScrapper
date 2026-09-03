@@ -63,14 +63,17 @@ def test_promote_moves_ig_collection():
     ghost = _add(platform="ig", label="Ghost", login="nosession")["account_id"]
     r = A.handle("POST", "/promote", {"account_id": omar}, {})
     assert r["ok"] and "@omarfarooq724 is now the collecting" in r["note"], r
+    assert "alongside @sanaakhtar221" in r["note"], r
     with ig.Store(igdb) as st:
         act = [x["username"] for x in st.all() if x["active"]]
-    assert act == ["omarfarooq724"], act
+    # 2026-09-04: accounts collect IN PARALLEL — a promote ADDS a collector
+    # and demotes nobody (sources are shared out by store_ig.assign_sources).
+    assert act == ["omarfarooq724", "sanaakhtar221"], act
     r = A.handle("POST", "/promote", {"account_id": ghost}, {})
     assert r["ok"] and "no session on this server" in r["note"], r
     with ig.Store(igdb) as st:
         act = [x["username"] for x in st.all() if x["active"]]
-    assert act == ["omarfarooq724"], "no session -> collection does not move"
+    assert act == ["omarfarooq724", "sanaakhtar221"], "no session -> nothing changes"
     r = A.handle("POST", "/failover", {"platform": "ig"}, {})
     # ghost is active in the pool now; failover quarantines it and promotes the oldest backup
     assert r["promoted"] and "note" in r, r

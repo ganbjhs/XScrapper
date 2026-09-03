@@ -47,15 +47,32 @@ first thing Instagram withdraws under a checkpoint. user/hashtag sources are
 unaffected, which is why one failing source no longer stops the others.
 
 Sources are stored in ig_results.db (store_ig), so the API and a future
-dashboard read the same list. The account that collects is the active Instagram
-login unless a source names its own (--account).
+dashboard read the same list.
+
+WHO COLLECTS WHAT (since 2026-09-04). Every ACTIVE Instagram login with a
+session and no checkpoint is a collector, and they run IN PARALLEL — one
+asyncio task per account, each on its own phone (ig_identity), its own proxy,
+its own human rhythm (ig_human, shifted per account) and its own daily budget.
+Every source is owned by exactly one of them: a human pin (`--account`) wins,
+otherwise the collector assigns it once and keeps it there (sticky) until the
+owner drops out, at which point it moves to the least-loaded healthy account
+and the move is logged (store_ig.assign_sources). No sort order ever decides.
+
+ONE PASS AT A TIME, ACROSS PROCESSES. The service loop and the dashboard's
+Fetch-now both call run_once; a file lock (profiles/.ig_pass.lock) makes the
+second one say "a pass is already running" instead of starting a second wave
+of the same profiles from other phones — the overlap that ended in a
+checkpoint on 2026-09-03 (23:45 pass on @youssef, 23:47 pass on @sana,
+23:49 ChallengeRequired).
 """
 
 import argparse
 import asyncio
 import json
 import os
+import random
 import time
+from pathlib import Path
 
 import asyncio as _asyncio
 
@@ -63,6 +80,7 @@ import activity_log
 import decider
 import ig
 import ig_human
+import ig_identity
 import pool_link
 import ig_session
 import store_ig
@@ -82,14 +100,120 @@ def _persist_log(log=None):
     return activity_log.logger("instagram")
 
 
-def _active_account() -> str:
-    """The Instagram handle to collect with: the first active one in the store."""
-    with ig.Store("ig_accounts.db") as st:
+ACCOUNTS_DB = "ig_accounts.db"
+
+
+def _active_account(store_path=ACCOUNTS_DB) -> str:
+    """Kept for the CLI paths that take ONE login (resolve-ids without
+    --account): the first active row. Collection itself never calls this any
+    more — see collectors()."""
+    with ig.Store(store_path) as st:
         rows = [r for r in st.all() if r.get("active")]
     if not rows:
-        raise RuntimeError("no active Instagram account — onboard one with "
-                           "ig_login.py or ig_import.py first")
+        raise RuntimeError("no active Instagram account — sign one in under "
+                           "Accounts & Sessions (or ig_login.py / ig_import.py)")
     return rows[0]["username"]
+
+
+def collectors(*, store_path=ACCOUNTS_DB, root=".", log=print) -> tuple:
+    """(owners, benched): every active login that can collect, and the ones
+    that cannot with the reason. An owner keeps its sources even while it
+    rests (rate limit / budget) — resting is a pause, not a departure; only a
+    benched account loses them. Benched: inactive, no session at all, or a
+    recorded checkpoint."""
+    owners, benched = [], {}
+    with ig.Store(store_path) as st:
+        rows = st.all()
+    for r in rows:
+        u = r["username"]
+        if not r.get("active"):
+            continue
+        sc = ig_session.sidecar_path(u, root)
+        meta = {}
+        if sc.exists():
+            try:
+                meta = json.loads(sc.read_text()).get("meta", {}) or {}
+            except (OSError, ValueError):
+                meta = {}
+        else:
+            try:
+                jar = json.loads(r.get("cookies") or "{}")
+            except ValueError:
+                jar = {}
+            if not jar.get("sessionid"):
+                benched[u] = "no session"
+                continue
+        if meta.get("checkpoint_at"):
+            benched[u] = f"checkpoint at {meta['checkpoint_at']}"
+            continue
+        owners.append(u)
+    return owners, benched
+
+
+class PassLock:
+    """One collection pass at a time on this machine, whichever process asks.
+    fcntl.flock on profiles/.ig_pass.lock; the file carries who holds it."""
+
+    def __init__(self, root="."):
+        self.path = Path(root) / "profiles" / ".ig_pass.lock"
+        self.fh = None
+        self.unlocked = ""      # why no lock could be taken, if so
+
+    def acquire(self, who="loop") -> bool:
+        import fcntl
+        try:
+            self.path.parent.mkdir(parents=True, exist_ok=True)
+            fh = open(self.path, "a+")
+        except OSError as e:
+            # A lock file that cannot be opened must not stop collection;
+            # it is said (run_once logs it) and the pass runs unguarded.
+            self.unlocked = f"{type(e).__name__}: {e}"
+            return True
+        try:
+            fcntl.flock(fh, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            fh.close()
+            return False
+        fh.seek(0); fh.truncate()
+        fh.write(json.dumps({"pid": os.getpid(), "who": who, "since": time.time()}))
+        fh.flush()
+        self.fh = fh
+        return True
+
+    def holder(self) -> dict:
+        try:
+            return json.loads(self.path.read_text() or "{}")
+        except (OSError, ValueError):
+            return {}
+
+    def release(self):
+        import fcntl
+        if self.fh is None:
+            return
+        try:
+            fcntl.flock(self.fh, fcntl.LOCK_UN)
+        finally:
+            self.fh.close()
+            self.fh = None
+
+
+HEARTBEAT = "profiles/ig_loop.json"
+
+
+def heartbeat(root=".", **fields) -> None:
+    """What the loop is doing, for the dashboard's diag view: written every
+    pass, never read by the collector. A missing file means no loop ran."""
+    path = Path(root) / HEARTBEAT
+    try:
+        cur = json.loads(path.read_text()) if path.exists() else {}
+    except (OSError, ValueError):
+        cur = {}
+    cur.update(fields, pid=os.getpid(), updated=time.time())
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(cur, indent=1))
+    except OSError:
+        pass
 
 
 def ig_failover(quarantined: str, reason: str, *, store_path="ig_accounts.db",
@@ -112,9 +236,24 @@ def ig_failover(quarantined: str, reason: str, *, store_path="ig_accounts.db",
         st.set_active(quarantined, False, error=reason[:300])
         if not was_active:
             return ""
+    # With N collectors nothing usually needs promoting: the next pass finds
+    # one owner fewer and moves its unpinned sources to the least-loaded
+    # remaining account (store_ig.assign_sources). Name who that will be, so
+    # the ping can say it.
+    owners, _ = collectors(store_path=store_path, root=root, log=log)
+    others = [u for u in owners if u != quarantined]
+    if others:
+        log(f"  failover: @{quarantined} is out; its unpinned sources move to "
+            f"{', '.join('@' + u for u in others)} on the next pass")
+        return others[0]
+    # Nobody else is collecting: wake a WARM BACKUP — the first inactive row
+    # with a usable session, no error and no recorded checkpoint — so a
+    # single checkpoint never stops collection outright. The pool is told
+    # (pool_link.promote) so the Account Control Panel agrees.
+    with ig.Store(store_path) as st:
         for r in rows:
             u = r["username"]
-            if u == quarantined or r.get("error_msg"):
+            if u == quarantined or r.get("active") or r.get("error_msg"):
                 continue
             sc = ig_session.sidecar_path(u, root)
             if sc.exists():
@@ -128,8 +267,8 @@ def ig_failover(quarantined: str, reason: str, *, store_path="ig_accounts.db",
                 continue
             st.set_active(u, True)
             pool_link.promote("ig", u)
-            log(f"  failover: @{quarantined} is out; @{u} is now the active "
-                f"Instagram account (sources without a pinned account follow it)")
+            log(f"  failover: @{quarantined} is out and nobody else was collecting; "
+                f"warm backup @{u} is now active (unpinned sources move to it)")
             return u
     return ""
 
@@ -224,12 +363,13 @@ def _decide_exc(dec, acct, group, e, *, fallback, log=print, src=None):
     ig_session._note_checkpoint(acct, ".", log=log)
     new = ig_failover(acct, reason, log=log)
     if new:
-        note = (f"Collection failed over to @{new}; sources not pinned to "
-                f"@{acct} continue there.")
+        note = (f"Collection failed over to @{new}: @{acct} is out of rotation "
+                f"and its unpinned sources move there on the next pass "
+                f"(sources pinned to @{acct} wait).")
     else:
-        note = ("No backup Instagram account with a working session — "
-                "collection is STOPPED until this is fixed or a backup is "
-                "signed in under Accounts & Sessions.")
+        note = ("No other Instagram account with a working session — "
+                "collection is STOPPED until this is fixed or another account "
+                "is signed in under Accounts & Sessions.")
     return dec.on("checkpoint", acct, detail=reason,
                   meta={"sources": [s.label for s in group],
                         "failover_to": new, "note": note})
@@ -281,225 +421,311 @@ async def collect_source(engine, store, source, *, page_size=12, max_pages=2, lo
     return new
 
 
+async def _collect_account(acct, group, store, dec, *, page_size, max_pages,
+                           log, budget_override=None) -> tuple:
+    """Everything ONE account does in a pass, over the sources it owns.
+    Returns (new_posts, ok). Runs concurrently with the other accounts'
+    tasks; nothing here touches another account's state."""
+    total = 0
+    log(f"account @{acct}: {len(group)} source(s)")
+    try:
+        cl = ig_session.load_client(acct, log=log)
+    except Exception as e:
+        log(f"  could not load @{acct}: {e}")
+        # Tell the Account Control Panel WHY this account is quiet.
+        # Without this the card just sits at "last success —" and the
+        # operator has to read journalctl to learn the session is gone.
+        pool_link.note_needs_login("ig", acct, f"{type(e).__name__}: {e}")
+        # A missing session is a checkpoint if that is what the
+        # RuntimeError says (ig_session wraps ChallengeRequired), and
+        # a session_missing otherwise. Either way: idle, tell a human.
+        _decide_exc(dec, acct, group, e, fallback="session_missing", log=log)
+        return 0, False
+
+    # Daily budget per account (warm-up ramp for young sessions). Once
+    # spent, this account rests until tomorrow — a person doesn't open
+    # the app 500 times a day, and a burner that does gets flagged.
+    budget = ig_human.daily_budget() if budget_override is None else budget_override
+    if _DAY.remaining(acct, budget) <= 0:
+        dec.on("budget_spent", acct,
+               detail=f"daily budget spent ({budget}) — resting until tomorrow")
+        return 0, False
+
+    # on_resolved turns a successful name lookup into a permanent row
+    # in the DB. This is what makes the lookup a one-time cost instead
+    # of a per-restart one — see engine_ig.resolve_user.
+    engine = IGEngine(cl, account=acct,
+                      on_resolved=store.cache_platform_id)
+    refreshed = False       # relogin is attempted at most ONCE per pass
+    # Did this account manage a single clean source this pass? That is
+    # the honest definition of "the session still works", and it is what
+    # stamps last_success_at in the pool (pool_link.record_success).
+    acct_ok = False
+
+    # Sources still without a numeric id. Two things before any of
+    # them costs a lookup request:
+    #   1. one that was refused recently is LEFT ALONE (decider
+    #      hold-off: 1h doubling to 24h) — asking a throttled lookup
+    #      endpoint again every pass is what keeps the 429 alive;
+    #   2. the rest are resolved off this account's FOLLOWING list in
+    #      one ordinary request, no lookup endpoint touched. Follow
+    #      the sources from the collecting account and this is the
+    #      path that always works (engine_ig.resolve_from_following).
+    held = set()
+    pending = []
+    unresolved = [s for s in group
+                  if s.type == "user" and not s.platform_id
+                  and not str(s.value).isdigit()]
+    # The account-level breaker first: while lookups from this
+    # session are refused, NO handle is asked about — not the
+    # following list either. Sources with ids collect as usual.
+    acct_hold = dec.holdoff(acct, "lookups")
+    if acct_hold and unresolved:
+        held.update(s.label for s in unresolved)
+        log(f"  {len(held)} source(s) wait for ids — lookups from @{acct} "
+            f"are held for {acct_hold // 3600}h {(acct_hold % 3600) // 60:02d}m "
+            f"more (refused earlier)")
+    for s in unresolved:
+        if s.label in held:
+            continue
+        h = dec.holdoff(acct, s.label)
+        if h > 0:
+            held.add(s.label)
+        else:
+            pending.append(s.value)
+    if held and not acct_hold:
+        log(f"  leaving {len(held)} unresolved source(s) alone this pass "
+            f"({', '.join(sorted(held))}) — hold-off after a refused lookup")
+    if pending:
+        try:
+            got = await _asyncio.to_thread(engine.resolve_from_following, pending)
+        except Exception as e:
+            got = {}
+            log(f"  following-list lookup failed: {type(e).__name__}: {e}")
+        if got:
+            dec.ok(acct, source="lookups")      # the session answers again
+        for name, pk in got.items():
+            log(f"  resolved @{name} -> {pk} from @{acct}'s following list")
+            for s in group:
+                if s.value.lower() == name and not s.platform_id:
+                    dec.ok(acct, source=s.label)
+
+    for i, s in enumerate(group):
+        if s.label in held:
+            continue
+        # Human rhythm BETWEEN sources: a person doesn't machine-gun
+        # profile after profile. First source in a pass starts right
+        # away; each subsequent one waits a human "switch" gap, with an
+        # occasional longer "put the phone down" break.
+        if i > 0:
+            gap = ig_human.source_gap()
+            brk = ig_human.maybe_long_break()
+            if brk:
+                log(f"  @{acct} …taking a {int(brk)}s break (human pause)")
+                gap += brk
+            await _asyncio.sleep(gap)
+        _DAY.spend(acct)
+        try:
+            total += await collect_source(engine, store, s, page_size=page_size,
+                                          max_pages=max_pages, log=log)
+            acct_ok = True
+            if s.label in {x.label for x in unresolved}:
+                dec.ok(acct, source="lookups")     # a lookup just worked
+            dec.ok(acct, source=s.label)   # closes an unresolved_source, if open
+            if _DAY.remaining(acct, budget) <= 0:
+                log(f"  @{acct}: daily budget reached mid-pass — stopping")
+                break
+            continue
+        except LoginRequired as e:
+            log(f"  [{s.label}] session rejected: {type(e).__name__}")
+            pool_link.note_needs_login(
+                "ig", acct, f"session rejected on {s.label}: {type(e).__name__}")
+        except Exception as e:
+            log(f"  [{s.label}] error: {type(e).__name__}: {e}")
+            # Not every exception is weather. A checkpoint or a
+            # PleaseWaitFewMinutes here used to be logged and then
+            # KNOCKED ON AGAIN by the very next source of the same
+            # account. The decider names it and, when the answer is
+            # "stop touching this account", the pass does.
+            d = _decide_exc(dec, acct, group, e, fallback="pass_error", log=log, src=s)
+            if d.kind == "lookup_throttled":
+                rest = [x.label for x in unresolved if x.label not in held
+                        and x.label != s.label]
+                held.update(rest)
+                if rest:
+                    log(f"  lookups from @{acct} refused — not asking for the "
+                        f"remaining {len(rest)} handle(s) this pass: "
+                        f"{', '.join(rest)}")
+                continue
+            if d.stop_account:
+                log(f"  @{acct}: {d.action} — leaving the remaining "
+                    f"{len(group) - i - 1} source(s) for the next pass")
+                break
+            continue
+
+        # THE SESSION IS THE TEST, not a probe run beforehand. Only a
+        # source that actually came back login_required triggers a
+        # relogin, and only the first one does — a checkpointed account
+        # must not be knocked on once per source. Sources that still
+        # work keep working either way: a partly-restricted session
+        # (common while a checkpoint is open) collects what it can.
+        if refreshed:
+            continue
+        refreshed = True
+        try:
+            cl = ig_session.refresh(acct, log=log)
+        except Exception as e:
+            log(f"  cannot refresh @{acct}: {e}")
+            # ig_session.refresh refuses (RuntimeError) on a recorded
+            # checkpoint, a missing sidecar, or a bad password; only a
+            # human fixes any of those. Stop this account for the pass.
+            _decide_exc(dec, acct, group, e, fallback="session_rejected", log=log)
+            break
+        engine = IGEngine(cl, account=acct,
+                          on_resolved=store.cache_platform_id)
+        try:
+            total += await collect_source(engine, store, s, page_size=page_size,
+                                          max_pages=max_pages, log=log)
+            acct_ok = True
+        except Exception as e:
+            log(f"  [{s.label}] still failing after refresh: "
+                f"{type(e).__name__}: {e}")
+            d = _decide_exc(dec, acct, group, e, fallback="session_rejected", log=log, src=s)
+            if d.stop_account:
+                break
+
+    # One write per account per pass, not one per post: the column means
+    # "this account was working at this time".
+    if acct_ok:
+        pool_link.record_success("ig", acct)
+        dec.ok(acct)        # closes any open condition on this account
+    return total, acct_ok
+
+
+# How far apart the accounts start within one pass. Three phones do not all
+# open Instagram in the same second; the first goes at once, the others
+# follow at a human distance.
+STAGGER_S = (15.0, 120.0)
+
+
 async def run_once(store_path="ig_results.db", account_override="", *,
-                   page_size=12, max_pages=2, log=print, dec=None) -> int:
-    """One collection pass. Every condition the pass meets goes through the
-    decider (decider.py): it says what to do next, how long to wait, and
+                   page_size=12, max_pages=2, log=print, dec=None,
+                   accounts_path=ACCOUNTS_DB, root=".", who="loop",
+                   rng=None, awake=None) -> int:
+    """One collection pass: every owning account runs its own sources, in
+    parallel, on its own phone. Every condition the pass meets goes through
+    the decider (decider.py): it says what to do next, how long to wait, and
     logs the condition ONCE rather than once per pass.
 
     `dec` is the long-lived Decider the --loop holds (its state persists in
     activity.db, so a restart does not re-announce an open condition). Left
     None — the dashboard's Fetch-now button — a one-shot, in-memory decider
     is used, which always speaks, so the UI log shows the reason every time.
+
+    `account_override` (CLI --account) makes that one login the sole owner
+    for this pass — a debugging aid, and it is said in the log. `awake`, when
+    given, is the set of accounts whose personal active-hours say "up"; the
+    others keep their sources and skip this pass (the loop decides it once
+    per cycle; Fetch-now and the CLI pass None = everyone).
     """
     log = _persist_log(log)
     if dec is None:
         dec = decider.Decider("instagram", log=log, db=None)
     dec.begin_pass()
-    with store_ig.Store(store_path) as store:
-        if store.setting("ig_paused") == "1":
-            dec.on("paused", detail="paused from the dashboard — resume it in "
-                                    "Watchlists → Network & settings")
-            return 0
-        sources = store.sources(only_enabled=True)
-        if not sources:
-            # Was: a warn line per pass, forever. Now: one line when the
-            # condition opens, a reminder every 6h, the operator told after 2h,
-            # and one "recovered" line when a source appears.
-            dec.on("no_sources",
-                   detail="add one in Watchlists → + New watchlist → Instagram")
-            return 0
-        dec.ok()        # platform-level: closes no_sources / paused / pass_error
+    rng = rng or random
 
-        # Group sources by the account that collects them, so one client serves
-        # all of that account's sources.
-        by_account = {}
-        try:
-            for s in sources:
-                acct = s.account or account_override or _active_account()
-                by_account.setdefault(acct, []).append(s)
-        except RuntimeError as e:
-            # No active Instagram login at all. Not a crash: a condition,
-            # idle on it and tell the operator once.
-            dec.on("session_missing", detail=str(e))
-            return 0
+    lock = PassLock(root)
+    if not lock.acquire(who):
+        h = lock.holder()
+        since = time.time() - float(h.get("since") or time.time())
+        log(f"a pass is already running (pid {h.get('pid', '?')}, "
+            f"{h.get('who', '?')}, started {int(since // 60)}m ago) — "
+            f"not starting a second one on top of it")
+        return 0
+    if lock.unlocked:
+        log(f"warning: could not take the pass lock ({lock.unlocked}) — running unguarded")
+    try:
+        with store_ig.Store(store_path) as store:
+            if store.setting("ig_paused") == "1":
+                dec.on("paused", detail="paused from the dashboard — resume it in "
+                                        "Watchlists → Network & settings")
+                return 0
+            sources = store.sources(only_enabled=True)
+            if not sources:
+                # Was: a warn line per pass, forever. Now: one line when the
+                # condition opens, a reminder every 6h, the operator told after 2h,
+                # and one "recovered" line when a source appears.
+                dec.on("no_sources",
+                       detail="add one in Watchlists → + New watchlist → Instagram")
+                return 0
+            dec.ok()        # platform-level: closes no_sources / paused / pass_error
 
-        total = 0
-        for acct, group in by_account.items():
-            log(f"account @{acct}: {len(group)} source(s)")
-            try:
-                cl = ig_session.load_client(acct, log=log)
-            except Exception as e:
-                log(f"  could not load @{acct}: {e}")
-                # Tell the Account Control Panel WHY this account is quiet.
-                # Without this the card just sits at "last success —" and the 
-                # operator has to read journalctl to learn the session is gone.
-                pool_link.note_needs_login("ig", acct, f"{type(e).__name__}: {e}")
-                # A missing session is a checkpoint if that is what the
-                # RuntimeError says (ig_session wraps ChallengeRequired), and
-                # a session_missing otherwise. Either way: idle, tell a human.
-                _decide_exc(dec, acct, group, e, fallback="session_missing", log=log)
-                continue
+            if account_override:
+                owners, benched = [account_override], {}
+                log(f"--account {account_override}: this pass runs on that login only")
+            else:
+                owners, benched = collectors(store_path=accounts_path, root=root, log=log)
+            for u, why in benched.items():
+                log(f"  @{u} is benched ({why}) — its sources go to the others")
+            if not owners:
+                # No collector at all. Not a crash: a condition, idle on it
+                # and tell the operator once.
+                dec.on("session_missing",
+                       detail="no active Instagram account with a usable "
+                              "session — sign one in under Accounts & Sessions")
+                return 0
 
-            # Daily budget per account (warm-up ramp for young sessions). Once
-            # spent, this account rests until tomorrow — a person doesn't open
-            # the app 500 times a day, and a burner that does gets flagged.
-            budget = ig_human.daily_budget()
-            if _DAY.remaining(acct, budget) <= 0:
-                dec.on("budget_spent", acct,
-                       detail=f"daily budget spent ({budget}) — resting until tomorrow")
-                continue
+            groups = store.assign_sources(owners, log=log)
+            plan = {a: [s.label for s in g] for a, g in groups.items() if g}
+            if len(owners) > 1:
+                log("plan: " + "; ".join(f"@{a} × {len(v)}" for a, v in plan.items()))
 
-            # on_resolved turns a successful name lookup into a permanent row
-            # in the DB. This is what makes the lookup a one-time cost instead
-            # of a per-restart one — see engine_ig.resolve_user.
-            engine = IGEngine(cl, account=acct,
-                              on_resolved=store.cache_platform_id)
-            refreshed = False       # relogin is attempted at most ONCE per pass
-            # Did this account manage a single clean source this pass? That is
-            # the honest definition of "the session still works", and it is what
-            # stamps last_success_at in the pool (pool_link.record_success).
-            acct_ok = False
-
-            # Sources still without a numeric id. Two things before any of
-            # them costs a lookup request:
-            #   1. one that was refused recently is LEFT ALONE (decider
-            #      hold-off: 1h doubling to 24h) — asking a throttled lookup
-            #      endpoint again every pass is what keeps the 429 alive;
-            #   2. the rest are resolved off this account's FOLLOWING list in
-            #      one ordinary request, no lookup endpoint touched. Follow
-            #      the sources from the collecting account and this is the
-            #      path that always works (engine_ig.resolve_from_following).
-            held = set()
-            pending = []
-            unresolved = [s for s in group
-                          if s.type == "user" and not s.platform_id
-                          and not str(s.value).isdigit()]
-            # The account-level breaker first: while lookups from this
-            # session are refused, NO handle is asked about — not the
-            # following list either. Sources with ids collect as usual.
-            acct_hold = dec.holdoff(acct, "lookups")
-            if acct_hold and unresolved:
-                held.update(s.label for s in unresolved)
-                log(f"  {len(held)} source(s) wait for ids — lookups from @{acct} "
-                    f"are held for {acct_hold // 3600}h {(acct_hold % 3600) // 60:02d}m "
-                    f"more (refused earlier)")
-            for s in unresolved:
-                if s.label in held:
+            # Per-account rest: an account that was told to back off (rate
+            # limit, dead proxy, budget) sits this pass out WITHOUT giving
+            # its sources away — resting is not leaving.
+            runnable = {}
+            for acct, group in groups.items():
+                if not group:
                     continue
-                h = dec.holdoff(acct, s.label)
-                if h > 0:
-                    held.add(s.label)
-                else:
-                    pending.append(s.value)
-            if held and not acct_hold:
-                log(f"  leaving {len(held)} unresolved source(s) alone this pass "
-                    f"({', '.join(sorted(held))}) — hold-off after a refused lookup")
-            if pending:
+                if awake is not None and acct not in awake:
+                    continue            # asleep by its own clock; quiet
+                w = dec.account_wait(acct)
+                if w > 0:
+                    log(f"  @{acct} rests for {w // 60}m more (open condition) — "
+                        f"{len(group)} source(s) wait with it")
+                    continue
+                runnable[acct] = group
+
+            async def one(i, acct, group):
+                if i:
+                    await _asyncio.sleep(rng.uniform(*STAGGER_S))
                 try:
-                    got = await _asyncio.to_thread(engine.resolve_from_following, pending)
+                    return acct, await _collect_account(
+                        acct, group, store, dec, page_size=page_size,
+                        max_pages=max_pages, log=log)
                 except Exception as e:
-                    got = {}
-                    log(f"  following-list lookup failed: {type(e).__name__}: {e}")
-                if got:
-                    dec.ok(acct, source="lookups")      # the session answers again
-                for name, pk in got.items():
-                    log(f"  resolved @{name} -> {pk} from @{acct}'s following list")
-                    for s in group:
-                        if s.value.lower() == name and not s.platform_id:
-                            dec.ok(acct, source=s.label)
+                    # The whole account blew up (not one source). Named,
+                    # never silent; the others carry on.
+                    log(f"  @{acct}: pass failed — {type(e).__name__}: {e}")
+                    dec.on("pass_error", acct, detail=f"{type(e).__name__}: {e}")
+                    return acct, (0, False)
 
-            for i, s in enumerate(group):
-                if s.label in held:
-                    continue
-                # Human rhythm BETWEEN sources: a person doesn't machine-gun
-                # profile after profile. First source in a pass starts right
-                # away; each subsequent one waits a human "switch" gap, with an
-                # occasional longer "put the phone down" break.
-                if i > 0:
-                    gap = ig_human.source_gap()
-                    brk = ig_human.maybe_long_break()
-                    if brk:
-                        log(f"  …taking a {int(brk)}s break (human pause)")
-                        gap += brk
-                    await _asyncio.sleep(gap)
-                _DAY.spend(acct)
-                try:
-                    total += await collect_source(engine, store, s, page_size=page_size,
-                                              max_pages=max_pages, log=log)
-                    acct_ok = True
-                    if s.label in {x.label for x in unresolved}:
-                        dec.ok(acct, source="lookups")     # a lookup just worked
-                    dec.ok(acct, source=s.label)   # closes an unresolved_source, if open
-                    if _DAY.remaining(acct, budget) <= 0:
-                        log(f"  @{acct}: daily budget reached mid-pass — stopping")
-                        break
-                    continue
-                except LoginRequired as e:
-                    log(f"  [{s.label}] session rejected: {type(e).__name__}")
-                    pool_link.note_needs_login(
-                        "ig", acct, f"session rejected on {s.label}: {type(e).__name__}")
-                except Exception as e:
-                    log(f"  [{s.label}] error: {type(e).__name__}: {e}")
-                    # Not every exception is weather. A checkpoint or a
-                    # PleaseWaitFewMinutes here used to be logged and then
-                    # KNOCKED ON AGAIN by the very next source of the same
-                    # account. The decider names it and, when the answer is
-                    # "stop touching this account", the pass does.
-                    d = _decide_exc(dec, acct, group, e, fallback="pass_error", log=log, src=s)
-                    if d.kind == "lookup_throttled":
-                        rest = [x.label for x in unresolved if x.label not in held
-                                and x.label != s.label]
-                        held.update(rest)
-                        if rest:
-                            log(f"  lookups from @{acct} refused — not asking for the "
-                                f"remaining {len(rest)} handle(s) this pass: "
-                                f"{', '.join(rest)}")
-                        continue
-                    if d.stop_account:
-                        log(f"  @{acct}: {d.action} — leaving the remaining "
-                            f"{len(group) - i - 1} source(s) for the next pass")
-                        break
-                    continue
-
-                # THE SESSION IS THE TEST, not a probe run beforehand. Only a
-                # source that actually came back login_required triggers a
-                # relogin, and only the first one does — a checkpointed account
-                # must not be knocked on once per source. Sources that still
-                # work keep working either way: a partly-restricted session
-                # (common while a checkpoint is open) collects what it can.
-                if refreshed:
-                    continue
-                refreshed = True
-                try:
-                    cl = ig_session.refresh(acct, log=log)
-                except Exception as e:
-                    log(f"  cannot refresh @{acct}: {e}")
-                    # ig_session.refresh refuses (RuntimeError) on a recorded
-                    # checkpoint, a missing sidecar, or a bad password; only a
-                    # human fixes any of those. Stop this account for the pass.
-                    _decide_exc(dec, acct, group, e, fallback="session_rejected", log=log)
-                    break
-                engine = IGEngine(cl, account=acct,
-                                  on_resolved=store.cache_platform_id)
-                try:
-                    total += await collect_source(engine, store, s, page_size=page_size,
-                                              max_pages=max_pages, log=log)
-                    acct_ok = True
-                except Exception as e:
-                    log(f"  [{s.label}] still failing after refresh: "
-                        f"{type(e).__name__}: {e}")
-                    d = _decide_exc(dec, acct, group, e, fallback="session_rejected", log=log, src=s)
-                    if d.stop_account:
-                        break
-
-            # One write per account per pass, not one per post: the column means
-            # "this account was working at this time".
-            if acct_ok:
-                pool_link.record_success("ig", acct)
-                dec.ok(acct)        # closes any open condition on this account
-        log(f"done: {total} new post(s) stored")
-        return total
+            results = await _asyncio.gather(
+                *(one(i, a, g) for i, (a, g) in enumerate(runnable.items())))
+            total = 0
+            per_account = {}
+            for acct, (n, ok) in results:
+                total += n
+                per_account[acct] = {"new": n, "ok": ok, "sources": len(runnable[acct]),
+                                     "at": time.time()}
+            heartbeat(root, last_pass=time.time(), who=who,
+                      owners=owners, benched=benched, plan=plan,
+                      accounts=per_account)
+            log(f"done: {total} new post(s) stored"
+                + (f" across {len(runnable)} account(s)" if len(owners) > 1 else ""))
+            return total
+    finally:
+        lock.release()
 
 
 async def resolve_ids(store_path="ig_results.db", account_override="", *,
@@ -695,6 +921,8 @@ def main() -> int:
         loop_log = _persist_log(None)
         dec = decider.Decider("instagram", log=loop_log)
 
+        heartbeat(".", started=time.time(), every=args.every)
+
         async def loop():
             while True:
                 started = time.time()
@@ -709,24 +937,34 @@ def main() -> int:
                     dec.on("paused")            # said once; then a quiet tick
                     await asyncio.sleep(60)
                     continue
-                # Human active-hours: overnight the collector mostly sleeps,
-                # with only a rare "checked my phone" poll — a feed that never
-                # goes quiet is not a person's.
-                if not ig_human.active_now(started, tz_offset_s=tz_off):
+                # Human active-hours, PER ACCOUNT: each phone's day is
+                # shifted by a stable hour or so (ig_identity.stable_offset),
+                # so three accounts do not wake at 07:00:00 together, and
+                # overnight each mostly sleeps with only a rare "checked my
+                # phone" poll. One draw per account per cycle, made here and
+                # handed to the pass, so the answer is decided once.
+                owners, _ = collectors(log=loop_log)
+                awake = {a for a in owners
+                         if ig_human.active_now(started, tz_offset_s=tz_off
+                                                + int(ig_identity.stable_offset(a) * 3600))}
+                if owners and not awake:
                     await asyncio.sleep(ig_human.next_interval(max(600, every)))
                     continue
                 try:
-                    await run_once(store_path, args.account, dec=dec, **paging)
+                    await run_once(store_path, args.account, dec=dec,
+                                   awake=awake or None, **paging)
                 except Exception as e:
                     # The whole pass blew up (DB locked, import gone, ...).
                     # Three in a row and the operator hears about it.
                     dec.on("pass_error", detail=f"{type(e).__name__}: {e}")
                 # Jitter the wait so the between-cycle rhythm is never a fixed
-                # clock (±35%) — unless a decision asked for longer (no
-                # sources: 30m; rate-limited: up to 4h; checkpoint: 6h). The
-                # decider's wait is a floor, never a ceiling, so the human
-                # rhythm still applies on top of it.
-                wait = max(ig_human.next_interval(every), dec.wait_s())
+                # clock (±35%) — unless a PLATFORM decision asked for longer
+                # (no sources: 30m; paused; a pass that blew up). An
+                # account's own backoff (rate limit up to 4h, checkpoint 6h)
+                # is served per account by run_once (dec.account_wait) and
+                # never idles the other phones. The decider's wait is a
+                # floor, never a ceiling, so the human rhythm still applies.
+                wait = max(ig_human.next_interval(every), dec.platform_wait_s())
                 wait -= (time.time() - started)
                 await asyncio.sleep(max(5, wait))
         try:

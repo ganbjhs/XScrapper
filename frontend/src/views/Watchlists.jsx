@@ -1041,7 +1041,11 @@ function IgDetail({ pid, data, reload, gotoSettings }) {
           <div className="wl-row" key={s.label} style={{ opacity: s.enabled ? 1 : 0.55 }}>
             <div className="who">
               <b>{s.label}{!s.enabled && " (paused)"}</b>
-              <small>{s.type}{s.value ? ` · ${s.value}` : ""}{s.account ? ` · @${s.account}` : ""}</small>
+              <small>
+                {s.type}{s.value ? ` · ${s.value}` : ""}
+                {s.account ? ` · pinned to @${s.account}` : (s.collector ? ` · via @${s.collector}` : " · not yet assigned")}
+                {s.platform_id ? "" : " · id pending"}
+              </small>
             </div>
             <div className="right" style={{ display: "flex", gap: 6, alignItems: "center" }}>
               <button className="btn btn-ghost btn-sm" onClick={() => editName(s.value || s.label)}
@@ -1291,12 +1295,12 @@ function IgSettings({ data, reload }) {
           <b className="st-crit">@{a.username} is checkpoint-locked — automatic
             relogins are stopped (since {a.checkpoint_at})</b>
           <div style={{ fontSize: 12.5, marginTop: 4, lineHeight: 1.5 }}>
-            No code can clear this; retrying makes the lock stickier. A human
-            must: log in as @{a.username} on instagram.com or the app, complete
-            the “confirm it's you” check, copy a fresh <code>sessionid</code>
-            cookie from that same browser, then on the server run{" "}
-            <code>python3 ig_import.py "&lt;sessionid&gt;"</code>. A successful
-            import clears this banner by itself.
+            No code can clear this; retrying makes the lock stickier. On
+            Accounts &amp; Sessions, press Sign in → “Open this account's
+            browser” (its own phone, its own proxy), complete the “confirm it's
+            you” check there, and the session is adopted for you. Or clear it
+            on a trusted phone and paste that browser's cookies into the same
+            panel. Either one clears this banner by itself.
           </div>
         </div>
       ))}
@@ -1305,11 +1309,24 @@ function IgSettings({ data, reload }) {
         <div className="kv" key={a.username}>
           <span>@{a.username}</span>
           <b className={a.active ? "st-good" : "st-crit"}>
-            {a.active ? "active" : "inactive"}{a.proxy ? " · proxied" : ""}
+            {a.active ? `collecting · owns ${a.owns ?? 0}` : "benched"}{a.proxy ? " · proxied" : ""}
+            {a.identity ? (
+              <span style={{ color: a.identity.legacy ? "var(--warn-text)" : "var(--ink-3)", fontWeight: 400 }}>
+                {` · ${a.identity.name || a.identity.model}${a.identity.legacy ? " (legacy phone — sign in again)" : ""}`}
+              </span>
+            ) : null}
             {a.error ? ` · ${a.error}` : ""}
           </b>
         </div>
       ))}
+      {accounts.filter((a) => a.active).length > 1 && (
+        <div style={{ color: "var(--ink-3)", fontSize: 12.5, marginTop: 4 }}>
+          {accounts.filter((a) => a.active).length} accounts collect in parallel; each source above
+          says which one reads it. Pin one by hand from the CLI
+          (<code>collect_ig.py add-source --account</code>); otherwise the collector balances them
+          and keeps them where they are.
+        </div>
+      )}
       {accounts.length === 0 && (
         <div style={{ color: "var(--ink-3)", fontSize: 13, marginTop: 6 }}>
           No Instagram account onboarded yet — accounts are managed on the

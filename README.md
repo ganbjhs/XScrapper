@@ -53,7 +53,11 @@ python3 main.py watch --all                   # the collector — keep it runnin
 ```
 
 Sign an account in from the dashboard (`/accounts`), create a project and a
-watchlist in the UI, and posts start flowing into the Live Feed.
+watchlist in the UI, and posts start flowing into the Live Feed. Instagram
+accounts each get their own phone (`ig_identity.py`) and collect **in
+parallel**; a sign-in has three doors on the card — paste a session, sign in
+in the background (the panel asks for Instagram's one-time code), or open
+this account's own browser on the server for the walls only a browser clears.
 
 The dashboard only *shows*; the `watch` process is what *collects*. If the
 Live Feed shows a red "Collection is OFF" banner, the watcher is not running.

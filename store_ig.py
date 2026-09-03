@@ -70,7 +70,10 @@ CREATE TABLE IF NOT EXISTS sources (
                                           -- 0 = unassigned; a scoped read never
                                           -- returns it, so an unassigned source
                                           -- is invisible rather than shared.
-  account      TEXT NOT NULL DEFAULT '',  -- which IG login collects it ('' = the active one)
+  account      TEXT NOT NULL DEFAULT '',  -- PINNED by a human to one IG login ('' = auto)
+  assigned_account TEXT NOT NULL DEFAULT '', -- which login collects it NOW (the collector
+                                           -- writes this: sticky, balanced across the
+                                           -- active accounts; see Store.assign_sources)
   enabled      INTEGER NOT NULL DEFAULT 1,
   watermark_pk INTEGER,                   -- newest pk seen; stop the walk here
   last_run     INTEGER,
@@ -134,6 +137,13 @@ class Source:
     account: str = ""
     platform_id: str = ""
     project_id: int = 0
+    assigned_account: str = ""
+
+    @property
+    def collector(self) -> str:
+        """The login that collects this source: the human pin wins, else the
+        collector's own assignment, else '' (nobody yet)."""
+        return self.account or self.assigned_account
 
     @property
     def following(self) -> bool:
@@ -173,7 +183,13 @@ class Store:
         self.db = None
 
     def open(self):
-        self.db = sqlite3.connect(self.path, timeout=10)
+        # check_same_thread=False: engine_ig resolves names inside
+        # asyncio.to_thread and calls on_resolved (= cache_platform_id) from
+        # that worker thread. With the default guard the write raised
+        # ProgrammingError, which resolve_user swallows — so "a resolved id is
+        # written to the DB" (RULEBOOK §6) was silently not happening from
+        # the live path. The write itself is serialised by _wlock.
+        self.db = sqlite3.connect(self.path, timeout=10, check_same_thread=False)
         self.db.row_factory = sqlite3.Row
         self.db.executescript(SCHEMA)
         self._migrate()
@@ -197,6 +213,9 @@ class Store:
         if "project_id" not in have:
             self.db.execute(
                 "ALTER TABLE sources ADD COLUMN project_id INTEGER NOT NULL DEFAULT 0")
+        if "assigned_account" not in have:
+            self.db.execute(
+                "ALTER TABLE sources ADD COLUMN assigned_account TEXT NOT NULL DEFAULT ''")
         havep = {r["name"] for r in self.db.execute("PRAGMA table_info(posts)")}
         if "project_id" not in havep:
             self.db.execute(
@@ -291,6 +310,8 @@ class Store:
                         (str(platform_id), label))
         self.db.commit()
 
+    _wlock = __import__("threading").RLock()
+
     def cache_platform_id(self, handle, platform_id) -> int:
         """Cache a resolved id against every user source carrying that handle.
 
@@ -301,12 +322,13 @@ class Store:
         h = str(handle or "").strip().lstrip("@")
         if not h or str(platform_id or "").strip() == "":
             return 0
-        cur = self.db.execute(
-            "UPDATE sources SET platform_id=? "
-            "WHERE type='user' AND platform_id='' AND lower(value)=lower(?)",
-            (str(platform_id), h))
-        self.db.commit()
-        return cur.rowcount
+        with self._wlock:
+            cur = self.db.execute(
+                "UPDATE sources SET platform_id=? "
+                "WHERE type='user' AND platform_id='' AND lower(value)=lower(?)",
+                (str(platform_id), h))
+            self.db.commit()
+            return cur.rowcount
 
     def unresolved_sources(self) -> list:
         """User sources that still have a handle but no cached id — the rows
@@ -336,8 +358,83 @@ class Store:
         if where:
             q += " WHERE " + " AND ".join(where)
         return [Source(r["label"], r["type"], r["value"], r["account"],
-                       r["platform_id"], r["project_id"])
+                       r["platform_id"], r["project_id"], r["assigned_account"])
                 for r in self.db.execute(q + " ORDER BY label", args)]
+
+    def assign_sources(self, accounts, *, log=lambda m: None) -> dict:
+        """
+        Give every enabled source exactly one collecting account, and return
+        {username: [Source, ...]} for `accounts` (the healthy ones, in the
+        collector's judgement: active, a session, no checkpoint, not resting).
+
+        The rules, in order:
+          1. A source PINNED by a human (`account`) goes to that login and
+             nowhere else. If that login is not healthy the source waits —
+             it is pinned on purpose — and is returned under its pin so the
+             caller can say so.
+          2. An auto source KEEPS its current assignment while that account
+             is healthy. Stickiness is the point: moving a source between
+             accounts means a different phone on a different IP starts
+             reading the same profile, which is exactly the shape of a
+             shared session. Nothing moves unless it has to.
+          3. A source with no healthy owner goes to the LEAST-LOADED healthy
+             account; ties break by a stable hash of the label, so two
+             collectors that reason at the same moment agree.
+        Every move is written to the row and logged. Returns the groups.
+        """
+        import hashlib
+        healthy = [a for a in accounts if a]
+        rows = self.sources(only_enabled=True)
+        groups = {a: [] for a in healthy}
+        load = {a: 0 for a in healthy}
+        pinned_waiting = {}
+        moves = []
+        # pass 1: pins and sticky assignments
+        todo = []
+        for s in rows:
+            if s.account:
+                if s.account in groups:
+                    groups[s.account].append(s); load[s.account] += 1
+                    if s.assigned_account != s.account:
+                        moves.append((s.label, s.assigned_account, s.account, "pinned"))
+                        s.assigned_account = s.account
+                else:
+                    pinned_waiting.setdefault(s.account, []).append(s)
+                continue
+            if s.assigned_account in groups:
+                groups[s.assigned_account].append(s); load[s.assigned_account] += 1
+                continue
+            todo.append(s)
+        # pass 2: the rest, least-loaded first, stable tie-break
+        for s in sorted(todo, key=lambda x: x.label):
+            if not healthy:
+                break
+            h = int(hashlib.sha1(s.label.encode()).hexdigest()[:8], 16)
+            best = min(healthy, key=lambda a: (load[a], (h + healthy.index(a)) % len(healthy)))
+            moves.append((s.label, s.assigned_account, best,
+                          "moved" if s.assigned_account else "new"))
+            s.assigned_account = best
+            groups[best].append(s); load[best] += 1
+        for label, old, new, why in moves:
+            self.db.execute("UPDATE sources SET assigned_account=? WHERE label=?",
+                            (new, label))
+            if why == "moved":
+                log(f"  [{label}] moves from @{old} to @{new} (previous owner is out)")
+            elif why == "new":
+                log(f"  [{label}] assigned to @{new}")
+        if moves:
+            self.db.commit()
+        for pin, srcs in pinned_waiting.items():
+            log(f"  {len(srcs)} source(s) pinned to @{pin} wait — that account is "
+                f"not collecting right now: {', '.join(x.label for x in srcs)}")
+        return groups
+
+    def assignment_counts(self) -> dict:
+        """{collector: n} over enabled sources — what the dashboard shows."""
+        out = {}
+        for s in self.sources(only_enabled=True):
+            out[s.collector or ""] = out.get(s.collector or "", 0) + 1
+        return out
 
     def project_for(self, label) -> int:
         r = self.db.execute("SELECT project_id FROM sources WHERE label=?",

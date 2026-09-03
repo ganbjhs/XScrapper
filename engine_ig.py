@@ -341,23 +341,32 @@ def _browser_session(cl):
     if proxies:
         sess.proxies.update(proxies)
 
-    # The web endpoint wants a WEB user-agent. A seeded client's UA is the
-    # mobile app string, which this endpoint does not expect; the harvested
-    # browser UA is kept in settings when there is one, so prefer it.
-    ua = ""
+    # The web endpoint wants a WEB user-agent — and it must be THIS PHONE's
+    # browser, not a Mac's. A seeded client carries the identity block
+    # (ig_identity, spliced in by ig_session.new_client): the same mobile
+    # Chrome string and Client Hints the streamed sign-in window presented.
+    # Before 2026-09-04 these calls left as desktop Chrome on a Mac from an
+    # Android app session, and instagram.com bounced them to the login page
+    # (TooManyRedirects) every time.
     try:
-        ua = cl.settings.get("web_user_agent") or ""
+        settings = cl.settings or {}
     except Exception:
-        pass
-    if "Mozilla" not in ua:
-        ua = getattr(cl, "user_agent", "") or ""
-    if "Mozilla" not in ua:
-        ua = ("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 "
-              "(KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36")
+        settings = {}
+    dev = {k: settings.get(k) for k in ("web_user_agent", "identity", "device_settings")}
+    if dev.get("identity"):
+        import ig_identity
+        headers = ig_identity.web_headers(dev)
+    else:
+        ua = settings.get("web_user_agent") or ""
+        if "Mozilla" not in ua:
+            ua = getattr(cl, "user_agent", "") or ""
+        if "Mozilla" not in ua:
+            ua = ("Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 "
+                  "(KHTML, like Gecko) Chrome/140.0.0.0 Mobile Safari/537.36")
+        headers = {"User-Agent": ua, "Accept-Language": "en-IN,en;q=0.9"}
     sess.headers.update({
-        "User-Agent": ua,
+        **headers,
         "Accept": "*/*",
-        "Accept-Language": "en-US,en;q=0.9",
         "X-IG-App-ID": WEB_APP_ID,
         "X-Requested-With": "XMLHttpRequest",
     })

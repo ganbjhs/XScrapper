@@ -60,6 +60,7 @@ import time
 from pathlib import Path
 
 import ig   # the session store (ig_accounts.db) and the Session dataclass
+import ig_identity   # the coherent-phone catalogue; minting happens there
 
 SETTINGS_DIR = Path("profiles")     # same folder the browser profiles live in
 
@@ -85,6 +86,11 @@ DEVICE_KEYS = (
     "timezone_offset",
     "timezone_name",
     "mid",
+    # Ours, not instagrapi's (ig_identity): the phone's matching mobile
+    # Chrome string for the web calls, and the human-readable identity block.
+    # get_settings() drops them, so persist() splices them back from the seed.
+    "web_user_agent",
+    "identity",
 )
 
 
@@ -168,8 +174,61 @@ def ensure_device(label: str, root: Path | str = ".", *, username: str = "",
                     f"'{label}' (the handset Instagram already knows)")
                 return adopted
 
-    from instagrapi import Client
-    return save_device(Client().get_settings(), label, root, log=log)
+    # Nothing to adopt: mint a NEW, COHERENT phone (ig_identity), never the
+    # library default. The default was the bug: every account this project
+    # ever ran was the same US-locale Pixel 8 Pro (CHECKPOINT 2026-09-04).
+    device = ig_identity.mint(label, taken=taken_models(root))
+    dev = save_device(device, label, root, log=log)
+    log(f"[ig] '{label}' is now {ig_identity.describe(dev)}")
+    return dev
+
+
+def taken_models(root: Path | str = ".") -> set:
+    """Catalogue models already in use by other labels on this server, so a
+    new mint does not hand two accounts the same handset."""
+    out = set()
+    d = Path(root) / SETTINGS_DIR
+    if not d.exists():
+        return out
+    for p in d.glob("ig_device_*.json"):
+        try:
+            ds = (json.loads(p.read_text()).get("device") or {}).get("device_settings") or {}
+            if ds.get("model"):
+                out.add(ds["model"])
+        except (OSError, ValueError):
+            continue
+    return out
+
+
+def reseed(label: str, root: Path | str = ".", *, why: str = "",
+           log=lambda m: None) -> dict:
+    """
+    Replace the device for `label` with a freshly minted one, ONLY ever as
+    part of a sign-in (signin.py calls this; nothing in a collection pass
+    may). The old seed is kept beside the new one as `.bak-<utc>` so a
+    mistaken reseed is recoverable, and the reason is logged: a device
+    change is a real event Instagram will notice, and the log must say why
+    it was worth it.
+
+    Legit reasons: the seed is the legacy library default (ig_identity
+    .is_legacy) — a fresh login is being paid for anyway, so the new phone
+    costs nothing extra; or the operator asked for a new handset.
+    """
+    path = device_path(label, root)
+    old = load_device(label, root)
+    if path.exists():
+        bak = path.with_name(path.name + ".bak-" + _now().replace(":", ""))
+        try:
+            path.replace(bak)
+            log(f"[ig] '{label}': previous device kept at {bak.name}")
+        except OSError:
+            path.unlink(missing_ok=True)
+    device = ig_identity.mint(label, taken=taken_models(root))
+    dev = save_device(device, label, root, log=log)
+    log(f"[ig] '{label}' reseeded{(' — ' + why) if why else ''}: was "
+        f"{ig_identity.describe(old) if old else 'nothing'}; now "
+        f"{ig_identity.describe(dev)}")
+    return dev
 
 
 def _splice_device(settings: dict, device: dict) -> dict:
@@ -208,7 +267,8 @@ def new_client(label: str = "ig_a", *, proxy: str = "", settings: dict | None = 
 
 def persist(cl, username: str, *, label: str = "ig_a", proxy: str = "",
             password_env: str = "", store_path: str = "ig_accounts.db",
-            root: Path | str = ".", log=lambda m: None) -> None:
+            root: Path | str = ".", exit: dict | None = None,
+            log=lambda m: None) -> None:
     """
     Write the reusable session (sidecar) AND the visible row (ig_accounts.db).
 
@@ -221,15 +281,22 @@ def persist(cl, username: str, *, label: str = "ig_a", proxy: str = "",
     # Pin the device before anything else. On the very first login for a label
     # this is what mints the seed; afterwards save_device is a no-op that just
     # confirms the client really did run on the pinned handset.
-    save_device(settings, label, root, log=log)
+    device = save_device(settings, label, root, log=log)
+    # get_settings() knows nothing of our keys (web UA, identity block); the
+    # sidecar should still be self-describing, so lay the seed back over it.
+    settings = _splice_device(settings, device)
 
     path = sidecar_path(username, root)
     path.parent.mkdir(parents=True, exist_ok=True)
-    payload = {
-        "meta": {"username": username, "label": label, "proxy": proxy,
-                 "password_env": password_env, "updated": _now()},
-        "settings": settings,
-    }
+    meta = {"username": username, "label": label, "proxy": proxy,
+            "password_env": password_env, "updated": _now()}
+    if exit:
+        # Where this session was minted from, as seen from outside: the exit
+        # IP and country of the proxy at sign-in. A later pass that finds a
+        # different exit has something to say (the "one steady IP" rule now
+        # has a number to check against).
+        meta["exit"] = dict(exit)
+    payload = {"meta": meta, "settings": settings}
     path.write_text(json.dumps(payload, indent=2))
     try:
         path.chmod(0o600)   # holds live session cookies
@@ -404,6 +471,107 @@ def _now() -> str:
     return time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime())
 
 
+# --------------------------------------------------------------------------
+# the exit — prove the proxy BEFORE a login is spent through it
+# --------------------------------------------------------------------------
+
+IP_ECHO = "https://api.ipify.org?format=json"
+GEO_URL = "https://ipapi.co/{ip}/country/"
+IG_HOME = "https://www.instagram.com/"
+
+
+def redact_proxy(proxy: str) -> str:
+    """A proxy URL is a credential. Show the host (and the session label in
+    the username, which is what the operator recognises), never the password."""
+    if not proxy:
+        return "the server IP"
+    try:
+        import urllib.parse as up
+        u = up.urlsplit(proxy)
+        host = u.hostname or "?"
+        who = f"{u.username}@" if u.username else ""
+        return f"{who}{host}:{u.port}" if u.port else f"{who}{host}"
+    except Exception:
+        return "the configured proxy"
+
+
+def proxy_check(proxy: str, *, timeout: int = 20, expect_country: str = "",
+                get=None) -> dict:
+    """
+    What the world sees when this account speaks: exit IP, its country, and
+    whether instagram.com answers through it with a certificate we trust.
+
+    Run at sign-in (signin.py) and by the diag endpoint — never per pass,
+    because none of these calls go to Instagram and one extra unrelated
+    request per pass buys nothing. Result keys:
+        ok            the exit is usable for Instagram
+        why           '' | no_proxy | network | tls_intercepted | blocked
+        exit_ip       what api.ipify.org saw
+        country       ISO-2 from ipapi.co ('' if that lookup failed — a
+                      lookup failure is not a proxy failure)
+        ig_status     HTTP status instagram.com returned through the exit
+        warn          a country that does not match `expect_country`
+        detail        one sentence for the operator
+    `get` is injectable (tests): get(url, proxies, timeout) -> response.
+    """
+    out = {"ok": False, "why": "", "proxy": redact_proxy(proxy), "exit_ip": "",
+           "country": "", "ig_status": 0, "warn": "", "detail": "",
+           "checked": _now()}
+    if not proxy:
+        out.update(why="no_proxy", detail="no proxy configured — Instagram "
+                                          "must never see the server IP")
+        return out
+    if get is None:
+        import requests
+
+        def get(url, proxies, timeout):
+            return requests.get(url, proxies=proxies, timeout=timeout,
+                                headers={"User-Agent": "curl/8.4.0"})
+    proxies = {"http": proxy, "https": proxy}
+    from engine_ig import network_why
+
+    try:
+        r = get(IP_ECHO, proxies, timeout)
+        out["exit_ip"] = str((r.json() or {}).get("ip") or "").strip()
+    except Exception as e:
+        out.update(why=network_why(e) or "network",
+                   detail=f"the exit does not answer: {type(e).__name__}: "
+                          f"{str(e)[:160]}")
+        return out
+    if out["exit_ip"]:
+        try:
+            r = get(GEO_URL.format(ip=out["exit_ip"]), proxies, timeout)
+            cc = (r.text or "").strip().upper()
+            if len(cc) == 2 and cc.isalpha():
+                out["country"] = cc
+        except Exception:
+            pass
+    try:
+        r = get(IG_HOME, proxies, timeout)
+        out["ig_status"] = int(getattr(r, "status_code", 0) or 0)
+    except Exception as e:
+        out.update(why=network_why(e) or "network",
+                   detail=f"instagram.com is unreachable through this exit: "
+                          f"{type(e).__name__}: {str(e)[:160]}")
+        return out
+    if out["ig_status"] in (401, 403, 429):
+        out.update(why="blocked",
+                   detail=f"instagram.com answered {out['ig_status']} to a bare "
+                          f"request through this exit — the address itself is "
+                          f"unwelcome; change the session number in the proxy "
+                          f"username")
+        return out
+    out["ok"] = True
+    if expect_country and out["country"] and out["country"] != expect_country:
+        out["warn"] = (f"the exit is in {out['country']}, the identity says "
+                       f"{expect_country} — a person whose phone and IP "
+                       f"disagree about the country")
+    out["detail"] = (f"exit {out['exit_ip'] or '?'}"
+                     + (f" ({out['country']})" if out["country"] else "")
+                     + f", instagram.com answers {out['ig_status']}")
+    return out
+
+
 def _checkpoint_help(username: str, label: str, root, detail: str) -> str:
     """The one message worth printing when Instagram has locked an account.
 
@@ -414,11 +582,13 @@ def _checkpoint_help(username: str, label: str, root, detail: str) -> str:
         f"@{username} is CHECKPOINT-LOCKED by Instagram: {detail}\n"
         f"  No code can clear this — re-running ig_login.py hits the same wall, "
         f"and repeated attempts make it worse.\n"
-        f"  A human must, on this machine:\n"
-        f"    1. open instagram.com (or the Instagram app) and log in as @{username}\n"
+        f"  A human must:\n"
+        f"    1. open Accounts & Sessions → Sign in → 'Open this account's browser'\n"
+        f"       (the account's own phone-shaped Chromium, through its own proxy),\n"
+        f"       or instagram.com / the app on a trusted phone, as @{username}\n"
         f"    2. complete the 'confirm it's you' / security-check prompt\n"
-        f"    3. copy a fresh sessionid cookie from that same browser, then run\n"
-        f"       python3 ig_import.py \"<sessionid>\"\n"
+        f"    3. the browser door adopts the session itself; from any other\n"
+        f"       browser, paste the cookies into the same panel instead\n"
         f"  The device is already pinned ({device_path(label, root)}), so the "
         f"imported cookie is adopted by the same handset it was minted on — which "
         f"is what should stop the session being invalidated again.")

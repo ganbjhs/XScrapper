@@ -68,6 +68,10 @@ export const api = {
   // server returns no sources (server-side accounts still come back — a login
   // belongs to the machine, not to a project).
   igStatus: (project) => request(`/api/ig/status${qs({ project })}`),
+  igDiag: () => request("/api/ig/diag"),
+  igAccount: (username, active) =>
+    request("/api/ig/account", { method: "POST", body: { username, active } }),
+  igReseed: (username) => request("/api/ig/reseed", { method: "POST", body: { username } }),
   igSource: (body) => request("/api/ig/source", { method: "POST", body }),
   igFetch: (project) => request("/api/ig/fetch", { method: "POST", body: { project } }),
   igControl: (action) => request("/api/ig/control", { method: "POST", body: { action } }),
@@ -135,6 +139,14 @@ export const api = {
                                   body: { ...body, user_agent: navigator.userAgent } }),
   poolSigninStatus: () => request("/api/pool/signin"),
   poolSigninHelp: () => request("/api/pool/signin/help"),
+  // The one-time code Instagram sent during a background sign-in.
+  loginCode: (code) => request("/api/login/code", { method: "POST", body: { code } }),
+  // The streamed sign-in window: the account's OWN browser on the server
+  // (its phone, its proxy), driven click by click from the panel.
+  loginStart: (account_id) =>
+    request("/api/login/start", { method: "POST", body: { account_id } }),
+  loginAct: (body) => request("/api/login/act", { method: "POST", body }),
+  loginCancel: () => request("/api/login/cancel", { method: "POST", body: {} }),
 
   projects: () => request("/api/projects"),
   createProject: (name) => request("/api/projects", { method: "POST", body: { name } }),

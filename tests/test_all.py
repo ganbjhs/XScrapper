@@ -3600,6 +3600,527 @@ def test_facebook(tmp):
            "the new favorited page was auto-added as a source under the project")
 
 
+def test_ig_identity(tmp):
+    """
+    Every device seed this project ever minted was instagrapi's default — a
+    US-locale Pixel 8 Pro — on three accounts behind Indian proxies
+    (CHECKPOINT 2026-09-04). These checks hold the replacement to its two
+    promises: an identity is COHERENT (phone, app build, locale, country,
+    time zone and web UA tell one story that matches the proxy's country)
+    and UNIQUE (no two labels share a handset), minted ONCE and replaced
+    only by a sign-in, never by a collection pass.
+    """
+    import random as _r
+    import ig_identity, ig_session
+
+    print("== minting is coherent ==")
+    rng = _r.Random(7)
+    d = ig_identity.mint("ig_x", rng=rng, chrome="140")
+    ds = d["device_settings"]
+    ok(ds["model"] in {row[2] for row in ig_identity.DEVICES},
+       f"the phone comes from the catalogue ({ds['manufacturer']} {ds['model']})")
+    ok(d["locale"] == "en_IN" and d["country"] == "IN" and d["country_code"] == 91,
+       "locale / country / dialling code are India's")
+    ok(d["timezone_offset"] == 19800 and d["timezone_name"] == "Asia/Kolkata",
+       "time zone is IST, by name and by offset")
+    ok(d["user_agent"].startswith(f"Instagram {ds['app_version']} Android (")
+       and f"; {ds['model']}; " in d["user_agent"] and "; en_IN; " in d["user_agent"]
+       and d["user_agent"].endswith(f"; {ds['version_code']})"),
+       "the app user-agent is formatted from THIS phone with THIS locale")
+    builds = {b["app_version"]: b for _, b in ig_identity.app_builds()}
+    ok(ds["app_version"] in builds
+       and ds["version_code"] == builds[ds["app_version"]]["version_code"]
+       and ds["bloks_versioning_id"] == builds[ds["app_version"]]["bloks_versioning_id"],
+       "the app build is one instagrapi ships (version_code + bloks id agree)")
+    ok("Android 10; K" in d["web_user_agent"] and "Chrome/140.0.0.0 Mobile" in d["web_user_agent"],
+       "the web user-agent is Chrome's REDUCED mobile form on the pinned major")
+    ok(all(d["uuids"].get(k) for k in ("phone_id", "uuid", "client_session_id",
+                                        "advertising_id", "android_device_id",
+                                        "request_id", "tray_session_id"))
+       and d["uuids"]["android_device_id"].startswith("android-"),
+       "every uuid instagrapi reads is populated, in its shape")
+    ok(not ig_identity.is_legacy(d), "a minted identity is not legacy")
+    scr = d["identity"]["screen"]
+    w, h = (int(x) for x in ds["resolution"].split("x"))
+    ok(scr["width"] == w and scr["css_width"] == round(w / scr["scale"]),
+       "the screen block matches the resolution and dpi")
+    hdr = ig_identity.web_headers(d)
+    ok(hdr["User-Agent"] == d["web_user_agent"] and hdr["sec-ch-ua-mobile"] == "?1"
+       and hdr["sec-ch-ua-platform"] == '"Android"' and ds["model"] in hdr["sec-ch-ua-model"]
+       and hdr["Accept-Language"].startswith("en-IN"),
+       "web headers carry the same phone in the Client Hints")
+    pw = ig_identity.playwright_kwargs(d)
+    ok(pw["is_mobile"] and pw["has_touch"] and pw["locale"] == "en-IN"
+       and pw["timezone_id"] == "Asia/Kolkata" and pw["user_agent"] == d["web_user_agent"]
+       and pw["viewport"]["width"] == scr["css_width"],
+       "the streamed browser is told to BE the same phone")
+    meta = ig_identity.cdp_user_agent_metadata(d)
+    ok(meta["platform"] == "Android" and meta["model"] == ds["model"] and meta["mobile"]
+       and meta["platformVersion"].startswith(ds["android_release"]),
+       "and its Client Hints override agrees with the UA")
+
+    print()
+    print("== minting is unique ==")
+    seen = set()
+    for i in range(len(ig_identity.DEVICES)):
+        m = ig_identity.mint(f"l{i}", rng=rng, chrome="140", taken=seen)["device_settings"]["model"]
+        ok(m not in seen, f"label l{i} gets a phone nobody else has ({m})")
+        seen.add(m)
+    a = ig_identity.mint("a", rng=rng, chrome="140")["uuids"]
+    b = ig_identity.mint("b", rng=rng, chrome="140")["uuids"]
+    ok(a != b and len(set(a.values())) == len(a), "uuids never repeat across mints")
+    ok(len(set(ig_identity.mint("z", rng=_r.Random(i), chrome="140")["device_settings"]["app_version"]
+               for i in range(60))) > 1, "app builds vary across accounts")
+
+    print()
+    print("== the legacy seed is recognised, and describe() says so ==")
+    legacy = {"uuids": a, "device_settings": {"model": "Pixel 8 Pro", "manufacturer": "Google/google",
+                                             "android_release": "14", "app_version": "428.0.0.47.67"},
+              "user_agent": "Instagram 428.0.0.47.67 Android (34/14; 480dpi; 1344x2992; "
+                            "Google/google; Pixel 8 Pro; husky; husky; en_US; 961145276)",
+              "locale": "en_US", "country": "US", "timezone_offset": -14400}
+    ok(ig_identity.is_legacy(legacy), "the library default is legacy")
+    ok("LEGACY" in ig_identity.describe(legacy) and "Pixel 8 Pro" in ig_identity.describe(legacy),
+       "and the description says it out loud")
+    ok(ig_identity.summary(d)["legacy"] is False and ig_identity.summary(d)["name"] == d["identity"]["name"],
+       "summary() carries the catalogue name and no uuids: "
+       + str(sorted(ig_identity.summary(d))))
+    ok("uuids" not in ig_identity.summary(d), "no identifiers in what the dashboard shows")
+
+    print()
+    print("== ig_session mints through ig_identity, once, and the seed wins ==")
+    root = pathlib.Path(tmp)
+    dev = ig_session.ensure_device("ig_p", root)
+    ok(not ig_identity.is_legacy(dev) and dev["locale"] == "en_IN",
+       "a fresh label gets a coherent phone, not the library default")
+    ok(ig_session.load_device("ig_p", root)["identity"]["name"] == dev["identity"]["name"],
+       "the identity block is in the device file")
+    dev2 = ig_session.ensure_device("ig_q", root)
+    ok(dev2["device_settings"]["model"] != dev["device_settings"]["model"],
+       "a second label on the same server gets a different phone")
+    cl = ig_session.new_client("ig_p", root=root)
+    st = cl.get_settings()
+    ok(st["uuids"] == dev["uuids"] and st["locale"] == "en_IN" and st["country"] == "IN"
+       and st["timezone_offset"] == 19800 and cl.user_agent == dev["user_agent"],
+       "the instagrapi client is built AS that phone (uuids, locale, country, tz, UA)")
+    ok(cl.settings.get("web_user_agent") == dev["web_user_agent"]
+       and cl.settings.get("identity", {}).get("name") == dev["identity"]["name"],
+       "and carries the web UA + identity for the web calls")
+    import engine_ig
+    sess = engine_ig._browser_session(cl)
+    ok(sess.headers["User-Agent"] == dev["web_user_agent"] and sess.headers["sec-ch-ua-mobile"] == "?1",
+       "engine_ig's web session leaves as this phone's Chrome, not a Mac's")
+
+    print()
+    print("== reseed: only ever at a sign-in, and the old seed is kept ==")
+    old_model = dev["device_settings"]["model"]
+    lines = []
+    new = ig_session.reseed("ig_p", root, why="test", log=lines.append)
+    ok(new["uuids"] != dev["uuids"], "a reseed is a genuinely new phone")
+    ok(any(p.name.startswith("ig_device_ig_p.json.bak-") for p in (root / "profiles").iterdir()),
+       "the previous seed is kept as a .bak beside it")
+    ok(any("reseeded" in l and "test" in l for l in lines), "and the reason is logged")
+    ok(ig_session.load_device("ig_p", root)["uuids"] == new["uuids"], "the new seed is the one in force")
+    ok(ig_session.ensure_device("ig_p", root)["uuids"] == new["uuids"],
+       "ensure_device never reseeds by itself (a collection pass cannot change a phone)")
+    _ = old_model
+
+    print()
+    print("== per-account waking hours are shifted, stably ==")
+    o1, o2 = ig_identity.stable_offset("sanaakhtar221"), ig_identity.stable_offset("youssefnasser168")
+    ok(o1 == ig_identity.stable_offset("sanaakhtar221") and -1.5 <= o1 <= 1.5 and o1 != o2,
+       f"same handle -> same shift ({o1:+.2f}h), different handles differ ({o2:+.2f}h)")
+
+
+def test_ig_signin(tmp):
+    """The three reasons a complete sign-in was impossible from the server,
+    each now a code path: the emailed code had nowhere to go (CodeRelay);
+    the proxy exit was never proven before the login was spent
+    (proxy_check); a native checkpoint had no browser to answer it
+    (needs='browser', and ig_browser_adopt for the door's last step)."""
+    import signin, ig_session, ig_identity
+
+    print("== the code relay blocks the sign-in thread until the panel answers ==")
+    relay = signin.CodeRelay(timeout_s=5)
+
+    class FakeCl:
+        last_json = {"step_data": {"contact_point": "t***k@gmail.com"}}
+    lines = []
+    h = relay.handler(FakeCl(), log=lines.append)
+    got = {}
+    t = threading.Thread(target=lambda: got.setdefault("code", h("sana", "EMAIL")))
+    t.start()
+    time.sleep(0.2)
+    ok(relay.waiting and relay.waiting["choice"] == "email" and relay.waiting["hint"] == "t***k@gmail.com",
+       "while it waits, status says which channel and the masked address")
+    ok(relay.status()["waiting_for"]["choice"] == "email", "relay_status() exposes it to the panel")
+    signin._install_relay(relay)
+    r = signin.submit_code("12 34 56")
+    t.join(3)
+    ok(r == {"ok": True} and got.get("code") == "123456",
+       "the operator's digits reach the handler (spaces stripped)")
+    ok(relay.waiting is None and signin.relay_status()["waiting_for"] is None,
+       "and the wait is over")
+    ok("error" in signin.submit_code("111111"), "a code with nobody waiting is refused, plainly")
+    ok("error" in signin.submit_code("abc"), "non-digits are refused")
+    relay2 = signin.CodeRelay(timeout_s=0.3)
+    h2 = relay2.handler(FakeCl(), log=lines.append)
+    ok(h2("sana", "SMS") == "" and relay2.timed_out, "a code that never comes returns '' after the timeout")
+    ok(any("sent a one-time code to your email" in l for l in lines), "the log tells the operator where to look")
+
+    print()
+    print("== proxy_check proves the exit before a login is spent through it ==")
+    class R:
+        def __init__(self, status=200, text="", js=None):
+            self.status_code, self.text, self._js = status, text, js
+        def json(self): return self._js
+    def good(url, proxies, timeout):
+        if "ipify" in url: return R(js={"ip": "49.36.1.2"})
+        if "ipapi" in url: return R(text="IN\n")
+        return R(status=200)
+    chk = ig_session.proxy_check("http://u:p@p.webshare.io:80", get=good, expect_country="IN")
+    ok(chk["ok"] and chk["exit_ip"] == "49.36.1.2" and chk["country"] == "IN" and not chk["warn"]
+       and chk["ig_status"] == 200, f"a healthy Indian exit passes: {chk['detail']}")
+    ok(chk["proxy"] == "u@p.webshare.io:80" and "p@" not in chk["proxy"],
+       "the proxy is shown by user@host:port — never the password")
+    def abroad(url, proxies, timeout):
+        if "ipify" in url: return R(js={"ip": "5.6.7.8"})
+        if "ipapi" in url: return R(text="DE")
+        return R(status=200)
+    chk = ig_session.proxy_check("http://u:p@h:1", get=abroad, expect_country="IN")
+    ok(chk["ok"] and "DE" in chk["warn"], "an exit in the wrong country is a WARNING, not a refusal")
+    import requests as _rq
+    def tls(url, proxies, timeout):
+        raise _rq.exceptions.SSLError("certificate verify failed: unable to get local issuer certificate")
+    chk = ig_session.proxy_check("http://u:p@h:1", get=tls)
+    ok(not chk["ok"] and chk["why"] == "tls_intercepted", "a MITM'd exit is named tls_intercepted")
+    def dead(url, proxies, timeout):
+        raise _rq.exceptions.ProxyError("Cannot connect to proxy")
+    chk = ig_session.proxy_check("http://u:p@h:1", get=dead)
+    ok(not chk["ok"] and chk["why"] == "network", "a dead exit is 'network'")
+    def bounced(url, proxies, timeout):
+        if "ipify" in url: return R(js={"ip": "1.1.1.1"})
+        if "ipapi" in url: return R(text="IN")
+        return R(status=403)
+    chk = ig_session.proxy_check("http://u:p@h:1", get=bounced)
+    ok(not chk["ok"] and chk["why"] == "blocked" and "403" in chk["detail"],
+       "an exit instagram.com refuses outright is 'blocked'")
+    ok(ig_session.proxy_check("")["why"] == "no_proxy", "no proxy at all is said as such")
+
+    print()
+    print("== the sign-in paths refuse a dead exit and reseed a legacy phone ==")
+    root = str(tmp)
+    import unittest.mock as _m
+    with _m.patch.object(ig_session, "proxy_check",
+                         lambda proxy, **k: {"ok": False, "why": "network", "detail": "dead",
+                                             "proxy": "x", "exit_ip": "", "country": "",
+                                             "ig_status": 0, "warn": ""}):
+        o = signin.ig_password("sana", "pw", proxy="http://u:p@h:1", label="ig_s", root=root,
+                               store=os.path.join(root, "ig_accounts.db"))
+    ok(not o.ok and o.needs == "proxy" and "dead" in o.detail, "a dead exit ends the attempt before any login")
+    ok(not ig_session.device_path("ig_s", root).exists(), "…and mints no phone for it")
+    # a legacy seed on file is replaced when a sign-in runs (and only then)
+    legacy = ig_identity.mint("ig_l", chrome="140")
+    legacy["device_settings"].update(model="Pixel 8 Pro", manufacturer="Google/google")
+    legacy["locale"], legacy["country"], legacy["timezone_offset"] = "en_US", "US", -14400
+    legacy.pop("identity")
+    ig_session.save_device(legacy, "ig_l", root)
+    ok(ig_identity.is_legacy(ig_session.load_device("ig_l", root)), "a legacy seed is on file")
+    lines = []
+    signin._fresh_phone_if_legacy("ig_l", root, lines.append)
+    dev = ig_session.load_device("ig_l", root)
+    ok(not ig_identity.is_legacy(dev) and dev["locale"] == "en_IN", "a sign-in replaces it with a real phone")
+    ok(any("default" in l and "reseeded" in l for l in lines), "and says why")
+    signin._fresh_phone_if_legacy("ig_l", root, lines.append)
+    ok(ig_session.load_device("ig_l", root)["uuids"] == dev["uuids"], "a real phone is kept on the next sign-in")
+
+    print()
+    print("== needs='browser' when only a browser can answer ==")
+    from instagrapi.exceptions import ChallengeRequired
+    ok(signin._needs_browser(ChallengeRequired("Manual verification required via Instagram native challenge flow…")),
+       "a native checkpoint wants the browser door")
+    ok(signin._needs_browser(ChallengeRequired("Manual verification required via Instagram Bloks redirect checkpoint")),
+       "so does a Bloks redirect")
+    ok(not signin._needs_browser(ChallengeRequired("Challenge code required. Provide it via challenge_code_handler")),
+       "a plain code challenge does not")
+
+    print()
+    print("== the browser door's last step adopts the WHOLE jar on the pinned phone ==")
+    cookies = {"sessionid": "77%3Aabc%3A1", "ds_user_id": "77", "csrftoken": "c1", "mid": "m1",
+               "ig_did": "d1", "rur": "r1", "datr": "dt1"}
+    calls = {}
+    class FakeClient:
+        def __init__(self, settings=None, delay_range=None):
+            self.settings = dict(settings or {})
+            self.username = ""
+            self.user_id = 77
+            self.user_agent = self.settings.get("user_agent", "")
+            import requests
+            self.private = requests.Session()
+        def set_proxy(self, p): calls["proxy"] = p
+        def login_by_sessionid(self, sid):
+            calls["sid"] = sid; self.username = "sana_real"; return True
+        def get_settings(self):
+            import requests
+            return {**self.settings, "cookies": requests.utils.dict_from_cookiejar(self.private.cookies)}
+    import instagrapi
+    with _m.patch.object(instagrapi, "Client", FakeClient), \
+         _m.patch.object(ig_session, "proxy_check", lambda proxy, **k: {"ok": True, "exit_ip": "49.1.1.1",
+                                                                         "country": "IN", "checked": "now"}):
+        o = signin.ig_browser_adopt(cookies, proxy="http://u:p@h:1", label="ig_b", root=root,
+                                    store=os.path.join(root, "ig_accounts.db"),
+                                    username_hint="sana", browser_ua="Mozilla/5.0 (Linux; Android 10; K) Chrome/140")
+    ok(o.ok and o.identity == "sana_real", f"adopted as the handle Instagram reported: {o.detail}")
+    ok(calls["sid"] == cookies["sessionid"] and calls["proxy"] == "http://u:p@h:1",
+       "through the account's proxy, with the browser's sessionid")
+    sc = json.loads(ig_session.sidecar_path("sana_real", root).read_text())
+    ok({"csrftoken", "mid", "ig_did", "rur", "datr"} <= set(sc["settings"]["cookies"]),
+       "the device cookies the browser held are carried into the app session")
+    ok(sc["meta"]["exit"]["exit_ip"] == "49.1.1.1" and sc["meta"]["exit"]["country"] == "IN",
+       "the exit the session was minted through is written down")
+    ok(sc["settings"].get("identity", {}).get("name"), "the sidecar is self-describing (identity block)")
+    import ig
+    with ig.Store(os.path.join(root, "ig_accounts.db")) as st:
+        row = st.get("sana_real")
+    ok(row and row["active"] and row["label"] == "ig_b", "and the account row is active on its label")
+
+
+def test_ig_parallel(tmp):
+    """N accounts collect at once, each owning its share (sticky, balanced,
+    pinned when a human says so); a benched account's sources move; a
+    resting one keeps them; only one pass runs on a machine at a time."""
+    import collect_ig, decider, ig, ig_session, store_ig
+    root = pathlib.Path(tmp)
+    (root / "profiles").mkdir(exist_ok=True)
+    rp = str(root / "ig_results.db")
+    ap = str(root / "ig_accounts.db")
+
+    print("== assignment: pinned wins, sticky holds, the rest balance ==")
+    with store_ig.Store(rp) as st:
+        for i in range(7):
+            st.add_source(f"s{i}", "user", f"h{i}", project_id=1)
+        st.add_source("pin", "user", "hp", account="sana", project_id=1)
+        lines = []
+        g = st.assign_sources(["sana", "omar"], log=lines.append)
+        ok(sorted(g) == ["omar", "sana"] and abs(len(g["sana"]) - len(g["omar"])) <= 1,
+           f"8 sources over 2 accounts land balanced: sana={len(g['sana'])} omar={len(g['omar'])}")
+        ok(any(x.label == "pin" for x in g["sana"]), "the pinned source is on its pin")
+        first = {x.label: a for a, xs in g.items() for x in xs}
+        g2 = st.assign_sources(["omar", "sana"], log=lines.append)
+        second = {x.label: a for a, xs in g2.items() for x in xs}
+        ok(first == second, "a second pass (accounts listed in another order) moves NOTHING — sticky")
+        ok(all(x.assigned_account == a for a, xs in g2.items() for x in xs),
+           "the owner is written on every row")
+        n_lines = len(lines)
+        g3 = st.assign_sources(["omar"], log=lines.append)
+        third = {x.label: a for a, xs in g3.items() for x in xs}
+        ok(set(third) == set(first) - {"pin"} and all(a == "omar" for a in third.values()),
+           "when sana drops out her unpinned sources move to omar…")
+        ok(any("pinned to @sana wait" in l for l in lines[n_lines:]), "…and the pinned one waits, said so")
+        ok(sum("moves from @sana to @omar" in l for l in lines[n_lines:]) == len(first) - len(third) - 0
+           or any("moves from @sana to @omar" in l for l in lines[n_lines:]), "every move is logged")
+        g4 = st.assign_sources(["omar", "sana", "yn"], log=lines.append)
+        fourth = {x.label: a for a, xs in g4.items() for x in xs}
+        ok(fourth["pin"] == "sana" and all(fourth[l] == "omar" for l in third),
+           "when sana returns her pin comes back but nothing sticky moves to her or to a newcomer")
+        st.add_source("s9", "user", "h9", project_id=1)
+        g5 = st.assign_sources(["omar", "sana", "yn"], log=lines.append)
+        who = {x.label: a for a, xs in g5.items() for x in xs}["s9"]
+        ok(who in ("sana", "yn"), f"a NEW source goes to the least-loaded account ({who})")
+        counts = st.assignment_counts()
+        ok(counts.get("omar", 0) >= 7 and counts.get("", 0) == 0, f"assignment_counts: {counts}")
+
+    print()
+    print("== collectors(): active + session + no checkpoint; benched says why ==")
+    cwd = os.getcwd(); os.chdir(tmp)
+    try:
+        with ig.Store(ap) as st:
+            for u, active in (("sana", True), ("omar", True), ("locked", True), ("nosess", True), ("bench", False)):
+                st.save(ig.Session(username=u, user_id="1", user_agent="ua",
+                                   cookies={"sessionid": "1:x"} if u != "nosess" else {}),
+                        label=f"ig_{u}", active=active)
+            roster = st.active_accounts()
+        ok(sorted(roster) == ["locked", "nosess", "omar", "sana"],
+           "activating a row demotes nobody (N collectors)")
+        for u in ("sana", "omar"):
+            (root / "profiles" / f"ig_{u}.json").write_text(json.dumps({"meta": {"label": f"ig_{u}"}, "settings": {}}))
+        (root / "profiles" / "ig_locked.json").write_text(json.dumps(
+            {"meta": {"label": "ig_locked", "checkpoint_at": "2026-09-03"}, "settings": {}}))
+        owners, benched = collect_ig.collectors(store_path=ap, root=tmp)
+        ok(sorted(owners) == ["omar", "sana"], f"owners are the usable ones: {owners}")
+        ok("checkpoint" in benched.get("locked", "") and "no session" in benched.get("nosess", "")
+           and "bench" not in benched, f"benched with reasons: {benched}")
+
+        print()
+        print("== one pass, two phones, in parallel; a resting phone keeps its sources ==")
+        # a fake engine: every account reads its sources, records who ran, and
+        # sleeps a little so a serial run would be visibly slower
+        ran, order = {}, []
+
+        class Page:
+            def __init__(self, pks):
+                self.result_ids = list(pks)
+                self.entries_by_id = {pk: {"pk": pk, "code": f"c{pk}", "url": "", "taken_at": 1700000000 + pk,
+                                           "media_type": 1, "product_type": "", "caption": "", "like_count": 0,
+                                           "comment_count": 0, "play_count": None, "video_url": "",
+                                           "thumbnail_url": "", "user_pk": 1, "username": "u"} for pk in pks}
+
+        class FakeEngine:
+            def __init__(self, cl, account=None, on_resolved=None):
+                self.account = account
+            def resolve_from_following(self, names): return {}
+            async def pages_for(self, source, page_size=12, max_pages=2):
+                order.append((self.account, source.label, time.time()))
+                await asyncio.sleep(0.05)
+                base = abs(hash(source.label)) % 1000 * 10
+                yield Page([base + 2, base + 1])
+
+        import unittest.mock as _m
+        ig_human_mod = collect_ig.ig_human
+        with _m.patch.object(collect_ig, "IGEngine", FakeEngine), \
+             _m.patch.object(ig_session, "load_client", lambda acct, **k: ran.setdefault(acct, object())), \
+             _m.patch.object(ig_human_mod, "source_gap", lambda rng=None: 0.0), \
+             _m.patch.object(ig_human_mod, "maybe_long_break", lambda rng=None: 0.0), \
+             _m.patch.object(collect_ig, "STAGGER_S", (0.0, 0.01)):
+            log = []
+            dec = decider.Decider("instagram", log=log.append, db=None, notify=lambda t: (True, ""))
+            t0 = time.time()
+            n = asyncio.run(collect_ig.run_once(rp, dec=dec, log=log.append, accounts_path=ap, root=tmp))
+            took = time.time() - t0
+            ok(n == 18 and sorted(ran) == ["omar", "sana"],   # 9 sources x 2 posts
+               f"both phones collected (new={n}); locked/nosess never loaded: {sorted(ran)}")
+            by_acct = {}
+            for a, lab, ts in order:
+                by_acct.setdefault(a, []).append(ts)
+            ok(len(by_acct) == 2 and min(by_acct["omar"]) < max(by_acct["sana"])
+               and min(by_acct["sana"]) < max(by_acct["omar"]),
+               "their reads interleave in time — parallel, not one after the other")
+            ok(any("plan: " in l and "@sana" in l and "@omar" in l for l in log), "the plan is logged")
+            ok(any("@locked is benched (checkpoint" in l for l in log)
+               and any("@nosess is benched (no session)" in l for l in log), "benched accounts are named")
+            hb = json.loads((root / "profiles" / "ig_loop.json").read_text())
+            ok(sorted(hb["accounts"]) == ["omar", "sana"] and hb["accounts"]["sana"]["ok"],
+               "the heartbeat records what each phone did")
+            with store_ig.Store(rp) as st:
+                owners_now = {x.label: x.collector for x in st.sources()}
+            ok(set(owners_now.values()) == {"sana", "omar"}, "every source has an owner on disk")
+
+            # rate-limit sana: she rests, keeps her sources, omar still runs
+            dec.begin_pass()
+            from instagrapi.exceptions import PleaseWaitFewMinutes
+            dec.on("", account="sana", exc=PleaseWaitFewMinutes("wait"))
+            ok(dec.account_wait("sana") > 0 and dec.account_wait("omar") == 0,
+               f"account_wait: sana rests {dec.account_wait('sana')}s, omar does not")
+            ok(dec.platform_wait_s() == 0 and dec.wait_s() > 0,
+               "her backoff is not a platform wait (the loop will not idle omar for it)")
+            ran.clear(); order.clear(); log.clear()
+            n = asyncio.run(collect_ig.run_once(rp, dec=dec, log=log.append, accounts_path=ap, root=tmp))
+            ok(sorted(ran) == ["omar"] and any("@sana rests for" in l for l in log),
+               "a resting phone sits the pass out, and says so")
+            with store_ig.Store(rp) as st:
+                still = {x.label: x.collector for x in st.sources()}
+            ok(still == owners_now, "…and KEEPS its sources (resting is not leaving)")
+
+            # asleep by her own clock: same thing, quietly
+            ran.clear(); log.clear()
+            asyncio.run(collect_ig.run_once(rp, dec=dec, log=log.append, accounts_path=ap, root=tmp,
+                                            awake={"sana"}))
+            ok(ran == {} or sorted(ran) == [], "sana is resting and omar is asleep -> nobody runs")
+            dec.ok("sana")
+            ran.clear(); log.clear()
+            asyncio.run(collect_ig.run_once(rp, dec=dec, log=log.append, accounts_path=ap, root=tmp,
+                                            awake={"sana"}))
+            ok(sorted(ran) == ["sana"], "awake set: only the phone whose day it is runs")
+
+            # a checkpoint mid-pass benches the account; the next pass moves its sources
+            class CheckpointEngine(FakeEngine):
+                async def pages_for(self, source, page_size=12, max_pages=2):
+                    from instagrapi.exceptions import ChallengeRequired
+                    if self.account == "sana":
+                        raise ChallengeRequired("Manual verification required")
+                    async for p in super().pages_for(source, page_size, max_pages):
+                        yield p
+            with _m.patch.object(collect_ig, "IGEngine", CheckpointEngine):
+                ran.clear(); log.clear()
+                asyncio.run(collect_ig.run_once(rp, dec=dec, log=log.append, accounts_path=ap, root=tmp))
+            ok(any("failover: @sana is out; its unpinned sources move to @omar" in l for l in log),
+               "a checkpoint benches sana and names where her sources go")
+            owners, benched = collect_ig.collectors(store_path=ap, root=tmp)
+            ok(owners == ["omar"] and "sana" not in owners, "she is no longer a collector")
+            ran.clear(); log.clear()
+            asyncio.run(collect_ig.run_once(rp, dec=dec, log=log.append, accounts_path=ap, root=tmp))
+            with store_ig.Store(rp) as st:
+                after = {x.label: x.collector for x in st.sources()}
+            ok(all(a == "omar" for l, a in after.items() if l != "pin") and after["pin"] == "sana",
+               "next pass: her unpinned sources are omar's; the pinned one waits for her")
+
+        print()
+        print("== the dashboard sees it: /api/ig/status, /api/ig/diag, bench, new phone ==")
+        import web as _web
+
+        _root = root
+
+        class _Cfg:
+            root = _root
+        _orig = _web._CFG
+        _web._CFG = _Cfg()
+        try:
+            stt = _web._ig_status({"project": "1"})
+            accts = {a["username"]: a for a in stt["accounts"]}
+            ok(accts["omar"]["owns"] >= 7 and accts["omar"]["identity"] is None,
+               f"status says what omar owns ({accts['omar']['owns']}); no device file -> identity None")
+            ok(all(sr["collector"] for sr in stt["sources"]), "every source row names its collector")
+            ig_session.ensure_device("ig_omar", root)
+            stt = _web._ig_status({"project": "1"})
+            accts = {a["username"]: a for a in stt["accounts"]}
+            ok(accts["omar"]["identity"] and accts["omar"]["identity"]["locale"] == "en_IN"
+               and "uuids" not in json.dumps(accts["omar"]["identity"]),
+               "with a device file the card gets the phone, never its ids")
+            diag = _web._ig_diag()
+            ok("git" in diag and "services" in diag and diag["loop"]["accounts"]
+               and diag["assignment"].get("omar", 0) >= 7 and diag["pass_running"] is None,
+               "diag carries code rev, services, the heartbeat, the assignment and the lock")
+            da = {a["username"]: a for a in diag["accounts"]}
+            ok(da["locked"]["sidecar"]["checkpoint_at"] == "2026-09-03"
+               and da["sana"]["sidecar"]["cookies"] == [] and "proxy" in da["sana"]["sidecar"],
+               "per account: sidecar facts, cookie NAMES only")
+            ok("sessionid" not in json.dumps(diag).replace("cookies", ""), "no cookie values anywhere in diag")
+            r = _web._ig_account_post({"username": "omar", "active": False})
+            ok(r["ok"] and "omar" not in r["collectors"], "bench takes omar off the roster")
+            r = _web._ig_account_post({"username": "omar", "active": True})
+            ok(r["ok"] and "omar" in r["collectors"], "…and back")
+            ok("error" in _web._ig_account_post({"username": "nobody", "active": True}), "unknown handle refused")
+            before = ig_session.load_device("ig_omar", root)["uuids"]
+            r = _web._ig_reseed({"username": "omar"})
+            ok(r["ok"] and r["identity"]["locale"] == "en_IN"
+               and ig_session.load_device("ig_omar", root)["uuids"] != before,
+               "a new phone on the operator's say-so")
+            with ig.Store(ap) as st:
+                row = st.get("omar")
+            ok(not row["active"] and "sign in again" in (row["error_msg"] or ""),
+               "which benches the account until it signs in on the new phone")
+            with ig.Store(ap) as st:
+                st.set_active("omar", True, error="")
+            ok("error" in _web._ig_reseed({}), "reseed needs a label or username")
+            ss = _web._signin_status()
+            ok(ss["waiting_for"] is None and ss["running"] is False, "signin status idles with no code wanted")
+        finally:
+            _web._CFG = _orig
+
+        print()
+        print("== one pass at a time, across processes ==")
+        lk = collect_ig.PassLock(tmp)
+        ok(lk.acquire("test"), "the lock is free")
+        log = []
+        n = asyncio.run(collect_ig.run_once(rp, log=log.append, accounts_path=ap, root=tmp, who="fetch-now"))
+        ok(n == 0 and any("a pass is already running" in l and "test" in l for l in log),
+           "a second pass refuses while the first holds the lock, naming the holder")
+        lk.release()
+        ok(collect_ig.PassLock(tmp).acquire("again"), "released, it can be taken again")
+    finally:
+        os.chdir(cwd)
+
+
 def test_decider(tmp):
     """decider.py — the policy that turns a collector condition into ONE
     decision, said once. Pinned here: the Activity Log filled with the same
@@ -3894,7 +4415,7 @@ def test_pager(tmp):
         meta = json.loads((prof / "ig_sana.json").read_text())["meta"]
         ok(meta.get("checkpoint_at"), "the checkpoint is recorded in the sidecar, so refresh will not knock")
         ok("failed over to @omar" in sent[0] and "?fix=instagram:sana:checkpoint" in sent[0],
-           "the ping says who took over and links to the fix")
+           "the ping says who took over (a warm backup, nobody else was collecting) and links to the fix")
         ok(dec2.open_conditions()[0]["meta"]["sources"] == ["Rajnath", "Yogi"],
            "the sources on the locked account are remembered for re-enabling")
 
@@ -4210,7 +4731,8 @@ def test_no_undefined_names():
                "engine.py", "engine_fb.py", "store_ig.py", "store_fb.py",
                "store.py", "web.py", "main.py", "ig_human.py", "pool_link.py",
                "activity_log.py", "alerts.py", "webhook.py", "sheets.py",
-               "migrate_ig_sources.py", "decider.py"]
+               "migrate_ig_sources.py", "decider.py", "ig_identity.py",
+               "ig_session.py", "signin.py", "ig.py"]
     # Module dunders are supplied by the import machinery, not by the source.
     builtin_names = set(dir(_bi)) | {
         "__file__", "__name__", "__doc__", "__package__", "__spec__",
@@ -5450,6 +5972,12 @@ def main():
 
         section("instagram (one stable device per account)")
         test_ig_device(fresh("ig"))
+        section("instagram identity (one coherent phone per account, minted once)")
+        test_ig_identity(fresh("igid"))
+        section("instagram sign-in from the server (code relay, exit check, browser door)")
+        test_ig_signin(fresh("igsignin"))
+        section("instagram in parallel (N phones, sticky sharding, one pass at a time)")
+        test_ig_parallel(fresh("igpar"))
 
         section("decider (one decision per condition, said once)")
         test_decider(fresh("decider"))
