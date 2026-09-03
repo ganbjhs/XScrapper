@@ -123,7 +123,7 @@ The organizing layer (in `store.py` + `web.py`):
 | `store_fb.py` | `fb_results.db`: posts (two-key dedup), sources (lowercase labels), settings, page_profiles, removed_pages tombstones |
 | `fb_debug.py` / `fb_probe.py` / `fb_data_probe.py` | FB page-structure diagnostics (standalone) |
 | `frontend/` | Vite + React SPA (source `src/`, built `dist/` committed — the server never runs Node). Shell is a 2-column grid: `nav.side` is `position: sticky` and therefore its own stacking context, so overlays portal to `<body>` rather than trusting z-index |
-| `deploy/` | VPS install: systemd units (`xscraper-web`, `xscraper-watch` X, `xscraper-fb`, `xscraper-ig`), nginx, re-runnable `setup.sh`, pre-commit hook. FB/IG units are enabled but start STOPPED (need a signed-in session; Fetch-now runs a pass on demand meanwhile) |
+| `deploy/` | VPS install: systemd units (`xscraper-web`, `xscraper-watch` X, `xscraper-fb`, `xscraper-ig`), nginx, re-runnable `setup.sh`, `update.sh` (the every-push update, called by `.github/workflows/deploy.yml`), pre-commit hook. FB/IG units are enabled but start STOPPED (need a signed-in session; Fetch-now runs a pass on demand meanwhile) |
 | `CHECKPOINT.md` | Running history of what changed, newest first — the evidence behind each rule's current wording. Protected: append every change, never delete |
 | `tests/` | The offline suite — no network, no budget spent. Run after every change |
 | `tools/ig_probe.py` | Instagram session diagnostic |
@@ -179,9 +179,20 @@ One-time: push to GitHub → on the VPS
 webhook secret, Telegram token, `ACCOUNTS_SECRET_KEY`) → sign accounts in →
 `systemctl start xscraper-watch xscraper-fb`.
 
-Every update: push, `git pull --ff-only`, `chown -R xscraper:xscraper .`,
-restart the touched services. `frontend/dist` is committed on purpose (no Node
-on the server). Install the pre-commit hook:
+Every update: push to `main`. That is the whole step — the GitHub Actions
+workflow `.github/workflows/deploy.yml` SSHes into the VPS, runs
+`git pull --ff-only`, then `deploy/update.sh` (chown, pip only if
+`requirements.txt` changed, re-install units only if `deploy/*.service`
+changed, restart `xscraper-web` plus whichever collectors are currently
+running — never starting a stopped one — and verify the web unit came back).
+Docs-only pushes restart nothing. Watch it in the repo's Actions tab; re-run
+from there with "Run workflow". It needs the repo secrets `DEPLOY_HOST` and
+`DEPLOY_SSH_KEY` (see the workflow header); until they are set it skips with
+a warning rather than failing.
+
+By hand, the same thing is `cd /opt/xscraper/app && git pull --ff-only &&
+bash deploy/update.sh` as root. `frontend/dist` is committed on purpose (no
+Node on the server). Install the pre-commit hook:
 `ln -sf ../../deploy/pre-commit .git/hooks/pre-commit`.
 
 ## 7. Invariants (each one was paid for — keep them)

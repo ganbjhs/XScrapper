@@ -1,0 +1,76 @@
+# Deploy to the VPS on every push to main (BLUEPRINT §6, automated).
+#
+# GitHub's runner SSHes into the server and runs the same two commands the
+# runbook has always asked for by hand: `git pull --ff-only`, then
+# deploy/update.sh (chown, pip if needed, restart the touched services, verify).
+#
+# Needs three repository secrets (Settings -> Secrets and variables -> Actions):
+#   DEPLOY_HOST      the VPS hostname or IP        e.g. scraper.vedictech.in
+#   DEPLOY_SSH_KEY   the PRIVATE half of a keypair whose PUBLIC half is in the
+#                    server's ~/.ssh/authorized_keys   (ed25519, no passphrase)
+#   DEPLOY_USER      optional, defaults to root (update.sh needs root: chown,
+#                    systemctl, /etc/systemd)
+#   DEPLOY_PORT      optional, defaults to 22
+#
+# Until DEPLOY_HOST is set the job skips with a warning instead of failing, so
+# the workflow can be committed before the server side is wired up.
+#
+# Re-run by hand: Actions tab -> "Deploy to VPS" -> Run workflow.
+
+name: Deploy to VPS
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+# One deploy at a time; a second push queues behind the first rather than
+# racing it for the same checkout.
+concurrency:
+  group: deploy-vps
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      DEPLOY_HOST: ${{ secrets.DEPLOY_HOST }}
+      DEPLOY_USER: ${{ secrets.DEPLOY_USER || 'root' }}
+      DEPLOY_PORT: ${{ secrets.DEPLOY_PORT || '22' }}
+    steps:
+      - name: Check secrets
+        id: check
+        run: |
+          if [ -z "$DEPLOY_HOST" ] || [ -z "${{ secrets.DEPLOY_SSH_KEY }}" ]; then
+            echo "::warning::DEPLOY_HOST / DEPLOY_SSH_KEY secrets are not set - skipping deploy. See .github/workflows/deploy.yml header."
+            echo "ready=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "ready=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Load SSH key
+        if: steps.check.outputs.ready == 'true'
+        env:
+          DEPLOY_SSH_KEY: ${{ secrets.DEPLOY_SSH_KEY }}
+        run: |
+          mkdir -p ~/.ssh && chmod 700 ~/.ssh
+          printf '%s\n' "$DEPLOY_SSH_KEY" > ~/.ssh/deploy_key
+          chmod 600 ~/.ssh/deploy_key
+          ssh-keyscan -p "$DEPLOY_PORT" -H "$DEPLOY_HOST" >> ~/.ssh/known_hosts 2>/dev/null
+          [ -s ~/.ssh/known_hosts ] || { echo "::error::could not reach $DEPLOY_HOST:$DEPLOY_PORT for ssh-keyscan"; exit 1; }
+
+      - name: Pull and restart on the VPS
+        if: steps.check.outputs.ready == 'true'
+        run: |
+          ssh -i ~/.ssh/deploy_key -p "$DEPLOY_PORT" \
+              -o StrictHostKeyChecking=yes -o BatchMode=yes -o ConnectTimeout=20 \
+              "$DEPLOY_USER@$DEPLOY_HOST" bash -s <<'REMOTE'
+            set -euo pipefail
+            cd /opt/xscraper/app
+            OLD=$(git rev-parse HEAD)
+            # The checkout is owned by xscraper; git (as root) refuses "dubious
+            # ownership" without this. Scoped to this one command, nothing global.
+            git -c safe.directory=/opt/xscraper/app pull --ff-only
+            bash deploy/update.sh "$OLD"
+          REMOTE

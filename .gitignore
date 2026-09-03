@@ -69,3 +69,8 @@ _to_delete/
 
 # Per-machine Claude Code settings and worktrees.
 .claude/
+
+# GitHub Actions deploy keypair, generated locally. The private half is pasted
+# into the repo secret DEPLOY_SSH_KEY and the public half into the VPS
+# authorized_keys; neither ever belongs in git.
+.deploy-key/
