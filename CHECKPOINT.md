@@ -19,6 +19,209 @@ must respect belongs in the rulebook, not here.
 
 ---
 
+## 2026-09-03 (II) — the pager: ping with a link, otherwise fix it yourself
+
+**Changed**
+
+- `decider.py` — condition ids (`platform:account:kind`), `fix_url()` from
+  `PUBLIC_BASE_URL`; every ping ends with "Fix it → …?fix=<id>" and
+  "Snooze 6h → …&snooze=6". Rules carry `fix` (steps), `actions` (what the
+  panel may offer) and `needs_human`. `open_conditions()`, `snooze()`,
+  `resolve()` for the panel; `decider_state` gains `snoozed_until_ms` and
+  `meta` (additive migration). A paged condition that closes — by itself,
+  by a switch to another kind, by sign-in or by "Mark fixed" — pings once
+  more ("recovered"). While snoozed: no lines, no ping, still counting.
+- `collect_ig.py` — `_decide_exc` is the one path for every account
+  exception; a checkpoint quarantines, records `checkpoint_at` in the
+  sidecar, and `ig_failover` promotes the first other `ig_accounts.db` row
+  with a session, no error and no checkpoint (pool mirrored via the new
+  `pool_link.promote`). The decision's meta records the account's sources
+  and whether failover happened; the ping says so. `.env` is loaded at
+  service start (the units set no EnvironmentFile).
+- `web.py` — `GET /api/decider/conditions`, `POST /api/decider` (snooze /
+  resolve / reenable_sources / resume); dashboard-only, not in
+  `API_KEY_PATHS`. `_decider_after_signin`: a successful IG sign-in closes
+  that account's session condition, re-enables its recorded sources, and
+  clears the row's error.
+- `frontend/src/views/Accounts.jsx` — the Fix panel ("Needs attention") at
+  the top of Accounts & Sessions: every open condition, the linked one
+  expanded, steps from the rule, buttons from the rule's actions (Sign in
+  opens the existing `SignInModal` for the pooled account, or "Add to pool"
+  first). `?snooze=` is applied once and dropped from the URL.
+  `src/api/client.js` — `deciderConditions`, `deciderAction`.
+  `frontend/dist` rebuilt → `index-zAzpVXsY.js`.
+- `tests/test_all.py` — `test_pager` (32 checks); one `test_decider` check
+  reworded for the transition ping. `RULEBOOK.md` §6 (two rules),
+  `BLUEPRINT.md`, `.env.example`.
+
+**Why**
+
+"If the tool needs me, ping me with a link where I fix it; otherwise fix it
+itself." The first decider paged, but a page without a destination is a
+notification, not a task, and the Sep 2 checkpoint on @sanaakhtar221 took
+collection down for a day although two other accounts with sessions were
+sitting in `ig_accounts.db`.
+
+**Verified**
+
+- Suite on a staged copy, Python 3.11.15, pinned deps: 785 checks pass
+  (`test_facebook` still skipped — the pre-existing graphql media failure).
+- `web._decider_conditions` / `_decider_post` exercised against a temp root:
+  re-enable restores only the condition's recorded sources; snooze and
+  resolve round-trip; unknown action refused.
+- Frontend built on the local VM (vite writes to `$HOME/distbuild`, copied
+  into `dist/` — the bridge cannot delete the old hashed assets, so stale
+  `index-*.js` files remain beside the new one; harmless, `index.html`
+  points at the new bundle). Bundle contains the panel.
+
+- Admin contact (same day): `ADMIN_TELEGRAM_CHAT_ID` / `ADMIN_NAME` in
+  `.env` — the decider pages the admin (fallback `TELEGRAM_CHAT_ID`);
+  `decider.admin_chat()` / `notify_ready()`; panel hint and `.env.example`
+  updated; 9 checks in `test_pager`. Watch-Tower is unaffected: no change to
+  the post shape, delivery, scoping or the key allow-list — nothing to resend.
+
+- Promote moves collection (same evening): the operator promoted a backup
+  in Accounts & Sessions and the log still read `account @sanaakhtar221`
+  — the pool and `ig_accounts.db` were never joined.
+  `accounts_api._activate_collector` (on `/promote` and `/failover`) now
+  sets the active row in `ig_accounts.db` when the account has a session,
+  and returns a `note` the card shows either way. `frontend/dist` →
+  `index-BdnaKueQ.js`. `tests/test_accounts_api.py` +1.
+
+**Still open**
+
+- The old hashed bundles in `frontend/dist/assets` should be deleted
+  locally before commit (`git status` shows the new one untracked).
+- `PUBLIC_BASE_URL`, `TELEGRAM_BOT_TOKEN`, `TELEGRAM_CHAT_ID` must be set
+  in the server's `.env`; the panel says so when Telegram is not configured.
+- Facebook's conditions (logged-out session seen Sep 2) are not routed
+  through the decider yet.
+
+---
+
+## 2026-09-03 — the decider: one decision per condition, said once
+
+**Changed**
+
+- `decider.py` (new) — a rule-based policy: `Event(kind, platform, account)`
+  → `Decision(action, wait_s, say, notify)`. Rules for `paused`,
+  `no_sources`, `session_missing`, `session_rejected`, `checkpoint`,
+  `rate_limited`, `budget_spent`, `pass_error`, `ok`. One open condition per
+  (platform, account) scope, persisted in `activity.db` → `decider_state`;
+  announced on open, reminded every 6h, escalated to Telegram once
+  (`TELEGRAM_BOT_TOKEN` / `TELEGRAM_CHAT_ID`, the `alerts.py` channel),
+  "recovered after …" on close. `classify_exception` maps instagrapi
+  exceptions by NAME (no import) and `ig_session`'s `RuntimeError` wrappers
+  by text, so a wrapped checkpoint is still a checkpoint.
+- `collect_ig.py` — `run_once(..., dec=None)`: every condition routes through
+  the decider. A checkpoint quarantines the account in the pool and stops
+  the pass for it; a rate limit stops the pass for it; a failed refresh stops
+  it (was: `continue`, which knocked once per remaining source). No active
+  account is a `session_missing` condition, not a crash. The `--loop` holds
+  ONE persistent decider and sleeps `max(ig_human.next_interval, dec.wait_s())`
+  — the decision's wait is a floor under the human rhythm. A pass that raises
+  is `pass_error` (third in a row pages the operator).
+- `activity_log.py` — level regexes know the decider's lines (QUARANTINE /
+  session / pass_error → error; a decision or reminder → warn; recovered →
+  info).
+- `tests/test_all.py` — `test_decider` (30 checks) + `decider.py` in the
+  undefined-names sweep. `RULEBOOK.md` §6 + §8, `BLUEPRINT.md` file map.
+
+**Why**
+
+The Activity Log on the server showed "no enabled sources — add one with
+`collect_ig.py add-source`" every 20–40 minutes for two days: the IG
+service was running against a store with no enabled source. Not an error —
+but nothing about it was a decision either. The cadence did not change,
+nobody was told, and any real error would have scrolled off behind it. The
+same print-and-continue shape sat under every other condition, including the
+one that kills accounts: a checkpoint inside `collect_source` was caught by
+`except Exception`, logged, and the next source of the same account was
+fetched anyway.
+
+**Verified**
+
+- `tests/test_all.py` on a staged copy under Python 3.11.15 with the pinned
+  deps: `test_decider` 30/30; the undefined-names sweep covers `decider.py`;
+  756 checks pass. `test_facebook` was skipped in that run — it fails on
+  `_stories_from_graphql` media (`gp[0]["media"]` empty) BEFORE this change,
+  from the 2026-09-02 FB feed-structure work; not touched here.
+- Dry run of `collect_ig.run_once` ×3 on an empty `ig_results.db` with one
+  persistent decider: one Activity Log row (`decision: IDLE on 'no_sources'
+  … next try in 30m; operator will be told if still open in 2h`), then
+  silence; `dec.wait_s()` = 1800. Two one-shot runs (Fetch-now path) both
+  speak.
+
+**Still open**
+
+- The server still has no enabled Instagram source for any project; add one
+  (Watchlists → + New watchlist → Instagram) and the open condition closes
+  with a "recovered" line. `TELEGRAM_BOT_TOKEN` / `TELEGRAM_CHAT_ID` must be
+  set in the server's `.env` for the escalation to reach a phone; without
+  them the log says "operator NOT told" once.
+- Facebook and X still print-and-continue; their conditions should route
+  through the same policy table (`collect_fb.py` has the identical
+  `no enabled sources` line).
+- `test_facebook` (graphql media) is red independently of this change.
+
+---
+
+## 2026-09-02 (III) — a post seen twice now learns; posted-time recovered from the embed
+
+**Changed**
+
+- `store_fb.py` — `upsert()` reads the existing row instead of a bare `SELECT
+  1`, and calls the new `_refresh()`: counts always take the newer number;
+  `created_ms` / `author_name` / `author_avatar` fill a hole but never
+  overwrite; text is replaced only when the stored copy was shorter (truncated
+  at "See more"); `media_json` is replaced only to swap Facebook's expiring
+  links for our stored copies, never the reverse. Still returns `False`, so
+  "new posts" counts are unchanged.
+- `tools/fb_media_backfill.py` — harvests with `show_text=true` and reads
+  `<abbr data-utime>` from the embed header, writing `created_ms` where the row
+  had none. Reports `posted-time recovered` and states plainly that counts are
+  not recoverable this way. Its row selection is now media-OR-time: selecting on
+  media alone meant a row the FIRST backfill had already fixed could never come
+  back for its timestamp, which is precisely the state that run left behind.
+- `RULEBOOK.md` §6, `tests/test_fb_media.py`.
+
+**Why**
+
+The media backfill fixed the pictures and left the metrics dashed, because it
+only ever rewrote `media_json` — and the rows themselves were collected by the
+DOM path back when it stored neither time nor counts. Worse, the collector
+could not heal them either: `upsert` refused a second sighting outright, so a
+post already held could never gain a fact it lacked, no matter how many richer
+passes saw it. That is dedup doing more than dedup was for.
+
+Two facts are recoverable and one is not. The public embed carries the post's
+exact creation epoch in `<abbr data-utime>` (verified: `1786637743` =
+2026-08-13 17:35 UTC on the Fadnavis post, consistent with its 17:53 collection
+time), so the backfill writes it. It renders Like / Comment / Share as buttons
+with NO numbers, so reaction counts are not publicly available for old posts;
+they stay null rather than becoming a number we invented. Reels embed as a
+nested video plugin with no `data-utime` at all, so they keep a null time.
+
+**Verified**
+
+- `tests/test_fb_media.py` — **60/60** (12 new): a second sighting fills time,
+  counts, author and truncated text, replaces an expiring link with ours,
+  follows engagement upward, refuses to overwrite a recorded time or author
+  with a poorer later value, never downgrades our media back to fbcdn, and
+  leaves exactly one row.
+- The `data-utime` claim read off the live embed for both a photo post (present,
+  exact) and a reel (absent) before the code was written.
+
+**Still open**
+
+- Counts for the 160 backfilled posts stay null unless those posts appear in a
+  future Favorites pass, which `_refresh` will now pick up. Posts older than the
+  feed's reach keep dashes permanently.
+- The extractor's own count/time reading is still unverified against live
+  Facebook; one `Fetch Favorites feed` on the server settles it.
+
+---
+
 ## 2026-09-02 (later) — Facebook media is stored, not linked; delivery stops rotting
 
 **Changed**

@@ -161,6 +161,65 @@ def test_absolutize():
     check("garbage tolerated", fb_media.absolutize(["nope", None]), [])
 
 
+def test_refresh(tmp):
+    """A post seen twice must LEARN, not freeze.
+
+    Dedup keeps a post to one row; it was never meant to keep that row
+    ignorant. 160 posts sat with "posted --" and four dashes because the second
+    sighting was refused outright."""
+    section("a second sighting of a post already held")
+    store_fb = _load("store_fb")
+    st = store_fb.Store(pathlib.Path(tmp) / "refresh.db")
+    st.open()
+
+    FBCDN = "https://scontent-x.xx.fbcdn.net/v/a.jpg?ctp=s960x960&oe=6A842163"
+    OURS = "/media/fb/aa/" + "b" * 64 + ".jpg"
+    poor = {"post_id": "p:1", "page": "p",
+            "url": "https://www.facebook.com/p/posts/1",
+            "created_ms": None, "author_name": None, "author_avatar": None,
+            "text": "a caption cut at... See more",
+            "like_count": None, "comment_count": None, "share_count": None,
+            "media": [{"type": "photo", "url": FBCDN, "thumb": FBCDN}],
+            "project_id": 9}
+    rich = dict(poor, created_ms=1786637743000, author_name="Page Name",
+                author_avatar="https://scontent-x.xx.fbcdn.net/av.jpg?p32x32",
+                text="a caption cut at nothing, whole and untruncated",
+                like_count=1300, comment_count=256, share_count=24,
+                media=[{"type": "photo", "url": OURS, "thumb": OURS,
+                        "src": FBCDN}])
+
+    check("first sighting inserts", st.upsert(poor), True)
+    check("second sighting does not duplicate", st.upsert(rich), False)
+    row = dict(st.db.execute(
+        "SELECT * FROM posts WHERE post_id='p:1'").fetchone())
+    check("time filled", row["created_ms"], 1786637743000)
+    check("counts filled",
+          (row["like_count"], row["comment_count"], row["share_count"]),
+          (1300, 256, 24))
+    check("author filled", row["author_name"], "Page Name")
+    check("truncated text replaced", "untruncated" in row["text"], True)
+    check("expiring media replaced by ours", "media/fb" in row["media_json"], True)
+
+    # Engagement moves and must follow; a fact already recorded must not be
+    # overwritten by a later, poorer sighting.
+    st.upsert(dict(rich, like_count=1450, comment_count=260,
+                   created_ms=1, author_name="WRONG"))
+    row = dict(st.db.execute(
+        "SELECT * FROM posts WHERE post_id='p:1'").fetchone())
+    check("counts follow engagement",
+          (row["like_count"], row["comment_count"]), (1450, 260))
+    check("recorded time not overwritten", row["created_ms"], 1786637743000)
+    check("recorded author not overwritten", row["author_name"], "Page Name")
+
+    st.upsert(dict(rich, media=[{"type": "photo", "url": FBCDN, "thumb": FBCDN}]))
+    row = dict(st.db.execute(
+        "SELECT * FROM posts WHERE post_id='p:1'").fetchone())
+    check("never downgrades to an expiring link",
+          "media/fb" in row["media_json"], True)
+    check("still exactly one row",
+          st.db.execute("SELECT COUNT(*) c FROM posts").fetchone()["c"], 1)
+
+
 def main():
     tmp = tempfile.mkdtemp(prefix="fbmedia-test-")
     test_is_post_image()
@@ -168,6 +227,7 @@ def main():
     test_counts_and_time()
     test_store(tmp)
     test_absolutize()
+    test_refresh(tmp)
     print("\n" + "=" * 62)
     if FAIL:
         print(f"FAILED: {len(FAIL)} of {len(PASS) + len(FAIL)}")

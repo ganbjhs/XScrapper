@@ -307,12 +307,21 @@ class Store:
         sig = _signature(post.get("page"), post.get("text"), post.get("created_ms"))
         if sig:
             exists = self.db.execute(
-                "SELECT 1 FROM posts WHERE post_id = ? OR sig = ?",
+                "SELECT * FROM posts WHERE post_id = ? OR sig = ?",
                 (post["post_id"], sig)).fetchone()
         else:
             exists = self.db.execute(
-                "SELECT 1 FROM posts WHERE post_id = ?", (post["post_id"],)).fetchone()
+                "SELECT * FROM posts WHERE post_id = ?",
+                (post["post_id"],)).fetchone()
         if exists:
+            # Seen before is not the same as nothing to learn. Dedup (RULEBOOK
+            # §6) exists so a post cannot occupy two ROWS; it was never meant to
+            # freeze the row it has. A post we saw an hour ago has more
+            # reactions now, and a post collected by a path that could read
+            # neither its time nor its counts gains both the moment a better
+            # path sees it again. Refusing the update is how 160 posts sat with
+            # "posted —" and four dashes for three weeks.
+            self._refresh(exists, post)
             return False
         self.db.execute(
             "INSERT INTO posts(post_id, page, url, created_ms, collected_ms, "
@@ -328,6 +337,46 @@ class Store:
              post.get("author_avatar"), sig,
              post.get("source_label") or post.get("page"),
              post.get("project_id")))
+        return True
+
+    # Which columns a later sighting is allowed to change, and on what terms.
+    #
+    #   counts  — always take the newer number. Engagement is a moving fact and
+    #             the whole point of watching a post is to see it move.
+    #   facts   — time, author, avatar: fill a hole, never overwrite. A stored
+    #             time came from a path that could read one; a later DOM-derived
+    #             guess must not overwrite it.
+    #   text    — only when the stored copy was truncated ("… See more") and the
+    #             new one is longer.
+    #   media   — only to replace Facebook's expiring links with our own stored
+    #             copies. Never the other way round.
+    _COUNTS = ("like_count", "comment_count", "share_count")
+    _FILL_ONLY = ("created_ms", "author_name", "author_avatar")
+
+    def _refresh(self, row, post) -> bool:
+        sets, vals = [], []
+        for k in self._COUNTS:
+            new = post.get(k)
+            if new is not None and new != row[k]:
+                sets.append(f"{k} = ?"); vals.append(new)
+        for k in self._FILL_ONLY:
+            new = post.get(k)
+            if new not in (None, "") and row[k] in (None, ""):
+                sets.append(f"{k} = ?"); vals.append(new)
+        new_text = (post.get("text") or "").strip()
+        old_text = (row["text"] or "").strip()
+        if new_text and len(new_text) > len(old_text):
+            sets.append("text = ?"); vals.append(new_text)
+        old_media = row["media_json"] or "[]"
+        new_media = post.get("media") or []
+        if new_media and ("fbcdn" in old_media or "scontent" in old_media) \
+                and not any("fbcdn" in str(m.get("url") or "") for m in new_media):
+            sets.append("media_json = ?"); vals.append(json.dumps(new_media))
+        if not sets:
+            return False
+        vals.append(row["post_id"])
+        self.db.execute(f"UPDATE posts SET {', '.join(sets)} WHERE post_id = ?",
+                        vals)
         return True
 
     def recent(self, project_id=None, limit=50, since_ms=None):

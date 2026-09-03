@@ -10,6 +10,7 @@
 //      ever disappears from this page. Each has an "Add to pool" button to
 //      bring it under management.
 import React, { useEffect, useState } from "react";
+import { Link, useSearchParams } from "react-router-dom";
 import { api, fmtAgo, useApi } from "../api/client.js";
 import { PageHead } from "../App.jsx";
 import { Empty, ErrorState, Loading, Modal } from "../components/ui.jsx";
@@ -445,6 +446,7 @@ function AccountCard({ a, live, onChanged }) {
     try {
       const r = await fn();
       if (r && r.ok === false && r.todo) setMsg(r.todo);
+      else if (r && r.note) setMsg(r.note);
       else setMsg(okMsg || "done");
       onChanged();
     } catch (e) { setMsg(String(e.message || e)); }
@@ -548,7 +550,7 @@ function PlatformSection({ platform, title, summary, accounts, orphans, liveFor,
     const proxy = prompt("Fresh proxy/IP id for the promoted account (recommended — leave blank to keep its own):", "");
     try {
       const r = await api.poolFailover(platform, proxy || null);
-      alert(r.promoted ? `Promoted ${r.promoted}.` : "No backup available to promote.");
+      alert(r.promoted ? `Promoted ${r.promoted}.${r.note ? " " + r.note : ""}` : "No backup available to promote.");
       onChanged();
     } catch (e) { alert(String(e.message || e)); }
   };
@@ -607,6 +609,149 @@ function PlatformSection({ platform, title, summary, accounts, orphans, liveFor,
 }
 
 // ---------------------------------------------------------------------------
+// The Fix panel — what the decider (decider.py) needs a human for.
+// ---------------------------------------------------------------------------
+//
+// A Telegram ping links here with ?fix=<condition id>. The panel shows every
+// open condition, the one linked first and expanded, with the steps the
+// policy wrote for it and ONLY the actions the policy allows. Nothing here
+// invents advice: `steps` and `actions` come from the rule table, so the
+// dashboard and the phone always say the same thing.
+
+const KIND_TXT = {
+  checkpoint: "Checkpoint — Instagram wants a human",
+  no_sources: "Nothing to collect",
+  session_missing: "No saved session",
+  session_rejected: "Session rejected",
+  rate_limited: "Rate-limited — backing off by itself",
+  pass_error: "Collector crashing",
+  paused: "Paused from the dashboard",
+  budget_spent: "Daily budget spent — resting",
+};
+
+function FixCard({ c, focus, accounts, onAdopt, onChanged, onSignin }) {
+  const [msg, setMsg] = useState("");
+  const [busy, setBusy] = useState(false);
+  const [open, setOpen] = useState(focus);
+  useEffect(() => { if (focus) setOpen(true); }, [focus]);
+
+  const norm = (v) => String(v || "").trim().toLowerCase().replace(/^@/, "");
+  const pooled = c.account
+    ? accounts.find((a) => a.platform === "ig"
+        && (norm(a.login) === norm(c.account) || norm(a.label) === norm(c.account)))
+    : null;
+
+  const run = async (body, okText) => {
+    setBusy(true); setMsg("…");
+    try {
+      const r = await api.deciderAction({ id: c.id, ...body });
+      setMsg(okText ? okText(r) : "done");
+      onChanged();
+    } catch (e) { setMsg(String(e.message || e)); } finally { setBusy(false); }
+  };
+
+  const snoozed = c.snoozed_until_ms > Date.now();
+  const cls = c.level === "error" ? "banner-crit" : c.level === "warn" ? "banner-warn" : "banner-ok";
+  const sources = c.meta?.sources || [];
+
+  return (
+    <div className={cls} style={{ marginBottom: 10, borderLeftWidth: focus ? 6 : undefined }}>
+      <div style={{ display: "flex", alignItems: "center", gap: 10, flexWrap: "wrap", cursor: "pointer" }}
+           onClick={() => setOpen(!open)}>
+        <b>{KIND_TXT[c.kind] || c.kind}</b>
+        {c.account && <span className="chip warn">@{c.account}</span>}
+        <span style={{ color: "var(--ink-3)", fontSize: 12.5 }}>
+          open {fmtAgo(c.since_ms)} · seen {c.count}× · {c.needs_human ? "needs you" : "self-healing"}
+          {c.notified_ms ? " · pinged" : ""}{snoozed ? " · snoozed" : ""}
+        </span>
+        <span className="right" style={{ fontSize: 12.5, color: "var(--ink-3)" }}>{open ? "hide" : "show"}</span>
+      </div>
+
+      {open && (
+        <div style={{ marginTop: 10 }}>
+          {c.detail && (
+            <div style={{ fontFamily: "ui-monospace, monospace", fontSize: 12, color: "var(--ink-2)",
+                          whiteSpace: "pre-wrap", marginBottom: 8 }}>{c.detail}</div>
+          )}
+          {c.meta?.note && <div style={{ marginBottom: 8 }}>{c.meta.note}</div>}
+          <ol style={{ margin: "0 0 10px 18px", padding: 0, lineHeight: 1.6 }}>
+            {c.steps.map((st, i) => <li key={i}>{st.replace(/^\d+\.\s*/, "")}</li>)}
+          </ol>
+          {sources.length > 0 && (
+            <div style={{ fontSize: 12.5, color: "var(--ink-3)", marginBottom: 8 }}>
+              Sources on this account: {sources.join(", ")}
+            </div>
+          )}
+
+          <div className="cactions" style={{ borderTop: "none", paddingTop: 0, marginTop: 4 }}>
+            {c.actions.includes("signin") && (
+              pooled
+                ? <button className="btn btn-brand btn-sm" onClick={() => onSignin(pooled)}>Sign in @{c.account}</button>
+                : <button className="btn btn-brand btn-sm"
+                          onClick={() => onAdopt({ platform: "ig", label: c.account, login: c.account })}>
+                    Add @{c.account} to the pool, then sign in
+                  </button>
+            )}
+            {c.actions.includes("add_source") && (
+              <Link className="btn btn-brand btn-sm" to="/watchlists">Add an Instagram source</Link>
+            )}
+            {c.actions.includes("reenable_sources") && (
+              <button className="btn btn-sm" disabled={busy}
+                      onClick={() => run({ action: "reenable_sources" },
+                        (r) => r.enabled?.length ? `re-enabled: ${r.enabled.join(", ")}` : "no source was switched off")}>
+                Re-enable {sources.length ? `${sources.length} source${sources.length === 1 ? "" : "s"}` : "switched-off sources"}
+              </button>
+            )}
+            {c.actions.includes("resume") && (
+              <button className="btn btn-sm" disabled={busy} onClick={() => run({ action: "resume" }, () => "resumed")}>Resume collection</button>
+            )}
+            {c.actions.includes("resolve") && (
+              <button className="btn btn-sm" disabled={busy} onClick={() => run({ action: "resolve" }, () => "closed")}>Mark fixed</button>
+            )}
+            {!snoozed && (
+              <button className="btn btn-ghost btn-sm" disabled={busy}
+                      onClick={() => run({ action: "snooze", hours: 6 }, () => "quiet for 6h")}>Snooze 6h</button>
+            )}
+          </div>
+          {msg && <div style={{ marginTop: 6, fontSize: 12.5 }}>{msg}</div>}
+        </div>
+      )}
+    </div>
+  );
+}
+
+function FixPanel({ conds, focusId, accounts, onAdopt, onChanged, telegram }) {
+  const [signin, setSignin] = useState(null);
+  if (!conds) return null;
+  const list = conds.conditions || [];
+  return (
+    <>
+      {list.length === 0 && focusId && (
+        <div className="banner-ok" style={{ marginBottom: 10 }}>
+          <b>Already closed.</b> The condition you were pinged about ({focusId}) is no longer open — it recovered or was fixed.
+        </div>
+      )}
+      {list.length > 0 && (
+        <div style={{ marginBottom: 14 }}>
+          <div className="feed-head" style={{ marginTop: 6 }}>
+            <h2>Needs attention</h2>
+            <span className="right" style={{ fontSize: 12.5, color: "var(--ink-3)" }}>
+              {list.filter((c) => c.needs_human).length} need you · {list.filter((c) => !c.needs_human).length} self-healing
+              {!telegram && " · Telegram not configured — set TELEGRAM_BOT_TOKEN and ADMIN_TELEGRAM_CHAT_ID in .env"}
+            </span>
+          </div>
+          {list.map((c) => (
+            <FixCard key={c.id} c={c} focus={c.id === focusId} accounts={accounts}
+                     onAdopt={onAdopt} onChanged={onChanged} onSignin={setSignin} />
+          ))}
+        </div>
+      )}
+      {signin && <SignInModal a={signin} onDone={onChanged} onClose={() => setSignin(null)} />}
+    </>
+  );
+}
+
+// ---------------------------------------------------------------------------
 // The view
 // ---------------------------------------------------------------------------
 
@@ -615,9 +760,29 @@ export default function Accounts({ onMenu }) {
   const liveX = useApi(() => api.status(), [], { every: 30_000 });
   const liveIg = useApi(() => api.igStatus(), []);
   const liveFb = useApi(() => api.fbStatus(), [], { every: 30_000 });
+  const conds = useApi(() => api.deciderConditions(), [], { every: 30_000 });
   const [adding, setAdding] = useState(null);   // null | {} | {platform,label,login}
 
-  const reload = () => { pool.reload(); liveX.reload(); liveIg.reload(); liveFb.reload(); };
+  // ?fix=<condition id> is what a Telegram ping links to; ?snooze=6 on the
+  // same link quiets it first. The snooze is applied once and the parameter
+  // dropped, so a reload does not snooze again.
+  const [params, setParams] = useSearchParams();
+  const focusId = params.get("fix") || "";
+  useEffect(() => {
+    const h = parseFloat(params.get("snooze") || "");
+    if (!focusId || !(h > 0)) return;
+    api.deciderAction({ action: "snooze", id: focusId, hours: h })
+      .catch(() => {})
+      .finally(() => {
+        const next = new URLSearchParams(params);
+        next.delete("snooze");
+        setParams(next, { replace: true });
+        conds.reload();
+      });
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [focusId]);
+
+  const reload = () => { pool.reload(); liveX.reload(); liveIg.reload(); liveFb.reload(); conds.reload(); };
 
   // Facebook runs ONE burner session (cookies / password / saved state), not a
   // list of accounts — shape it like one live entry so it shows up here too.
@@ -706,6 +871,10 @@ export default function Accounts({ onMenu }) {
           2FA secrets can’t be stored — the panel refuses to keep them in plaintext.
         </div>
       )}
+
+      <FixPanel conds={conds.data} focusId={focusId} accounts={accounts}
+                telegram={!!conds.data?.telegram}
+                onAdopt={(initial) => setAdding(initial)} onChanged={reload} />
 
       {(() => {
         // One glance across all three platforms before the per-platform detail.

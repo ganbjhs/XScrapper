@@ -48,6 +48,35 @@ def test_promote_and_failover():
     print("ok  promote + failover (with IP rotation) via API")
 
 
+def test_promote_moves_ig_collection():
+    """Promote in the pool must also move WHO COLLECTS (ig_accounts.db) —
+    the 2026-09-03 bug: @omar promoted, log still said @sanaakhtar221."""
+    import ig
+    igdb = os.path.join(tempfile.mkdtemp(), "ig_accounts.db")
+    os.environ["IG_ACCOUNTS_DB"] = igdb
+    with ig.Store(igdb) as st:
+        for u, active in (("sanaakhtar221", True), ("omarfarooq724", False)):
+            st.save(ig.Session(username=u, user_id="1", user_agent="ua",
+                               cookies={"sessionid": "1:x"}), label="ig_a", active=active)
+    sana = _add(platform="ig", label="Sana", login="sanaakhtar221")["account_id"]
+    omar = _add(platform="ig", label="Omar", login="omarfarooq724")["account_id"]
+    ghost = _add(platform="ig", label="Ghost", login="nosession")["account_id"]
+    r = A.handle("POST", "/promote", {"account_id": omar}, {})
+    assert r["ok"] and "@omarfarooq724 is now the collecting" in r["note"], r
+    with ig.Store(igdb) as st:
+        act = [x["username"] for x in st.all() if x["active"]]
+    assert act == ["omarfarooq724"], act
+    r = A.handle("POST", "/promote", {"account_id": ghost}, {})
+    assert r["ok"] and "no session on this server" in r["note"], r
+    with ig.Store(igdb) as st:
+        act = [x["username"] for x in st.all() if x["active"]]
+    assert act == ["omarfarooq724"], "no session -> collection does not move"
+    r = A.handle("POST", "/failover", {"platform": "ig"}, {})
+    # ghost is active in the pool now; failover quarantines it and promotes the oldest backup
+    assert r["promoted"] and "note" in r, r
+    print("ok  promote/failover of an IG account moves collection in ig_accounts.db")
+
+
 def test_update_remove_backupcodes_totp():
     aid = _add(platform="ig", label="ig1", password="pw")["account_id"]
     assert A.handle("POST", "/update", {"account_id": aid, "proxy_id": "p9"}, {})["ok"]

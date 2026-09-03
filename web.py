@@ -3903,6 +3903,8 @@ def _signin_start(body):
                     db=str(_CFG.root / "activity.db"))
             except Exception:
                 pass
+            if o.ok and plat == "ig":
+                _decider_after_signin(login, o.identity)
 
         _SIGNIN.update({"account_id": aid, "label": label, "outcome": None,
                         "lines": [], "started": time.time()})
@@ -3911,6 +3913,48 @@ def _signin_start(body):
         t.start()
         return {"ok": True, "account_id": aid, "label": label, "mode": mode,
                 "platform": plat}
+
+
+def _decider_after_signin(login: str, identity: str):
+    """A successful Instagram sign-in IS the fix for a session condition on
+    that account (checkpoint, session_missing, session_rejected): close it,
+    make the account collectable again, and let the phone know. The sources
+    the condition recorded are re-enabled too — the operator asked for the
+    account back, and an account with its sources off is not back."""
+    try:
+        import activity_log
+        import decider
+        import store_ig
+        adb = str(_CFG.root / "activity.db")
+        log = activity_log.logger("instagram", db=adb)
+        names = {str(login or "").strip().lower().lstrip("@"),
+                 str(identity or "").strip().lower().lstrip("@")} - {""}
+        for c in decider.open_conditions("instagram", db=adb):
+            if c["account"].lower() not in names:
+                continue
+            if c["kind"] not in ("checkpoint", "session_missing", "session_rejected"):
+                continue
+            labels = list(c.get("meta", {}).get("sources") or [])
+            if labels:
+                with store_ig.Store(_CFG.root / "ig_results.db") as st:
+                    for lab in labels:
+                        st.set_enabled(lab, True)
+                    st.db.commit()
+                log(f"[{c['account']}] {len(labels)} source(s) re-enabled after "
+                    f"sign-in: {', '.join(labels)}")
+            # The row in ig_accounts.db carries the old error; a fresh
+            # session clears it (signin already made it active if it was).
+            try:
+                import ig
+                with ig.Store(_CFG.root / "ig_accounts.db") as st:
+                    row = st.get(c["account"])
+                    if row:
+                        st.set_active(c["account"], bool(row.get("active")), error="")
+            except Exception:
+                pass
+            decider.resolve(c["id"], db=adb, who="sign-in", log=log)
+    except Exception as e:
+        print(f"[decider] after-signin hook: {type(e).__name__}: {e}")
 
 
 def _signin_status():
@@ -4516,6 +4560,98 @@ def _ig_control(body):
         "instagram", f"collection {action.upper()}D by operator from the "
         f"dashboard", db=str(_CFG.root / "activity.db"))
     return {"ok": True, "paused": action == "pause"}
+
+
+# ---------------------------------------------------------------------------
+# The decider's conditions (decider.py) — what needs a human, and the Fix
+# panel's actions. Dashboard-only: none of these paths are in API_KEY_PATHS.
+# ---------------------------------------------------------------------------
+
+def _decider_conditions(q):
+    """Every open condition, newest-urgent first, with the steps and the
+    actions the Fix panel may offer. `?platform=instagram` narrows."""
+    import decider
+    try:
+        conds = decider.open_conditions(q.get("platform") or None,
+                                        db=str(_CFG.root / "activity.db"))
+    except Exception as e:
+        return {"error": f"{type(e).__name__}: {e}", "conditions": []}
+    return {"conditions": conds, "base_url": decider.base_url(),
+            "telegram": decider.notify_ready(),
+            "admin": decider.admin_name(),
+            "admin_chat": decider.admin_chat()}
+
+
+def _decider_post(body):
+    """One endpoint, four operator moves:
+
+        snooze            {id, hours}      quiet for N hours (default 6)
+        resolve           {id}             close it by hand ("I fixed it")
+        reenable_sources  {id}             switch the condition's sources back on
+                                           (or, for no_sources, every disabled IG source)
+        resume            {}               un-pause Instagram collection
+
+    Every move is logged to the activity log under the operator's name, and
+    a resolve on a condition that was pinged pings once more ("recovered").
+    """
+    import activity_log
+    import decider
+    import store_ig
+    action = (body.get("action") or "").lower()
+    cid = str(body.get("id") or "").strip()
+    adb = str(_CFG.root / "activity.db")
+    log = activity_log.logger("instagram", db=adb)
+
+    if action == "snooze":
+        try:
+            hours = float(body.get("hours") or 6)
+        except (TypeError, ValueError):
+            return {"error": "hours must be a number"}
+        if not (0 < hours <= 72):
+            return {"error": "hours must be between 0 and 72"}
+        r = decider.snooze(cid, hours, db=adb)
+        if r.get("ok"):
+            log(f"'{cid}' snoozed {hours:g}h by operator from the dashboard")
+        return r
+
+    if action == "resolve":
+        return decider.resolve(cid, db=adb, who="operator (dashboard)", log=log)
+
+    if action == "reenable_sources":
+        try:
+            plat, acct, kind = decider.parse_cond_id(cid)
+        except ValueError as e:
+            return {"error": str(e)}
+        conds = {c["id"]: c for c in decider.open_conditions(db=adb)}
+        c = conds.get(cid)
+        labels = list((c or {}).get("meta", {}).get("sources") or [])
+        with store_ig.Store(_CFG.root / "ig_results.db") as st:
+            if labels:
+                rows = st.db.execute(
+                    "SELECT label FROM sources WHERE enabled = 0 AND label IN (%s)"
+                    % ",".join("?" * len(labels)), labels).fetchall()
+            else:
+                # no_sources, or a condition that recorded none: everything
+                # that is switched off. The operator sees the names before
+                # confirming (the panel lists them), so this is not a blind
+                # "enable all".
+                rows = st.db.execute(
+                    "SELECT label FROM sources WHERE enabled = 0").fetchall()
+            names = [r["label"] for r in rows]
+            for lab in names:
+                st.set_enabled(lab, True)
+            st.db.commit()
+        log(f"{len(names)} Instagram source(s) re-enabled by operator from the "
+            f"Fix panel for '{cid}': {', '.join(names) or '(none were off)'}")
+        return {"ok": True, "enabled": names}
+
+    if action == "resume":
+        with store_ig.Store(_CFG.root / "ig_results.db") as st:
+            st.set_setting("ig_paused", "")
+        log("collection RESUMED by operator from the Fix panel")
+        return {"ok": True}
+
+    return {"error": "action must be snooze, resolve, reenable_sources or resume"}
 
 
 def _ig_settings_post(body):
@@ -5340,6 +5476,8 @@ class Handler(BaseHTTPRequestHandler):
                 return self._send(200, _label_categories_json(q))
             if u.path == "/api/pool/signin":
                 return self._send(200, _signin_status())
+            if u.path == "/api/decider/conditions":
+                return self._send(200, _decider_conditions(q))
             if u.path == "/api/pool/signin/help":
                 return self._send(200, _signin_help())
             if u.path == "/api/pool" or u.path.startswith("/api/pool/"):
@@ -5514,6 +5652,8 @@ class Handler(BaseHTTPRequestHandler):
                 # Not accounts_api's job: that module is a thin validator over
                 # the store and must not open sockets or spawn threads.
                 return self._send(200, _signin_start(body))
+            if u.path == "/api/decider":
+                return self._send(200, _decider_post(body))
             if u.path == "/api/pool" or u.path.startswith("/api/pool/"):
                 import accounts_api
                 return self._send(200, accounts_api.handle(

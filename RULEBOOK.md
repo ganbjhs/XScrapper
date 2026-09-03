@@ -617,6 +617,71 @@ single request. These are hard rules, not tuning:
 - **One relogin attempt per pass, never into a checkpoint.** The `checkpoint_at`
   breaker is absolute — retrying a locked account is the fastest way to kill
   it permanently.
+- **A condition is DECIDED once, not logged every pass (`decider.py`).**
+  Every condition the IG collector meets — no enabled source, paused, a
+  session it cannot load, a rejected session, a checkpoint, a rate limit, the
+  daily budget, a pass that blew up — is an EVENT that goes through one
+  rule-based policy and comes back as a DECISION: what to do (`idle`,
+  `backoff`, `relogin`, `quarantine`, `rest`), how long the loop waits, and
+  whether the operator is told. The policy table in `decider.py` is the
+  decider; nothing else may print-and-continue on those conditions. Paid for
+  on 2026-09-03: `no enabled sources` was written to the Activity Log on every
+  pass for two days (28 rows a day, nothing decided, nobody told), and a
+  checkpoint caught by a generic `except Exception` was knocked on again by
+  the very next source of the same account. The rules that follow from it:
+  (1) an open condition is announced when it OPENS, reminded every 6h,
+  escalated to the operator ONCE (Telegram, the `alerts.py` channel), and
+  announced again when it CLOSES ("recovered after 3h") — its state lives in
+  `activity.db` so a restart does not re-announce it; (2) a checkpoint or a
+  rate limit STOPS the pass for that account (`Decision.stop_account`) and a
+  checkpoint also quarantines it in the pool — one more request makes both
+  worse; (3) the decider's wait is a FLOOR under `ig_human` pacing, never a
+  ceiling, so the human rhythm still applies on top; (4) a one-shot run
+  (the dashboard's Fetch-now, `dec=None`) uses an in-memory decider that
+  always speaks, because a button that answers with silence is broken;
+  (5) `paused` and `budget_spent` are never escalated — the first is the
+  operator's own act, the second is the design. Extending the decider to
+  Facebook and X means routing THEIR conditions through the same table, not
+  writing a second one. Test: `test_decider`.
+- **A ping ends in a fix, or it is noise (the pager, 2026-09-03).** Every
+  operator message the decider sends carries a link to the dashboard's Fix
+  panel for exactly that condition (`PUBLIC_BASE_URL/app/accounts?fix=<id>`,
+  id = `platform:account:kind`) and a second link that snoozes it for six
+  hours. The panel shows the rule's own `fix` steps and offers ONLY the
+  rule's `actions` (sign in / re-enable sources / add source / resume / mark
+  fixed) — advice lives in the policy table, never in the UI, so the phone
+  and the screen cannot disagree. A condition that was pinged pings ONCE
+  more when it closes, whoever closed it (the collector, a sign-in, or the
+  operator's "Mark fixed"), so a story the phone saw start is a story it
+  sees end. A successful Instagram sign-in from the panel is itself the fix
+  for that account's session condition: it closes it and re-enables the
+  sources the condition recorded (`web._decider_after_signin`).
+  Pings go to the ADMIN — `ADMIN_TELEGRAM_CHAT_ID` (a person, not the
+  delivery group; `TELEGRAM_CHAT_ID` only as a fallback), addressed by
+  `ADMIN_NAME`. Anything the collector cannot decide for itself — a sign-in,
+  a permission, a stopped platform — goes to the admin and nowhere else.
+- **A checkpoint fails over by itself before it pages.** `collect_ig._decide_exc`
+  is the one path every account exception takes: a checkpoint quarantines
+  the account in the pool, writes `checkpoint_at` into its sidecar (so
+  `ig_session.refresh` will not knock), and, if it was the active account,
+  promotes the first other row in `ig_accounts.db` that has a session, no
+  recorded error and no checkpoint (`collect_ig.ig_failover`,
+  `pool_link.promote`). Sources with no pinned account follow the active
+  row on the next pass; a source pinned to the locked handle waits for the
+  human. The ping says which of the two happened ("failed over to @x" or
+  "collection is STOPPED — no backup"). Test: `test_pager`.
+- **The pool decides WHO SHOULD collect; the collector's own store says
+  WHO DOES — and a promote must move both.** Instagram keeps two tables:
+  `managed_accounts` in `pool.db` (the panel's Promote / Failover) and
+  `accounts.active` in `ig_accounts.db` (what `collect_ig._active_account`
+  reads). Until 2026-09-03 nothing joined them: the operator promoted a
+  backup and the log went on saying `account @sanaakhtar221`. Now
+  `accounts_api._activate_collector` makes a promoted or failed-over IG
+  account the active row in `ig_accounts.db` when it has a session there,
+  and says plainly when it has none ("no session on this server yet —
+  collection stays on the current account until you sign it in"). A promote
+  that cannot move collection must say so; a silent one is the bug.
+  Test: `tests/test_accounts_api.py::test_promote_moves_ig_collection`.
 - **Exactly one active row, enforced on write.** `ig.Store.save()` and
   `set_active()` demote every other row when they activate one. They did not
   until 2026-08-31, and all three Instagram accounts were live at once on the
@@ -714,6 +779,16 @@ before changing the engine; nearly every "obvious" idea has been tried.)
   content signature (page + normalized caption) was — so the same post can't
   slip in twice just because a different path handed it to us under a different
   id scheme.
+- **Dedup keeps a post to one ROW; it must never keep that row ignorant.** A
+  second sighting REFRESHES what it can (`store_fb._refresh`), on these terms:
+  counts always take the newer number, because engagement is a moving fact and
+  watching it move is the point; time, author and avatar FILL A HOLE and never
+  overwrite (a stored value came from a path that could read one, and a later
+  DOM guess must not clobber it); text is replaced only when the stored copy was
+  shorter, i.e. truncated at "See more"; media is replaced only to swap
+  Facebook's expiring links for our own stored copies, NEVER the other way
+  round. Paid for: 160 posts sat for three weeks with "posted —" and four
+  dashed counts because every later, richer sighting was refused outright.
 - **Removing a page is FINAL against auto-register, and label matching is
   case-insensitive.** Facebook injects "Suggested for you" posts into the
   Favorites feed, so a page appearing there is NOT consent to track it —
@@ -1067,6 +1142,10 @@ wording. Every change appends an entry in the same commit (2026-08-25).
   account; human imports a fresh sessionid to clear it.
 - Account activity log (`activity.db`): every collector/engine line,
   timestamped, browsable per platform in the dashboard.
+- The decider (`decider.py`): one rule-based decision per collector
+  condition, said once, escalated to the operator once, recovery announced.
+  Every IG condition routes through it; a call site that logs-and-continues
+  on a checkpoint or a rate limit is a regression.
 - Guard (advisory only), `doctor`, pinned scraper versions with startup
   asserts, additive self-applying migrations.
 - IG username→id resolution: three independent paths, the answer persisted to

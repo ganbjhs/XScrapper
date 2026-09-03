@@ -108,6 +108,7 @@ The organizing layer (in `store.py` + `web.py`):
 | `xlsx_min.py` | A .xlsx writer in one file, no dependencies: the Collections export is one workbook with a summary sheet and a sheet per board. Text and numbers, bold frozen header, column widths — nothing more |
 | `guard.py` | Advisory risk findings; never changes state |
 | `activity_log.py` | Persistent account-activity log (`activity.db`); `logger()` wraps every collector's log= |
+| `decider.py` | The decider: every collector condition (no sources, paused, session missing/rejected, checkpoint, rate limit, budget, pass error) → ONE rule-based decision (idle / backoff / relogin / quarantine / rest + wait), logged once, operator paged once via Telegram WITH a link to the Fix panel (`/app/accounts?fix=<id>`) and a snooze link, recovery announced. `open_conditions` / `snooze` / `resolve` back the panel (`/api/decider/conditions`, `POST /api/decider`). State in `activity.db` (`decider_state`). IG wired (incl. checkpoint failover, `collect_ig.ig_failover`); FB/X next |
 | `store_accounts.py` / `accounts_api.py` | Managed account pool (encrypted secrets, TOTP, backup codes, failover) + its API |
 | `config.py` / `config.toml` | What to watch + accounts; passwords live in `.env` by name |
 | `web.py` | THE server: JSON API, SSE live stream, auth, serves `frontend/dist` at `/app` |

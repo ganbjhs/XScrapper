@@ -106,6 +106,9 @@ export const api = {
   fbSettings: (body) =>
     request("/api/fb/settings", { method: "POST", body }),
 
+  // --- The decider (decider.py): what needs a human, and the Fix panel's moves ---
+  deciderConditions: (platform) => request(`/api/decider/conditions${qs({ platform })}`),
+  deciderAction: (body) => request("/api/decider", { method: "POST", body }),
   // --- Account Control Panel: the managed account pool (store_accounts) ---
   pool: () => request("/api/pool"),
   poolAdd: (body) => request("/api/pool/add", { method: "POST", body }),

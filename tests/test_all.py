@@ -3515,6 +3515,293 @@ def test_facebook(tmp):
            "the new favorited page was auto-added as a source under the project")
 
 
+def test_decider(tmp):
+    """decider.py — the policy that turns a collector condition into ONE
+    decision, said once. Pinned here: the Activity Log filled with the same
+    `no enabled sources` warn every pass for two days (2026-09-03), and a
+    checkpoint caught by `except Exception` was knocked on again by the next
+    source of the same account."""
+    import decider
+
+    clock = [1_700_000_000_000]
+    now = lambda: clock[0]
+    lines, sent = [], []
+    rec = lambda t: (sent.append(t) or (True, ""))
+    db = str(pathlib.Path(tmp) / "activity.db")
+
+    print("== a condition is said once, reminded rarely, escalated once ==")
+    dec = decider.Decider("instagram", log=lines.append, db=db, notify=rec, now=now)
+    for _ in range(8):                          # 8 passes over 4 hours
+        dec.begin_pass()
+        d = dec.on("no_sources", detail="add one")
+        clock[0] += 30 * 60 * 1000
+    said = [l for l in lines if "decision:" in l]
+    ok(len(said) == 1, f"8 identical passes -> ONE decision line (got {len(said)})")
+    ok(d.action == "idle" and dec.wait_s(300) == 1800,
+       "no_sources decides IDLE and asks the loop for a 30m wait, not 5m")
+    ok(len(sent) == 1 and "nothing to collect" in sent[0],
+       "operator told exactly once, after the 2h threshold")
+    ok(not [l for l in lines if "still 'no_sources'" in l],
+       "no reminder inside the first 6h")
+    clock[0] += 3 * 3600 * 1000
+    dec.on("no_sources")
+    ok(any("still 'no_sources'" in l for l in lines), "a reminder after 6h")
+
+    print()
+    print("== state survives a restart; recovery closes the condition ==")
+    dec2 = decider.Decider("instagram", log=lines.append, db=db, notify=rec, now=now)
+    n = len(lines)
+    dec2.on("no_sources")
+    ok(len(lines) == n, "a fresh Decider on the same db does NOT re-announce")
+    ok(len(sent) == 1, "…and does not re-send")
+    d = dec2.ok()
+    ok(d.action == "collect" and any("recovered from 'no_sources'" in l for l in lines),
+       "ok closes it with a 'recovered after …' line")
+    ok(dec2.open_conditions() == [], "nothing open afterwards")
+    n = len(lines); dec2.ok()
+    ok(len(lines) == n, "ok with nothing open says nothing")
+
+    print()
+    print("== a different outcome replaces the open one ==")
+    dec2.on("no_sources"); n = len(lines)
+    dec2.on("paused")
+    ok(any("(was 'no_sources'" in l for l in lines[n:]),
+       "switching conditions says what it replaced")
+
+    print()
+    print("== exceptions are classified by name and by text ==")
+    class ChallengeRequired(Exception): pass
+    class PleaseWaitFewMinutes(Exception): pass
+    class LoginRequired(Exception): pass
+    ok(decider.classify_exception(ChallengeRequired("x")) == "checkpoint", "ChallengeRequired -> checkpoint")
+    ok(decider.classify_exception(PleaseWaitFewMinutes("x")) == "rate_limited", "PleaseWait -> rate_limited")
+    ok(decider.classify_exception(LoginRequired("x")) == "session_rejected", "LoginRequired -> session_rejected")
+    ok(decider.classify_exception(RuntimeError("a checkpoint was recorded at …")) == "checkpoint",
+       "ig_session's RuntimeError wrapper still reads as a checkpoint")
+    ok(decider.classify_exception(KeyError("boom")) == "pass_error", "anything else -> pass_error")
+
+    print()
+    print("== checkpoint: quarantine, stop the account, tell a human now ==")
+    dec3 = decider.Decider("instagram", log=lines.append, db=None, notify=rec, now=now)
+    sent.clear()
+    d = dec3.on("", account="omar", exc=ChallengeRequired("challenge_required"))
+    ok(d.action == "quarantine" and d.stop_account and d.wait_s == 6 * 3600,
+       "checkpoint -> QUARANTINE, stop_account, 6h back-off")
+    ok(len(sent) == 1 and "@omar" in sent[0] and "CHECKPOINT" in sent[0],
+       "operator told at once, by account")
+    d = dec3.on("", account="omar", exc=ChallengeRequired("again"))
+    ok(len(sent) == 1, "second checkpoint in the same open condition does not re-send")
+
+    print()
+    print("== rate limit backs off exponentially and stops the account ==")
+    waits = [dec3.on("", account="sana", exc=PleaseWaitFewMinutes("wait")).wait_s for _ in range(6)]
+    ok(waits == [900, 1800, 3600, 7200, 14400, 14400], f"15m doubling to a 4h ceiling: {waits}")
+    ok(dec3.on("rate_limited", account="sana").stop_account, "rate_limited stops the account's pass")
+    ok(len(sent) == 1, "rate limit does not page the operator before 6h")
+
+    print()
+    print("== pass_error pages on the third in a row; budget/paused never do ==")
+    sent.clear()
+    for _ in range(3):
+        dec3.on("pass_error", detail="KeyError: x")
+    ok(len(sent) == 1 and "3 passes in a row" in sent[0], "third consecutive pass_error -> operator told")
+    sent.clear()
+    dec3.on("budget_spent", account="sana"); dec3.on("paused")
+    # 'paused' replaced a paged pass_error, so the phone hears that story end
+    # ("recovered … now 'paused'"); what it must never hear is a page FOR
+    # budget_spent or paused.
+    ok(all(t.startswith("Collector · instagram: recovered") for t in sent),
+       "budget_spent and paused are never escalated (only a paged condition's closing is announced)")
+
+    print()
+    print("== nowhere to send is said once, not per decision ==")
+    nowhere = lambda t: (False, "TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID not set")
+    dec4 = decider.Decider("instagram", log=lines.append, db=None, notify=nowhere, now=now)
+    n = len(lines)
+    dec4.on("", account="a", exc=ChallengeRequired("x"))
+    dec4.on("", account="b", exc=ChallengeRequired("x"))
+    ok(sum("operator NOT told" in l for l in lines[n:]) == 1,
+       "missing Telegram config is reported once per process")
+
+    print()
+    print("== collect_ig.run_once routes its conditions through the decider ==")
+    import collect_ig, store_ig
+    rp = str(pathlib.Path(tmp) / "ig_results.db")
+    with store_ig.Store(rp):
+        pass                                    # creates the empty schema
+    lines.clear()
+    dec5 = decider.Decider("instagram", log=lines.append, db=db, notify=rec, now=now)
+    for _ in range(3):
+        asyncio.run(collect_ig.run_once(rp, log=lines.append, dec=dec5))
+    ok(sum("no_sources" in l for l in lines) == 1,
+       "three empty passes -> ONE 'no_sources' decision line (was three warns)")
+    ok(dec5.wait_s() == 1800, "the loop is told to wait 30m")
+    with store_ig.Store(rp) as st:
+        st.set_setting("ig_paused", "1")
+    asyncio.run(collect_ig.run_once(rp, log=lines.append, dec=dec5))
+    ok(any("(was 'no_sources'" in l and "'paused'" in l for l in lines),
+       "pausing from the dashboard replaces the open condition")
+    one_shot = []
+    asyncio.run(collect_ig.run_once(rp, log=one_shot.append))
+    asyncio.run(collect_ig.run_once(rp, log=one_shot.append))
+    ok(sum("paused" in l for l in one_shot) == 2,
+       "Fetch-now (no shared decider) still says the reason EVERY time")
+
+
+def test_pager(tmp):
+    """Phase 1 of the decider (2026-09-03): every ping carries a link to the
+    fix, a snooze is honoured, a resolve or a self-recovery pings once more,
+    and a checkpoint fails collection over to a backup account by itself."""
+    import decider
+
+    clock = [1_700_000_000_000]
+    now = lambda: clock[0]
+    lines, sent = [], []
+    rec = lambda t: (sent.append(t) or (True, ""))
+    db = str(pathlib.Path(tmp) / "activity.db")
+    os.environ["PUBLIC_BASE_URL"] = "https://scraper.example.in/"
+
+    class ChallengeRequired(Exception): pass
+
+    print("== a ping carries the fix link and the snooze link ==")
+    dec = decider.Decider("instagram", log=lines.append, db=db, notify=rec, now=now)
+    d = dec.on("", account="sana", exc=ChallengeRequired("checkpoint"),
+               meta={"sources": ["A", "B"], "note": "Collection failed over to @omar."})
+    ok(d.cond_id == "instagram:sana:checkpoint", "decision names its condition id")
+    ok("?fix=instagram:sana:checkpoint" in sent[0] and "&snooze=6" in sent[0],
+       "ping links to /app/accounts?fix=<id> and to a 6h snooze")
+    ok("failed over to @omar" in sent[0], "meta.note reaches the operator text")
+    ok(sent[0].count("https://scraper.example.in/app") == 2, "trailing slash on PUBLIC_BASE_URL is trimmed")
+
+    print()
+    print("== the panel's view ==")
+    conds = decider.open_conditions(db=db, now_ms=now())
+    c = conds[0]
+    ok(c["id"] == "instagram:sana:checkpoint" and c["needs_human"] and c["notified_ms"],
+       "open_conditions carries id / needs_human / notified")
+    ok(c["actions"] == ["signin", "reenable_sources", "resolve"], "actions come from the rule table")
+    ok(any("@sana" in st for st in c["steps"]), "steps are formatted with the account")
+    ok(c["meta"]["sources"] == ["A", "B"], "meta (the sources on the account) is kept")
+    ok(c["fix_url"].endswith("?fix=instagram:sana:checkpoint"), "fix_url matches the ping")
+
+    print()
+    print("== snooze silences reminders and pings; counting continues ==")
+    r = decider.snooze("instagram:sana:checkpoint", 6, db=db, now_ms=now())
+    ok(r["ok"], "snooze accepted")
+    n_lines, n_sent = len(lines), len(sent)
+    clock[0] += 7 * 3600 * 1000            # past the 6h reminder, inside the snooze? no: snooze is 6h
+    # re-open the clock inside the snooze window
+    clock[0] -= 2 * 3600 * 1000            # 5h after snooze
+    dec.on("checkpoint", account="sana")
+    ok(len(lines) == n_lines and len(sent) == n_sent, "nothing said or sent while snoozed")
+    ok(decider.open_conditions(db=db, now_ms=now())[0]["count"] == 2, "…but the occurrence is counted")
+    ok(not decider.snooze("instagram:nobody:checkpoint", 1, db=db)["ok"], "snoozing a closed condition is refused")
+    try:
+        decider.snooze("garbage", 1, db=db); ok(False, "bad id refused")
+    except ValueError:
+        ok(True, "bad condition id is refused")
+
+    print()
+    print("== resolve by hand closes it, logs it, pings 'recovered' ==")
+    clock[0] += 3 * 3600 * 1000
+    r = decider.resolve("instagram:sana:checkpoint", db=db, who="operator", log=lines.append, notify=rec, now_ms=now())
+    ok(r["ok"] and "resolved by operator" in lines[-1], "resolve logs who closed it")
+    ok(sent[-1].startswith("Collector · instagram: recovered") and "by operator" in sent[-1],
+       "the phone hears the end of the story")
+    ok(decider.open_conditions(db=db) == [], "nothing open")
+    ok(not decider.resolve("instagram:sana:checkpoint", db=db)["ok"], "resolving twice is refused")
+
+    print()
+    print("== self-recovery pings once only if the open condition was pinged ==")
+    sent.clear()
+    dec.on("no_sources")                        # not pinged yet (2h threshold)
+    dec.ok()
+    ok(sent == [], "a condition that never paged does not page on recovery")
+    dec.on("", account="omar", exc=ChallengeRequired("x"))
+    sent.clear(); dec.ok("omar")
+    ok(len(sent) == 1 and "recovered" in sent[0] and "by itself" in sent[0],
+       "a paged condition that heals itself says so once")
+
+    print()
+    print("== the admin is who gets paged ==")
+    for k in ("ADMIN_TELEGRAM_CHAT_ID", "TELEGRAM_CHAT_ID", "TELEGRAM_BOT_TOKEN", "ADMIN_NAME"):
+        os.environ.pop(k, None)
+    ok(decider.admin_chat() == "" and not decider.notify_ready(), "nothing set: nobody to page, not ready")
+    os.environ["TELEGRAM_CHAT_ID"] = "-100999"
+    ok(decider.admin_chat() == "-100999", "no admin set: falls back to the delivery chat")
+    os.environ["ADMIN_TELEGRAM_CHAT_ID"] = "2126402349"
+    ok(decider.admin_chat() == "2126402349", "admin set: the admin wins over the delivery chat")
+    ok(decider.admin_name() == "Admin", "no ADMIN_NAME: addressed as Admin")
+    os.environ["ADMIN_NAME"] = "Tilak"
+    ok(decider.admin_name() == "Tilak", "ADMIN_NAME is used")
+    ok(not decider.notify_ready(), "…still not ready without a bot token")
+    os.environ["TELEGRAM_BOT_TOKEN"] = "123456789:AAHxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+    ok(decider.notify_ready(), "token + admin chat = ready")
+    for k in ("ADMIN_TELEGRAM_CHAT_ID", "TELEGRAM_CHAT_ID", "TELEGRAM_BOT_TOKEN", "ADMIN_NAME"):
+        os.environ.pop(k, None)
+    ok(decider._default_notify("x") == (False, "TELEGRAM_BOT_TOKEN / ADMIN_TELEGRAM_CHAT_ID not set"),
+       "the nowhere-to-send reason names the admin variable")
+
+    print()
+    print("== no PUBLIC_BASE_URL: the ping says how to get a link ==")
+    os.environ["PUBLIC_BASE_URL"] = ""
+    sent.clear(); dec.on("", account="pat", exc=ChallengeRequired("x"))
+    ok("PUBLIC_BASE_URL" in sent[0] and "?fix=" not in sent[0], "link absent, hint present")
+    os.environ["PUBLIC_BASE_URL"] = "https://scraper.example.in"
+
+    print()
+    print("== checkpoint → quarantine + failover to a backup with a session ==")
+    import collect_ig, ig, ig_session
+    cwd = os.getcwd(); os.chdir(tmp)
+    try:
+        prof = pathlib.Path(tmp) / ig_session.SETTINGS_DIR
+        prof.mkdir(exist_ok=True)
+        with ig.Store("ig_accounts.db") as st:
+            for u, active in (("sana", True), ("omar", False), ("locked", False)):
+                st.save(ig.Session(username=u, user_id="1", user_agent="ua", cookies={"sessionid": "1:x"}),
+                        label="ig_a", active=active)
+        (prof / "ig_sana.json").write_text(json.dumps({"meta": {"label": "ig_a"}, "settings": {}}))
+        (prof / "ig_omar.json").write_text(json.dumps({"meta": {"label": "ig_b"}, "settings": {}}))
+        (prof / "ig_locked.json").write_text(json.dumps({"meta": {"label": "ig_c", "checkpoint_at": "2026-09-01"}, "settings": {}}))
+
+        class Src:  # what _decide_exc reads off a source
+            def __init__(self, label): self.label = label
+        lines.clear(); sent.clear()
+        dec2 = decider.Decider("instagram", log=lines.append, db=None, notify=rec, now=now)
+        d = collect_ig._decide_exc(dec2, "sana", [Src("Rajnath"), Src("Yogi")],
+                                   ChallengeRequired("Manual verification required"),
+                                   fallback="pass_error", log=lines.append)
+        ok(d.action == "quarantine" and d.stop_account, "checkpoint decides QUARANTINE and stops the account")
+        ok(collect_ig._active_account() == "omar", "the backup with a clean session is now active — not the locked one")
+        rows = {r["username"]: r for r in ig.Store("ig_accounts.db").open().all()}
+        ok(not rows["sana"]["active"] and "ChallengeRequired" in (rows["sana"]["error_msg"] or ""),
+           "the quarantined row is inactive and carries the reason")
+        meta = json.loads((prof / "ig_sana.json").read_text())["meta"]
+        ok(meta.get("checkpoint_at"), "the checkpoint is recorded in the sidecar, so refresh will not knock")
+        ok("failed over to @omar" in sent[0] and "?fix=instagram:sana:checkpoint" in sent[0],
+           "the ping says who took over and links to the fix")
+        ok(dec2.open_conditions()[0]["meta"]["sources"] == ["Rajnath", "Yogi"],
+           "the sources on the locked account are remembered for re-enabling")
+
+        # a second checkpoint on the NEW active account with nobody left
+        d = collect_ig._decide_exc(dec2, "omar", [Src("Rajnath")], ChallengeRequired("again"),
+                                   fallback="pass_error", log=lines.append)
+        ok("STOPPED" in sent[-1], "with no clean backup left the ping says collection is stopped")
+        try:
+            collect_ig._active_account(); ok(False, "no active account")
+        except RuntimeError:
+            ok(True, "no active account remains — the next pass reports session_missing, not a crash")
+
+        # a non-checkpoint exception does not fail over
+        with ig.Store("ig_accounts.db") as st:
+            st.set_active("locked", True, error="")
+        d = collect_ig._decide_exc(dec2, "locked", [Src("x")], KeyError("boom"), fallback="pass_error", log=lines.append)
+        ok(d.action == "backoff" and collect_ig._active_account() == "locked",
+           "a plain error backs off and leaves the active account alone")
+    finally:
+        os.chdir(cwd)
+
+
 def test_no_undefined_names():
     """Every name a scope LOADS must be bound in that scope, an enclosing
     scope, the module, or builtins — checked PER SCOPE, not per file.
@@ -3551,7 +3838,7 @@ def test_no_undefined_names():
                "engine.py", "engine_fb.py", "store_ig.py", "store_fb.py",
                "store.py", "web.py", "main.py", "ig_human.py", "pool_link.py",
                "activity_log.py", "alerts.py", "webhook.py", "sheets.py",
-               "migrate_ig_sources.py"]
+               "migrate_ig_sources.py", "decider.py"]
     # Module dunders are supplied by the import machinery, not by the source.
     builtin_names = set(dir(_bi)) | {
         "__file__", "__name__", "__doc__", "__package__", "__spec__",
@@ -4790,6 +5077,11 @@ def main():
 
         section("instagram (one stable device per account)")
         test_ig_device(fresh("ig"))
+
+        section("decider (one decision per condition, said once)")
+        test_decider(fresh("decider"))
+        section("pager (links, snooze, resolve, recovery ping, failover)")
+        test_pager(fresh("pager"))
 
         section("dashboard filters (category, verified, views, followers, dates)")
         test_filters(fresh("filters"))

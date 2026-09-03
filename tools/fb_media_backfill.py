@@ -80,16 +80,35 @@ def needs_backfill(media_json: str) -> bool:
 
 
 async def harvest(page, url: str):
-    """Fresh image URLs for one post, newest signature, from the embed."""
+    """What the public embed still knows about one post: fresh image URLs, and
+    the exact posted time.
+
+    `show_text=true` deliberately — the timestamp lives in the header the flag
+    controls, and the header is where `<abbr data-utime>` carries the post's
+    creation epoch to the second. That is a REAL fact, not a reconstruction,
+    and it is the only place the old rows can get one: they were collected by
+    the DOM path back when it stored no time at all.
+
+    Counts are not here to be had. The embed renders Like / Comment / Share as
+    buttons with no numbers on them, so a backfilled post keeps null counts
+    rather than a number we invented."""
     src = f"{PLUGIN}?href={urllib.parse.quote(embed_href(url), safe='')}" \
-          f"&show_text=false&width=750"
+          f"&show_text=true&width=750"
     await page.goto(src, wait_until="domcontentloaded", timeout=45000)
     await page.wait_for_timeout(2500)
-    return await page.evaluate("""() =>
-        [...document.querySelectorAll('img, image')]
+    return await page.evaluate("""() => ({
+        images: [...document.querySelectorAll('img, image')]
           .map(e => e.tagName === 'IMG' ? e.src
                 : (e.getAttribute('xlink:href') || e.getAttribute('href') || ''))
-          .filter(Boolean)""")
+          .filter(Boolean),
+        // Document order: the post's own header comes first, before any
+        // attached or quoted story.
+        utime: (() => {
+          const el = document.querySelector('[data-utime]');
+          const n = el ? parseInt(el.getAttribute('data-utime'), 10) : 0;
+          return Number.isFinite(n) && n > 1000000000 ? n : null;
+        })(),
+      })""")
 
 
 async def main():
@@ -104,14 +123,20 @@ async def main():
 
     db = sqlite3.connect(args.db)
     db.row_factory = sqlite3.Row
+    # A row needs this pass if its pictures are still Facebook's OR its posted
+    # time is missing — the two are independent. Selecting on media alone meant
+    # a row whose media was already recovered by an earlier run could never get
+    # its time, which is exactly the state the first backfill left behind.
     rows = [r for r in db.execute(
-        "SELECT post_id, url, media_json FROM posts "
-        "WHERE media_json IS NOT NULL AND media_json != '[]' "
+        "SELECT post_id, url, media_json, created_ms FROM posts "
         "ORDER BY collected_ms DESC")
-        if needs_backfill(r["media_json"]) and r["url"]]
+        if r["url"] and (needs_backfill(r["media_json"])
+                         or not r["created_ms"])]
     if args.limit:
         rows = rows[:args.limit]
-    print(f"{len(rows)} posts still point at Facebook's CDN")
+    need_media = sum(1 for r in rows if needs_backfill(r["media_json"]))
+    print(f"{len(rows)} posts to visit — {need_media} still point at Facebook's "
+          f"CDN, {sum(1 for r in rows if not r['created_ms'])} have no posted time")
     if not rows or args.dry_run:
         for r in rows[:10]:
             print("  would fetch", r["post_id"], embed_href(r["url"])[:90])
@@ -119,7 +144,7 @@ async def main():
 
     store = fb_media.MediaStore(ROOT)
     from playwright.async_api import async_playwright
-    done = empty = failed = 0
+    done = empty = failed = timed = 0
     async with async_playwright() as pw:
         browser = await pw.chromium.launch(headless=True)
         ctx = await browser.new_context(user_agent=UA,
@@ -128,7 +153,8 @@ async def main():
         try:
             for i, r in enumerate(rows, 1):
                 try:
-                    found = await harvest(page, r["url"])
+                    got = await harvest(page, r["url"])
+                    found, utime = got["images"], got.get("utime")
                 except Exception as e:
                     failed += 1
                     print(f"  [{i}/{len(rows)}] {r['post_id']}: "
@@ -142,10 +168,22 @@ async def main():
                     if _is_post_image(u) and u not in seen:
                         seen.add(u)
                         urls.append(u)
-                if not urls:
-                    empty += 1
-                    print(f"  [{i}/{len(rows)}] {r['post_id']}: embed showed no "
-                          f"post images (deleted, or not public)")
+                # The time is worth writing even when the pictures are not
+                # recoverable — "posted —" on every card is what a row with no
+                # created_ms looks like in the feed.
+                if utime and not r["created_ms"]:
+                    db.execute("UPDATE posts SET created_ms = ? WHERE post_id = ?",
+                               (utime * 1000, r["post_id"]))
+                    db.commit()
+                    timed += 1
+                if not urls or not needs_backfill(r["media_json"]):
+                    # Either the embed had no pictures, or this row only came
+                    # back for its timestamp and already holds our copies.
+                    if not urls and needs_backfill(r["media_json"]):
+                        empty += 1
+                        print(f"  [{i}/{len(rows)}] {r['post_id']}: embed showed "
+                              f"no post images (deleted, or not public)")
+                    await asyncio.sleep(args.pause * random.uniform(0.6, 1.6))
                     continue
                 try:
                     old = json.loads(r["media_json"])
@@ -175,9 +213,12 @@ async def main():
         finally:
             await browser.close()
     swept = store.sweep()
-    print(f"\nrewritten {done}, no images {empty}, failed {failed}; "
+    print(f"\nrewritten {done}, posted-time recovered {timed}, "
+          f"no images {empty}, failed {failed}; "
           f"store holds {store.total_bytes()//1024} KB"
           + (f", evicted {swept}" if swept else ""))
+    print("Counts (reactions / comments / shares) are NOT recoverable here: the "
+          "public embed shows no numbers. New posts get them from the collector.")
     return 0
 
 

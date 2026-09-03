@@ -53,12 +53,14 @@ login unless a source names its own (--account).
 
 import argparse
 import asyncio
+import json
 import os
 import time
 
 import asyncio as _asyncio
 
 import activity_log
+import decider
 import ig
 import ig_human
 import pool_link
@@ -88,6 +90,74 @@ def _active_account() -> str:
         raise RuntimeError("no active Instagram account — onboard one with "
                            "ig_login.py or ig_import.py first")
     return rows[0]["username"]
+
+
+def ig_failover(quarantined: str, reason: str, *, store_path="ig_accounts.db",
+                root=".", log=print) -> str:
+    """The self-healing move for a checkpoint: mark @quarantined inactive with
+    the reason, and if it WAS the active account, promote the first other
+    account that has a usable session and no recorded checkpoint. Returns the
+    new active username, or "" when there is nobody to hand over to.
+
+    Sources that name their own account (`sources.account`) do not move — a
+    source pinned to a handle is pinned on purpose. Sources with no account
+    follow the active row (`_active_account`), so they continue on the next
+    pass without anyone touching them. The pool (store_accounts) is told the
+    same story through pool_link so the Account Control Panel agrees.
+    """
+    with ig.Store(store_path) as st:
+        rows = st.all()
+        was_active = any(r["username"] == quarantined and r.get("active")
+                         for r in rows)
+        st.set_active(quarantined, False, error=reason[:300])
+        if not was_active:
+            return ""
+        for r in rows:
+            u = r["username"]
+            if u == quarantined or r.get("error_msg"):
+                continue
+            sc = ig_session.sidecar_path(u, root)
+            if sc.exists():
+                try:
+                    meta = json.loads(sc.read_text()).get("meta", {})
+                except (OSError, ValueError):
+                    meta = {}
+                if meta.get("checkpoint_at"):
+                    continue
+            elif not r.get("cookies"):
+                continue
+            st.set_active(u, True)
+            pool_link.promote("ig", u)
+            log(f"  failover: @{quarantined} is out; @{u} is now the active "
+                f"Instagram account (sources without a pinned account follow it)")
+            return u
+    return ""
+
+
+def _decide_exc(dec, acct, group, e, *, fallback, log=print):
+    """Every exception an account throws goes through here, so a checkpoint
+    is handled ONE way wherever it surfaces: quarantine in the pool, record
+    it in the sidecar (refresh refuses to knock on it), fail over, and tell
+    the decider what happened so the ping says so."""
+    reason = f"{type(e).__name__}: {e}"
+    kind = decider.classify_exception(e)
+    if kind == "pass_error":
+        kind = fallback
+    if kind != "checkpoint":
+        return dec.on(kind, acct, detail=reason)
+    pool_link.quarantine("ig", acct, reason)
+    ig_session._note_checkpoint(acct, ".", log=log)
+    new = ig_failover(acct, reason, log=log)
+    if new:
+        note = (f"Collection failed over to @{new}; sources not pinned to "
+                f"@{acct} continue there.")
+    else:
+        note = ("No backup Instagram account with a working session — "
+                "collection is STOPPED until this is fixed or a backup is "
+                "signed in under Accounts & Sessions.")
+    return dec.on("checkpoint", acct, detail=reason,
+                  meta={"sources": [s.label for s in group],
+                        "failover_to": new, "note": note})
 
 
 async def collect_source(engine, store, source, *, page_size=12, max_pages=2, log=print) -> int:
@@ -137,24 +207,47 @@ async def collect_source(engine, store, source, *, page_size=12, max_pages=2, lo
 
 
 async def run_once(store_path="ig_results.db", account_override="", *,
-                   page_size=12, max_pages=2, log=print) -> int:
+                   page_size=12, max_pages=2, log=print, dec=None) -> int:
+    """One collection pass. Every condition the pass meets goes through the
+    decider (decider.py): it says what to do next, how long to wait, and
+    logs the condition ONCE rather than once per pass.
+
+    `dec` is the long-lived Decider the --loop holds (its state persists in
+    activity.db, so a restart does not re-announce an open condition). Left
+    None — the dashboard's Fetch-now button — a one-shot, in-memory decider
+    is used, which always speaks, so the UI log shows the reason every time.
+    """
     log = _persist_log(log)
+    if dec is None:
+        dec = decider.Decider("instagram", log=log, db=None)
+    dec.begin_pass()
     with store_ig.Store(store_path) as store:
         if store.setting("ig_paused") == "1":
-            log("collection is PAUSED from the dashboard — pass skipped "
-                "(resume it in Watchlists → Network & settings)")
+            dec.on("paused", detail="paused from the dashboard — resume it in "
+                                    "Watchlists → Network & settings")
             return 0
         sources = store.sources(only_enabled=True)
         if not sources:
-            log("no enabled sources — add one with `collect_ig.py add-source`")
+            # Was: a warn line per pass, forever. Now: one line when the
+            # condition opens, a reminder every 6h, the operator told after 2h,
+            # and one "recovered" line when a source appears.
+            dec.on("no_sources",
+                   detail="add one in Watchlists → + New watchlist → Instagram")
             return 0
+        dec.ok()        # platform-level: closes no_sources / paused / pass_error
 
         # Group sources by the account that collects them, so one client serves
         # all of that account's sources.
         by_account = {}
-        for s in sources:
-            acct = s.account or account_override or _active_account()
-            by_account.setdefault(acct, []).append(s)
+        try:
+            for s in sources:
+                acct = s.account or account_override or _active_account()
+                by_account.setdefault(acct, []).append(s)
+        except RuntimeError as e:
+            # No active Instagram login at all. Not a crash: a condition,
+            # idle on it and tell the operator once.
+            dec.on("session_missing", detail=str(e))
+            return 0
 
         total = 0
         for acct, group in by_account.items():
@@ -167,6 +260,10 @@ async def run_once(store_path="ig_results.db", account_override="", *,
                 # Without this the card just sits at "last success —" and the 
                 # operator has to read journalctl to learn the session is gone.
                 pool_link.note_needs_login("ig", acct, f"{type(e).__name__}: {e}")
+                # A missing session is a checkpoint if that is what the
+                # RuntimeError says (ig_session wraps ChallengeRequired), and
+                # a session_missing otherwise. Either way: idle, tell a human.
+                _decide_exc(dec, acct, group, e, fallback="session_missing", log=log)
                 continue
 
             # Daily budget per account (warm-up ramp for young sessions). Once
@@ -174,8 +271,8 @@ async def run_once(store_path="ig_results.db", account_override="", *,
             # the app 500 times a day, and a burner that does gets flagged.
             budget = ig_human.daily_budget()
             if _DAY.remaining(acct, budget) <= 0:
-                log(f"  @{acct}: daily budget spent ({budget}) — resting until "
-                    f"tomorrow")
+                dec.on("budget_spent", acct,
+                       detail=f"daily budget spent ({budget}) — resting until tomorrow")
                 continue
 
             # on_resolved turns a successful name lookup into a permanent row
@@ -215,6 +312,16 @@ async def run_once(store_path="ig_results.db", account_override="", *,
                         "ig", acct, f"session rejected on {s.label}: {type(e).__name__}")
                 except Exception as e:
                     log(f"  [{s.label}] error: {type(e).__name__}: {e}")
+                    # Not every exception is weather. A checkpoint or a
+                    # PleaseWaitFewMinutes here used to be logged and then
+                    # KNOCKED ON AGAIN by the very next source of the same
+                    # account. The decider names it and, when the answer is
+                    # "stop touching this account", the pass does.
+                    d = _decide_exc(dec, acct, group, e, fallback="pass_error", log=log)
+                    if d.stop_account:
+                        log(f"  @{acct}: {d.action} — leaving the remaining "
+                            f"{len(group) - i - 1} source(s) for the next pass")
+                        break
                     continue
 
                 # THE SESSION IS THE TEST, not a probe run beforehand. Only a
@@ -230,7 +337,11 @@ async def run_once(store_path="ig_results.db", account_override="", *,
                     cl = ig_session.refresh(acct, log=log)
                 except Exception as e:
                     log(f"  cannot refresh @{acct}: {e}")
-                    continue
+                    # ig_session.refresh refuses (RuntimeError) on a recorded
+                    # checkpoint, a missing sidecar, or a bad password; only a
+                    # human fixes any of those. Stop this account for the pass.
+                    _decide_exc(dec, acct, group, e, fallback="session_rejected", log=log)
+                    break
                 engine = IGEngine(cl, account=acct,
                                   on_resolved=store.cache_platform_id)
                 try:
@@ -240,11 +351,15 @@ async def run_once(store_path="ig_results.db", account_override="", *,
                 except Exception as e:
                     log(f"  [{s.label}] still failing after refresh: "
                         f"{type(e).__name__}: {e}")
+                    d = _decide_exc(dec, acct, group, e, fallback="session_rejected", log=log)
+                    if d.stop_account:
+                        break
 
             # One write per account per pass, not one per post: the column means
             # "this account was working at this time".
             if acct_ok:
                 pool_link.record_success("ig", acct)
+                dec.ok(acct)        # closes any open condition on this account
         log(f"done: {total} new post(s) stored")
         return total
 
@@ -301,6 +416,14 @@ async def resolve_ids(store_path="ig_results.db", account_override="", *,
 
 
 def main() -> int:
+    # The service units set no EnvironmentFile, so .env is read here: the
+    # decider's Telegram token / chat id and PUBLIC_BASE_URL (the link in a
+    # ping) live there. Missing dotenv is not fatal — the env may be real.
+    try:
+        from dotenv import load_dotenv
+        load_dotenv()
+    except Exception:
+        pass
     ap = argparse.ArgumentParser(description="Collect Instagram posts into store_ig")
     sub = ap.add_subparsers(dest="cmd", required=True)
 
@@ -420,6 +543,12 @@ def main() -> int:
         # the media house's clock). Env IG_TZ_OFFSET_S overrides.
         tz_off = int(os.getenv("IG_TZ_OFFSET_S", str(int(5.5 * 3600))))
 
+        # ONE decider for the life of the service. Its state lives in
+        # activity.db, so an open condition is announced once, not once per
+        # pass and not again after a restart (decider.py).
+        loop_log = _persist_log(None)
+        dec = decider.Decider("instagram", log=loop_log)
+
         async def loop():
             while True:
                 started = time.time()
@@ -430,7 +559,9 @@ def main() -> int:
                     paused = st.setting("ig_paused") == "1"
                     every = int(st.setting("ig_interval_s") or args.every)
                 if paused:
-                    await asyncio.sleep(60)     # cheap idle tick, no log spam
+                    dec.begin_pass()
+                    dec.on("paused")            # said once; then a quiet tick
+                    await asyncio.sleep(60)
                     continue
                 # Human active-hours: overnight the collector mostly sleeps,
                 # with only a rare "checked my phone" poll — a feed that never
@@ -439,12 +570,18 @@ def main() -> int:
                     await asyncio.sleep(ig_human.next_interval(max(600, every)))
                     continue
                 try:
-                    await run_once(store_path, args.account, **paging)
+                    await run_once(store_path, args.account, dec=dec, **paging)
                 except Exception as e:
-                    print(f"pass error: {type(e).__name__}: {e}")
+                    # The whole pass blew up (DB locked, import gone, ...).
+                    # Three in a row and the operator hears about it.
+                    dec.on("pass_error", detail=f"{type(e).__name__}: {e}")
                 # Jitter the wait so the between-cycle rhythm is never a fixed
-                # clock (±35%).
-                wait = ig_human.next_interval(every) - (time.time() - started)
+                # clock (±35%) — unless a decision asked for longer (no
+                # sources: 30m; rate-limited: up to 4h; checkpoint: 6h). The
+                # decider's wait is a floor, never a ceiling, so the human
+                # rhythm still applies on top of it.
+                wait = max(ig_human.next_interval(every), dec.wait_s())
+                wait -= (time.time() - started)
                 await asyncio.sleep(max(5, wait))
         try:
             asyncio.run(loop())

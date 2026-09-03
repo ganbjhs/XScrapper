@@ -33,6 +33,13 @@ Facebook has two side-docs: `FACEBOOK_RUNBOOK.md` (how to turn it on) and
 `FACEBOOK_LESSONS.md` (**everything already tried and why it failed** — read it
 before touching the Facebook engine, it will save you days).
 
+The consumer has one: `WATCH_TOWER.md` — what Watch-Tower is, how it ingests
+from us, which of our fields its features depend on, and the compatibility
+rules (R1–R14) plus a pre-change checklist. **Read it before touching
+delivery, the API surface, the post shape, project scoping, media or
+retention.** The `WATCH_TOWER_*HANDOVER.md` / `*_PROMPT.md` files beside it
+are what has actually been sent to their side; keep them true.
+
 ## Run it
 
 ```bash

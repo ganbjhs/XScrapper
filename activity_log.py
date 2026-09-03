@@ -31,10 +31,15 @@ _KEEP = 20_000          # newest rows kept; older pruned on write
 
 _ERROR_RE = re.compile(
     r"error|failed|NOT LOGGED|cannot |could not|rejected|checkpoint"
-    r"|cap reached|wrong password|still failing", re.I)
+    r"|cap reached|wrong password|still failing"
+    # decider.py lines: a decision that needs a human is an error
+    r"|decision: QUARANTINE|'session_missing'|'session_rejected'|'pass_error'",
+    re.I)
 _WARN_RE = re.compile(
     r"logged out|re-login|login available|skipping|no enabled|stale"
-    r"|not found|already running|fell back|home feed instead", re.I)
+    r"|not found|already running|fell back|home feed instead"
+    # decider.py lines: an open condition is a warn until it recovers
+    r"|decision: |still '|operator NOT told", re.I)
 
 
 def _con(db=None):

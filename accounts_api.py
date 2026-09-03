@@ -80,6 +80,42 @@ def _need_int(body: dict, key: str) -> int:
     return int(v)
 
 
+def _activate_collector(a) -> dict:
+    """The pool says WHO SHOULD collect; the collector reads WHO DOES from
+    its own store. For Instagram those are two tables (`managed_accounts`
+    in pool.db, `accounts` in ig_accounts.db), and until 2026-09-03 nothing
+    joined them: "Promote" flipped the pool row and collect_ig kept reading
+    `ig_accounts.db`'s active flag — so the operator promoted @omar and the
+    log kept saying `account @sanaakhtar221`. Now a promote of an IG account
+    also makes it the active row in ig_accounts.db, IF it has a session
+    there; if it has none, the promote stands in the pool and the answer
+    says plainly that collection cannot move until the account is signed in.
+
+    X and Facebook keep their own single-session models; nothing to sync.
+    """
+    if a is None or a.platform != "ig":
+        return {}
+    try:
+        import ig
+        path = os.getenv("IG_ACCOUNTS_DB", "ig_accounts.db")
+        with ig.Store(path) as ist:
+            rows = ist.all()
+            norm = lambda v: (v or "").strip().lower().lstrip("@")
+            hit = next((r for r in rows if norm(r["username"]) in
+                        (norm(a.login), norm(a.label))), None)
+            if hit is None:
+                return {"note": f"promoted in the pool, but @{a.login} has no "
+                                f"session on this server yet — collection stays "
+                                f"on the current account until you sign it in "
+                                f"(Sign in on this card)."}
+            ist.set_active(hit["username"], True, error="")
+            return {"note": f"@{hit['username']} is now the collecting "
+                            f"Instagram account (from the next pass)."}
+    except Exception as e:
+        return {"note": f"promoted in the pool, but the collector's account "
+                        f"store could not be updated: {type(e).__name__}: {e}"}
+
+
 def handle(method: str, subpath: str, body: dict | None, query: dict | None) -> dict:
     """
     Dispatch one `/api/pool*` request. `subpath` is the part AFTER '/api/pool'
@@ -161,8 +197,9 @@ def handle(method: str, subpath: str, body: dict | None, query: dict | None) -> 
             return {"ok": True}
 
         if method == "POST" and sub == "/promote":
-            st.promote(_need_int(body, "account_id"))
-            return {"ok": True}
+            aid = _need_int(body, "account_id")
+            st.promote(aid)
+            return {"ok": True, **_activate_collector(st.get(aid))}
 
         if method == "POST" and sub == "/failover":
             platform = (body.get("platform") or "").strip()
@@ -173,7 +210,10 @@ def handle(method: str, subpath: str, body: dict | None, query: dict | None) -> 
                 rotate_proxy=(body.get("rotate_proxy") or None),
                 reason=body.get("reason") or "manual failover from panel",
             )
-            return {"ok": True, "promoted": promoted.label if promoted else None}
+            out = {"ok": True, "promoted": promoted.label if promoted else None}
+            if promoted:
+                out.update(_activate_collector(promoted))
+            return out
 
         if method == "POST" and sub == "/backup_codes":
             aid = _need_int(body, "account_id")

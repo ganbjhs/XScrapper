@@ -177,6 +177,12 @@ def note_health(platform: str, who: str, health: str) -> bool:
         platform, who, lambda st, a: st.set_status(a.account_id, a.status, (health or "")[:400]))
 
 
+def promote(platform: str, who: str) -> bool:
+    """Make `who` the pool's active account for its platform (failover's
+    other half). The one-active invariant is store_accounts.promote's."""
+    return _with_account(platform, who, lambda st, a: st.promote(a.account_id))
+
+
 def quarantine(platform: str, who: str, reason: str = "") -> bool:
     """Checkpoint / ban / anything a human must clear. Pulls it out of rotation."""
     return _with_account(
