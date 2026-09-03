@@ -98,7 +98,9 @@ def check() -> Report:
     # The session bootstrap and the fingerprint setters.
     for name in ("login_by_sessionid", "set_proxy", "set_user_agent",
                  "set_settings", "get_timeline_feed",
-                 "user_medias_paginated_v1", "hashtag_medias_recent_v1"):
+                 "user_medias_paginated_v1", "hashtag_medias_recent_v1",
+                 "user_id_from_username", "search_users_v1",
+                 "user_following_v1"):
         r.check(f"Client.{name}() exists", callable(getattr(Client, name, None)))
 
     r.check("extract_media_v1() is importable (our timeline parser needs it)",
@@ -365,6 +367,99 @@ def _browser_session(cl):
     return sess
 
 
+class ResolveError(RuntimeError):
+    """A username could not be turned into a numeric id. `why` says what kind
+    of refusal it was, so the collector can decide how long to leave it:
+
+        rate_limited   429 / "please wait" — Instagram is throttling LOOKUPS
+                       from this session. Asking again sooner makes it last
+                       longer. Leave it for hours, not minutes.
+        blocked        the web side bounced us to the login page or answered
+                       401/403 — the signature of a datacenter IP or a session
+                       instagram.com does not accept. A proxy problem, not a
+                       handle problem.
+        not_found      404 — the handle does not exist (typo, renamed, banned).
+                       No retry will ever help; a human fixes the handle.
+        unknown        everything else.
+    """
+
+    def __init__(self, msg: str, why: str = "unknown", attempts=()):
+        super().__init__(msg)
+        self.why = why
+        self.attempts = list(attempts)
+
+
+def _status_of(e) -> int:
+    """HTTP status behind a requests/instagrapi exception, or 0."""
+    import re
+    for attr in ("response", "last_response"):
+        r = getattr(e, attr, None)
+        code = getattr(r, "status_code", None)
+        if code:
+            return int(code)
+    # requests: "429 Client Error: Too Many Requests for url"; instagrapi
+    # often carries "status_code=429" / "status 429" in the text.
+    m = re.search(r"\b(4\d\d|5\d\d) (?:Client|Server) Error"
+                  r"|status(?:_code| code)?\D{0,3}(4\d\d|5\d\d)", str(e))
+    return int(m.group(1) or m.group(2)) if m else 0
+
+
+def _why(e) -> str:
+    name = type(e).__name__
+    text = str(e).lower()
+    code = _status_of(e)
+    if name == "RetryError" or code == 429 or "please wait" in text \
+            or "too many requests" in text:
+        # requests.RetryError is urllib3 giving up after instagrapi's adapter
+        # re-sent a 429 three times — i.e. three 429s in a row.
+        return "rate_limited"
+    if name == "TooManyRedirects" or code in (401, 403) or "login_required" in text:
+        return "blocked"
+    if code == 404 or name == "UserNotFound" or "user not found" in text:
+        return "not_found"
+    return "unknown"
+
+
+class _no_retries:
+    """instagrapi mounts a urllib3 Retry on the private session that re-sends
+    a request up to three times on 429 (0s, 2s, 4s apart). For a media read
+    that is arguably fine; for a NAME LOOKUP it is the worst possible reply
+    to "please wait" — three more knocks in six seconds, from a session that
+    was just told to stop. Lookups run with retries off and the setting is
+    restored afterwards, whatever happens."""
+
+    def __init__(self, cl):
+        self.cl = cl
+        self.saved = None
+
+    def __enter__(self):
+        try:
+            self.saved = self.cl.session_retry_total
+            self.cl.session_retry_total = 0
+            self.cl._configure_private_session_retry()
+        except Exception:
+            self.saved = None
+        return self
+
+    def __exit__(self, *a):
+        if self.saved is not None:
+            try:
+                self.cl.session_retry_total = self.saved
+                self.cl._configure_private_session_retry()
+            except Exception:
+                pass
+
+
+def _pk_via_search(cl, name: str):
+    """users/search/ — a different private endpoint from usernameinfo, gated
+    separately, and it answers with pk + username for every match. Exact
+    match on the username only; a search is not a lookup."""
+    for u in cl.search_users_v1(name, 10) or []:
+        if str(getattr(u, "username", "")).lower() == name.lower():
+            return str(getattr(u, "pk", "") or "")
+    return None
+
+
 def _pk_via_web_profile_info(cl, name: str, timeout: int = 15):
     """The endpoint instagram.com hits when you open a profile in a tab.
 
@@ -427,6 +522,7 @@ class IGEngine:
         self.cl = client
         self.account = account
         self._pk_cache: dict = {}
+        self._following: dict = {}      # username.lower() -> pk, see below
         # Called as on_resolved(handle, numeric_pk) the moment a name is
         # resolved. The collector points this at store_ig.cache_platform_id so
         # the lookup is paid ONCE, ever — not once per process. Without it the
@@ -482,36 +578,82 @@ class IGEngine:
         if name in self._pk_cache:
             return self._pk_cache[name]
 
-        attempts, pk = [], None
-        for how, fn in (("private user_id_from_username",
-                         lambda: self.cl.user_id_from_username(name)),
-                        ("web_profile_info",
-                         lambda: _pk_via_web_profile_info(self.cl, name)),
-                        ("profile HTML",
-                         lambda: _pk_via_profile_html(self.cl, name))):
-            try:
-                got = fn()
-            except Exception as e:
-                attempts.append(f"{how}: {type(e).__name__}")
-                continue
-            if got and str(got).isdigit():
-                pk, via = str(got), how
-                break
-            attempts.append(f"{how}: no id in the response")
+        # The following list first: if this account follows the target, one
+        # request that was probably already paid for this pass answers with
+        # no lookup endpoint touched at all (see resolve_from_following).
+        if name.lower() in self._following:
+            pk = self._following[name.lower()]
+            self._pk_cache[name] = pk
+            if self.on_resolved:
+                try:
+                    self.on_resolved(name, pk)
+                except Exception:
+                    pass
+            return pk
+
+        attempts, pk, whys = [], None, []
+        with _no_retries(self.cl):
+            for how, fn in (("private usernameinfo",
+                             lambda: self.cl.user_id_from_username(name)),
+                            ("private users/search",
+                             lambda: _pk_via_search(self.cl, name)),
+                            ("web_profile_info",
+                             lambda: _pk_via_web_profile_info(self.cl, name)),
+                            ("profile HTML",
+                             lambda: _pk_via_profile_html(self.cl, name))):
+                try:
+                    got = fn()
+                except Exception as e:
+                    why = _why(e)
+                    code = _status_of(e)
+                    attempts.append(f"{how}: {type(e).__name__}"
+                                    + (f" {code}" if code else ""))
+                    whys.append(why)
+                    if why in ("rate_limited", "not_found"):
+                        # A 429 on one lookup endpoint is a 429 on the next —
+                        # they share the limiter. And a 404 is an answer, not
+                        # an outage. Either way: stop knocking.
+                        break
+                    continue
+                if got and str(got).isdigit():
+                    pk = str(got)
+                    break
+                attempts.append(f"{how}: no id in the response")
+                whys.append("unknown")
 
         if pk is None:
-            raise RuntimeError(
+            why = ("rate_limited" if "rate_limited" in whys
+                   else "not_found" if "not_found" in whys
+                   else "blocked" if whys and all(w == "blocked" for w in whys)
+                   else "unknown")
+            advice = {
+                "rate_limited": (
+                    "Instagram is throttling name lookups from this session "
+                    "(429). It clears by itself if left alone for hours; asking "
+                    "again sooner extends it. The other sources still collect."),
+                "blocked": (
+                    "instagram.com refused this session's web requests (login "
+                    "bounce / 401 / 403). That is what a datacenter IP looks "
+                    "like to Instagram — give this account its residential "
+                    "proxy (Accounts & Sessions → Edit)."),
+                "not_found": (
+                    f"Instagram says there is no user '{name}' (404). Check the "
+                    f"spelling in Watchlists — a retry cannot fix a typo."),
+                "unknown": (
+                    "Instagram gates name lookup separately from media reads, "
+                    "so this can fail on a session that fetches fine."),
+            }[why]
+            raise ResolveError(
                 f"could not resolve the username '{name}' to a numeric id. "
-                f"Instagram gates name lookup separately from media reads, so "
-                f"this can fail on a session that fetches fine.\n"
+                f"{advice}\n"
                 f"  tried — {'; '.join(attempts)}\n"
-                f"  Fix: cache the id by hand, ONCE. The label and the handle "
-                f"both stay exactly as they are:\n"
-                f"    open https://www.instagram.com/{name}/ , view source, "
-                f"search for \"profile_id\"\n"
-                f"    python3 collect_ig.py set-id --label <label> --id <numeric_id>\n"
-                f"  Or resolve every pending source in one paced pass:\n"
-                f"    python3 collect_ig.py resolve-ids")
+                f"  Fix by hand, ONCE (the id never changes): open "
+                f"https://www.instagram.com/{name}/ , view source, search for "
+                f"\"profile_id\", paste it on the Fix panel or run "
+                f"`python3 collect_ig.py set-id --label <label> --id <numeric_id>`. "
+                f"Or follow @{name} from the collecting account — the next pass "
+                f"reads the id off the following list, no lookup needed.",
+                why=why, attempts=attempts)
 
         self._pk_cache[name] = pk
         if self.on_resolved:
@@ -521,6 +663,47 @@ class IGEngine:
             except Exception:
                 pass
         return pk
+
+    def resolve_from_following(self, names) -> dict:
+        """Fill ids for every `names` entry this account FOLLOWS, in one
+        request, touching no lookup endpoint.
+
+        This is the permanent answer to "why does it fail to resolve every
+        time". The lookup endpoints (usernameinfo, users/search, the web
+        profile call) are the most tightly limited calls Instagram has, and a
+        session that gets a 429 on them and asks again a few minutes later
+        keeps the 429 alive indefinitely. The following list is a normal feed
+        call, pays one request for every followed account at once, and is
+        exactly what a human account looks like: it follows the people it
+        reads. So: follow the sources from the collecting account, and ids
+        resolve themselves without ever hitting the limiter.
+
+        Returns {username: pk} for the names it could fill. Never raises —
+        a failure here just means the per-name paths run as before.
+        """
+        wanted = {str(n).lstrip("@").lower() for n in names if not str(n).isdigit()}
+        if not wanted:
+            return {}
+        try:
+            me = str(getattr(self.cl, "user_id", "") or "")
+            rows = self.cl.user_following_v1(me, amount=0) if me else []
+        except Exception:
+            return {}
+        found = {}
+        for u in rows or []:
+            un = str(getattr(u, "username", "") or "").lower()
+            pk = str(getattr(u, "pk", "") or "")
+            if un and pk.isdigit():
+                self._following[un] = pk
+                if un in wanted:
+                    found[un] = pk
+                    self._pk_cache[un] = pk
+                    if self.on_resolved:
+                        try:
+                            self.on_resolved(un, pk)
+                        except Exception:
+                            pass
+        return found
 
     # -- one target account -------------------------------------------------
     async def user_pages(self, user_id, *, page_size: int = 12,

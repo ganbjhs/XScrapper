@@ -4651,7 +4651,30 @@ def _decider_post(body):
         log("collection RESUMED by operator from the Fix panel")
         return {"ok": True}
 
-    return {"error": "action must be snooze, resolve, reenable_sources or resume"}
+    if action == "set_id":
+        # The fix for 'unresolved_source': the numeric id, typed once. Same
+        # write as `collect_ig.py set-id` / the Watchlists set-id action —
+        # label and handle untouched (RULEBOOK §2, the three-column source).
+        pk = str(body.get("platform_id") or "").strip()
+        if not pk.isdigit():
+            return {"error": "the Instagram id is a number (search the page "
+                             "source for \"profile_id\")"}
+        conds = {c["id"]: c for c in decider.open_conditions(db=adb)}
+        c = conds.get(cid)
+        label = (c or {}).get("meta", {}).get("label") or (c or {}).get("source") or ""
+        if not label:
+            return {"error": "that condition is no longer open"}
+        with store_ig.Store(_CFG.root / "ig_results.db") as st:
+            if not st.db.execute("SELECT 1 FROM sources WHERE label=?",
+                                 (label,)).fetchone():
+                return {"error": f"no source labelled '{label}' any more"}
+            st.set_platform_id(label, pk)
+        log(f"[{label}] id {pk} set by operator from the Fix panel")
+        r = decider.resolve(cid, db=adb, who="operator (id pasted)", log=log)
+        return {"ok": True, "label": label, "platform_id": pk, **r}
+
+    return {"error": "action must be snooze, resolve, reenable_sources, "
+                     "resume or set_id"}
 
 
 def _ig_settings_post(body):

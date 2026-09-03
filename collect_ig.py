@@ -134,15 +134,30 @@ def ig_failover(quarantined: str, reason: str, *, store_path="ig_accounts.db",
     return ""
 
 
-def _decide_exc(dec, acct, group, e, *, fallback, log=print):
+def _decide_exc(dec, acct, group, e, *, fallback, log=print, src=None):
     """Every exception an account throws goes through here, so a checkpoint
     is handled ONE way wherever it surfaces: quarantine in the pool, record
     it in the sidecar (refresh refuses to knock on it), fail over, and tell
-    the decider what happened so the ping says so."""
+    the decider what happened so the ping says so.
+
+    `src` is the source being collected when it happened. A handle that
+    cannot be resolved to an id is THAT SOURCE's condition, not the
+    account's: it is skipped, the other sources continue, and after three
+    passes the admin is asked for the id (decider 'unresolved_source')."""
     reason = f"{type(e).__name__}: {e}"
     kind = decider.classify_exception(e)
     if kind == "pass_error":
         kind = fallback
+    if kind == "unresolved_source" and src is not None:
+        why = getattr(e, "why", "unknown")
+        # first line of the engine's message = the advice for THIS kind of
+        # refusal (throttled / blocked IP / no such user); it rides along to
+        # the Fix panel and the ping as the note.
+        first = str(e).split("\n", 1)[0]
+        advice = first.split("numeric id. ", 1)[-1] if "numeric id. " in first else ""
+        return dec.on(kind, acct, detail=src.value or src.label, source=src.label,
+                      meta={"label": src.label, "handle": src.value, "why": why,
+                            "note": advice})
     if kind != "checkpoint":
         return dec.on(kind, acct, detail=reason)
     pool_link.quarantine("ig", acct, reason)
@@ -285,7 +300,44 @@ async def run_once(store_path="ig_results.db", account_override="", *,
             # the honest definition of "the session still works", and it is what
             # stamps last_success_at in the pool (pool_link.record_success).
             acct_ok = False
+
+            # Sources still without a numeric id. Two things before any of
+            # them costs a lookup request:
+            #   1. one that was refused recently is LEFT ALONE (decider
+            #      hold-off: 1h doubling to 24h) — asking a throttled lookup
+            #      endpoint again every pass is what keeps the 429 alive;
+            #   2. the rest are resolved off this account's FOLLOWING list in
+            #      one ordinary request, no lookup endpoint touched. Follow
+            #      the sources from the collecting account and this is the
+            #      path that always works (engine_ig.resolve_from_following).
+            held = set()
+            pending = []
+            for s in group:
+                if s.type != "user" or s.platform_id or str(s.value).isdigit():
+                    continue
+                h = dec.holdoff(acct, s.label)
+                if h > 0:
+                    held.add(s.label)
+                else:
+                    pending.append(s.value)
+            if held:
+                log(f"  leaving {len(held)} unresolved source(s) alone this pass "
+                    f"({', '.join(sorted(held))}) — hold-off after a refused lookup")
+            if pending:
+                try:
+                    got = await _asyncio.to_thread(engine.resolve_from_following, pending)
+                except Exception as e:
+                    got = {}
+                    log(f"  following-list lookup failed: {type(e).__name__}: {e}")
+                for name, pk in got.items():
+                    log(f"  resolved @{name} -> {pk} from @{acct}'s following list")
+                    for s in group:
+                        if s.value.lower() == name and not s.platform_id:
+                            dec.ok(acct, source=s.label)
+
             for i, s in enumerate(group):
+                if s.label in held:
+                    continue
                 # Human rhythm BETWEEN sources: a person doesn't machine-gun
                 # profile after profile. First source in a pass starts right
                 # away; each subsequent one waits a human "switch" gap, with an
@@ -302,6 +354,7 @@ async def run_once(store_path="ig_results.db", account_override="", *,
                     total += await collect_source(engine, store, s, page_size=page_size,
                                               max_pages=max_pages, log=log)
                     acct_ok = True
+                    dec.ok(acct, source=s.label)   # closes an unresolved_source, if open
                     if _DAY.remaining(acct, budget) <= 0:
                         log(f"  @{acct}: daily budget reached mid-pass — stopping")
                         break
@@ -317,7 +370,7 @@ async def run_once(store_path="ig_results.db", account_override="", *,
                     # KNOCKED ON AGAIN by the very next source of the same
                     # account. The decider names it and, when the answer is
                     # "stop touching this account", the pass does.
-                    d = _decide_exc(dec, acct, group, e, fallback="pass_error", log=log)
+                    d = _decide_exc(dec, acct, group, e, fallback="pass_error", log=log, src=s)
                     if d.stop_account:
                         log(f"  @{acct}: {d.action} — leaving the remaining "
                             f"{len(group) - i - 1} source(s) for the next pass")
@@ -351,7 +404,7 @@ async def run_once(store_path="ig_results.db", account_override="", *,
                 except Exception as e:
                     log(f"  [{s.label}] still failing after refresh: "
                         f"{type(e).__name__}: {e}")
-                    d = _decide_exc(dec, acct, group, e, fallback="session_rejected", log=log)
+                    d = _decide_exc(dec, acct, group, e, fallback="session_rejected", log=log, src=s)
                     if d.stop_account:
                         break
 
@@ -398,6 +451,14 @@ async def resolve_ids(store_path="ig_results.db", account_override="", *,
                 log(f"  could not load @{acct}: {e}")
                 continue
             engine = IGEngine(cl, account=acct, on_resolved=store.cache_platform_id)
+            # The following list first: one request, no lookup endpoint, and
+            # it answers for every followed handle at once.
+            got = await _asyncio.to_thread(engine.resolve_from_following,
+                                           [s.value for s in group])
+            for name, pk in got.items():
+                log(f"  @{name} -> {pk} (from @{acct}'s following list)")
+                done += 1
+            group = [s for s in group if s.value.lower() not in got]
             for i, src in enumerate(group):
                 if i > 0:
                     await _asyncio.sleep(ig_human.source_gap())

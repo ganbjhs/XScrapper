@@ -238,6 +238,22 @@ to restamp ownership.
   Distribution costs query length, so it is capped (`MAX_ALTERNATIVES`) and a
   rule that multiplies past it is refused with the reason — separate rules OR
   together anyway.
+- **A collection filter must hold on every stream kind, so it is checked on
+  OUR parsed fields after the fetch.** The watchlist checkboxes ("No
+  retweets" …) compile into X search operators, and those are hints X
+  honours well but does not promise. An X List timeline is fetched, not
+  searched, so the operators have nowhere to go at all. Therefore
+  `store.tweet_passes_filters` is applied by the collector to every result
+  before it is stored (`poll_once` / `backfill_once`), reading the SAME fields
+  `normalize_tweet` writes (`retweetedTweet` → `is_retweet`, and so on) — so
+  what the collector dropped and what the feed's own filters would hide can
+  never disagree. A filtered result still bounds the watermark (seen and
+  rejected is not unseen; otherwise the newest retweet on a List is re-read
+  and re-dropped every poll) and is reported as `filtered=N`. A filter set the
+  collector cannot parse reads as "no filters": the failure mode must be "a
+  retweet got through", never "nothing was collected". Filters are re-read
+  from `streams.filters` on every poll, so a dashboard save needs no restart
+  (2026-09-03).
 - **Labelling is a fetch too, and spends money instead of budget.** Everything
   the two rules above say about going out to a platform applies to going out to
   Grok: explicit (the Classify button, never a timer), serialized behind ONE
@@ -682,6 +698,40 @@ single request. These are hard rules, not tuning:
   collection stays on the current account until you sign it in"). A promote
   that cannot move collection must say so; a silent one is the bug.
   Test: `tests/test_accounts_api.py::test_promote_moves_ig_collection`.
+- **A handle that will not resolve is the SOURCE's condition, never the
+  account's.** `engine_ig` raising "could not resolve the username" was
+  filed as `pass_error` on the first live pass of the decider (2026-09-03),
+  which backed the whole account off for ten minutes over one source. Now it
+  is `unresolved_source`, scoped `account/label` (two unresolved sources on
+  one account are two conditions), decision `SKIP`: no wait, the other
+  sources continue, the admin is paged after three passes in a row with the
+  exact profile URL, and the Fix panel's "Save id" box writes
+  `platform_id` (same write as `collect_ig.py set-id`; label and handle
+  untouched, §2). A clean collect of that source later closes it. Note that
+  name lookup is the permission a restricted session loses first, so the
+  cure is often a cleaner account, not a hand-typed id.
+- **A refused name lookup is never asked again on the next pass.** The id
+  behind a handle is PERMANENT — it survives renames — so resolving it is a
+  one-time cost, and a lookup that failed a few minutes ago will fail again
+  for the same reason. Live on 2026-09-03 (`awaj.news`, `dalimss.news.banaras`
+  from @youssefnasser168): every pass re-asked `usernameinfo` (which
+  instagrapi's transport re-sent THREE times on each 429), then
+  `web_profile_info`, then the profile HTML — six-plus knocks per handle per
+  pass on the most throttled endpoints Instagram has, which is exactly how a
+  429 is kept alive forever. Now (`engine_ig.resolve_user`): transport
+  retries are OFF for lookups (`_no_retries`); the first 429 or 404 ends the
+  attempt (they share a limiter; a 404 is an answer); `ResolveError.why`
+  names the refusal — `rate_limited` (leave it for hours), `blocked` (login
+  bounce / 401 / 403 = a datacenter IP; the fix is the account's residential
+  proxy), `not_found` (a typo; no retry can help) — and the decider holds
+  THAT SOURCE off for 1h doubling to 24h (`Decider.holdoff`, a per-source
+  wait that never delays the loop; `Rule.loop_wait`). Before any lookup the
+  collector reads the account's own FOLLOWING list once
+  (`resolve_from_following`, one ordinary request, every followed handle at
+  once) — so the standing advice is: follow the sources from the collecting
+  account and ids resolve themselves without touching a lookup endpoint.
+  `users/search/` is a fourth door between usernameinfo and the web calls.
+  Test: `test_resolve`.
 - **Exactly one active row, enforced on write.** `ig.Store.save()` and
   `set_active()` demote every other row when they activate one. They did not
   until 2026-08-31, and all three Instagram accounts were live at once on the

@@ -120,8 +120,11 @@ class Rule:
     remind_every_s: int = REMIND_EVERY_S
     fix: tuple = ()             # the steps the Fix panel shows, in order
     actions: tuple = ()         # panel buttons: signin | add_source |
-                                #   reenable_sources | resolve | resume
+                                #   reenable_sources | resolve | resume | set_id
     needs_human: bool = False   # can code close this on its own? no → True
+    loop_wait: bool = True      # does wait_s hold the whole LOOP (an account
+                                # or platform condition) or just this scope
+                                # (a per-source hold-off)? see Decider.holdoff
 
 
 RULES = {
@@ -203,6 +206,26 @@ RULES = {
         "rest", 1 * H, level="info",
         human="",           # by design; a person doesn't open the app 500×/day
     ),
+    "unresolved_source": Rule(
+        "skip", 1 * H, max_wait_s=24 * H, escalate_after_n=3, level="warn",
+        loop_wait=False,
+        human="cannot turn the handle '{detail}' into a numeric Instagram id "
+              "from @{account}'s session ({count} tries).{extra} The other "
+              "sources still collect; this one is left alone for a while "
+              "(1h, doubling to 24h) instead of being asked again every pass. "
+              "Paste the id on the Fix panel, or follow @{detail} from the "
+              "collecting account and it resolves itself.",
+        fix=("Instagram refused to translate this handle into its numeric "
+             "id. Name lookup is a separate permission from reading posts, "
+             "and a restricted session loses it first — so a cleaner account "
+             "may resolve it by itself.",
+             "To fix it by hand, once: open https://www.instagram.com/{detail}/ "
+             "in a browser, view the page source, search for \"profile_id\" "
+             "and paste the number below. The label and the handle stay as "
+             "they are."),
+        actions=("set_id", "resolve"),
+        needs_human=True,
+    ),
     "pass_error": Rule(
         "backoff", 10 * 60, max_wait_s=1 * H, escalate_after_n=3,
         level="error",
@@ -246,6 +269,8 @@ def classify_exception(e: BaseException) -> str:
     if name in _EXC_KIND:
         return _EXC_KIND[name]
     text = str(e).lower()
+    if "could not resolve the username" in text:
+        return "unresolved_source"
     if "checkpoint" in text or "challenge" in text:
         return "checkpoint"
     if "please wait" in text or "rate limit" in text:
@@ -263,10 +288,29 @@ class Event:
     platform: str = "instagram"
     account: str = ""
     detail: str = ""
+    source: str = ""            # a per-SOURCE condition (unresolved id) —
+                                # keyed as account/source so two sources on
+                                # one account do not overwrite each other
+
+    @property
+    def who(self) -> str:
+        return _who(self.account, self.source)
 
     @property
     def scope(self) -> str:
-        return f"{self.platform}:{self.account or '-'}"
+        return f"{self.platform}:{self.who}"
+
+
+def _who(account: str, source: str = "") -> str:
+    """The account/source part of a scope. ':' is the id separator, so a
+    label may not carry one."""
+    a = account or "-"
+    return f"{a}/{source.replace(':', '·')}" if source else a
+
+
+def _split_who(who: str):
+    acct, _, src = (who or "-").partition("/")
+    return ("" if acct == "-" else acct), src
 
 
 @dataclass
@@ -301,20 +345,21 @@ def _fmt_dur(s: float) -> str:
     return f"{s // H}h {(s % H) // 60:02d}m"
 
 
-def cond_id(platform: str, account: str, kind: str) -> str:
-    return f"{platform}:{account or '-'}:{kind}"
+def cond_id(platform: str, account: str, kind: str, source: str = "") -> str:
+    return f"{platform}:{_who(account, source)}:{kind}"
 
 
 def parse_cond_id(cid: str):
     """'instagram:sanaakhtar221:checkpoint' → (platform, account, kind).
-    Account '-' means platform-wide (comes back as '')."""
+    'instagram:sana/Bhajanlal Sharma:unresolved_source' keeps the source in
+    the account part (see _split_who). Account '-' means platform-wide."""
     parts = (cid or "").split(":")
     if len(parts) != 3 or not all(parts):
         raise ValueError(f"bad condition id {cid!r}")
-    plat, acct, kind = parts
+    plat, who, kind = parts
     if kind not in RULES:
         raise ValueError(f"unknown condition kind {kind!r}")
-    return plat, ("" if acct == "-" else acct), kind
+    return plat, who, kind
 
 
 def base_url() -> str:
@@ -455,6 +500,13 @@ def _loads(text) -> dict:
 
 # -------------------------------------------------------------- the policy
 
+def _wait_for(rule: Rule, count: int) -> int:
+    """Fixed, or doubling per occurrence up to the ceiling."""
+    if rule.max_wait_s:
+        return int(min(rule.max_wait_s, rule.wait_s * (2 ** (max(1, count) - 1))))
+    return int(rule.wait_s)
+
+
 def _recovered_text(platform, account, prev, now, how="") -> str:
     who = f"@{account}" if account else platform
     return (f"Collector · {platform}: recovered — '{prev['kind']}' on {who} "
@@ -476,7 +528,8 @@ def decide(state: _State, ev: Event, now_ms=None, meta=None) -> Decision:
     if rule is None:
         raise ValueError(f"unknown event kind {ev.kind!r}")
     prev = state.get(ev.scope)
-    who = f"[{ev.platform}{'@' + ev.account if ev.account else ''}]"
+    who = (f"[{ev.platform}{'@' + ev.account if ev.account else ''}"
+           f"{' · ' + ev.source if ev.source else ''}]")
 
     # --- ok: close whatever was open for this scope -----------------------
     if ev.kind == "ok":
@@ -488,8 +541,9 @@ def decide(state: _State, ev: Event, now_ms=None, meta=None) -> Decision:
                 f"({prev['count']} occurrence(s))")
             # The phone saw the start of this story; let it see the end.
             if prev.get("notified_ms"):
-                d.notify = _recovered_text(ev.platform, ev.account, prev, now,
-                                           " by itself")
+                d.notify = _recovered_text(
+                    ev.platform, ev.account + (" · " + ev.source if ev.source else ""),
+                    prev, now, " by itself")
             state.clear(ev.scope)
         return d
 
@@ -500,8 +554,9 @@ def decide(state: _State, ev: Event, now_ms=None, meta=None) -> Decision:
                "reminded_ms": now, "notified_ms": 0, "detail": ev.detail,
                "snoozed_until_ms": 0, "meta": {}}
         if changed and prev.get("notified_ms"):
-            d_note = _recovered_text(ev.platform, ev.account, prev, now,
-                                     f" (now '{ev.kind}')")
+            d_note = _recovered_text(
+                ev.platform, ev.account + (" · " + ev.source if ev.source else ""),
+                prev, now, f" (now '{ev.kind}')")
         else:
             d_note = ""
     else:
@@ -518,13 +573,9 @@ def decide(state: _State, ev: Event, now_ms=None, meta=None) -> Decision:
     open_for_s = (now - row["first_ms"]) / 1000
     count = row["count"]
 
-    # wait: fixed, or doubling per occurrence up to the ceiling
-    if rule.max_wait_s:
-        wait = min(rule.max_wait_s, rule.wait_s * (2 ** (count - 1)))
-    else:
-        wait = rule.wait_s
+    wait = _wait_for(rule, count)
 
-    cid = cond_id(ev.platform, ev.account, ev.kind)
+    cid = cond_id(ev.platform, ev.account, ev.kind, ev.source)
     d = Decision(rule.action, int(wait),
                  reason=f"{ev.kind}: {ev.detail}" if ev.detail else ev.kind,
                  kind=ev.kind, count=count, open_since_ms=row["first_ms"],
@@ -548,9 +599,12 @@ def decide(state: _State, ev: Event, now_ms=None, meta=None) -> Decision:
             tell = f"; operator will be told if still open in {_fmt_dur(rule.escalate_after_s)}"
         else:
             tell = ""
+        nxt = (f" — next try in {_fmt_dur(wait)}" if wait and rule.loop_wait
+               else f" — skipped for {_fmt_dur(wait)}, the other sources continue"
+               if wait else " — skipped, the other sources continue")
         d.say.append(
             f"{who} decision: {rule.action.upper()} {pre}on '{ev.kind}'{detail}"
-            f" — next try in {_fmt_dur(wait)}{tell}")
+            f"{nxt}{tell}")
     elif now - row["reminded_ms"] >= rule.remind_every_s * 1000:
         row["reminded_ms"] = now
         d.say.append(
@@ -593,18 +647,19 @@ def open_conditions(platform=None, *, db=DEFAULT_DB, now_ms=None,
     now = int(time.time() * 1000) if now_ms is None else int(now_ms)
     out = []
     for r in (state or _State(db)).open_for_platform(platform):
-        plat, acct = (r["scope"].split(":", 1) + [""])[:2]
-        acct = "" if acct == "-" else acct
+        plat, who = (r["scope"].split(":", 1) + [""])[:2]
+        acct, src = _split_who(who)
         rule = RULES.get(r["kind"])
         if rule is None:
             continue
-        cid = cond_id(plat, acct, r["kind"])
+        cid = cond_id(plat, acct, r["kind"], src)
         meta = _loads(r.get("meta"))
         fmt = dict(account=acct or "-", detail=r.get("detail") or "-",
                    open_for=_fmt_dur((now - r["first_ms"]) / 1000),
                    count=r["count"], extra="")
         out.append({
-            "id": cid, "platform": plat, "account": acct, "kind": r["kind"],
+            "id": cid, "platform": plat, "account": acct, "source": src,
+            "kind": r["kind"],
             "action": rule.action, "level": rule.level,
             "needs_human": rule.needs_human,
             "since_ms": r["first_ms"], "last_ms": r["last_ms"],
@@ -623,10 +678,10 @@ def open_conditions(platform=None, *, db=DEFAULT_DB, now_ms=None,
 def snooze(cid: str, hours: float = 6, *, db=DEFAULT_DB, now_ms=None) -> dict:
     """Silence one open condition: no reminders, no ping, for `hours`.
     The collector keeps deciding (idle/backoff) — only the talking stops."""
-    plat, acct, kind = parse_cond_id(cid)
+    plat, who, kind = parse_cond_id(cid)
     now = int(time.time() * 1000) if now_ms is None else int(now_ms)
     st = _State(db)
-    scope = f"{plat}:{acct or '-'}"
+    scope = f"{plat}:{who}"
     row = st.get(scope)
     if not row or row["kind"] != kind:
         return {"ok": False, "error": "that condition is no longer open"}
@@ -640,15 +695,17 @@ def resolve(cid: str, *, db=DEFAULT_DB, who="operator", log=None,
             notify=None, now_ms=None) -> dict:
     """Close one open condition by hand. Logs it, and if the phone was pinged
     about it, pings once more so the story ends there too."""
-    plat, acct, kind = parse_cond_id(cid)
+    plat, whom, kind = parse_cond_id(cid)
+    acct, src = _split_who(whom)
     now = int(time.time() * 1000) if now_ms is None else int(now_ms)
     st = _State(db)
-    scope = f"{plat}:{acct or '-'}"
+    scope = f"{plat}:{whom}"
     row = st.get(scope)
     if not row or row["kind"] != kind:
         return {"ok": False, "error": "that condition is no longer open"}
     st.clear(scope)
-    line = (f"[{plat}{'@' + acct if acct else ''}] '{kind}' resolved by {who} "
+    line = (f"[{plat}{'@' + acct if acct else ''}{' · ' + src if src else ''}] "
+            f"'{kind}' resolved by {who} "
             f"after {_fmt_dur((now - row['first_ms']) / 1000)} "
             f"({row['count']} occurrence(s))")
     if log:
@@ -657,7 +714,8 @@ def resolve(cid: str, *, db=DEFAULT_DB, who="operator", log=None,
         except Exception:
             pass
     if row.get("notified_ms"):
-        text = _recovered_text(plat, acct, row, now, f" by {who}")
+        text = _recovered_text(plat, acct + (" · " + src if src else ""), row, now,
+                               f" by {who}")
         try:
             (notify or _default_notify)(text)
         except Exception:
@@ -738,11 +796,12 @@ class Decider:
         """The longest wait a decision in this pass asked for (0 = none)."""
         return self._pass_wait or int(default)
 
-    def on(self, kind, account="", detail="", exc=None, meta=None) -> Decision:
+    def on(self, kind, account="", detail="", exc=None, meta=None,
+           source="") -> Decision:
         if exc is not None and not kind:
             kind = classify_exception(exc)
             detail = detail or f"{type(exc).__name__}: {exc}"
-        ev = Event(kind, self.platform, account, str(detail)[:400])
+        ev = Event(kind, self.platform, account, str(detail)[:400], source)
         with _LOCK:
             d = decide(self.state, ev, self.now() if self.now else None, meta)
         for line in d.say:
@@ -755,11 +814,28 @@ class Decider:
             elif not self._said_nowhere:
                 self._said_nowhere = True
                 self._log(f"[{self.platform}] operator NOT told — {err}")
-        self._pass_wait = max(self._pass_wait, d.wait_s)
+        if RULES[ev.kind].loop_wait:
+            self._pass_wait = max(self._pass_wait, d.wait_s)
         return d
 
-    def ok(self, account="") -> Decision:
-        return self.on("ok", account)
+    def holdoff(self, account="", source="") -> int:
+        """Seconds this scope should still be left alone, 0 if it may be
+        tried now. For a per-source condition (unresolved id) the collector
+        asks this BEFORE spending a request, so a handle that was refused an
+        hour ago is not asked about again every pass — that repetition is
+        what keeps a 429 alive."""
+        row = self.state.get(f"{self.platform}:{_who(account, source)}")
+        if not row:
+            return 0
+        rule = RULES.get(row["kind"])
+        if rule is None or rule.loop_wait:
+            return 0
+        now = self.now() if self.now else int(time.time() * 1000)
+        until = int(row["last_ms"]) + _wait_for(rule, int(row["count"])) * 1000
+        return max(0, int((until - now) / 1000))
+
+    def ok(self, account="", source="") -> Decision:
+        return self.on("ok", account, source=source)
 
     def open_conditions(self) -> list:
         return open_conditions(self.platform, state=self.state,

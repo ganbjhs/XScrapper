@@ -19,6 +19,69 @@ must respect belongs in the rulebook, not here.
 
 ---
 
+## 2026-09-03 (III) — collection filters now hold on X List watchlists
+
+**Changed**
+
+- `store.py` — `tweet_passes_filters(tweet, filters)`: the same checkbox set
+  (`WATCHLIST_FILTERS` + `lang` / `min_likes` / `min_retweets`) applied to a
+  PARSED tweet, reading the exact fields `normalize_tweet` stores
+  (`retweetedTweet`, `quotedTweet`, `inReplyToTweetId`, media, links,
+  `user.blue`/`verified`, `lang`, `likeCount`, `retweetCount`). New
+  `streams.filters` TEXT column; `compile_watchlist` copies the watchlist's
+  filter JSON onto every compiled stream. `set_watchlist_filters` no longer
+  refuses `kind='xlist'`.
+- `collector.py` — `apply_settings` re-reads `streams.filters` every poll
+  (so a dashboard save takes effect on the next check, no restart);
+  `poll_once` / `backfill_once` drop a result that fails the filters BEFORE
+  it is committed, count it in `PollResult.filtered`, and still let it bound
+  the watermark. Log lines show `filtered=N` when non-zero. `config.StreamCfg`
+  gains `filters: dict | None` (never set from config.toml).
+- `frontend/src/views/Watchlists.jsx` — the Collection filters panel now
+  renders for X List watchlists too, with hint text that says the honest
+  thing: the List timeline is read as usual and filtered posts are dropped
+  before storage.
+
+**Why**
+
+Filters compiled only into the search query (`-filter:retweets` …). A List
+timeline is fetched, not searched, so there was nowhere for the operator to
+put them and the panel was hidden for X Lists — "untick RT" had no way to
+stop retweets from a List. Post-fetch filtering is the only mechanism a List
+allows; it costs no extra requests (same pages) and, because it reads our own
+parsed columns, it is the check that actually holds (RULEBOOK's
+`-filter:replies` lesson). Search streams go through the same predicate as
+belt-and-braces to X's hints.
+
+**Verified**
+
+- New suite section "X List collection filters (post-fetch)" in
+  `tests/test_all.py` (18 checks): the trap payload served as a LIST page
+  with `skip_retweets` stores the two originals, drops the retweet
+  (`filtered=1 new=2`), never writes it to `results.db`, and still sets
+  `max_id`/`min_id` from the full result set; unticking collects it on the
+  next poll; each checkbox exercised against parsed tweets; an xlist
+  watchlist accepts `set_watchlist_filters`, compiles the JSON onto
+  `wl:<id>:0`, and `Collector.apply_settings` hands it to the stream (and
+  clears it after the box is unticked).
+- `tests/test_all.py` — **All checks passed** (849) on Python 3.12 against
+  a copy of the tree in the local VM (the suite's sqlite scratch under
+  `tests/.tmp` hits "disk I/O error" on the mounted folder; the stray
+  `tests/.tmp` from that attempt was moved to `_to_delete/tests-tmp-scratch`).
+- `frontend/dist/` rebuilt (`--emptyOutDir false`); bundle moved to
+  `index-BL-ILiLj.js`, the stale `index-BgcKJ9uU.js` moved to
+  `_to_delete/old-dist-assets/`.
+
+**Still open**
+
+- Already-collected retweets stay (by decision): the filter affects new
+  collection only. Hide them in the Live Feed if needed.
+- `only_media` / `skip_links` on a List rely on our media/link parsing; a
+  media type `_media_urls` does not know would be dropped under
+  `only_media`.
+
+---
+
 ## 2026-09-03 (II) — the pager: ping with a link, otherwise fix it yourself
 
 **Changed**
@@ -87,6 +150,30 @@ sitting in `ig_accounts.db`.
   sets the active row in `ig_accounts.db` when the account has a session,
   and returns a `note` the card shows either way. `frontend/dist` →
   `index-BdnaKueQ.js`. `tests/test_accounts_api.py` +1.
+
+- `unresolved_source` (first live pass): a resolve failure on one source
+  had been filed as `pass_error` and backed the account off. New condition,
+  scoped `account/label` (`Event.source`, `_who`/`_split_who`; ids like
+  `instagram:sana/Bhajanlal Sharma:unresolved_source`), decision `SKIP`,
+  admin paged after 3 in a row, Fix panel "Save id" → `POST /api/decider
+  {action: set_id}` → `store_ig.set_platform_id` + resolve. `collect_ig`
+  passes the source into `_decide_exc` and calls `dec.ok(acct,
+  source=label)` after each clean collect. `frontend/dist` →
+  `index-BgcKJ9uU.js`. `test_decider`/`test_pager` +11 (805 pass).
+
+- Resolution, permanently (evening): `engine_ig.resolve_user` runs with
+  transport retries off, stops at the first 429/404, tries `users/search/`
+  as a second private door, records status codes, and raises
+  `ResolveError(why=rate_limited|blocked|not_found|unknown)` with advice per
+  kind (throttled → leave it; blocked → residential proxy; 404 → spelling).
+  New `IGEngine.resolve_from_following`: one `user_following_v1` call
+  fills every followed handle; `collect_ig` runs it per account before the
+  source loop and `resolve-ids` runs it first. `decider`: `Rule.loop_wait`,
+  `_wait_for`, `Decider.holdoff(account, source)`; `unresolved_source` now
+  holds the SOURCE off 1h→24h without delaying the loop, and `collect_ig`
+  skips held sources before spending a request ("leaving N unresolved
+  source(s) alone this pass"). `engine_ig.check` asserts the three Client
+  methods now called. `test_resolve` (27 checks); 831 pass.
 
 **Still open**
 

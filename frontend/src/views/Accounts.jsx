@@ -623,6 +623,7 @@ const KIND_TXT = {
   no_sources: "Nothing to collect",
   session_missing: "No saved session",
   session_rejected: "Session rejected",
+  unresolved_source: "Handle needs its numeric id",
   rate_limited: "Rate-limited — backing off by itself",
   pass_error: "Collector crashing",
   paused: "Paused from the dashboard",
@@ -633,6 +634,7 @@ function FixCard({ c, focus, accounts, onAdopt, onChanged, onSignin }) {
   const [msg, setMsg] = useState("");
   const [busy, setBusy] = useState(false);
   const [open, setOpen] = useState(focus);
+  const [pk, setPk] = useState("");
   useEffect(() => { if (focus) setOpen(true); }, [focus]);
 
   const norm = (v) => String(v || "").trim().toLowerCase().replace(/^@/, "");
@@ -660,6 +662,7 @@ function FixCard({ c, focus, accounts, onAdopt, onChanged, onSignin }) {
            onClick={() => setOpen(!open)}>
         <b>{KIND_TXT[c.kind] || c.kind}</b>
         {c.account && <span className="chip warn">@{c.account}</span>}
+        {c.source && <span className="chip">{c.source}</span>}
         <span style={{ color: "var(--ink-3)", fontSize: 12.5 }}>
           open {fmtAgo(c.since_ms)} · seen {c.count}× · {c.needs_human ? "needs you" : "self-healing"}
           {c.notified_ms ? " · pinged" : ""}{snoozed ? " · snoozed" : ""}
@@ -701,6 +704,18 @@ function FixCard({ c, focus, accounts, onAdopt, onChanged, onSignin }) {
                         (r) => r.enabled?.length ? `re-enabled: ${r.enabled.join(", ")}` : "no source was switched off")}>
                 Re-enable {sources.length ? `${sources.length} source${sources.length === 1 ? "" : "s"}` : "switched-off sources"}
               </button>
+            )}
+            {c.actions.includes("set_id") && (
+              <>
+                <input value={pk} onChange={(e) => setPk(e.target.value)} placeholder="numeric profile_id"
+                       style={{ width: 170, padding: "5px 8px", border: "1px solid var(--line)", borderRadius: 6,
+                                fontFamily: "ui-monospace, monospace", fontSize: 12.5 }} />
+                <button className="btn btn-brand btn-sm" disabled={busy || !/^\d+$/.test(pk.trim())}
+                        onClick={() => run({ action: "set_id", platform_id: pk.trim() },
+                          (r) => `id ${r.platform_id} saved for ${r.label} — collected on the next pass`)}>
+                  Save id
+                </button>
+              </>
             )}
             {c.actions.includes("resume") && (
               <button className="btn btn-sm" disabled={busy} onClick={() => run({ action: "resume" }, () => "resumed")}>Resume collection</button>
