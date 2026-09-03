@@ -28,6 +28,7 @@ Three failure modes this loop is explicitly built to avoid:
 """
 
 import asyncio
+import json
 import random
 import time
 from contextlib import aclosing
@@ -147,6 +148,7 @@ class PollResult:
     dup: int = 0
     embedded: int = 0
     orphans: int = 0
+    filtered: int = 0    # results seen, then dropped by the stream's collection filters
     stop_reason: str = STOP_EXHAUSTED
     account: str | None = None
     rl_limit: int | None = None
@@ -162,6 +164,23 @@ class PollResult:
     @property
     def starved(self) -> bool:
         return self.stop_reason == STOP_STARVED
+
+
+def _keep(stream, tweet) -> bool:
+    """
+    The stream's collection filters, applied to one fetched result.
+
+    A search stream carries its filters inside the query, where X honours
+    them as hints; an X List stream has no query, so this is the ONLY place
+    its "No retweets" box can act. Both kinds go through here — for search
+    it is the belt to X's braces (the RULEBOOK's `-filter:replies` lesson),
+    for a list it is the whole mechanism. A stream with no filters, or one
+    built from config.toml that never had the attribute, keeps everything.
+    """
+    flt = getattr(stream, "filters", None)
+    if not flt:
+        return True
+    return sf.tweet_passes_filters(tweet, flt)
 
 
 async def poll_once(engine, store, stream, stream_id, *, kind="poll", log=None) -> PollResult:
@@ -228,7 +247,15 @@ async def poll_once(engine, store, stream, stream_id, *, kind="poll", log=None) 
                         tweet = page.tweets.get(tid)
                         if tweet is None:
                             continue  # orphan, already counted
+                        # Seen and deliberately rejected is not the same as
+                        # unseen: a filtered tweet still bounds the watermark
+                        # (else the newest retweet on a list would be re-read
+                        # and re-dropped every poll), it just never reaches
+                        # the store. Lag is measured on what we keep.
                         stored_ids.append(tid)
+                        if not _keep(stream, tweet):
+                            res.filtered += 1
+                            continue
                         committed.append((tweet, page, "result", page.entries_by_id.get(tid)))
                         if sf.is_snowflake(tid):
                             res.lags.append(sf.lag_ms(tid, page.collected_ms))
@@ -440,6 +467,9 @@ async def backfill_once(engine, store, stream, stream_id, *,
                         if tweet is None:
                             continue
                         stored_ids.append(tid)
+                        if not _keep(stream, tweet):   # same rule as poll_once
+                            res.filtered += 1
+                            continue
                         committed.append((tweet, page, "result", page.entries_by_id.get(tid)))
                     if stored_ids:   # what we HAVE, as in poll_once
                         lo, hi = min(stored_ids), max(stored_ids)
@@ -672,12 +702,21 @@ class Collector:
         """
         try:
             row = self.store.db.execute(
-                "SELECT paused, min_interval_s, max_interval_s, max_pages_per_poll "
-                "FROM streams WHERE label = ?", (stream.label,)).fetchone()
+                "SELECT paused, min_interval_s, max_interval_s, max_pages_per_poll, "
+                "filters FROM streams WHERE label = ?", (stream.label,)).fetchone()
         except Exception:
             return True     # settings unreadable is not a reason to stop collecting
         if row is None:
             return True
+
+        # Collection filters, re-read every poll like the rest: unticking
+        # "No retweets" in the dashboard takes effect on the next check, not
+        # the next restart. Unparseable JSON reads as "no filters" — the
+        # failure mode must be "collected a retweet", never "collected nothing".
+        try:
+            stream.filters = json.loads(row["filters"]) if row["filters"] else None
+        except (TypeError, ValueError):
+            stream.filters = None
 
         if row["min_interval_s"] is not None:
             stream.min_interval_s = float(row["min_interval_s"])
@@ -810,6 +849,8 @@ class Collector:
         bits = [f"[{res.stream_label}]", "backfill",
                 f"older={res.new}", f"dup={res.dup}",
                 f"pages={res.pages}", f"stop={res.stop_reason}"]
+        if res.filtered:
+            bits.append(f"filtered={res.filtered}")
         if res.account:
             bits.append(f"acct=@{res.account}")
         if res.rl_remaining is not None:
@@ -832,6 +873,8 @@ class Collector:
             f"pages={res.pages}",
             f"stop={res.stop_reason}",
         ]
+        if res.filtered:
+            bits.append(f"filtered={res.filtered}")
         if res.lags:
             p50 = sorted(res.lags)[len(res.lags) // 2] / 1000
             bits.append(f"lag_p50={p50:.1f}s")

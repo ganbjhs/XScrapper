@@ -316,8 +316,9 @@ function FiltersPanel({ w, onChanged }) {
                  style={{ fontSize: 12.5, fontWeight: 600 }}>{msg}</div>
           )}
           <div style={{ color: "var(--ink-3)", fontSize: 12 }}>
-            Applies at collection time — filtered posts are never fetched at
-            all. Already-collected posts stay.
+            {w.kind === "xlist"
+              ? "Applies at collection time — the List timeline is read as usual and filtered posts are dropped before they are stored, so they never reach the feed, exports or Telegram. Already-collected posts stay."
+              : "Applies at collection time — filtered posts are never fetched at all. Already-collected posts stay."}
           </div>
         </div>
       )}
@@ -713,7 +714,7 @@ function XDetail({ w, onChanged }) {
       {w.kind === "xlist" && <XListMembers listId={w.list_id} />}
       {err && <div style={{ color: "var(--critical)", fontSize: 13, marginTop: 8 }}>{err}</div>}
 
-      {w.kind !== "xlist" && <FiltersPanel w={w} onChanged={onChanged} />}
+      <FiltersPanel w={w} onChanged={onChanged} />
 
       {editing && (
         <Modal title={w.kind === "keywords" ? "Edit keyword rule" : "Edit handle"}

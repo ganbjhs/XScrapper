@@ -116,6 +116,10 @@ class StreamCfg:
     query: str = ""
     list_id: str = ""       # set instead of query to poll an X List timeline
     tab: str = "Latest"
+    # Collection filters applied AFTER fetching (store.tweet_passes_filters).
+    # Never set from config.toml: the collector refreshes it every poll from
+    # the streams.filters column that a dashboard watchlist compiles to.
+    filters: dict | None = None
     watermark: bool = True
     enabled: bool = True
 

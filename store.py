@@ -1010,6 +1010,51 @@ def filters_suffix(filters: dict) -> str:
     return (" " + " ".join(parts)) if parts else ""
 
 
+def tweet_passes_filters(t, filters: dict | None) -> bool:
+    """
+    The same checkboxes, applied to a PARSED tweet after it was fetched.
+
+    This is what makes the filters hold for an X List. A list timeline is not
+    a search: there is no query string to append `-filter:retweets` to, so for
+    an xlist watchlist the operators in WATCHLIST_FILTERS have nowhere to go.
+    The list pages are fetched exactly as before (same requests, same
+    rate-limit spend) and each result is checked here before it is stored —
+    a retweet the operator unticked is seen, counted as `filtered`, and never
+    written to results.db, so it never reaches the feed, an export, or
+    Telegram.
+
+    Deliberately reads the SAME fields normalize_tweet stores (is_retweet is
+    `retweetedTweet is not None`, and so on) so that "what the collector
+    dropped" and "what the feed's own filters would hide" can never disagree.
+    Unknown or empty filters pass everything: a missing predicate must mean
+    "no filter", never "drop all".
+    """
+    if not filters:
+        return True
+    if filters.get("skip_retweets") and _g(t, "retweetedTweet") is not None:
+        return False
+    if filters.get("skip_quotes") and _g(t, "quotedTweet") is not None:
+        return False
+    if filters.get("skip_replies") and _g(t, "inReplyToTweetId") is not None:
+        return False
+    if filters.get("only_media") and not _media_urls(_g(t, "media")):
+        return False
+    if filters.get("skip_links") and (_g(t, "links", []) or []):
+        return False
+    if filters.get("verified_only"):
+        user = _g(t, "user")
+        if not (_g(user, "blue") or _g(user, "verified")):
+            return False
+    lang = filters.get("lang")
+    if lang and (str(_g(t, "lang") or "").lower() != lang):
+        return False
+    if filters.get("min_likes") and (_g(t, "likeCount") or 0) < int(filters["min_likes"]):
+        return False
+    if filters.get("min_retweets") and (_g(t, "retweetCount") or 0) < int(filters["min_retweets"]):
+        return False
+    return True
+
+
 def _percentile(values: list[int], pct: float) -> int:
     if not values:
         return 0
@@ -1103,6 +1148,14 @@ class Store:
                   # added before anyone was asked.
                   "watchlists": {"filters": "TEXT", "owner_handle": "TEXT"},
                   "streams": {"list_id": "TEXT",
+                              # The watchlist's collection filters, as JSON,
+                              # copied onto each compiled stream so the
+                              # collector can apply them AFTER fetching (see
+                              # tweet_passes_filters). For a search stream the
+                              # same filters are also baked into `query` as
+                              # operators; for an X List stream this column is
+                              # the only place they can act.
+                              "filters": "TEXT",
                               # "The watcher should poll this even though
                               # config.toml never heard of it." Watchlist-
                               # compiled streams set it; the same mechanism
@@ -1753,15 +1806,17 @@ class Store:
 
     async def set_watchlist_filters(self, watchlist_id: int, raw) -> dict:
         """Save the checkbox filters and recompile — the running watcher picks
-        the changed queries up on its next cycle for those streams."""
+        the changed queries (and the post-fetch filter set) up on its next
+        cycle for those streams."""
         w = self.db.execute("SELECT * FROM watchlists WHERE watchlist_id = ?",
                             (int(watchlist_id),)).fetchone()
         if not w:
             return {"error": f"no watchlist {watchlist_id}"}
-        if w["kind"] == "xlist":
-            return {"error": "an X-List watchlist collects the list timeline "
-                             "as-is — search filters cannot apply to it. Use a "
-                             "handle watchlist for filtered collection."}
+        # An X List has no query to compile operators into, so its filters
+        # act after the fetch instead (tweet_passes_filters, applied by the
+        # collector on every result before it is stored). Same checkboxes,
+        # same meaning; the only difference is that a filtered post is fetched
+        # and discarded rather than never requested.
         clean, err = normalize_filters(raw or {})
         if err:
             return {"error": err}
@@ -1907,6 +1962,7 @@ class Store:
         except (TypeError, ValueError):
             flt = {}
         suffix = filters_suffix(flt)
+        flt_json = json.dumps(flt) if flt else None
 
         labels = []
         if w["kind"] == "xlist":
@@ -1914,7 +1970,8 @@ class Store:
             sid = await self.ensure_stream(label, "", "Latest", True,
                                            list_id=w["list_id"] or "")
             self.db.execute(
-                "UPDATE streams SET watched = 1, paused = 0 WHERE stream_id = ?", (sid,))
+                "UPDATE streams SET watched = 1, paused = 0, filters = ? "
+                "WHERE stream_id = ?", (flt_json, sid))
             await self.attach_stream(w["project_id"], sid)
             labels.append(label)
         elif w["kind"] == "keywords":
@@ -1949,8 +2006,8 @@ class Store:
                 query = "(" + " OR ".join(chunk) + ")" + suffix
                 sid = await self.ensure_stream(label, query, "Latest", True)
                 self.db.execute(
-                    "UPDATE streams SET watched = 1, paused = 0 WHERE stream_id = ?",
-                    (sid,))
+                    "UPDATE streams SET watched = 1, paused = 0, filters = ? "
+                    "WHERE stream_id = ?", (flt_json, sid))
                 await self.attach_stream(w["project_id"], sid)
                 labels.append(label)
         else:
@@ -1963,8 +2020,8 @@ class Store:
                 query = "(" + " OR ".join(f"from:{h}" for h in chunk) + ")" + suffix
                 sid = await self.ensure_stream(label, query, "Latest", True)
                 self.db.execute(
-                    "UPDATE streams SET watched = 1, paused = 0 WHERE stream_id = ?",
-                    (sid,))
+                    "UPDATE streams SET watched = 1, paused = 0, filters = ? "
+                    "WHERE stream_id = ?", (flt_json, sid))
                 await self.attach_stream(w["project_id"], sid)
                 labels.append(label)
 
