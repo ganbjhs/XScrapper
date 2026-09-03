@@ -91,7 +91,7 @@ must respect belongs in the rulebook, not here.
   shows each source's collector and the checkpoint banner points at the
   browser door. `src/api/client.js`: `loginCode`, `loginStart`, `loginAct`,
   `loginCancel`, `igDiag`, `igAccount`, `igReseed`. `frontend/dist` →
-  `index-DUzEGdNn.js`.
+  `index-BW98rivS.js`.
 - `tests/test_all.py` — `test_ig_identity` (coherence, uniqueness, legacy
   detection, reseed, the client and the web session ARE the phone),
   `test_ig_signin` (the relay end to end, `proxy_check` on six exits, exit
@@ -134,8 +134,27 @@ that look like people, sign in from the server, and run in parallel.
   then). @sanaakhtar221's checkpoint must be cleared through her browser
   door or on a trusted phone first.
 
+- First live run (same night, IST 01:50–02:15): the deploy workflow had
+  skipped (no `DEPLOY_HOST` / `DEPLOY_SSH_KEY` secrets), so the pull +
+  `update.sh` ran by hand from the VPS terminal. The server's Playwright
+  was 1.62 with browsers from an older build (`chromium-1228`; the door
+  failed "Executable doesn't exist … 1234") — `playwright install
+  chromium` + `install-deps` fixed it (Chrome 151). Background sign-in on
+  @youssefnasser168: exit check OK (a Jio exit, and a DIFFERENT one two
+  minutes later — `resi-in-31` rotates), legacy Pixel reseeded to a Samsung
+  Galaxy A15 · en_IN · Asia/Kolkata, then Instagram answered with a native
+  checkpoint → `needs=browser`. The browser door rendered Instagram's
+  mobile login through the proxy as that phone, but mouse clicks never
+  focused a field while Tab + type did: `ig.InteractiveLogin.click` now
+  TAPS (`page.touchscreen.tap`) on a phone-shaped context. The frame is
+  height-bound in the modal so the whole screen is visible.
+
 **Still open**
 
+- Webshare's session-pinned exits are not steady: two sign-ins two minutes
+  apart left through two different IPs. Instagram will see the account
+  moving within one ISP (which real phones on CGNAT also do), but "one IP
+  forever" needs a static residential / ISP proxy per account.
 - `resolve-ids` (CLI) still uses one login (`_active_account`) unless
   `--account` is given.
 - The pool's "one active per platform" summary line is X/FB's model; for

@@ -420,6 +420,17 @@ class InteractiveLogin:
 
     async def click(self, x: int, y: int):
         self._alive()
+        # A phone-shaped context (has_touch) gets a TAP, not a mouse click.
+        # Observed live 2026-09-04: mouse clicks reached the page (the act
+        # returned ok) but Instagram's mobile login never focused the field,
+        # while Tab + typing filled it — the page listens for touch/pointer
+        # input on a touch device. A finger is what it expects.
+        if self.device:
+            try:
+                await self.page.touchscreen.tap(x, y)
+                return
+            except Exception:
+                pass
         await self.page.mouse.click(x, y)
 
     async def type_text(self, text: str):

@@ -314,11 +314,14 @@ function BrowserLoginModal({ a, onDone, onClose }) {
       <div style={{ display: "flex", gap: 14, alignItems: "flex-start", flexWrap: "wrap" }}>
         <div style={{ flex: "0 0 auto", border: "1px solid var(--line)", borderRadius: 10,
                       overflow: "hidden", background: "#000",
-                      width: win ? Math.min(win.width, 380) : 380 }}>
+                      width: win ? "auto" : 380 }}>
           {win ? (
+            // The whole phone screen stays visible without scrolling the
+            // modal: height-bound, width follows the phone's aspect ratio.
             <img ref={imgRef} src={`/api/login/frame?t=${tick}`} alt="the sign-in window"
                  onClick={click} draggable={false}
-                 style={{ display: "block", width: "100%", cursor: busy ? "progress" : "pointer",
+                 style={{ display: "block", height: "min(72vh, 760px)", width: "auto",
+                          cursor: busy ? "progress" : "pointer",
                           aspectRatio: `${win.width} / ${win.height}` }} />
           ) : (
             <div style={{ padding: 40, color: "#bbb", fontSize: 13 }}>
