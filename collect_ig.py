@@ -658,8 +658,6 @@ async def run_once(store_path="ig_results.db", account_override="", *,
                 dec.on("no_sources",
                        detail="add one in Watchlists → + New watchlist → Instagram")
                 return 0
-            dec.ok()        # platform-level: closes no_sources / paused / pass_error
-
             if account_override:
                 owners, benched = [account_override], {}
                 log(f"--account {account_override}: this pass runs on that login only")
@@ -669,11 +667,17 @@ async def run_once(store_path="ig_results.db", account_override="", *,
                 log(f"  @{u} is benched ({why}) — its sources go to the others")
             if not owners:
                 # No collector at all. Not a crash: a condition, idle on it
-                # and tell the operator once.
+                # and tell the operator once. (session_missing is a
+                # PLATFORM-scope condition, so the platform-level ok() below
+                # must not run first: live on 2026-09-04 it did, and every
+                # pass said "recovered" and then "session_missing" again —
+                # two Telegram pings per pass for a state that never changed.)
                 dec.on("session_missing",
                        detail="no active Instagram account with a usable "
                               "session — sign one in under Accounts & Sessions")
                 return 0
+            dec.ok()        # platform-level: closes no_sources / paused /
+                            # session_missing / pass_error — the pass is on
 
             groups = store.assign_sources(owners, log=log)
             plan = {a: [s.label for s in g] for a, g in groups.items() if g}

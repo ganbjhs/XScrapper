@@ -149,8 +149,27 @@ that look like people, sign in from the server, and run in parallel.
   TAPS (`page.touchscreen.tap`) on a phone-shaped context. The frame is
   height-bound in the modal so the whole screen is visible.
 
+- Morning after (IST 09:55–10:05): @youssefnasser168 signed in through
+  his browser door — the operator typed the password into the streamed
+  window, Instagram let him in, `ig_browser_adopt` carried the WHOLE jar
+  (csrftoken, datr, ds_user_id, ig_did, mid, ps_l, ps_n, rur, sessionid)
+  onto the Samsung Galaxy A15, the checkpoint tombstone cleared. The next
+  pass (Fetch-now) assigned all ten sources to him, resolved EIGHT handles
+  in one request off his following list (the lookups that had 429'd for
+  days), and stored the first Instagram posts this project has ever kept
+  (`awaj.news new=24`). Then it took a 388 s human break, as designed.
+  One bug seen in the night's loop and fixed here: `run_once` called the
+  platform-level `dec.ok()` BEFORE checking for collectors, so an idle
+  server "recovered from session_missing" and re-opened it every pass —
+  two Telegram pings per 30 minutes for nothing. `dec.ok()` now runs only
+  once a pass actually has owners.
+
 **Still open**
 
+- The identities minted before Chromium 151 was installed carry
+  `chrome_major: 140` (the fallback); the real browser is 151. Coherent
+  with each other, not with the binary — a reseed would fix it, at the
+  cost of a sign-in. Leave it.
 - Webshare's session-pinned exits are not steady: two sign-ins two minutes
   apart left through two different IPs. Instagram will see the account
   moving within one ISP (which real phones on CGNAT also do), but "one IP
