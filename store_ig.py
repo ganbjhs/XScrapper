@@ -471,6 +471,22 @@ class Store:
             (pk, _now(), label))
         self.db.commit()
 
+    def touch_source(self, label, at=None) -> None:
+        """Stamp last_run = "we looked at this source now", whether or not it
+        had anything new. Until 2026-09-04 only set_watermark wrote last_run,
+        so a quiet source read "checked 3 days ago" on the dashboard after
+        being checked an hour ago — and the trickle (collect_ig, one visit at
+        a time, most overdue first) needs the honest stamp to pick fairly."""
+        self.db.execute("UPDATE sources SET last_run=? WHERE label=?",
+                        (int(at or _now()), label))
+        self.db.commit()
+
+    def last_runs(self) -> dict:
+        """{label: last_run or None} for every source — the trickle's
+        due-list, read once per visit."""
+        return {r["label"]: r["last_run"] for r in
+                self.db.execute("SELECT label, last_run FROM sources")}
+
     # -- posts --------------------------------------------------------------
     def upsert_posts(self, records, source_label, project_id=None) -> int:
         """Insert engine_ig.record() dicts; ignore ones already stored. Returns new count.

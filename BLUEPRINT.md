@@ -121,7 +121,7 @@ The organizing layer (in `store.py` + `web.py`):
 | `engine_ig.py`, `collect_ig.py`, `store_ig.py` | Instagram engine / poll loop / store (`ig_results.db`, settings). `collect_ig.run_once` runs every collecting account IN PARALLEL (one task per phone, own proxy and rhythm, `PassLock` = one pass per machine, `profiles/ig_loop.json` heartbeat); `store_ig.assign_sources` gives every source one sticky owner (`assigned_account`; a human pin in `account` wins). Sources are three columns: `label` person, `value` handle, `platform_id` numeric id |
 | `migrate_ig_sources.py` | One-time, manual, idempotent: moves an old `ig_results.db` onto the three-column source model. Backs up first; never writes `label` |
 | `IDENTITY_MODEL.md` | The label/handle/id contract — why it exists, how IG implements it, the migration order for FB and X |
-| `ig_human.py` | Human-behavior pacing: active-hours, humanized gaps, long breaks, daily budget, warm-up — makes IG move like a person (pure, testable) |
+| `ig_human.py` | Human-behavior pacing: active-hours, humanized gaps, long breaks, daily budget, warm-up — and since 2026-09-04 the per-account DAY PLAN (`day_plan` / `session_now`: 2–4 seeded sessions plus glances; zero requests outside them) and `visit_gap`, the budget-paced gap between the loop's one-source visits. Pure, testable |
 | `engine_fb.py` | FB engine: desktop-UA headless render, GraphQL capture (primary), on-page JSON, DOM fallback; login circuit breaker; byte meter |
 | `collect_fb.py` | FB scheduler: per-page cadence or favorites mode; honors pause/block; avatar cache from post data only |
 | `store_fb.py` | `fb_results.db`: posts (two-key dedup), sources (lowercase labels), settings, page_profiles, removed_pages tombstones |

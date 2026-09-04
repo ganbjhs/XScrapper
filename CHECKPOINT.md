@@ -19,6 +19,92 @@ must respect belongs in the rulebook, not here.
 
 ---
 
+## 2026-09-04 (III) — Instagram rhythm: phone-time sessions, and one visit at a time
+
+**Changed**
+
+- `ig_human.py` — the day plan. `day_plan(account, now, tz_offset_s)` draws,
+  from a seed of (account, local day), 2–4 sessions of 20–120 min spread
+  across the active hours (one slot per session, a random start inside it,
+  so they never overlap and the morning / afternoon / evening each get a
+  turn) plus 0–2 glances of 2–6 min at any hour (a night one survives only
+  `NIGHT_POLL_CHANCE` of the time). `session_now` → (in hand, seconds until
+  that changes — into tomorrow's first window after the last).
+  `planned_seconds`, `local_day`. `visit_gap(budget, planned_s)` = the human
+  switch gap + an occasional break, floored at planned ÷ budget. Knobs:
+  `IG_SESSIONS_MIN/MAX`, `IG_SESSION_MIN_S/MAX_S`, `IG_GLANCES_MAX`,
+  `IG_GLANCE_MIN_S/MAX_S`. `active_now` is kept (the day's bounds).
+- `collect_ig.py` — `run_once(max_sources=, due_after=)` makes a pass a
+  VISIT: `_collect_account` decides the lookup hold-offs first (they are
+  the decider's memory, no session needed), then `_due_sources` picks the N
+  most overdue sources not seen within `due_after` (never-seen first, then
+  oldest `last_run`, ties by label), reads only those, resolves only their
+  names off the following list, and stamps `store.touch_source` on the
+  ATTEMPT. A visit says `@acct visits <label> (most overdue of N)` and
+  nothing at all when nothing is due; the `plan:` and `done:` lines belong
+  to full passes. The decider always sees the account's FULL group. The
+  `--loop`: per account, `session_now` with the stable per-phone offset;
+  nobody in hand → sleep to the earliest next window (≤ 30 min, so a
+  dashboard change still applies); otherwise one visit (`max_sources=1,
+  due_after=<cadence>`), then `visit_gap` (floored by `platform_wait_s`).
+  `--every` / the dashboard cadence now means "a source seen within this is
+  not due". Fetch-now and `run` without `--loop` are unchanged full passes.
+- `store_ig.py` — `touch_source(label, at)` and `last_runs()`. `last_run`
+  was only ever written by `set_watermark`, i.e. when a source had something
+  NEW — so the Watchlists page said "checked 3 days ago" about a quiet
+  source checked an hour ago. Now every look stamps it.
+- `tests/test_all.py` — `test_ig_rhythm` (33 checks): the plan is seeded,
+  per-account, per-day, inside local active hours, non-overlapping, bounded;
+  night glances rare over 300 account-days; `session_now` inside / before /
+  after the last window / a day with no windows; `visit_gap` floor and
+  human minimum; `_due_sources` ordering and cadence; a visit reads one
+  source, stamps it, narrates only that, is silent when nothing is due,
+  moves on after a failure; a full pass is unchanged.
+- `RULEBOOK.md` §6 (new bullet under the Instagram strict rules),
+  `BLUEPRINT.md` (the `ig_human.py` row).
+
+**Why**
+
+The operator's plan (2026-09-04): "in a day every account gets a random
+time to be on Instagram; while it is, the scraper reads what it needs one
+handle at a time, the way a person who opened the app would; the rest of
+the time it is quiet." The collector already had human gaps, active hours,
+a budget and a warm-up, but the SHAPE of a day was still a machine's: a
+thin, even smear from 07:00 to midnight with a burst of every owned source
+at the top of each cycle, and the day's budget spent in the first hour then
+silence. No person's usage looks like that. Sessions fix the day; the visit
+fixes the burst; the floor in `visit_gap` fixes the budget dying early.
+
+Nothing here is a claim about Meta's weights — the precise signals are
+theirs. Volume, device/IP consistency and account age are the established
+levers; the shape of a day is the plausible next one, and the counters that
+would prove it (requests per endpoint per account per day, checkpoints per
+thousand requests) are the next step, alongside the app-mix reads
+(timeline, reels tray, notifications) and follow-based collection.
+
+**Verified**
+
+`python3 tests/test_all.py` green at 1069, offline. A sample plan for
+"sana" on one IST day: 07:50–09:34, 12:25–13:42, glance 15:53, glance
+17:01, 17:23–18:15, 21:36–23:24 (5.8 h); "omar" the same day: 11:54–12:38,
+14:44–16:14, 22:46–23:53 (3.3 h). Same call, same answer, every time.
+
+**Still open**
+
+- The loop body (`main()` → `loop()`) is exercised by the service only; its
+  decisions are pure functions that ARE tested (`session_now`, `visit_gap`,
+  `_due_sources`), and the symtable check guards its names.
+- The between-visit floor uses the LARGEST plan among the phones in hand,
+  because the loop has one clock for all of them. A per-account clock would
+  let a phone with a short plan read a little faster; not worth a second
+  loop yet.
+- Steps 3–4 of the plan (the app-mix reads; follow the shard, read the home
+  feed, `feed/user` as gap-fill) and the dynamic headers
+  (`X-IG-Connection-Type`, `X-IG-Nav-Chain` are constants in instagrapi) are
+  not started.
+
+---
+
 ## 2026-09-04 (II) — Instagram profile pictures: stored on the first sighting, from the post itself
 
 **Changed**

@@ -13,6 +13,12 @@ The four questions:
   1. active_now(now)      — is it a plausible hour for THIS account to be
                             scrolling at all? People sleep. A feed that never
                             goes quiet overnight is not a person's.
+     session_now(acct)    — and within that day, is the phone IN HAND right
+                            now? People use the app in bursts (day_plan: two
+                            to four sessions of random length at random
+                            times, plus a glance or two), not evenly from
+                            breakfast to midnight. Outside the plan: zero
+                            requests.
   2. request_gap(rng)     — how long to pause between two page requests, drawn
                             from a human-shaped (log-normal) distribution:
                             mostly a few seconds, sometimes a long glance-away.
@@ -28,6 +34,7 @@ tighten it, but the DEFAULTS are already conservative — the point of this file
 is that doing nothing is already gentle.
 """
 
+import hashlib
 import math
 import os
 import random
@@ -145,6 +152,135 @@ def next_interval(base_s, rng=None):
     """
     rng = rng or random
     return max(30.0, base_s * rng.uniform(0.65, 1.35))
+
+
+# ---- sessions: phone-time windows, not an all-day smear (2026-09-04) ----
+#
+# active_now says WHEN THE DAY IS. The plan below says when in that day the
+# phone is actually in hand: a person opens Instagram in bursts — ten minutes
+# over breakfast, half an hour at lunch, an hour in the evening — and the
+# app is closed in between. A collector that is "on" from 07:00 to midnight
+# with pauses is a thin, even smear across seventeen hours, and no person's
+# usage looks like that.
+#
+# The plan is drawn ONCE per account per local day from a seed, so a restart
+# replays the same plan and the same account keeps the same plan all day; a
+# different account, or the same account tomorrow, gets a different one. It
+# is pure arithmetic — no clock read, no network — and fully testable.
+
+SESSIONS_MIN = _envi("IG_SESSIONS_MIN", 2)           # sessions per day
+SESSIONS_MAX = _envi("IG_SESSIONS_MAX", 4)
+SESSION_MIN_S = _envi("IG_SESSION_MIN_S", 20 * 60)   # 20 min
+SESSION_MAX_S = _envi("IG_SESSION_MAX_S", 120 * 60)  # 2 h
+GLANCES_MAX = _envi("IG_GLANCES_MAX", 2)             # short "checked my phone" looks
+GLANCE_MIN_S = _envi("IG_GLANCE_MIN_S", 2 * 60)
+GLANCE_MAX_S = _envi("IG_GLANCE_MAX_S", 6 * 60)
+
+
+def local_day(now=None, tz_offset_s=0) -> int:
+    """The account's LOCAL calendar day as an integer (days since the epoch)."""
+    now = time.time() if now is None else now
+    return int((now + tz_offset_s) // 86400)
+
+
+def _plan_rng(account, day):
+    # sha256 of a string, then random.Random(str): deterministic across
+    # processes and restarts (a str seed never goes through hash()).
+    seed = hashlib.sha256(
+        f"ig-day-plan:{(account or '').lower()}:{int(day)}".encode()).hexdigest()
+    return random.Random(seed)
+
+
+def day_plan(account, now=None, *, tz_offset_s=0, start_h=None, end_h=None,
+             day=None) -> list:
+    """
+    The phone-time plan for ONE account on ONE local day: a sorted list of
+    (start_epoch, end_epoch, kind), kind 'session' or 'glance'.
+
+    Sessions: SESSIONS_MIN..SESSIONS_MAX of them, each SESSION_MIN_S..
+    SESSION_MAX_S long, spread through the active hours — the window is cut
+    into one slot per session and each session lands at a random point in
+    its slot, so the morning, the afternoon and the evening each get their
+    turn and two sessions can never overlap. Glances: up to GLANCES_MAX
+    short looks at a random time of the 24-hour day; one that falls outside
+    the active hours is kept only NIGHT_POLL_CHANCE of the time, so the
+    night is quiet but not perfectly, to-the-minute quiet.
+
+    `day` (a local_day integer) selects a day other than the one `now` is
+    in — session_now uses it to look at tomorrow's first window.
+    """
+    now = time.time() if now is None else now
+    start_h = ACTIVE_START_H if start_h is None else start_h
+    end_h = ACTIVE_END_H if end_h is None else end_h
+    day = local_day(now, tz_offset_s) if day is None else int(day)
+    rng = _plan_rng(account, day)
+    midnight = day * 86400 - tz_offset_s              # epoch of local 00:00
+    lo, hi = start_h * 3600.0, end_h * 3600.0          # seconds into the local day
+    span = max(0.0, hi - lo)
+    out = []
+    n = rng.randint(max(1, SESSIONS_MIN), max(max(1, SESSIONS_MIN), SESSIONS_MAX))
+    if span > 0:
+        slot = span / n
+        for i in range(n):
+            s_lo, s_hi = lo + i * slot, lo + (i + 1) * slot
+            length = min(rng.uniform(SESSION_MIN_S, SESSION_MAX_S), slot * 0.9)
+            start = rng.uniform(s_lo, max(s_lo, s_hi - length))
+            out.append((midnight + start, midnight + start + length, "session"))
+    for _ in range(rng.randint(0, max(0, GLANCES_MAX))):
+        at = rng.uniform(0.0, 86400.0)
+        if not (lo <= at < hi) and rng.random() >= NIGHT_POLL_CHANCE:
+            continue
+        a = midnight + at
+        b = a + rng.uniform(GLANCE_MIN_S, GLANCE_MAX_S)
+        if any(a < e and b > s for s, e, _ in out):
+            continue
+        out.append((a, b, "glance"))
+    out.sort()
+    return out
+
+
+def session_now(account, now=None, *, tz_offset_s=0, start_h=None, end_h=None):
+    """
+    (in_hand, seconds_until_change): is the phone in hand right now, and how
+    long until that changes — the end of the current window, or the start of
+    the next one (today's, else tomorrow's first).
+    """
+    now = time.time() if now is None else now
+    kw = dict(tz_offset_s=tz_offset_s, start_h=start_h, end_h=end_h)
+    day = local_day(now, tz_offset_s)
+    for s, e, _ in day_plan(account, now, day=day, **kw):
+        if s <= now < e:
+            return True, e - now
+        if now < s:
+            return False, s - now
+    for s, e, _ in day_plan(account, now, day=day + 1, **kw):
+        return False, s - now
+    # A plan with no windows at all (start_h == end_h): look again tomorrow.
+    return False, 86400.0 - ((now + tz_offset_s) % 86400.0)
+
+
+def planned_seconds(account, now=None, *, tz_offset_s=0, start_h=None,
+                    end_h=None) -> float:
+    """Total phone-time in today's plan — the denominator that paces the
+    daily budget across the day instead of into its first hour."""
+    return sum(e - s for s, e, _ in day_plan(
+        account, now, tz_offset_s=tz_offset_s, start_h=start_h, end_h=end_h))
+
+
+def visit_gap(budget, planned_s, rng=None) -> float:
+    """
+    Seconds between two source VISITS inside a session (the trickle): the
+    human switch gap plus an occasional break, floored so that the day's
+    budget lasts the day's plan. With 300 requests and three hours of
+    planned phone-time the floor is 36 s — a visit every minute or two,
+    all session long, instead of ten profiles in a row and then silence.
+    """
+    gap = source_gap(rng) + maybe_long_break(rng)
+    try:
+        floor = float(planned_s) / float(budget) if budget and planned_s else 0.0
+    except (TypeError, ValueError, ZeroDivisionError):
+        floor = 0.0
+    return max(gap, floor)
 
 
 class DayCounter:

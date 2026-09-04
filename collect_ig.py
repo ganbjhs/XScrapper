@@ -58,6 +58,18 @@ otherwise the collector assigns it once and keeps it there (sticky) until the
 owner drops out, at which point it moves to the least-loaded healthy account
 and the move is logged (store_ig.assign_sources). No sort order ever decides.
 
+WHEN IT COLLECTS (since 2026-09-04, later the same day). The --loop is not a
+pass every N seconds. Each phone has a PLAN for its local day
+(ig_human.day_plan): two to four sessions of random length at random times,
+plus a glance or two, drawn from a seed so a restart replays it. Only while a
+phone is in hand does the loop call run_once — and then as a VISIT
+(max_sources=1): the account reads its single most overdue source, the loop
+sleeps a human gap (floored so the day's budget lasts the day's plan), and
+comes back for the next one. Ten sources are read one at a time across an
+hour, not ten in a row and then silence. --every (the dashboard cadence) is
+the per-source floor: a source seen within that window is not due. Fetch-now
+and `run` without --loop are still full passes over everything.
+
 ONE PASS AT A TIME, ACROSS PROCESSES. The service loop and the dashboard's
 Fetch-now both call run_once; a file lock (profiles/.ig_pass.lock) makes the
 second one say "a pass is already running" instead of starting a second wave
@@ -421,13 +433,88 @@ async def collect_source(engine, store, source, *, page_size=12, max_pages=2, lo
     return new
 
 
+def _due_sources(group, last_runs, *, now, due_after=0, limit=1) -> list:
+    """The trickle's pick: of `group`, the sources not visited within
+    `due_after` seconds, most overdue first (never visited = most overdue of
+    all), ties by label so the order is stable. At most `limit` of them."""
+    due = [s for s in group
+           if now - float(last_runs.get(s.label) or 0) >= float(due_after or 0)]
+    due.sort(key=lambda s: (float(last_runs.get(s.label) or 0), s.label))
+    return due[:max(1, int(limit))]
+
+
 async def _collect_account(acct, group, store, dec, *, page_size, max_pages,
-                           log, budget_override=None) -> tuple:
+                           log, budget_override=None, max_sources=None,
+                           due_after=0) -> tuple:
     """Everything ONE account does in a pass, over the sources it owns.
     Returns (new_posts, ok). Runs concurrently with the other accounts'
-    tasks; nothing here touches another account's state."""
+    tasks; nothing here touches another account's state.
+
+    Two shapes. A FULL pass (max_sources=None — Fetch-now, the CLI) walks
+    every source the account owns, with human gaps between them. A VISIT
+    (max_sources=N — the --loop trickle, 2026-09-04) picks the N most
+    overdue sources not seen within `due_after` seconds and reads only
+    those; the loop calls again after a human gap, all session long. Same
+    reads, spread across the phone-time instead of fired in one burst."""
     total = 0
-    log(f"account @{acct}: {len(group)} source(s)")
+    full = group            # every source this account owns, for the decider
+    trickle = bool(max_sources)
+    if not trickle:
+        log(f"account @{acct}: {len(group)} source(s)")
+
+    # Sources still without a numeric id. Two things before any of
+    # them costs a lookup request:
+    #   1. one that was refused recently is LEFT ALONE (decider
+    #      hold-off: 1h doubling to 24h) — asking a throttled lookup
+    #      endpoint again every pass is what keeps the 429 alive;
+    #   2. the rest are resolved off this account's FOLLOWING list in
+    #      one ordinary request, no lookup endpoint touched. Follow
+    #      the sources from the collecting account and this is the
+    #      path that always works (engine_ig.resolve_from_following).
+    # Decided here, before the session is even loaded: a hold is the
+    # decider's memory, not Instagram's answer, and the trickle must not
+    # pick a source it is then told to leave alone.
+    held = set()
+    unresolved = [s for s in full
+                  if s.type == "user" and not s.platform_id
+                  and not str(s.value).isdigit()]
+    # The account-level breaker first: while lookups from this
+    # session are refused, NO handle is asked about — not the
+    # following list either. Sources with ids collect as usual.
+    acct_hold = dec.holdoff(acct, "lookups")
+    if acct_hold and unresolved:
+        held.update(s.label for s in unresolved)
+        if not trickle:
+            log(f"  {len(held)} source(s) wait for ids — lookups from @{acct} "
+                f"are held for {acct_hold // 3600}h {(acct_hold % 3600) // 60:02d}m "
+                f"more (refused earlier)")
+    for s in unresolved:
+        if s.label in held:
+            continue
+        if dec.holdoff(acct, s.label) > 0:
+            held.add(s.label)
+    if held and not acct_hold and not trickle:
+        log(f"  leaving {len(held)} unresolved source(s) alone this pass "
+            f"({', '.join(sorted(held))}) — hold-off after a refused lookup")
+
+    # Daily budget per account (warm-up ramp for young sessions). Once
+    # spent, this account rests until tomorrow — a person doesn't open
+    # the app 500 times a day, and a burner that does gets flagged.
+    budget = ig_human.daily_budget() if budget_override is None else budget_override
+    if _DAY.remaining(acct, budget) <= 0:
+        dec.on("budget_spent", acct,
+               detail=f"daily budget spent ({budget}) — resting until tomorrow")
+        return 0, False
+
+    if trickle:
+        group = _due_sources([s for s in full if s.label not in held],
+                             store.last_runs(), now=time.time(),
+                             due_after=due_after, limit=max_sources)
+        if not group:
+            return 0, False         # nothing due: not a visit, not a word
+        log(f"@{acct} visits {', '.join(s.label for s in group)} "
+            f"(most overdue of {len(full)})")
+
     try:
         cl = ig_session.load_client(acct, log=log)
     except Exception as e:
@@ -439,16 +526,7 @@ async def _collect_account(acct, group, store, dec, *, page_size, max_pages,
         # A missing session is a checkpoint if that is what the
         # RuntimeError says (ig_session wraps ChallengeRequired), and
         # a session_missing otherwise. Either way: idle, tell a human.
-        _decide_exc(dec, acct, group, e, fallback="session_missing", log=log)
-        return 0, False
-
-    # Daily budget per account (warm-up ramp for young sessions). Once
-    # spent, this account rests until tomorrow — a person doesn't open
-    # the app 500 times a day, and a burner that does gets flagged.
-    budget = ig_human.daily_budget() if budget_override is None else budget_override
-    if _DAY.remaining(acct, budget) <= 0:
-        dec.on("budget_spent", acct,
-               detail=f"daily budget spent ({budget}) — resting until tomorrow")
+        _decide_exc(dec, acct, full, e, fallback="session_missing", log=log)
         return 0, False
 
     # on_resolved turns a successful name lookup into a permanent row
@@ -462,40 +540,11 @@ async def _collect_account(acct, group, store, dec, *, page_size, max_pages,
     # stamps last_success_at in the pool (pool_link.record_success).
     acct_ok = False
 
-    # Sources still without a numeric id. Two things before any of
-    # them costs a lookup request:
-    #   1. one that was refused recently is LEFT ALONE (decider
-    #      hold-off: 1h doubling to 24h) — asking a throttled lookup
-    #      endpoint again every pass is what keeps the 429 alive;
-    #   2. the rest are resolved off this account's FOLLOWING list in
-    #      one ordinary request, no lookup endpoint touched. Follow
-    #      the sources from the collecting account and this is the
-    #      path that always works (engine_ig.resolve_from_following).
-    held = set()
-    pending = []
-    unresolved = [s for s in group
-                  if s.type == "user" and not s.platform_id
-                  and not str(s.value).isdigit()]
-    # The account-level breaker first: while lookups from this
-    # session are refused, NO handle is asked about — not the
-    # following list either. Sources with ids collect as usual.
-    acct_hold = dec.holdoff(acct, "lookups")
-    if acct_hold and unresolved:
-        held.update(s.label for s in unresolved)
-        log(f"  {len(held)} source(s) wait for ids — lookups from @{acct} "
-            f"are held for {acct_hold // 3600}h {(acct_hold % 3600) // 60:02d}m "
-            f"more (refused earlier)")
-    for s in unresolved:
-        if s.label in held:
-            continue
-        h = dec.holdoff(acct, s.label)
-        if h > 0:
-            held.add(s.label)
-        else:
-            pending.append(s.value)
-    if held and not acct_hold:
-        log(f"  leaving {len(held)} unresolved source(s) alone this pass "
-            f"({', '.join(sorted(held))}) — hold-off after a refused lookup")
+    # Names to resolve off the following list: the unresolved sources this
+    # pass will actually read (a visit resolves only what it visits).
+    pending = [s.value for s in group
+               if s.label not in held and s.type == "user"
+               and not s.platform_id and not str(s.value).isdigit()]
     if pending:
         try:
             got = await _asyncio.to_thread(engine.resolve_from_following, pending)
@@ -525,6 +574,10 @@ async def _collect_account(acct, group, store, dec, *, page_size, max_pages,
                 gap += brk
             await _asyncio.sleep(gap)
         _DAY.spend(acct)
+        # "We looked" — stamped on the attempt, not the outcome, so the
+        # trickle never re-picks a source that just failed ahead of the
+        # ones it has not seen (the decider's hold-off is the retry policy).
+        store.touch_source(s.label)
         try:
             total += await collect_source(engine, store, s, page_size=page_size,
                                           max_pages=max_pages, log=log)
@@ -547,7 +600,7 @@ async def _collect_account(acct, group, store, dec, *, page_size, max_pages,
             # KNOCKED ON AGAIN by the very next source of the same
             # account. The decider names it and, when the answer is
             # "stop touching this account", the pass does.
-            d = _decide_exc(dec, acct, group, e, fallback="pass_error", log=log, src=s)
+            d = _decide_exc(dec, acct, full, e, fallback="pass_error", log=log, src=s)
             if d.kind == "lookup_throttled":
                 rest = [x.label for x in unresolved if x.label not in held
                         and x.label != s.label]
@@ -579,7 +632,7 @@ async def _collect_account(acct, group, store, dec, *, page_size, max_pages,
             # ig_session.refresh refuses (RuntimeError) on a recorded
             # checkpoint, a missing sidecar, or a bad password; only a
             # human fixes any of those. Stop this account for the pass.
-            _decide_exc(dec, acct, group, e, fallback="session_rejected", log=log)
+            _decide_exc(dec, acct, full, e, fallback="session_rejected", log=log)
             break
         engine = IGEngine(cl, account=acct,
                           on_resolved=store.cache_platform_id)
@@ -590,7 +643,7 @@ async def _collect_account(acct, group, store, dec, *, page_size, max_pages,
         except Exception as e:
             log(f"  [{s.label}] still failing after refresh: "
                 f"{type(e).__name__}: {e}")
-            d = _decide_exc(dec, acct, group, e, fallback="session_rejected", log=log, src=s)
+            d = _decide_exc(dec, acct, full, e, fallback="session_rejected", log=log, src=s)
             if d.stop_account:
                 break
 
@@ -611,7 +664,7 @@ STAGGER_S = (15.0, 120.0)
 async def run_once(store_path="ig_results.db", account_override="", *,
                    page_size=12, max_pages=2, log=print, dec=None,
                    accounts_path=ACCOUNTS_DB, root=".", who="loop",
-                   rng=None, awake=None) -> int:
+                   rng=None, awake=None, max_sources=None, due_after=0) -> int:
     """One collection pass: every owning account runs its own sources, in
     parallel, on its own phone. Every condition the pass meets goes through
     the decider (decider.py): it says what to do next, how long to wait, and
@@ -624,9 +677,15 @@ async def run_once(store_path="ig_results.db", account_override="", *,
 
     `account_override` (CLI --account) makes that one login the sole owner
     for this pass — a debugging aid, and it is said in the log. `awake`, when
-    given, is the set of accounts whose personal active-hours say "up"; the
-    others keep their sources and skip this pass (the loop decides it once
-    per cycle; Fetch-now and the CLI pass None = everyone).
+    given, is the set of accounts whose phone is in hand right now
+    (ig_human.session_now); the others keep their sources and skip this pass
+    (the loop decides it once per cycle; Fetch-now and the CLI pass None =
+    everyone).
+
+    `max_sources` turns the pass into a VISIT: each account reads only its
+    N most overdue sources not seen within `due_after` seconds, and the
+    pass says nothing when there is nothing due. This is the --loop trickle
+    (2026-09-04); Fetch-now and the CLI leave it None and walk everything.
     """
     log = _persist_log(log)
     if dec is None:
@@ -681,7 +740,8 @@ async def run_once(store_path="ig_results.db", account_override="", *,
 
             groups = store.assign_sources(owners, log=log)
             plan = {a: [s.label for s in g] for a, g in groups.items() if g}
-            if len(owners) > 1:
+            quiet = bool(max_sources)       # a visit narrates only what it reads
+            if len(owners) > 1 and not quiet:
                 log("plan: " + "; ".join(f"@{a} × {len(v)}" for a, v in plan.items()))
 
             # Per-account rest: an account that was told to back off (rate
@@ -706,7 +766,8 @@ async def run_once(store_path="ig_results.db", account_override="", *,
                 try:
                     return acct, await _collect_account(
                         acct, group, store, dec, page_size=page_size,
-                        max_pages=max_pages, log=log)
+                        max_pages=max_pages, log=log,
+                        max_sources=max_sources, due_after=due_after)
                 except Exception as e:
                     # The whole account blew up (not one source). Named,
                     # never silent; the others carry on.
@@ -725,8 +786,9 @@ async def run_once(store_path="ig_results.db", account_override="", *,
             heartbeat(root, last_pass=time.time(), who=who,
                       owners=owners, benched=benched, plan=plan,
                       accounts=per_account)
-            log(f"done: {total} new post(s) stored"
-                + (f" across {len(runnable)} account(s)" if len(owners) > 1 else ""))
+            if total or not quiet:
+                log(f"done: {total} new post(s) stored"
+                    + (f" across {len(runnable)} account(s)" if len(owners) > 1 else ""))
             return total
     finally:
         lock.release()
@@ -835,7 +897,9 @@ def main() -> int:
     r = sub.add_parser("run")
     r.add_argument("--account", default="", help="override which IG login collects")
     r.add_argument("--loop", action="store_true")
-    r.add_argument("--every", type=int, default=120, help="seconds between passes with --loop")
+    r.add_argument("--every", type=int, default=120,
+                   help="with --loop: a source seen within this many seconds is "
+                        "not due again (the dashboard's cadence setting wins)")
     r.add_argument("--max-pages", type=int, default=2,
                    help="pages per source per pass (default 2; a warm poll uses 1)")
     r.add_argument("--page-size", type=int, default=12,
@@ -941,34 +1005,51 @@ def main() -> int:
                     dec.on("paused")            # said once; then a quiet tick
                     await asyncio.sleep(60)
                     continue
-                # Human active-hours, PER ACCOUNT: each phone's day is
-                # shifted by a stable hour or so (ig_identity.stable_offset),
-                # so three accounts do not wake at 07:00:00 together, and
-                # overnight each mostly sleeps with only a rare "checked my
-                # phone" poll. One draw per account per cycle, made here and
-                # handed to the pass, so the answer is decided once.
+                # Phone-time, PER ACCOUNT (ig_human.day_plan, 2026-09-04):
+                # each phone has its own plan for the day — two to four
+                # sessions of random length at random times, a glance or
+                # two — drawn from a seed so a restart replays it, and
+                # shifted by a stable hour or so (ig_identity.stable_offset)
+                # so three accounts never wake together. An account whose
+                # phone is not in hand makes ZERO requests; the loop sleeps
+                # until the earliest next window (re-reading the dashboard
+                # settings at least every half hour).
                 owners, _ = collectors(log=loop_log)
-                awake = {a for a in owners
-                         if ig_human.active_now(started, tz_offset_s=tz_off
-                                                + int(ig_identity.stable_offset(a) * 3600))}
-                if owners and not awake:
-                    await asyncio.sleep(ig_human.next_interval(max(600, every)))
+                in_hand, until = {}, []
+                for a in owners:
+                    off = tz_off + int(ig_identity.stable_offset(a) * 3600)
+                    on, change = ig_human.session_now(a, started, tz_offset_s=off)
+                    until.append(change)
+                    if on:
+                        in_hand[a] = off
+                if owners and not in_hand:
+                    nap = min(until) + random.uniform(5, 60)
+                    await asyncio.sleep(max(30, min(1800, nap)))
                     continue
+                # A VISIT, not a pass: every phone in hand reads its ONE most
+                # overdue source (not seen within the dashboard cadence), and
+                # the loop comes back after a human gap — a trickle across
+                # the whole session instead of every source in one burst.
                 try:
                     await run_once(store_path, args.account, dec=dec,
-                                   awake=awake or None, **paging)
+                                   awake=set(in_hand) or None,
+                                   max_sources=1, due_after=every, **paging)
                 except Exception as e:
                     # The whole pass blew up (DB locked, import gone, ...).
                     # Three in a row and the operator hears about it.
                     dec.on("pass_error", detail=f"{type(e).__name__}: {e}")
-                # Jitter the wait so the between-cycle rhythm is never a fixed
-                # clock (±35%) — unless a PLATFORM decision asked for longer
-                # (no sources: 30m; paused; a pass that blew up). An
-                # account's own backoff (rate limit up to 4h, checkpoint 6h)
-                # is served per account by run_once (dec.account_wait) and
-                # never idles the other phones. The decider's wait is a
-                # floor, never a ceiling, so the human rhythm still applies.
-                wait = max(ig_human.next_interval(every), dec.platform_wait_s())
+                # Between visits: the human switch gap plus an occasional
+                # break, floored so today's budget lasts today's plan — but
+                # never shorter than a PLATFORM decision asked for (no
+                # sources: 30m; paused; a pass that blew up). An account's
+                # own backoff (rate limit up to 4h, checkpoint 6h) is served
+                # per account by run_once (dec.account_wait) and never idles
+                # the other phones. The decider's wait is a floor, never a
+                # ceiling, so the human rhythm still applies.
+                budget = ig_human.daily_budget()
+                planned = max(ig_human.planned_seconds(a, started, tz_offset_s=off)
+                              for a, off in in_hand.items())
+                wait = max(ig_human.visit_gap(budget, planned), dec.platform_wait_s())
                 wait -= (time.time() - started)
                 await asyncio.sleep(max(5, wait))
         try:

@@ -3720,6 +3720,217 @@ def test_ig_avatar(tmp):
            "and the first post with a picture lights up the older one by the same author")
 
 
+def test_ig_rhythm(tmp):
+    """
+    Phone-time and the trickle (2026-09-04, later the same day).
+
+    A person uses Instagram in bursts, not evenly from breakfast to midnight;
+    and within a burst they look at one profile, then another a while later —
+    never ten in a row. `ig_human.day_plan` gives every account its own day
+    (two to four sessions of random length at random times, a glance or two,
+    seeded so a restart replays it); `collect_ig.run_once(max_sources=1)` is
+    a VISIT — the single most overdue source, and silence when nothing is
+    due. These pin both, offline.
+    """
+    import collect_ig, decider, ig, ig_human as H, ig_session, store_ig
+    root = pathlib.Path(tmp).resolve()
+    tmp = str(root)
+    (root / "profiles").mkdir(exist_ok=True)
+    rp = str(root / "ig_results.db")
+    ap = str(root / "ig_accounts.db")
+    IST = 19800
+    now = 1_757_000_000                    # a fixed instant; the plan is arithmetic
+
+    print("== day_plan: a person's day, drawn once, replayed on restart ==")
+    plan = H.day_plan("sana", now, tz_offset_s=IST)
+    ok(plan == H.day_plan("sana", now, tz_offset_s=IST),
+       "the same account on the same day gets the same plan (a restart replays it)")
+    ok(plan != H.day_plan("omar", now, tz_offset_s=IST),
+       "a different account gets a different plan")
+    ok(plan != H.day_plan("sana", now + 86400, tz_offset_s=IST),
+       "and the same account tomorrow gets a different one")
+    sessions = [w for w in plan if w[2] == "session"]
+    ok(H.SESSIONS_MIN <= len(sessions) <= H.SESSIONS_MAX,
+       f"{len(sessions)} session(s) today — within [{H.SESSIONS_MIN}, {H.SESSIONS_MAX}]")
+    ok(all(H.SESSION_MIN_S <= e - s <= H.SESSION_MAX_S for s, e, _ in sessions),
+       "every session is between the configured shortest and longest")
+    midnight = H.local_day(now, IST) * 86400 - IST
+    ok(all(midnight + H.ACTIVE_START_H * 3600 <= s and e <= midnight + H.ACTIVE_END_H * 3600
+           for s, e, _ in sessions),
+       "and every session sits inside the active hours of the account's LOCAL day")
+    ok(all(plan[i][1] <= plan[i + 1][0] for i in range(len(plan) - 1)),
+       "windows are sorted and never overlap")
+    ok(all(H.GLANCE_MIN_S <= e - s <= H.GLANCE_MAX_S for s, e, k in plan if k == "glance"),
+       "a glance is a two-to-six-minute look")
+    # Across many accounts and days: glances exist, most are by day, and a
+    # night glance is the rare exception, not the rule.
+    day_g = night_g = 0
+    for i in range(300):
+        for s, e, k in H.day_plan(f"acct{i}", now + (i % 7) * 86400, tz_offset_s=IST):
+            if k != "glance":
+                continue
+            h = ((s + IST) % 86400) / 3600
+            if H.ACTIVE_START_H <= h < H.ACTIVE_END_H:
+                day_g += 1
+            else:
+                night_g += 1
+    ok(day_g > 0 and night_g < day_g * 0.25,
+       f"over 300 account-days: {day_g} daytime glances, {night_g} at night — the night is mostly quiet")
+    ok(all(0 < H.planned_seconds(f"acct{i}", now, tz_offset_s=IST) <= 4 * H.SESSION_MAX_S + 2 * H.GLANCE_MAX_S
+           for i in range(50)),
+       "planned_seconds is the day's phone-time, bounded by the knobs")
+    empty = H.day_plan("nobody", now, tz_offset_s=IST, start_h=9, end_h=9)
+    ok(all(k == "glance" for *_, k in empty), "no active hours at all -> no sessions (glances at most)")
+
+    print("== session_now: in hand, or how long until it is ==")
+    s0, e0, _ = sessions[0]
+    on, left = H.session_now("sana", s0 + 60, tz_offset_s=IST)
+    ok(on and abs(left - (e0 - s0 - 60)) < 1e-6, "inside a session: in hand, and the time left in it")
+    on, until = H.session_now("sana", s0 - 600, tz_offset_s=IST)
+    prev_end = max([e for s, e, _ in plan if e <= s0 - 600] or [None])
+    ok(not on and (abs(until - 600) < 1e-6 or prev_end is not None),
+       "before it: not in hand, and the wait is to the next window's start")
+    last_end = plan[-1][1]
+    on, until = H.session_now("sana", last_end + 1, tz_offset_s=IST)
+    nxt = H.day_plan("sana", last_end + 1, tz_offset_s=IST, day=H.local_day(last_end + 1, IST) + 1)[0][0]
+    ok(not on and abs(until - (nxt - last_end - 1)) < 1e-6,
+       "after the last window: the wait reaches into TOMORROW's first")
+    on, until = H.session_now("nobody", now, tz_offset_s=IST, start_h=9, end_h=9)
+    ok(not on and 0 < until <= 86400, "a day with no windows waits for tomorrow, never spins")
+
+    print("== visit_gap: a human gap, floored so the budget lasts the plan ==")
+    class Rng:
+        def uniform(self, a, b): return a
+        def random(self): return 1.0          # never a long break
+    ok(H.visit_gap(300, 3 * 3600, rng=Rng()) == 36.0,
+       "300 requests over three hours of phone-time -> at least 36 s between visits")
+    ok(H.visit_gap(300, 60, rng=Rng()) == H.SRC_GAP_MIN,
+       "a tiny plan never pushes the gap BELOW the human minimum")
+    ok(H.visit_gap(0, 3600, rng=Rng()) == H.SRC_GAP_MIN and H.visit_gap(300, 0, rng=Rng()) == H.SRC_GAP_MIN,
+       "no budget / no plan -> just the human gap")
+
+    print("== _due_sources: most overdue first, never-seen ahead of all, due_after respected ==")
+    S = store_ig.Source
+    g = [S("a", "user", "ha", platform_id="1"), S("b", "user", "hb", platform_id="2"),
+         S("c", "user", "hc", platform_id="3")]
+    lr = {"a": now - 100, "b": None, "c": now - 5000}
+    ok([x.label for x in collect_ig._due_sources(g, lr, now=now, limit=3)] == ["b", "c", "a"],
+       "never-visited first, then the oldest visit")
+    ok([x.label for x in collect_ig._due_sources(g, lr, now=now, limit=1)] == ["b"], "limit=1 is the top pick")
+    ok([x.label for x in collect_ig._due_sources(g, lr, now=now, due_after=600, limit=3)] == ["b", "c"],
+       "a source seen 100 s ago is not due when the cadence is 600 s")
+    ok(collect_ig._due_sources(g, {"a": now, "b": now, "c": now}, now=now, due_after=1, limit=3) == [],
+       "all fresh -> nothing due")
+
+    print("== a VISIT reads one source, stamps it, says only what it read; nothing due -> silence ==")
+    with store_ig.Store(rp) as st:
+        for lab in ("s1", "s2", "s3"):
+            st.add_source(lab, "user", "h" + lab, project_id=1)
+            st.set_platform_id(lab, {"s1": "11", "s2": "22", "s3": "33"}[lab])
+    cwd = os.getcwd(); os.chdir(tmp)
+    try:
+        with ig.Store(ap) as st:
+            st.save(ig.Session(username="sana", user_id="1", user_agent="ua",
+                               cookies={"sessionid": "1:x"}), label="ig_sana", active=True)
+        (root / "profiles" / "ig_sana.json").write_text(json.dumps({"meta": {"label": "ig_sana"}, "settings": {}}))
+
+        reads = []
+
+        class Page:
+            def __init__(self, pks):
+                self.result_ids = list(pks)
+                self.entries_by_id = {pk: {"pk": pk, "code": f"c{pk}", "url": "", "taken_at": 1700000000 + pk,
+                                           "media_type": 1, "product_type": "", "caption": "", "like_count": 0,
+                                           "comment_count": 0, "play_count": None, "video_url": "",
+                                           "thumbnail_url": "", "user_pk": 1, "username": "u"} for pk in pks}
+
+        class FakeEngine:
+            def __init__(self, cl, account=None, on_resolved=None):
+                self.account = account
+            def resolve_from_following(self, names): return {}
+            async def pages_for(self, source, page_size=12, max_pages=2):
+                reads.append(source.label)
+                base = {"s1": 100, "s2": 200, "s3": 300}[source.label] + len(reads) * 1000
+                yield Page([base + 2, base + 1])
+
+        import unittest.mock as _m
+        with _m.patch.object(collect_ig, "IGEngine", FakeEngine), \
+             _m.patch.object(ig_session, "load_client", lambda acct, **k: object()), \
+             _m.patch.object(collect_ig.ig_human, "source_gap", lambda rng=None: 0.0), \
+             _m.patch.object(collect_ig.ig_human, "maybe_long_break", lambda rng=None: 0.0), \
+             _m.patch.object(collect_ig, "STAGGER_S", (0.0, 0.01)):
+            dec = decider.Decider("instagram", log=lambda m: None, db=None, notify=lambda t: (True, ""))
+            log = []
+            n = asyncio.run(collect_ig.run_once(rp, dec=dec, log=log.append, accounts_path=ap, root=tmp,
+                                                max_sources=1, due_after=600))
+            ok(n == 2 and reads == ["s1"], f"the first visit reads exactly ONE source (reads={reads})")
+            ok(any(l.startswith("@sana visits s1 (most overdue of 3)") for l in log),
+               "and says which one, and out of how many")
+            ok(not any(l.startswith("account @sana:") or l.startswith("plan:") for l in log),
+               "no pass-style narration on a visit")
+            with store_ig.Store(rp) as st:
+                lr = st.last_runs()
+            ok(lr["s1"] and not lr["s2"] and not lr["s3"], "the visited source is stamped; the others are not")
+
+            log.clear()
+            asyncio.run(collect_ig.run_once(rp, dec=dec, log=log.append, accounts_path=ap, root=tmp,
+                                            max_sources=1, due_after=600))
+            asyncio.run(collect_ig.run_once(rp, dec=dec, log=log.append, accounts_path=ap, root=tmp,
+                                            max_sources=1, due_after=600))
+            ok(reads == ["s1", "s2", "s3"], f"the next visits take the never-seen ones, in a stable order ({reads})")
+
+            log.clear()
+            n = asyncio.run(collect_ig.run_once(rp, dec=dec, log=log.append, accounts_path=ap, root=tmp,
+                                                max_sources=1, due_after=600))
+            ok(n == 0 and reads == ["s1", "s2", "s3"], "all three seen within the cadence: nothing is read")
+            ok(not any("visits" in l or l.startswith("done:") for l in log),
+               f"…and nothing is said about it (log: {[l for l in log if 'visits' in l or 'done' in l]})")
+
+            with store_ig.Store(rp) as st:
+                st.touch_source("s2", at=int(time.time()) - 5000)      # s2 is now the stalest
+            log.clear()
+            asyncio.run(collect_ig.run_once(rp, dec=dec, log=log.append, accounts_path=ap, root=tmp,
+                                            max_sources=1, due_after=600))
+            ok(reads[-1] == "s2", "once its cadence has passed, the stalest source is the next visit")
+
+            # A full pass (Fetch-now, the CLI) is unchanged: everything, narrated.
+            reads.clear(); log.clear()
+            n = asyncio.run(collect_ig.run_once(rp, dec=dec, log=log.append, accounts_path=ap, root=tmp,
+                                                who="fetch-now"))
+            ok(sorted(reads) == ["s1", "s2", "s3"] and any(l.startswith("account @sana: 3 source(s)") for l in log)
+               and any(l.startswith("done:") for l in log),
+               "a full pass still walks every source and says so")
+
+            # A visit stamps the ATTEMPT: a source that blows up is not re-picked
+            # ahead of the ones not yet seen.
+            class Boom(FakeEngine):
+                async def pages_for(self, source, page_size=12, max_pages=2):
+                    reads.append(source.label)
+                    raise RuntimeError("weather")
+                    yield  # pragma: no cover
+            with store_ig.Store(rp) as st:
+                for lab in ("s1", "s2", "s3"):
+                    st.touch_source(lab, at=1)
+            with _m.patch.object(collect_ig, "IGEngine", Boom):
+                reads.clear()
+                t_before = int(time.time())
+                asyncio.run(collect_ig.run_once(rp, dec=dec, log=log.append, accounts_path=ap, root=tmp,
+                                                max_sources=1, due_after=600))
+                with store_ig.Store(rp) as st:
+                    lr = st.last_runs()
+                ok(reads == ["s1"] and lr["s1"] >= t_before and lr["s2"] == 1,
+                   "a failed visit is still stamped 'looked' (the decider, not the stamp, owns the retry)")
+                # The decider makes the account rest after an error; a fresh one
+                # (no open condition) shows the pick itself: the next visit
+                # moves on to a source not yet seen, not back to the one that failed.
+                dec2 = decider.Decider("instagram", log=lambda m: None, db=None, notify=lambda t: (True, ""))
+                asyncio.run(collect_ig.run_once(rp, dec=dec2, log=log.append, accounts_path=ap, root=tmp,
+                                                max_sources=1, due_after=600))
+            ok(reads == ["s1", "s2"], f"…so the next visit moves on ({reads})")
+    finally:
+        os.chdir(cwd)
+
+
 def test_ig_identity(tmp):
     """
     Every device seed this project ever minted was instagrapi's default — a
@@ -6094,6 +6305,8 @@ def main():
         test_ig_device(fresh("ig"))
         section("instagram profile pictures (from the post's own user object, never a fetch)")
         test_ig_avatar(fresh("igav"))
+        section("instagram rhythm (phone-time sessions, one visit at a time)")
+        test_ig_rhythm(fresh("igrhythm"))
         section("instagram identity (one coherent phone per account, minted once)")
         test_ig_identity(fresh("igid"))
         section("instagram sign-in from the server (code relay, exit check, browser door)")

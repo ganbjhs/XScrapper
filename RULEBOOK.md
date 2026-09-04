@@ -652,6 +652,33 @@ single request. These are hard rules, not tuning:
   daily request budget, and a warm-up ramp for young accounts. The loop may
   never fire at a fixed machine tick. Removing or bypassing `ig_human` pacing
   is a rule violation (it is on the §8 protected list).
+- **Phone-time, not an all-day smear; one visit at a time, not a pass
+  (2026-09-04, later the same day).** A person opens Instagram in BURSTS —
+  minutes over breakfast, half an hour at lunch, an hour at night — and
+  within a burst looks at one profile, then another a while later. So every
+  account has a PLAN for its local day (`ig_human.day_plan`): two to four
+  sessions of 20–120 min at random times spread across the active hours,
+  plus a glance or two (a 2–6 min look; at night only `NIGHT_POLL_CHANCE` of
+  the time), drawn from a seed of (account, day) so a restart replays it and
+  no two phones share a day. Outside the plan an account makes ZERO
+  requests; the loop sleeps to the next window (`session_now`). Inside it,
+  the loop does not run a pass: it runs a VISIT (`run_once(max_sources=1,
+  due_after=<cadence>)`) — the account reads its single most overdue source
+  not seen within the dashboard cadence (`_due_sources`: never-seen first,
+  then oldest `last_run`, ties by label), the loop sleeps
+  `ig_human.visit_gap` (the human switch gap plus an occasional break,
+  FLOORED at planned-phone-time ÷ daily budget so the budget lasts the plan
+  instead of dying in the first hour), and comes back for the next one. Ten
+  sources are read one at a time across an hour, never ten in a row and
+  then silence. A visit narrates only what it read and says nothing when
+  nothing is due; the decider, not the visit, owns retries — a source that
+  failed is still stamped `last_run` (`store_ig.touch_source`, on the
+  ATTEMPT), so it never jumps the queue ahead of sources not yet seen. The
+  dashboard's Fetch-now and `run` without `--loop` are still full passes,
+  and say so. What this replaces: "every N seconds, every source the
+  account owns, then sleep" — a thin even smear from 07:00 to midnight with
+  a burst at the top of every cycle, which no person's usage looks like.
+  Tests: `test_ig_rhythm`.
 - **One account : one coherent phone, minted once (`ig_identity.py`,
   2026-09-04).** Every device seed this project had ever minted was
   instagrapi's default — a US-locale Pixel 8 Pro, US Eastern time — on three
