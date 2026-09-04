@@ -3600,6 +3600,126 @@ def test_facebook(tmp):
            "the new favorited page was auto-added as a source under the project")
 
 
+def test_ig_avatar(tmp):
+    """
+    Instagram profile pictures come from the post's OWN user object, on the
+    FIRST sighting — never from a fetch made for the picture.
+
+    Until 2026-09-04 every Instagram post in the dashboard sat with a blank
+    circle unless its handle happened to match an X account we collect:
+    engine_ig.record() dropped the `profile_pic_url` instagrapi hands over
+    with every media row, the posts table had no column to hold it, and
+    to_api never carried the field the Watch-Tower contract documents — so
+    the read-time X match was the only path a picture had. These checks pin
+    the whole chain: record keeps it, the first insert stores it, a later
+    sighting fills a hole and never overwrites, the per-author cache
+    backfills posts collected before the picture was known, and an old
+    database upgrades itself on open.
+    """
+    import engine_ig, store_ig, sqlite3 as _sq, os as _os
+    from types import SimpleNamespace as NS
+
+    print("== engine_ig.record keeps the picture the media row already carries ==")
+    pic1 = "https://scontent.cdninstagram.com/v/t51.2885-19/a.jpg?oe=68B90001"
+    pic2 = "https://scontent.cdninstagram.com/v/t51.2885-19/a.jpg?oe=68B90002"
+    pic3 = "https://scontent.cdninstagram.com/v/t51.2885-19/a.jpg?oe=68B90003"
+    u = NS(pk=1550693326, username="narendramodi", profile_pic_url=pic1)
+    m = NS(pk=3456789012345678901, code="C1a2B3c4D5e", taken_at=1725000000,
+           media_type=1, product_type="feed", caption_text="hi", like_count=1,
+           comment_count=0, play_count=None, video_url="", thumbnail_url="",
+           user=u)
+    rec = engine_ig.record(m)
+    ok(rec["author_avatar"] == pic1,
+       "record() carries author_avatar — structured data off the media row, zero requests")
+    ok(engine_ig.record(NS(pk=1, code="x", taken_at=0, user=None))["author_avatar"] == "",
+       "a media row with no user object yields '' rather than raising")
+    ok(engine_ig.record(NS(pk=2, code="y", taken_at=0,
+                           user=NS(pk=5, username="q", profile_pic_url=None)))["author_avatar"] == "",
+       "and a user with no picture yields '' too — never the string 'None'")
+
+    print("== the store: first sighting stores it, a later one fills a hole, "
+          "the cache backfills the past ==")
+    rp = _os.path.join(str(tmp), "ig_results.db")
+    with store_ig.Store(rp) as st:
+        st.add_source("Narendra Modi", "user", "narendramodi", project_id=1)
+        # A post collected BEFORE the column existed: no picture at all.
+        old_row = {"pk": 100, "code": "old", "taken_at": 10,
+                   "username": "narendramodi", "user_pk": 1550693326}
+        ok(st.upsert_posts([dict(old_row)], "Narendra Modi") == 1, "an avatar-less post inserts")
+        ok(st.query(project_id=1)[0]["author_avatar"] is None,
+           "and reads back as None — not '' (a blank that counts as known is a hole nothing can fill)")
+        ok(st.db.execute("SELECT author_avatar FROM posts WHERE pk=100").fetchone()[0] is None,
+           "stored as NULL, never ''")
+
+        ok(st.upsert_posts([dict(rec)], "Narendra Modi") == 1,
+           "the first sighting of a new post is a new post")
+        rows = {r["pk"]: r for r in st.query(project_id=1)}
+        ok(rows[rec["pk"]]["author_avatar"] == pic1,
+           "and it stores the picture on that FIRST sighting — no second pass needed")
+        ok(rows[100]["author_avatar"] == pic1,
+           "the older post by the same author gets it at read time through the per-author cache")
+        ok(st.db.execute("SELECT author_avatar FROM posts WHERE pk=100").fetchone()[0] is None,
+           "without rewriting the old row — the cache is a join, not a backfill")
+        ok(st.profile_avatar(1550693326) == pic1, "profile_avatar reads the cache")
+
+        again = dict(old_row, author_avatar=pic2)
+        ok(st.upsert_posts([again], "Narendra Modi") == 0,
+           "the old post seen again, now carrying a picture, is NOT a new post")
+        ok(st.db.execute("SELECT author_avatar FROM posts WHERE pk=100").fetchone()[0] == pic2,
+           "but the sighting fills the empty avatar on the row itself")
+
+        st.upsert_posts([dict(old_row, author_avatar=pic3)], "Narendra Modi")
+        ok(st.db.execute("SELECT author_avatar FROM posts WHERE pk=100").fetchone()[0] == pic2,
+           "a third sighting never overwrites a picture already stored (fill a hole, RULEBOOK §6)")
+        ok(st.profile_avatar(1550693326) == pic3,
+           "while the per-author cache always keeps the NEWEST URL — Instagram signs its CDN "
+           "links with an expiry, so the freshest signature is the one that still opens")
+        ok(all(r["author_avatar"] == pic3 for r in st.query(project_id=1)),
+           "and it is the cache's URL a reader is served first, on every post by that author")
+        ok([r["author_avatar"] for r in st.by_pks([100, 999])] == [pic3],
+           "by_pks resolves through the cache too (the mixed-platform board reads this way)")
+        ok(st.by_pks([]) == [] and st.by_pks(["x"]) == [],
+           "and an empty or non-numeric id list is simply no rows")
+
+        st.upsert_posts([{"pk": 300, "code": "nouser", "taken_at": 30,
+                          "username": "", "user_pk": 0, "author_avatar": pic1}],
+                        "Narendra Modi")
+        ok(st.db.execute("SELECT COUNT(*) FROM profiles WHERE user_pk = 0").fetchone()[0] == 0,
+           "a row with no numeric author never writes a cache entry under pk 0")
+
+        api = store_ig.to_api(rows[rec["pk"]])
+        ok(api["author_avatar"] == pic1,
+           "to_api carries author_avatar at top level, as the Watch-Tower contract documents")
+        ok(store_ig.to_feed(rows[rec["pk"]])["author_avatar"] == pic1,
+           "and so does the shared feed shape")
+        ok(store_ig.to_api({"pk": 1, "author_avatar": ""})["author_avatar"] is None,
+           "an empty string is served as null, never as ''")
+        ok(st.count(project_id=1) == 3 and len(st.query(project_id=1)) == 3,
+           "count and query still agree once the join is in the read path")
+
+    # A database written before author_avatar existed must upgrade on open.
+    old = _os.path.join(str(tmp), "old.db")
+    _c = _sq.connect(old)
+    _c.executescript(
+        "CREATE TABLE posts (pk INTEGER PRIMARY KEY, code TEXT, url TEXT, "
+        "taken_at INTEGER, username TEXT, user_pk INTEGER, caption TEXT, "
+        "media_type INTEGER, product_type TEXT, like_count INTEGER, "
+        "comment_count INTEGER, play_count INTEGER, video_url TEXT, "
+        "thumbnail_url TEXT, source_label TEXT, collected_at INTEGER NOT NULL);"
+        "INSERT INTO posts(pk, code, taken_at, username, user_pk, collected_at) "
+        "VALUES (7, 'z', 1, 'x', 5, 1);")
+    _c.commit(); _c.close()
+    with store_ig.Store(old) as st:
+        ok(st.query()[0]["author_avatar"] is None,
+           "a database written before the column existed upgrades on open and reads None")
+        ok(st.db.execute("SELECT COUNT(*) FROM profiles").fetchone()[0] == 0,
+           "and gains an (empty) profile cache")
+        st.upsert_posts([{"pk": 8, "code": "n", "taken_at": 2, "username": "x",
+                          "user_pk": 5, "author_avatar": pic1}], "nobody")
+        ok(st.query()[0]["pk"] == 8 and all(r["author_avatar"] == pic1 for r in st.query()),
+           "and the first post with a picture lights up the older one by the same author")
+
+
 def test_ig_identity(tmp):
     """
     Every device seed this project ever minted was instagrapi's default — a
@@ -5972,6 +6092,8 @@ def main():
 
         section("instagram (one stable device per account)")
         test_ig_device(fresh("ig"))
+        section("instagram profile pictures (from the post's own user object, never a fetch)")
+        test_ig_avatar(fresh("igav"))
         section("instagram identity (one coherent phone per account, minted once)")
         test_ig_identity(fresh("igid"))
         section("instagram sign-in from the server (code relay, exit check, browser door)")

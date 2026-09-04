@@ -39,6 +39,9 @@ CREATE TABLE IF NOT EXISTS posts (
   play_count    INTEGER,
   video_url     TEXT,
   thumbnail_url TEXT,
+  author_avatar TEXT,                     -- the author's profile picture URL, as
+                                          -- the media row carried it (NULL when
+                                          -- the sighting had none — never '')
   source_label  TEXT,                     -- which source surfaced it
   project_id    INTEGER NOT NULL DEFAULT 0, -- WHOSE post: copied from the source
                                           -- that collected it. 0 = unassigned,
@@ -53,6 +56,20 @@ CREATE INDEX IF NOT EXISTS ix_posts_source  ON posts(source_label);
 -- CREATE TABLE IF NOT EXISTS is a no-op on a database that already has the
 -- table — so an index naming a column the migration has not added yet raises
 -- "no such column" on open, for every database written before scoping.
+
+-- The per-author profile-picture cache. Written ONLY from a collected post
+-- that carried the picture (engine_ig.record reads it off the media row's own
+-- user object — structured data, no request, RULEBOOK §6) and joined in at
+-- read time, so a post collected before its author's picture was known shows
+-- it too. Newest URL wins on purpose: Instagram signs its CDN links with an
+-- expiry (`oe=`), so the freshest signature is the one most likely to still
+-- open, and every pass over a live source renews it for free.
+CREATE TABLE IF NOT EXISTS profiles (
+  user_pk     INTEGER PRIMARY KEY,        -- Instagram's numeric id for the author
+  handle      TEXT NOT NULL DEFAULT '',   -- the username at the time, for legibility
+  avatar_url  TEXT,                       -- the newest profile-picture URL a post carried
+  updated_at  INTEGER NOT NULL            -- unix seconds, when a post last confirmed it
+);
 
 CREATE TABLE IF NOT EXISTS sources (
   label        TEXT PRIMARY KEY,          -- IDENTITY: the person, e.g. 'Narendra Modi'.
@@ -220,6 +237,8 @@ class Store:
         if "project_id" not in havep:
             self.db.execute(
                 "ALTER TABLE posts ADD COLUMN project_id INTEGER NOT NULL DEFAULT 0")
+        if "author_avatar" not in havep:
+            self.db.execute("ALTER TABLE posts ADD COLUMN author_avatar TEXT")
         # Created here, unconditionally, for BOTH paths: a fresh database (the
         # column came from SCHEMA) and an upgraded one (the column came from
         # the ALTER above). IF NOT EXISTS makes the repeat free.
@@ -470,19 +489,94 @@ class Store:
             pk = int(r.get("pk") or 0)
             if not pk:
                 continue
+            # NULL, never '', when the sighting carried no picture: '' is a
+            # value to COALESCE and to the fill-a-hole test below, and a blank
+            # that counts as "known" is a hole nothing can ever fill.
+            avatar = str(r.get("author_avatar") or "").strip() or None
             cur = self.db.execute(
                 "INSERT OR IGNORE INTO posts(pk,code,url,taken_at,username,user_pk,"
                 "caption,media_type,product_type,like_count,comment_count,play_count,"
-                "video_url,thumbnail_url,source_label,project_id,collected_at) "
-                "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                "video_url,thumbnail_url,author_avatar,source_label,project_id,"
+                "collected_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                 (pk, r.get("code"), r.get("url"), r.get("taken_at"),
                  r.get("username"), r.get("user_pk"), r.get("caption"),
                  r.get("media_type"), r.get("product_type"), r.get("like_count"),
                  r.get("comment_count"), r.get("play_count"), r.get("video_url"),
-                 r.get("thumbnail_url"), source_label, project_id, now))
-            new += cur.rowcount
+                 r.get("thumbnail_url"), avatar, source_label, project_id, now))
+            if cur.rowcount:
+                new += 1
+            elif avatar:
+                # A post seen again FILLS A HOLE and never overwrites (RULEBOOK
+                # §6): the stored picture came from a sighting that could read
+                # one, and the cache below — not the row — is where freshness
+                # lives. Still not a new post, so the count is untouched.
+                self.db.execute(
+                    "UPDATE posts SET author_avatar = ? WHERE pk = ? "
+                    "AND (author_avatar IS NULL OR author_avatar = '')",
+                    (avatar, pk))
+            if avatar:
+                self.set_profile(r.get("user_pk"), r.get("username"), avatar, now)
         self.db.commit()
         return new
+
+    # -- profile pictures (per-author cache) ---------------------------------
+    def set_profile(self, user_pk, handle, avatar_url, at=None) -> None:
+        """Remember the newest profile picture a collected post carried for
+        this author. The ONLY writer is upsert_posts, so the only thing that
+        can ever land here is what a media row said about its own author —
+        no lookup, no render, no guess. Newest wins (see the schema note:
+        Instagram signs its CDN URLs with an expiry)."""
+        try:
+            user_pk = int(user_pk or 0)
+        except (TypeError, ValueError):
+            user_pk = 0
+        if not user_pk or not avatar_url:
+            return
+        self.db.execute(
+            "INSERT INTO profiles(user_pk, handle, avatar_url, updated_at) "
+            "VALUES(?,?,?,?) ON CONFLICT(user_pk) DO UPDATE SET "
+            "  handle = CASE WHEN excluded.handle != '' THEN excluded.handle "
+            "                ELSE profiles.handle END, "
+            "  avatar_url = excluded.avatar_url, "
+            "  updated_at = excluded.updated_at",
+            (user_pk, str(handle or ""), str(avatar_url), int(at or _now())))
+
+    def profile_avatar(self, user_pk):
+        """The cached picture for one author (None when no post ever carried it)."""
+        r = self.db.execute(
+            "SELECT avatar_url FROM profiles WHERE user_pk = ?",
+            (int(user_pk or 0),)).fetchone()
+        return r["avatar_url"] if r else None
+
+    def _with_avatars(self, inner_sql, args) -> list:
+        """Run a posts SELECT and resolve each row's author_avatar through the
+        cache: the cache's URL (newest signature) first, the row's own (its
+        first sighting) second. The page is selected first and joined after,
+        so every filter stays on the bare table — _post_filter's clauses are
+        unqualified, and a join at that level would make `username`
+        ambiguous the day the cache grows a column of that name."""
+        rows = self.db.execute(
+            "SELECT p.*, COALESCE(pp.avatar_url, p.author_avatar) AS _avatar_resolved "
+            f"FROM ({inner_sql}) p "
+            "LEFT JOIN profiles pp ON pp.user_pk = p.user_pk "
+            "ORDER BY p.pk DESC", args)
+        out = []
+        for r in rows:
+            d = dict(r)
+            d["author_avatar"] = d.pop("_avatar_resolved") or None
+            out.append(d)
+        return out
+
+    def by_pks(self, pks) -> list:
+        """The named posts, any project — the caller has already chosen the
+        ids — with avatars resolved exactly as query() resolves them. This is
+        how the mixed-platform board reads Instagram rows."""
+        nums = [int(x) for x in pks if str(x).isdigit()]
+        if not nums:
+            return []
+        marks = ",".join("?" * len(nums))
+        return self._with_avatars(
+            f"SELECT * FROM posts WHERE pk IN ({marks})", nums)
 
     def query(self, *, since=None, until=None, source=None, username=None,
               limit=50, before_pk=None, project_id=None) -> list:
@@ -505,7 +599,7 @@ class Store:
             sql += " WHERE " + " AND ".join(where)
         sql += " ORDER BY pk DESC LIMIT ?"
         args.append(max(1, min(int(limit), 200)))
-        return [dict(r) for r in self.db.execute(sql, args)]
+        return self._with_avatars(sql, args)
 
     @staticmethod
     def _post_filter(*, project_id=None, since=None, until=None, source=None,
@@ -611,7 +705,7 @@ def to_feed(row: dict) -> dict:
         # Instagram gives no display name on a media row, so the handle stands
         # in. Saying the handle twice is honest; inventing a name is not.
         "author_display_name": row.get("username"),
-        "author_avatar": row.get("author_avatar"),
+        "author_avatar": row.get("author_avatar") or None,
         "media": media,
         "like_count": row.get("like_count"),
         "reply_count": row.get("comment_count"),
@@ -648,6 +742,10 @@ def to_api(row: dict) -> dict:
             "views": row.get("play_count"),
         },
         "source": row.get("source_label"),
+        # Top-level, as WATCH_TOWER_INSTAGRAM_HANDOVER.md has documented it all
+        # along; the row simply never carried one until 2026-09-04, so the
+        # dashboard's read-time X match was the only picture a post could get.
+        "author_avatar": row.get("author_avatar") or None,
     }
 
 

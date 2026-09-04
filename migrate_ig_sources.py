@@ -124,7 +124,9 @@ def main() -> int:
     COLUMNS = [
         ("sources", "platform_id", "TEXT NOT NULL DEFAULT ''"),
         ("sources", "project_id", "INTEGER NOT NULL DEFAULT 0"),
+        ("sources", "assigned_account", "TEXT NOT NULL DEFAULT ''"),
         ("posts", "project_id", "INTEGER NOT NULL DEFAULT 0"),
+        ("posts", "author_avatar", "TEXT"),
     ]
     for table, col, decl in COLUMNS:
         if col not in _cols(db, table):

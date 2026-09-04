@@ -2586,11 +2586,12 @@ def _resolve_pins(pins: list, project_id: int = 0) -> list:
         import store_ig
         nums = [int(i) for i in ids if str(i).isdigit()]
         if nums:
-            marks = ",".join("?" * len(nums))
+            # by_pks resolves author_avatar through the per-author cache, the
+            # same way the Instagram feed does — the picture a post's own row
+            # never carried is the one the newest post by that author did.
             with store_ig.Store(rp) as st:
-                for r in st.db.execute(
-                        f"SELECT * FROM posts WHERE pk IN ({marks})", nums):
-                    out.append(store_ig.to_feed(dict(r)))
+                for r in st.by_pks(nums):
+                    out.append(store_ig.to_feed(r))
 
     # The X avatar for the same handle, exactly as the FB and IG feeds do it.
     missing = {p.get("author_username") for p in out

@@ -19,6 +19,76 @@ must respect belongs in the rulebook, not here.
 
 ---
 
+## 2026-09-04 (II) — Instagram profile pictures: stored on the first sighting, from the post itself
+
+**Changed**
+
+- `engine_ig.py` — `record()` keeps `author_avatar`: the `profile_pic_url`
+  on the media row's own `UserShort`. It was being dropped with the rest of
+  the nested user object. No request is made for it; it is in the payload
+  every post already arrives in.
+- `store_ig.py` — `posts.author_avatar` (guarded `ALTER TABLE` on open, so
+  every existing `ig_results.db` upgrades itself; NULL, never `''`, when a
+  sighting had none). `upsert_posts` writes it on the FIRST insert; a post
+  seen again fills an empty avatar and never overwrites one, and still
+  counts as no new post. New `profiles` table — the per-author cache
+  (`user_pk` → newest `avatar_url`, written only by `upsert_posts`) — and
+  `set_profile` / `profile_avatar`. `query()` and the new `by_pks()` resolve
+  every row's `author_avatar` through the cache (cache first, row second)
+  via `_with_avatars`, which joins AFTER the page is selected so
+  `_post_filter`'s unqualified clauses stay unambiguous. `to_api` now carries
+  top-level `author_avatar` (the shape `WATCH_TOWER_INSTAGRAM_HANDOVER.md`
+  has documented all along); `to_feed` serves `''` as `None`.
+- `web.py` — the mixed-platform board reads Instagram rows through
+  `Store.by_pks` instead of a bare `SELECT`, so it gets the cache too. The
+  Instagram feed itself needed no change: `_ig_posts` already backfilled
+  only the posts still missing a picture, and now most are not.
+- `migrate_ig_sources.py` — `COLUMNS` back in step with `Store._migrate`
+  (`posts.author_avatar`, and `sources.assigned_account`, which had been
+  missed).
+- `tests/test_all.py` — `test_ig_avatar`: record keeps it, first insert
+  stores it, re-sighting fills a hole and never overwrites, the cache
+  backfills older posts and keeps the newest URL, `by_pks`, both external
+  shapes, `''` → null, and an old database upgrading on open.
+- `RULEBOOK.md` §6 (the profile-picture rule gains its Instagram clause),
+  `BLUEPRINT.md` §5/§7.
+
+**Why**
+
+Every Instagram post in the dashboard sat with a blank circle unless its
+handle happened to match an X account we collect. The read-time X
+handle-match (`web._x_avatars_for`) was the ONLY path a picture had, because
+the collector had been throwing the picture away: `record()` dropped it,
+the table could not hold it, and `to_api` did not emit it. The operator's
+reading of the rule was the right one — "if the profile picture is empty,
+fill it, and on the first time too" — and it is satisfied without a single
+extra request, because Instagram puts the picture inside every post.
+
+Two design choices worth keeping. NULL, not `''`, for "no picture": `''` is
+a value to `COALESCE` and to the fill-a-hole test, so a blank that counts as
+known would be a hole nothing could ever fill. And the cache keeps the NEWEST
+URL while the row keeps its first: Instagram signs its CDN links with an
+expiry (`oe=`), so the freshest signature is the one most likely to still
+open, and a pass over a live source renews it for free — the reader is
+served the cache first for exactly that reason.
+
+**Verified**
+
+`python3 tests/test_all.py` green offline, including the new section.
+
+**Still open**
+
+- Instagram `thumbnail_url` / `video_url` carry the same signed expiry and
+  are still stored as bare links (RULEBOOK §1.3: media travels as URLs).
+  Facebook moved to stored bytes for this reason on 2026-09-02
+  (`fb_media.py`); whether Instagram follows is an operator decision, not
+  an extension of this change.
+- Posts older than this change by an author who has NOT been collected
+  since still show the X fallback or nothing; the next pass over that
+  source fills the cache and lights them up. No backfill script is needed.
+
+---
+
 ## 2026-09-04 — Instagram in parallel: one coherent phone per account, three sign-in doors, N collectors
 
 **Changed**

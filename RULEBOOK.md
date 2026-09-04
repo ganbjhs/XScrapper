@@ -956,6 +956,30 @@ before changing the engine; nearly every "obvious" idea has been tried.)
   Facebook's login-page artwork as the "profile picture" of real pages. A
   heuristic that reads pixels off whatever page happens to be showing will
   eventually cache garbage forever; structured data or nothing.
+
+  **Instagram: the same rule, and the same free source — the picture arrives
+  INSIDE the post, so it is stored on the FIRST sighting.** instagrapi hands
+  every media row its author as a `UserShort` that already carries
+  `profile_pic_url`; `engine_ig.record` keeps it as `author_avatar`, the
+  store writes it on the first insert (`posts.author_avatar`, NULL — never
+  `''` — when a sighting had none), a later sighting of the same post FILLS
+  A HOLE and never overwrites, and a per-author cache (`profiles`, keyed on
+  the numeric `user_pk`, written only by `upsert_posts`) is joined in at
+  read time (`Store.query` / `Store.by_pks`) so a post collected before its
+  author's picture was known shows it too. The cache keeps the NEWEST URL on
+  purpose: Instagram signs its CDN links with an expiry (`oe=`), so the
+  freshest signature is the one most likely to still open, and every pass
+  over a live source renews it at no cost — which is why a reader is served
+  the cache's URL first and the row's own second. The X handle-match stays
+  as the fallback for a post whose author never carried a picture. Paid for
+  (2026-09-04): every Instagram post in the dashboard sat with a blank
+  circle unless its handle happened to match an X account we collect —
+  `record()` had been dropping the picture that arrived in the payload, the
+  posts table had no column for it, and `to_api` never carried the field
+  the Watch-Tower contract had documented from the start, so the read-time
+  X match was the ONLY path. No profile lookup was added and none may be:
+  `users/<pk>/info` is on the most throttled endpoints Instagram has, and
+  the media row already says everything a picture needs.
 - **The collector only READS the account. It never changes account settings** —
   no enabling 2FA, no answering verification flows, no profile edits, nothing
   under Settings. Anything Facebook asks that is not "show me the feed" is a

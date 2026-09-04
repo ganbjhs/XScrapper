@@ -215,6 +215,14 @@ def record(media) -> dict:
         "thumbnail_url": str(getattr(media, "thumbnail_url", "") or ""),
         "user_pk": int(getattr(u, "pk", 0) or 0) if u else 0,
         "username": getattr(u, "username", "") or "" if u else "",
+        # The author's profile picture, exactly as the media row carried it.
+        # instagrapi's UserShort hands it over with every post, so keeping it
+        # costs no request (RULEBOOK §6: structured data or nothing — never a
+        # fetch made just for a picture, never a pixel read off a rendered
+        # page). Dropped here until 2026-09-04, which is why every Instagram
+        # post sat with a blank circle unless its handle matched an X account.
+        "author_avatar": (str(getattr(u, "profile_pic_url", "") or "")
+                          if u else ""),
     }
 
 

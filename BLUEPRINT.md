@@ -146,8 +146,11 @@ bytes), `activity.db` (account log), `api_keys.db` (hashes only),
    FB re-reads its dashboard settings (mode/cadence/pause) every cycle.
 2. **See** — the SPA's Live Feed loads backlog per platform
    (`/api/tweets`, `/api/ig/posts`, `/api/fb/posts` — one shared post shape)
-   and receives new X posts over SSE within ~2s. Profile pictures: X is the
-   canonical avatar source; FB/IG posts are handle-matched to it at read time.
+   and receives new X posts over SSE within ~2s. Profile pictures: a post's
+   own structured payload first (X every tweet, IG every media row's
+   `UserShort`, FB a GraphQL Story), stored on the first sighting and cached
+   per author; a post whose author never carried one is handle-matched to
+   the X avatar at read time.
 3. **Deliver** — `webhook.py` pushes signed batches to Watch-Tower
    (cursor-based, at-least-once, ids as strings). IG/FB are pull
    (`/api/fb/posts`, `/v1/instagram/posts`).
@@ -227,7 +230,8 @@ Node on the server). Install the pre-commit hook:
 14. X raw payloads live in `tweet_raw` — payload fields are read via
     LEFT JOIN, extracting only what's needed in SQL.
 15. Profile pictures come from structured data or X handle-match — never
-    scraped off a rendered page.
+    scraped off a rendered page, and never fetched for their own sake (on
+    Instagram the media row already carries it; no profile lookup exists).
 
 ## 8. Hard realities (do not underestimate)
 
