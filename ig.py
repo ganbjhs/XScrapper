@@ -25,6 +25,7 @@ rather than to guess, because the first run is where that gets discovered.
 """
 
 import json
+import re
 import sqlite3
 import time
 from dataclasses import dataclass, field
@@ -245,9 +246,17 @@ async def detect_state(page, ctx, diag=None) -> tuple:
     url = (page.url or "").lower()
     note["url"] = url
     # Instagram parks you on these when it wants something from a human.
-    if "/challenge" in url or "/accounts/suspended" in url:
-        note["why"] = "on a challenge or suspension page"
-        return CHALLENGE, ""
+    # A sessionid is already set on every one of them, so without this check
+    # the whoami below says "signed in", the jar is copied, the window closes
+    # and the thing Instagram wanted answered follows the session into the
+    # app unanswered. Live on 2026-09-05: @shoaibakhtar4915 was captured off
+    # /accounts/scraping_warning/ — the "we suspect automated behaviour"
+    # notice — which the panel showed as `unknown`.
+    for needle, hint in INTERSTITIALS:
+        if needle in url:
+            note["why"] = f"on {needle}"
+            note["hint"] = hint
+            return CHALLENGE, ""
     if "/accounts/login" in url:
         note["why"] = "still on the login page"
         return NEEDS_LOGIN, ""
@@ -274,7 +283,35 @@ async def detect_state(page, ctx, diag=None) -> tuple:
     # rather than guessing a colour.
     note["why"] = (f"sessionid present but identity unreadable "
                    f"(api={res.get('status') or res.get('error')})")
+    note["hint"] = ("Signed-in cookie present, but the app has not rendered "
+                    "yet. Give it a moment and press Check state, or Reload.")
     return UNKNOWN, ""
+
+
+# Pages Instagram sends a signed-in browser to when it wants a PERSON to read
+# or answer something. The session is never copied while the window is on one
+# of these: what is unanswered here is unanswered in the app too. The hint is
+# what the panel shows next to the red state.
+INTERSTITIALS = (
+    ("/accounts/scraping_warning",
+     "Instagram is showing its automated-behaviour warning for this account. "
+     "Read it and dismiss it in the frame — the session is copied only after "
+     "that, because a warning left open here follows the session into the app "
+     "and the next read comes back as a checkpoint."),
+    ("/challenge",
+     "Instagram wants something from a person on this page — a code, a "
+     "captcha, \"confirm it's you\". Answer it in the frame."),
+    ("/accounts/suspended",
+     "Instagram says this account is suspended. Only an appeal in the frame "
+     "can change that; the collector will not touch the account."),
+)
+
+# The one prompt worth ANSWERING on the way in, and the answer a person gives.
+# "Save your login info?" → Save Info marks this browser profile as a
+# remembered device for one-tap login, so the next sign-in from this phone is
+# a tap on the profile photo rather than a password — and not a "new login"
+# event. It is answered BEFORE the jar is copied (InteractiveLogin.settle).
+SAVE_INFO = re.compile(r"^\s*save\s+(your\s+)?(login\s+)?info\s*$", re.I)
 
 
 async def cookies_dict(ctx) -> dict:
@@ -309,6 +346,7 @@ class InteractiveLogin:
         self.state = UNKNOWN
         self.screen_name = ""
         self.error = ""
+        self.hint = ""          # what Instagram wants from a person, if anything
         self.viewport = dict(LOGIN_VIEWPORT)
         self.device = {}
         self.ig_label = getattr(acct, "ig_label", "") or acct.label
@@ -400,13 +438,40 @@ class InteractiveLogin:
         return time.time() - self.touched
 
     async def refresh_state(self):
+        note = {}
         try:
-            self.state, name = await detect_state(self.page, self.ctx)
+            self.state, name = await detect_state(self.page, self.ctx, diag=note)
             if name:
                 self.screen_name = name
         except Exception as e:
             self.state, self.error = UNKNOWN, f"{type(e).__name__}: {e}"
+        self.hint = note.get("hint", "") or ""
         return self.state
+
+    async def settle(self, log=lambda m: None, wait_ms=4000) -> str:
+        """
+        Answer "Save your login info?" with Save Info, if it is showing, and
+        return "save_info"; "" when it never appeared. Called by the capture
+        BEFORE the jar is copied.
+
+        Why here and not left to the operator: the capture fires the instant
+        the page is signed in, and that is the instant this dialog appears —
+        so until 2026-09-05 the window closed on top of it, and an operator's
+        click on Save Info was the very click that closed the window (the
+        panel refreshes state on each click). A person always answers this
+        one; now the window does too, and says so.
+        """
+        self._alive()
+        try:
+            btn = self.page.get_by_role("button", name=SAVE_INFO).first
+            await btn.wait_for(state="visible", timeout=wait_ms)
+            await btn.click(timeout=5000)
+            await self.page.wait_for_timeout(2500)
+            log('answered "Save your login info?" with Save Info — this phone '
+                'is now a remembered device')
+            return "save_info"
+        except Exception:
+            return ""
 
     async def frame(self) -> bytes:
         self._alive()

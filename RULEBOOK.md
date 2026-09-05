@@ -585,6 +585,30 @@ agree with its user-agent). `signin.py` and the panel offer, in this order:
    fresh browser on a residential IP is still a new device to Instagram,
    just a coherent one.
 
+   Two rules for the moment the page is signed in (2026-09-05):
+   - **The jar is never copied off an interstitial.** A `sessionid` is
+     already set on `/accounts/scraping_warning/` (the "we suspect
+     automated behaviour" notice), `/challenge/…` and
+     `/accounts/suspended/`, so the whoami says "signed in" there —
+     `ig.detect_state` checks the URL against `ig.INTERSTITIALS` FIRST and
+     reports CHALLENGE with a hint the panel shows in red. What a person
+     leaves unanswered in the window is unanswered in the app: the next
+     read comes back as a checkpoint and the account is quarantined. Paid
+     for: @shoaibakhtar4915 was captured off the scraping warning (shown
+     as `unknown`) and was in quarantine within the hour.
+   - **"Save your login info?" is answered with Save Info, by the window,
+     before the copy** (`InteractiveLogin.settle`, called by
+     `web._login_capture`). The capture fires the instant the page is
+     signed in, which is the instant that dialog appears; the operator's
+     click on Save Info was therefore the click that closed the window
+     (the panel refreshes state on each click). Save Info is what marks
+     the browser profile — the trusted device, kept on disk — as a
+     remembered device for one-tap login, so the next sign-in from this
+     phone is a tap on the photo, not a password and not a "new login".
+     Best effort: a window that never shows the prompt is captured as
+     before. The answer is logged and shown on the done banner.
+     Tests: `test_ig_browser_door`.
+
 X has no background login (twscrape's HTTP password login is unusable for
 the four reasons in `auth.py`'s docstring); Facebook's only non-cookie path
 is a headless browser at the login form on the server IP, which stays

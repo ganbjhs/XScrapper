@@ -3931,6 +3931,105 @@ def test_ig_rhythm(tmp):
         os.chdir(cwd)
 
 
+def test_ig_browser_door(tmp):
+    """
+    The browser door (2026-09-05): the pages Instagram parks a signed-in
+    browser on are CHALLENGE, never "signed in"; "Save your login info?" is
+    answered with Save Info before the jar is copied.
+
+    Live: @shoaibakhtar4915 was captured off /accounts/scraping_warning/ (the
+    automated-behaviour notice, shown as `unknown`), and the operator's click
+    on Save Info was the click that closed the window.
+    """
+    import ig
+
+    class Ctx:
+        def __init__(self, cookies): self._c = cookies
+        async def cookies(self):
+            return [{"domain": ".instagram.com", "name": k, "value": v} for k, v in self._c.items()]
+
+    class Page:
+        def __init__(self, url, who=None, dom=None):
+            self.url = url
+            self._who = who or {"ok": False, "status": 403}
+            self._dom = dom or {"username": "", "loginForm": False}
+        async def evaluate(self, js):
+            return self._who if "web_form_data" in js else self._dom
+
+    jar = {"sessionid": "1:x", "ds_user_id": "1", "csrftoken": "c"}
+    signed = {"ok": True, "username": "shoaibakhtar4915"}
+
+    print("== detect_state: interstitials are a CHALLENGE even with a live session ==")
+    note = {}
+    st, name = asyncio.run(ig.detect_state(
+        Page("https://www.instagram.com/accounts/scraping_warning/?challenge_context=Q9y1", who=signed),
+        Ctx(jar), diag=note))
+    ok(st == ig.CHALLENGE and not name, "the automated-behaviour warning is CHALLENGE, though whoami says signed in")
+    ok("automated-behaviour" in note["hint"] and "dismiss" in note["hint"].lower(),
+       "and the hint tells the operator to read it and dismiss it in the frame")
+    note = {}
+    st, _ = asyncio.run(ig.detect_state(Page("https://www.instagram.com/challenge/action/abc/", who=signed), Ctx(jar), diag=note))
+    ok(st == ig.CHALLENGE and "captcha" in note["hint"], "a /challenge page is CHALLENGE with its own hint")
+    st, _ = asyncio.run(ig.detect_state(Page("https://www.instagram.com/accounts/suspended/", who=signed), Ctx(jar)))
+    ok(st == ig.CHALLENGE, "a suspension page is CHALLENGE")
+    note = {}
+    st, name = asyncio.run(ig.detect_state(Page("https://www.instagram.com/accounts/onetap/?next=%2F", who=signed), Ctx(jar), diag=note))
+    ok(st == ig.LOGGED_IN and name == "shoaibakhtar4915" and not note.get("hint"),
+       "the Save-your-login-info page (/accounts/onetap/) IS signed in — no hint")
+    note = {}
+    st, _ = asyncio.run(ig.detect_state(Page("https://www.instagram.com/"), Ctx(jar), diag=note))
+    ok(st == ig.UNKNOWN and "not rendered" in note["hint"], "a session with no readable identity is UNKNOWN, with a hint")
+    note = {}
+    st, _ = asyncio.run(ig.detect_state(Page("https://www.instagram.com/accounts/login/"), Ctx({}), diag=note))
+    ok(st == ig.NEEDS_LOGIN and not note.get("hint"), "no sessionid is NEEDS_LOGIN, no hint")
+    st, _ = asyncio.run(ig.detect_state(Page("https://www.instagram.com/accounts/login/two_factor?next=%2F"), Ctx(jar)))
+    ok(st == ig.NEEDS_LOGIN, "the two-factor step is still the login page")
+
+    print("== settle: Save your login info? -> Save Info, before the jar is copied ==")
+    class Btn:
+        def __init__(self, appears): self.appears, self.clicked = appears, 0
+        @property
+        def first(self): return self
+        async def wait_for(self, state="visible", timeout=0):
+            if not self.appears:
+                raise TimeoutError("never appeared")
+        async def click(self, timeout=0): self.clicked += 1
+
+    class SPage:
+        def __init__(self, btn):
+            self.btn, self.waited = btn, 0
+            self.url = "https://www.instagram.com/accounts/onetap/?next=%2F"
+        def get_by_role(self, role, name=None):
+            assert role == "button"
+            self.matches = [bool(name.search(t)) for t in ("Save Info", "Save info", "Save your login info", "Not now", "Save")]
+            return self.btn
+        async def wait_for_timeout(self, ms): self.waited += ms
+
+    login = ig.InteractiveLogin.__new__(ig.InteractiveLogin)
+    login.page, login.touched, login.hint = SPage(Btn(True)), 0, ""
+    lines = []
+    ok(asyncio.run(login.settle(log=lines.append)) == "save_info" and login.page.btn.clicked == 1,
+       "the prompt is answered with ONE click on Save Info")
+    ok(login.page.matches == [True, True, True, False, False],
+       "the button is matched by its label in either capitalisation — never Not now")
+    ok(login.page.waited >= 2000 and any("Save Info" in l and "remembered device" in l for l in lines),
+       "then the page gets a moment to record it, and the log says what was answered")
+    login.page = SPage(Btn(False))
+    ok(asyncio.run(login.settle(log=lines.append, wait_ms=1)) == "" and login.page.btn.clicked == 0,
+       "no prompt within the wait -> nothing clicked, nothing raised, the capture goes on")
+
+    print("== refresh_state carries the hint to the panel ==")
+    login.page, login.ctx = Page("https://www.instagram.com/accounts/scraping_warning/?x=1", who=signed), Ctx(jar)
+    login.screen_name = login.error = ""
+    asyncio.run(login.refresh_state())
+    ok(login.state == ig.CHALLENGE and "automated-behaviour" in login.hint,
+       "state is CHALLENGE and the hint is on the window object")
+    login.page = Page("https://www.instagram.com/", who=signed)
+    asyncio.run(login.refresh_state())
+    ok(login.state == ig.LOGGED_IN and login.hint == "" and login.screen_name == "shoaibakhtar4915",
+       "once past it: signed in, hint cleared, name read")
+
+
 def test_ig_identity(tmp):
     """
     Every device seed this project ever minted was instagrapi's default — a
@@ -6311,6 +6410,8 @@ def main():
         test_ig_identity(fresh("igid"))
         section("instagram sign-in from the server (code relay, exit check, browser door)")
         test_ig_signin(fresh("igsignin"))
+        section("instagram browser door (interstitials are a challenge; Save your login info is answered)")
+        test_ig_browser_door(fresh("igdoor"))
         section("instagram in parallel (N phones, sticky sharding, one pass at a time)")
         test_ig_parallel(fresh("igpar"))
 

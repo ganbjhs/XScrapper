@@ -3654,7 +3654,8 @@ def _login_start(label="", account_id=None):
         return {"ok": True, "label": label, "platform": acct.platform,
                 "account_id": pool_id,
                 "state": sess.state, "screen_name": sess.screen_name,
-                "url": sess.url(), "took_s": round(took, 1), "trace": trace,
+                "url": sess.url(), "hint": getattr(sess, "hint", "") or "",
+                "took_s": round(took, 1), "trace": trace,
                 "warning": (getattr(sess, "error", "") or "") or proxy_warning,
                 # An Instagram window is the account's PHONE, so its size is
                 # the phone's (ig.InteractiveLogin.viewport); X keeps the
@@ -3688,7 +3689,7 @@ def _login_act(body):
         return {"error": f"{type(e).__name__}: {e}"}
 
     out = {"ok": True, "state": state, "screen_name": s.screen_name,
-           "url": s.url()}
+           "url": s.url(), "hint": getattr(s, "hint", "") or ""}
     if state == "logged_in":
         out.update(_login_capture())
     return out
@@ -3724,6 +3725,20 @@ def _login_capture():
             cfg = _CFG.account(label)
         except Exception as e:
             return {"error": f"Could not resolve the account: {e}"}
+
+    # Before the jar is copied: answer "Save your login info?" with Save
+    # Info when it is showing (ig.InteractiveLogin.settle). The X window has
+    # no such step. Best effort — a window that never shows the prompt is
+    # captured exactly as before.
+    answered = ""
+    settle = getattr(s, "settle", None)
+    if settle is not None:
+        try:
+            answered = _run(settle(log=lambda m: print(f"[signin:{label}] {m}",
+                                                       flush=True)), timeout=20)
+        except Exception as e:
+            print(f"[signin:{label}] settle skipped: {type(e).__name__}: {e}", flush=True)
+            answered = ""
 
     try:
         harvest = _run(s.harvest(), timeout=60)
@@ -3782,6 +3797,7 @@ def _login_capture():
     _login_drop()
     return {"captured": True, "username": username, "active": active,
             "platform": platform, "account_id": pool_id,
+            "answered": answered,
             "detail": "" if active else detail}
 
 

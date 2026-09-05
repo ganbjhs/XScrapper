@@ -266,6 +266,7 @@ function BrowserLoginModal({ a, onDone, onClose }) {
   const [state, setState] = useState("");
   const [name, setName] = useState("");
   const [url, setUrl] = useState("");
+  const [hint, setHint] = useState("");     // what Instagram wants from a person, if anything
   const [tick, setTick] = useState(0);
   const [text, setText] = useState("");
   const [err, setErr] = useState("");
@@ -278,6 +279,7 @@ function BrowserLoginModal({ a, onDone, onClose }) {
     api.loginStart(a.account_id).then((r) => {
       if (!alive) return;
       setWin(r); setState(r.state); setName(r.screen_name || ""); setUrl(r.url || "");
+      setHint(r.hint || "");
       setBusy(false);
       if (r.warning) setErr(r.warning);
     }).catch((e) => { if (alive) { setErr(String(e.message || e)); setBusy(false); } });
@@ -291,6 +293,7 @@ function BrowserLoginModal({ a, onDone, onClose }) {
     try {
       const r = await api.loginAct(body);
       setState(r.state); setName(r.screen_name || ""); setUrl(r.url || "");
+      setHint(r.hint || "");
       if (r.captured) { setDone(r); onDone(); }
       else if (r.closed) setErr("The window closed.");
     } catch (e) { setErr(String(e.message || e)); }
@@ -336,6 +339,11 @@ function BrowserLoginModal({ a, onDone, onClose }) {
             </b>
           </div>
           {url && <div className="kv"><span>page</span><b style={{ fontWeight: 400, wordBreak: "break-all" }}>{url}</b></div>}
+          {hint && (
+            <div className={state === "challenge" ? "banner-crit" : "banner-warn"} style={{ marginTop: 8, marginBottom: 0, fontSize: 12.5, lineHeight: 1.5 }}>
+              {hint}
+            </div>
+          )}
           <div className="field" style={{ marginTop: 8 }}>
             <label>Type into the page</label>
             <div style={{ display: "flex", gap: 6 }}>
@@ -358,12 +366,14 @@ function BrowserLoginModal({ a, onDone, onClose }) {
           <div style={{ color: "var(--ink-3)", fontSize: 12.5, lineHeight: 1.55, marginTop: 10 }}>
             Sign in as you would on a phone. Whatever Instagram asks — a code, a captcha,
             "confirm it's you" — answer it here. The moment the page is signed in, the
+            window answers "Save your login info?" with Save Info for you, then the
             session is adopted by the collector on this same phone and this window closes.
           </div>
           {done && (
             <div className={done.active ? "banner-ok" : "banner-crit"} style={{ marginTop: 10 }}>
               <b>{done.active ? "Signed in and adopted." : "Signed in, but not adopted."}</b>{" "}
               {done.username ? `@${done.username}. ` : ""}{done.detail}
+              {done.answered === "save_info" ? " Login info saved on this phone — the next sign-in is a tap, not a password." : ""}
             </div>
           )}
           {err && <div className="err" style={{ marginTop: 8 }}>{err}</div>}

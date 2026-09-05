@@ -19,6 +19,65 @@ must respect belongs in the rulebook, not here.
 
 ---
 
+## 2026-09-05 — the browser door: no capture off a warning page; Save Info answered for you
+
+**Changed**
+
+- `ig.py` — `INTERSTITIALS`: `/accounts/scraping_warning`, `/challenge`,
+  `/accounts/suspended`, each with the sentence the panel shows.
+  `detect_state` checks them before the whoami and returns CHALLENGE with
+  `note["hint"]`; UNKNOWN carries a hint too ("give it a moment, Check
+  state, or Reload"). `InteractiveLogin.hint`, set by `refresh_state`.
+  `InteractiveLogin.settle(log, wait_ms=4000)`: waits up to 4 s for a
+  button named "Save Info" / "Save info" / "Save your login info" (role +
+  regex `SAVE_INFO`, never "Not now"), clicks it once, gives the page 2.5 s,
+  logs it, returns `"save_info"`; anything else returns `""` and the
+  capture proceeds as before.
+- `web.py` — `_login_start` / `_login_act` return `hint`; `_login_capture`
+  calls `settle` (when the window has one — the X window does not) before
+  `harvest`, and returns `answered`.
+- `frontend/src/views/Accounts.jsx` (+ rebuilt `dist`) — the browser modal
+  shows the hint under the page URL (red for a challenge, amber otherwise),
+  the done banner says "Login info saved on this phone" when it was, and
+  the help text says the window answers the prompt itself.
+- `tests/test_all.py` — `test_ig_browser_door` (14 checks): each
+  interstitial is CHALLENGE with its hint even when whoami says signed in;
+  `/accounts/onetap/` is signed in; UNKNOWN / NEEDS_LOGIN hints; two-factor
+  is still the login page; `settle` clicks once, matches both
+  capitalisations and never "Not now", waits, logs; no prompt → "" with no
+  error; `refresh_state` carries and clears the hint.
+- `RULEBOOK.md` §6 (sign-in door 3, two new rules).
+
+**Why**
+
+The operator opened @shoaibakhtar4915's browser on 2026-09-05 10:52 and
+saw "Save your login info?" over `/accounts/scraping_warning/` with the
+panel saying `unknown`; when they clicked Save Info the window closed.
+Two defects. The panel refreshes state only on a click, and the capture
+fires the instant the state reads signed in — so the click that answered
+the prompt was the click that closed the window, and the prompt was never
+answered. And the URL check knew `/challenge` and `/accounts/suspended`
+but not the automated-behaviour warning, so the jar was copied with the
+warning open; the app client inherited it, and the account was quarantined
+within the hour.
+
+**Verified**
+
+`python3 tests/test_all.py` green at 1083, offline. `npm run build` in
+`frontend/` (dist committed).
+
+**Still open**
+
+- @shoaibakhtar4915 still has the warning pending on Instagram's side. The
+  fix is the same door, once this deploys: open the browser, the panel
+  now shows the warning in red with what to do, dismiss it in the frame,
+  the window answers Save Info and adopts the session; then Return to pool
+  and Promote.
+- "Turn on notifications?" (the dialog after Save Info) is not answered;
+  the window closes on it, which is what "Not now" amounts to.
+
+---
+
 ## 2026-09-04 (III) — Instagram rhythm: phone-time sessions, and one visit at a time
 
 **Changed**
