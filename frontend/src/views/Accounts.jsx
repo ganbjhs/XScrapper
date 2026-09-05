@@ -1011,7 +1011,11 @@ function FixPanel({ conds, focusId, accounts, onAdopt, onChanged, telegram }) {
 export default function Accounts({ onMenu }) {
   const pool = useApi(() => api.pool(), [], { every: 30_000 });
   const liveX = useApi(() => api.status(), [], { every: 30_000 });
-  const liveIg = useApi(() => api.igStatus(), []);
+  // Same 30 s refresh as the others. Loaded once, the Instagram session rows
+  // went stale the moment an account signed in on this very page: the pool
+  // half of the card said "last success 1m ago" while the session half said
+  // "never signed in on this server" (seen live 2026-09-05, all three cards).
+  const liveIg = useApi(() => api.igStatus(), [], { every: 30_000 });
   const liveFb = useApi(() => api.fbStatus(), [], { every: 30_000 });
   const conds = useApi(() => api.deciderConditions(), [], { every: 30_000 });
   const [adding, setAdding] = useState(null);   // null | {} | {platform,label,login}

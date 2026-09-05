@@ -19,6 +19,27 @@ must respect belongs in the rulebook, not here.
 
 ---
 
+## 2026-09-05 (II) — Accounts page: the Instagram session rows refresh like everything else
+
+**Changed**
+
+- `frontend/src/views/Accounts.jsx` (+ rebuilt `dist`) — `liveIg` is fetched
+  every 30 s, as `pool`, `liveX`, `liveFb` and `conds` already were.
+
+**Why**
+
+Seen live: all three Instagram cards said "never signed in on this server"
+while their pool half said "last success 1m ago". The session rows were
+loaded once when the page opened; three sign-ins later on that same page
+they had never been refetched, so the card contradicted itself and the
+operator asked whether the accounts were working at all. (They were.)
+
+**Verified**
+
+`npm run build`; no Python change, suite untouched (`RULE_OK=1`).
+
+---
+
 ## 2026-09-05 — the browser door: no capture off a warning page; Save Info answered for you
 
 **Changed**
