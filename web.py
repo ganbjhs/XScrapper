@@ -444,11 +444,24 @@ def _query_tweets(p):
     offset = max(0, int(p.get("offset") or 0))
 
     with _connect() as con:
-        total = con.execute(
-            f"SELECT COUNT(*) c FROM tweets t "
-            f"LEFT JOIN tweet_raw r USING(tweet_id) "
-            f"{joins} WHERE {' AND '.join(where)}", params
-        ).fetchone()["c"]
+        if cursoring:
+            # A mirror pages until a page comes back short; it does not need
+            # the exact remainder, and counting it walked the whole project
+            # on every call whenever a cursor was old (a resync, a new
+            # binding). Count at most ten pages beyond this one: exact when
+            # small, "more than that" when not, never a full scan.
+            total = con.execute(
+                f"SELECT COUNT(*) c FROM (SELECT 1 FROM tweets t "
+                f"LEFT JOIN tweet_raw r USING(tweet_id) "
+                f"{joins} WHERE {' AND '.join(where)} LIMIT ?)",
+                [*params, limit * 10 + 1]
+            ).fetchone()["c"]
+        else:
+            total = con.execute(
+                f"SELECT COUNT(*) c FROM tweets t "
+                f"LEFT JOIN tweet_raw r USING(tweet_id) "
+                f"{joins} WHERE {' AND '.join(where)}", params
+            ).fetchone()["c"]
         rows = con.execute(
             f"{sql} ORDER BY {order_by} {order} LIMIT ? OFFSET ?",
             [*params, limit, offset]
@@ -5443,7 +5456,31 @@ class Handler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
 
     def log_message(self, fmt, *args):
-        pass  # the access log is noise here
+        pass  # the access log is noise here — except a SLOW request (below)
+
+    # Watch-Tower's mirror gives /api/tweets 60 s and then reports "the mirror
+    # failed: timeout" — and on 2026-09-06 it did, for four projects, with
+    # nothing on our side to say why: the access log is off. So: one line
+    # for any request slower than SLOW_REQUEST_S — method, path, the query
+    # KEYS (never values: keys, cursors and tokens ride in values), the
+    # caller, the seconds — into journalctl. The next such alert has a trail.
+    SLOW_REQUEST_S = 3.0
+
+    def _note_slow(self, code):
+        t0 = getattr(self, "_t0", None)
+        if t0 is None:
+            return
+        took = time.time() - t0
+        if took < self.SLOW_REQUEST_S:
+            return
+        try:
+            u = urllib.parse.urlparse(self.path)
+            keys = ",".join(sorted(urllib.parse.parse_qs(u.query).keys()))
+            print(f"[web] slow {self.command} {u.path}"
+                  f"{('?' + keys) if keys else ''} -> {code} in {took:.1f}s "
+                  f"from {self._client_ip()}", flush=True)
+        except Exception:
+            pass
 
     # ---------------- auth plumbing ----------------
 
@@ -5720,6 +5757,7 @@ class Handler(BaseHTTPRequestHandler):
         for k, v in (extra or {}).items():
             self.send_header(k, v)
         self.end_headers()
+        self._note_slow(code)
         if not self._head_only:
             self.wfile.write(data)
 
@@ -5739,6 +5777,7 @@ class Handler(BaseHTTPRequestHandler):
             self._head_only = False
 
     def do_GET(self):
+        self._t0 = time.time()
         u = urllib.parse.urlparse(self.path)
         q = {k: v[0] for k, v in urllib.parse.parse_qs(u.query).items()}
         try:
@@ -5881,6 +5920,7 @@ class Handler(BaseHTTPRequestHandler):
             return self._send(500, {"error": f"{type(e).__name__}: {e}"})
 
     def do_POST(self):
+        self._t0 = time.time()
         u = urllib.parse.urlparse(self.path)
         try:
             if u.path == "/login":

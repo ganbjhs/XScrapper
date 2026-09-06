@@ -19,6 +19,55 @@ must respect belongs in the rulebook, not here.
 
 ---
 
+## 2026-09-06 (II) — Watch-Tower "silent Collector list": a slow-request log, and a bounded mirror count
+
+**Changed**
+
+- `web.py` — `Handler._note_slow`: any request slower than `SLOW_REQUEST_S`
+  (3 s) prints one line to journalctl — method, path, the query KEYS
+  (never values), status, seconds, caller. `do_GET` / `do_POST` stamp
+  `_t0`; `_send` reports. The access log stays off otherwise.
+- `web.py` — `_query_tweets`: on a cursor walk (`since_id` /
+  `since_collected_ms`) the `COUNT(*)` is bounded to ten pages beyond the
+  current one (`LIMIT limit*10+1`), so an old or reset cursor no longer
+  walks the whole project's rows on every call. `has_more` is unchanged
+  in meaning. Nothing in the dashboard uses the cursor parameters; only
+  the mirror does.
+
+**Why**
+
+Watch-Tower's WhatsApp alert, 2026-09-06 13:55–14:20 IST: four projects
+"have a silent Collector list — the mirror failed: timeout of 60000ms
+exceeded" (Varanasi, BJP Rajasthan, Bihar, Devendra Fadnavis). Their
+mirror calls our `GET /api/tweets?project=P&since_collected_ms=…&limit=500`
+and gives it 60 s; the alert opens when their newest mirrored post is
+older than 6 h, so the stall may have run for hours before it, not just
+the 25 minutes the alert was open. On our side there was nothing to read:
+the access log is disabled. The two changes are the minimum that makes
+the next one diagnosable and removes the one known way the call itself
+gets slow. The cause of this one is not established — see below.
+
+**Verified**
+
+`python3 tests/test_all.py` green at 1113.
+
+**Still open**
+
+- The cause. On the server, for the window 07:30–14:30 IST:
+  `journalctl -u xscraper-web -u xscraper-watch --since "2026-09-06 07:30"
+  --until "2026-09-06 14:30"`, `free -m`, `uptime`, `ls -la
+  /opt/xscraper/app/results.db*`, and whether a streamed browser window
+  (Chromium — ~1 GB) was open. The candidates, in order: the server
+  starved (a Chromium from the browser door, or swap); the X collector
+  itself producing nothing for 6 h (Watch-Tower's threshold is on OUR
+  newest post — the timeout is only the error it last recorded); a mirror
+  with an old cursor hitting the unbounded count (now bounded).
+- Facebook and X collectors still print-and-continue instead of going
+  through the decider, so a stalled X collector pages nobody on our side.
+  Watch-Tower noticed first. That is the next thing to route.
+
+---
+
 ## 2026-09-06 — the pager, phase 2: short pings, rare pings, its own bot
 
 **Changed**

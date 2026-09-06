@@ -407,6 +407,24 @@ to restamp ownership.
 - **Facebook/Instagram delivery is pull.** Watch-Tower pulls IG/FB via
   `/api/fb/posts` and `/api/instagram/posts`; X is pushed via webhook. Both are
   the same normalized shape.
+- **The X mirror is a pull too, and it has 60 seconds (2026-09-06).**
+  Watch-Tower's Collector page fills its projects from `GET
+  /api/tweets?project=P&since_collected_ms=<cursor>&limit=500`, pages until a
+  page comes back short, and times the call out at 60 s — after which its
+  own alert says "the mirror failed: timeout" and, once its newest mirrored
+  post is 6 h old, "silent Collector list" to WhatsApp. Two rules follow.
+  A cursor walk never counts the whole project: `_query_tweets` bounds the
+  `COUNT(*)` to ten pages beyond the current one when `since_id` /
+  `since_collected_ms` is given (exact when small, "more" when not) — the
+  unbounded count walked every row of the project on every call whenever a
+  cursor was old. And a slow request is written down: the access log is
+  off, but any request over `Handler.SLOW_REQUEST_S` (3 s) prints one line
+  to journalctl — method, path, query KEYS (never values), status, seconds,
+  caller — because on 2026-09-06 four projects timed out for at least 25
+  minutes and our side had nothing to read. Their alert is measured on OUR
+  newest post, so an X collector that produces nothing for 6 h trips it
+  just the same; X and Facebook still print-and-continue rather than going
+  through the decider, so Watch-Tower notices that before we do.
 - **A new delivery target is a transport, never a second pipeline.** Webhook,
   Telegram and Google Sheet share one cursor, one back-off, one filter set and
   one loop; a target kind adds a `deliver_*` function and a row shape and
