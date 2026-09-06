@@ -375,13 +375,11 @@ def _decide_exc(dec, acct, group, e, *, fallback, log=print, src=None):
     ig_session._note_checkpoint(acct, ".", log=log)
     new = ig_failover(acct, reason, log=log)
     if new:
-        note = (f"Collection failed over to @{new}: @{acct} is out of rotation "
-                f"and its unpinned sources move there on the next pass "
-                f"(sources pinned to @{acct} wait).")
+        note = (f"Collection failed over to @{new}; sources pinned to "
+                f"@{acct} wait.")
     else:
-        note = ("No other Instagram account with a working session — "
-                "collection is STOPPED until this is fixed or another account "
-                "is signed in under Accounts & Sessions.")
+        note = ("Collection is STOPPED — no other account with a working "
+                "session.")
     return dec.on("checkpoint", acct, detail=reason,
                   meta={"sources": [s.label for s in group],
                         "failover_to": new, "note": note})
@@ -673,7 +671,8 @@ async def run_once(store_path="ig_results.db", account_override="", *,
     `dec` is the long-lived Decider the --loop holds (its state persists in
     activity.db, so a restart does not re-announce an open condition). Left
     None — the dashboard's Fetch-now button — a one-shot, in-memory decider
-    is used, which always speaks, so the UI log shows the reason every time.
+    is used, which always speaks, so the UI log shows the reason every time,
+    and never pages (quiet=True): the loop pages once if it persists.
 
     `account_override` (CLI --account) makes that one login the sole owner
     for this pass — a debugging aid, and it is said in the log. `awake`, when
@@ -689,7 +688,10 @@ async def run_once(store_path="ig_results.db", account_override="", *,
     """
     log = _persist_log(log)
     if dec is None:
-        dec = decider.Decider("instagram", log=log, db=None)
+        # One-shot (Fetch-now, the CLI): decides and speaks in the log every
+        # time, never pages — the operator is looking at this screen, and a
+        # decider with no memory paged on every click (2026-09-06).
+        dec = decider.Decider("instagram", log=log, db=None, quiet=True)
     dec.begin_pass()
     rng = rng or random
 

@@ -19,6 +19,79 @@ must respect belongs in the rulebook, not here.
 
 ---
 
+## 2026-09-06 — the pager, phase 2: short pings, rare pings, its own bot
+
+**Changed**
+
+- `decider.py` — `Rule.human` is gone; `Rule.title` (the ping's first line)
+  and `Rule.short` (the "Do:" line) replace it on every paging rule.
+  `_ping_text` composes `🔴 IG @acct — title / Do: … / Now: <meta.note> /
+  Fix → … / Snooze 6h → …`; `_still_open_text`; `_recovered_text` is one
+  line (`🟢 IG @acct — recovered from 'kind' by … after …`). New table
+  `decider_pinged(scope, kind, ms)` (kept after a condition closes) with
+  `_State.pinged_ms` / `mark_pinged`; `REPING_COOLDOWN_S` 24h,
+  `STILL_OPEN_AFTER_S` 24h, `RECOVERED_MIN_OPEN_S` 10m,
+  `RECOVERED_DEDUPE_S` 1h; `_worth_telling`. `decide()`: escalation checks
+  the cooldown (suppressed → `meta.not_paged_ms` + a log line), one
+  still-open ping (`meta.still_open_ms`), no "recovered (now X)" on a
+  change of kind. `resolve(quiet=)`. `Decider(quiet=)` logs once instead
+  of paging. The channel: `admin_token()` (`ADMIN_TELEGRAM_BOT_TOKEN`, then
+  `TELEGRAM_BOT_TOKEN`), `send_admin` (the text as composed — the
+  "Admin —" prefix is gone), `discover_chat` (the last private chat in
+  `getUpdates`), `_tg`; `notify_ready` uses the admin token. A CLI:
+  `python3 decider.py test | chat`.
+- `collect_ig.py` — the one-shot decider in `run_once` is `quiet=True`; the
+  failover notes are one line each ("Collection failed over to @x; sources
+  pinned to @y wait." / "Collection is STOPPED — no other account with a
+  working session.").
+- `web.py` — `_decider_after_signin` resolves with `quiet=True`; `_env_set`
+  (factored out of `_save_telegram`); `POST /api/pager/telegram` (token,
+  chat id, name → `.env`; a blank chat id is read off the bot's updates),
+  `POST /api/pager/test` (one real ping; finds and saves the chat id if it
+  is missing); `/api/decider/conditions` carries `pager` (ready, own_bot,
+  token_hint — the id before the colon, never the token — admin, chat).
+- `frontend/src/views/Accounts.jsx` (+ `client.js`, rebuilt `dist`) —
+  `PagerBox` above "Needs attention": one line saying who is paged through
+  which bot, Send test, and a Set up / Change form.
+- `.env.example` — `ADMIN_TELEGRAM_BOT_TOKEN`, and the dashboard/CLI ways
+  to set it.
+- `tests/test_all.py` — `test_pager_quiet` (32 checks); two string
+  expectations in `test_pager` / `test_decider` updated to the new text.
+- `RULEBOOK.md` §6 (the pager bullet rewritten; a new "short and rare"
+  bullet).
+
+**Why**
+
+The operator's three complaints, all fair. The pings were paragraphs
+("60 words, a phone shows 20") — the fix line was somewhere in the middle.
+One checkpoint produced a stream of them: the Fetch-now button runs a
+one-shot decider with no memory, so every click paged again; a sign-in
+closed the condition with a "recovered" and the adopted session re-opened
+it with a fresh page — two messages per attempt; and a change of kind sent
+"recovered (now X)" before X's own ping. And the pings came from the
+delivery bot, whose voice belongs to collected content, not to "sign this
+account in". If an account is quarantined and the operator has not been
+able to return it to the pool in a day, something bigger is wrong — a
+fourth reminder does not fix it; one "still open, this is the last" says
+that honestly.
+
+**Verified**
+
+`python3 tests/test_all.py` green at 1113, offline (the admin-bot checks
+patch `decider._tg`, so no message leaves the test). `npm run build`.
+`python3 decider.py -h` / `chat` without a token say so and exit non-zero.
+
+**Still open**
+
+- The admin bot token must be set on the SERVER: Accounts & Sessions →
+  Pager → Set up (or `ADMIN_TELEGRAM_BOT_TOKEN=` in the server's `.env`),
+  then press Start on the bot in Telegram and Send test. The token is a
+  secret and is in neither the repo nor this file.
+- Facebook and X conditions do not go through the decider yet (their
+  collectors print-and-continue); when they do, they inherit all of this.
+
+---
+
 ## 2026-09-05 (II) — Accounts page: the Instagram session rows refresh like everything else
 
 **Changed**

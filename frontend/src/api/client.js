@@ -113,6 +113,9 @@ export const api = {
   // --- The decider (decider.py): what needs a human, and the Fix panel's moves ---
   deciderConditions: (platform) => request(`/api/decider/conditions${qs({ platform })}`),
   deciderAction: (body) => request("/api/decider", { method: "POST", body }),
+  // The pager: the admin bot that pages one person about what needs a human.
+  pagerSave: (body) => request("/api/pager/telegram", { method: "POST", body }),
+  pagerTest: () => request("/api/pager/test", { method: "POST", body: {} }),
   // --- Account Control Panel: the managed account pool (store_accounts) ---
   pool: () => request("/api/pool"),
   poolAdd: (body) => request("/api/pool/add", { method: "POST", body }),

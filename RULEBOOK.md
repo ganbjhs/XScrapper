@@ -800,16 +800,51 @@ single request. These are hard rules, not tuning:
   hours. The panel shows the rule's own `fix` steps and offers ONLY the
   rule's `actions` (sign in / re-enable sources / add source / resume / mark
   fixed) — advice lives in the policy table, never in the UI, so the phone
-  and the screen cannot disagree. A condition that was pinged pings ONCE
-  more when it closes, whoever closed it (the collector, a sign-in, or the
-  operator's "Mark fixed"), so a story the phone saw start is a story it
-  sees end. A successful Instagram sign-in from the panel is itself the fix
-  for that account's session condition: it closes it and re-enables the
-  sources the condition recorded (`web._decider_after_signin`).
-  Pings go to the ADMIN — `ADMIN_TELEGRAM_CHAT_ID` (a person, not the
-  delivery group; `TELEGRAM_CHAT_ID` only as a fallback), addressed by
-  `ADMIN_NAME`. Anything the collector cannot decide for itself — a sign-in,
-  a permission, a stopped platform — goes to the admin and nowhere else.
+  and the screen cannot disagree. A successful Instagram sign-in from the
+  panel is itself the fix for that account's session condition: it closes
+  it and re-enables the sources the condition recorded
+  (`web._decider_after_signin`).
+  Pings go to the ADMIN — through the ADMIN BOT (`ADMIN_TELEGRAM_BOT_TOKEN`,
+  "Vedic Scraper Admin"; the delivery bot only as a fallback) to
+  `ADMIN_TELEGRAM_CHAT_ID` (a person, not the delivery group;
+  `TELEGRAM_CHAT_ID` only as a fallback). Set from the dashboard (Accounts &
+  Sessions → Pager), which writes `.env` and can read the chat id off the
+  bot's own updates once the admin has pressed Start; `python3 decider.py
+  test` / `chat` do the same from the server. Anything the collector cannot
+  decide for itself — a sign-in, a permission, a stopped platform — goes to
+  the admin and nowhere else.
+- **A ping is SHORT, and a ping is RARE (the pager, phase 2, 2026-09-06).**
+  Short: five lines at most — `🔴 IG @acct — <condition>`, `Do: <the first
+  move>`, `Now: <what the collector already did>` when there is one, and
+  the two links. Every rule carries its `title` and its `short`; the long
+  steps stay on the Fix panel the link opens, and Instagram's own paragraph
+  never rides along (`decider._ping_text`). Rare, in five clauses:
+    1. A condition pages ONCE when it becomes due (unchanged).
+    2. The same condition on the same scope does not page again for
+       `REPING_COOLDOWN_S` (24h), however many times it closes and re-opens
+       in between — `decider_pinged` remembers what the phone heard AFTER
+       the condition closes, which is the point. The Activity Log says
+       "operator NOT paged again — paged 5m ago". A checkpoint that re-opens
+       after every sign-in attempt is one story, not five.
+    3. A condition a human must clear gets ONE "still open" ping at
+       `STILL_OPEN_AFTER_S` (24h), which says it is the last; then silence
+       until it closes. If the operator could not clear it in a day,
+       something bigger is wrong, and a fourth reminder does not fix it.
+    4. "Recovered" goes out once, only for a story the phone heard the
+       start of, only when collection actually worked again (`ok`) or the
+       operator pressed Mark fixed — never from the sign-in hook
+       (`resolve(quiet=True)`: a sign-in is a STEP of the fix, not its
+       outcome), never for a blip shorter than `RECOVERED_MIN_OPEN_S` that
+       was not itself paged, never twice within `RECOVERED_DEDUPE_S`. A
+       change of kind is logged, not paged — the new kind pages on its own
+       terms.
+    5. A one-shot decider (Fetch-now, `run` without `--loop`) never pages
+       (`Decider(quiet=True)`): the operator is looking at the screen that
+       shows the reason, and a decider with no memory paged on every click.
+       The service loop pages once if the condition persists.
+  Paid for (2026-09-05/06): one checkpoint on one account = a stream of
+  60-word messages, each shown to its first 20 words. Tests:
+  `test_pager_quiet`.
 - **A checkpoint fails over by itself before it pages.** `collect_ig._decide_exc`
   is the one path every account exception takes: a checkpoint quarantines
   the account in the pool, writes `checkpoint_at` into its sidecar (so

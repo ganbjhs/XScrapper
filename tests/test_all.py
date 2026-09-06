@@ -4643,11 +4643,9 @@ def test_decider(tmp):
     ok(len(sent) == 1 and "3 passes in a row" in sent[0], "third consecutive pass_error -> operator told")
     sent.clear()
     dec3.on("budget_spent", account="sana"); dec3.on("paused")
-    # 'paused' replaced a paged pass_error, so the phone hears that story end
-    # ("recovered … now 'paused'"); what it must never hear is a page FOR
-    # budget_spent or paused.
-    ok(all(t.startswith("Collector · instagram: recovered") for t in sent),
-       "budget_spent and paused are never escalated (only a paged condition's closing is announced)")
+    # 'paused' replaced a paged pass_error. Since 2026-09-06 a change of kind
+    # is logged, never paged — and budget_spent / paused never page at all.
+    ok(sent == [], f"budget_spent and paused never page, and a change of kind is not a ping: {sent}")
 
     print()
     print("== nowhere to send is said once, not per decision ==")
@@ -4742,8 +4740,8 @@ def test_pager(tmp):
     clock[0] += 3 * 3600 * 1000
     r = decider.resolve("instagram:sana:checkpoint", db=db, who="operator", log=lines.append, notify=rec, now_ms=now())
     ok(r["ok"] and "resolved by operator" in lines[-1], "resolve logs who closed it")
-    ok(sent[-1].startswith("Collector · instagram: recovered") and "by operator" in sent[-1],
-       "the phone hears the end of the story")
+    ok(sent[-1].startswith("🟢 IG @sana — recovered from 'checkpoint' by operator"),
+       f"the phone hears the end of the story, in one line: {sent[-1]!r}")
     ok(decider.open_conditions(db=db) == [], "nothing open")
     ok(not decider.resolve("instagram:sana:checkpoint", db=db)["ok"], "resolving twice is refused")
 
@@ -4775,8 +4773,8 @@ def test_pager(tmp):
     ok(decider.notify_ready(), "token + admin chat = ready")
     for k in ("ADMIN_TELEGRAM_CHAT_ID", "TELEGRAM_CHAT_ID", "TELEGRAM_BOT_TOKEN", "ADMIN_NAME"):
         os.environ.pop(k, None)
-    ok(decider._default_notify("x") == (False, "TELEGRAM_BOT_TOKEN / ADMIN_TELEGRAM_CHAT_ID not set"),
-       "the nowhere-to-send reason names the admin variable")
+    ok(decider._default_notify("x") == (False, "ADMIN_TELEGRAM_BOT_TOKEN / ADMIN_TELEGRAM_CHAT_ID not set"),
+       "the nowhere-to-send reason names the admin variables")
 
     print()
     print("== no PUBLIC_BASE_URL: the ping says how to get a link ==")
@@ -4950,6 +4948,150 @@ def test_pager(tmp):
            "a plain error backs off and leaves the active account alone")
     finally:
         os.chdir(cwd)
+
+
+def test_pager_quiet(tmp):
+    """
+    The pager, phase 2 (2026-09-06): short pings, and rare ones.
+
+    Seen live: a checkpoint on one account produced a stream of Telegram
+    messages — one from every Fetch-now click (a one-shot decider has no
+    memory), a "recovered" from every sign-in attempt and a fresh page when
+    the adopted session re-opened the checkpoint, plus "recovered (now X)"
+    on every change of kind — each a 60-word paragraph a phone shows the
+    first 20 of. These pin the new contract: one page per condition per day,
+    one "still open" at 24h, "recovered" only for a story the phone heard,
+    nothing from a one-shot pass, nothing from a sign-in's resolve, and the
+    message itself in five lines with the first move on the second.
+    """
+    import decider
+    clock = [1_800_000_000_000]
+    now = lambda: clock[0]
+    lines, sent = [], []
+    rec = lambda t: (sent.append(t) or (True, ""))
+    db = str(pathlib.Path(tmp) / "activity.db")
+    os.environ["PUBLIC_BASE_URL"] = "https://scraper.example.in"
+    class ChallengeRequired(Exception): pass
+
+    print("== the ping: title, Do, Now, links — and nothing else ==")
+    dec = decider.Decider("instagram", log=lines.append, db=db, notify=rec, now=now)
+    dec.on("", account="youssefnasser168", exc=ChallengeRequired("Manual verification required via Instagram native challenge flow. This checkpoint is not handled by challenge_code_handler…"),
+           meta={"sources": ["A"], "note": "Collection failed over to @sanaakhtar221; sources pinned to @youssefnasser168 wait."})
+    t = sent[0].split("\n")
+    ok(len(t) == 5, f"five lines, not a paragraph ({len(t)}): {sent[0]!r}")
+    ok(t[0] == "🔴 IG @youssefnasser168 — CHECKPOINT — out of rotation, nothing knocks on it",
+       f"line 1: emoji, platform, account, the condition: {t[0]!r}")
+    ok(t[1].startswith("Do: Accounts & Sessions → @youssefnasser168 → Sign in → Open this account's browser"),
+       f"line 2 is the first move: {t[1]!r}")
+    ok(t[2] == "Now: Collection failed over to @sanaakhtar221; sources pinned to @youssefnasser168 wait.",
+       "line 3 is what the collector already did")
+    ok(t[3] == "Fix → https://scraper.example.in/app/accounts?fix=instagram:youssefnasser168:checkpoint"
+       and t[4].startswith("Snooze 6h → ") and t[4].endswith("&snooze=6"), "lines 4-5 are the links")
+    ok("Manual verification" not in sent[0] and "challenge_code_handler" not in sent[0],
+       "Instagram's own paragraph stays on the Fix panel, not on the phone")
+    ok(len("\n".join(t[:3])) < 300, f"the words (before the links) fit in 300 characters ({len(chr(10).join(t[:3]))})")
+
+    print("== the same condition re-opening pages ONCE a day, however it re-opens ==")
+    # the sign-in hook closes it quietly (a step of the fix, not its outcome)
+    r = decider.resolve("instagram:youssefnasser168:checkpoint", db=db, who="sign-in",
+                        log=lines.append, notify=rec, now_ms=now(), quiet=True)
+    ok(r["ok"] and len(sent) == 1, "a sign-in's resolve does not page 'recovered'")
+    clock[0] += 5 * 60 * 1000
+    n = len(lines)
+    dec.on("", account="youssefnasser168", exc=ChallengeRequired("again"))
+    ok(len(sent) == 1, "the adopted session re-opening the checkpoint 5 min later does NOT page again")
+    ok(any("operator NOT paged again" in l and "was paged 5m ago" in l for l in lines[n:]),
+       "…and the Activity Log says why, once")
+    for _ in range(4):                                   # four more sign-in attempts over an hour
+        decider.resolve("instagram:youssefnasser168:checkpoint", db=db, who="sign-in", log=lines.append, notify=rec, now_ms=now(), quiet=True)
+        clock[0] += 15 * 60 * 1000
+        dec.on("", account="youssefnasser168", exc=ChallengeRequired("again"))
+    ok(len(sent) == 1, "five re-opens in an hour: still one message on the phone")
+    clock[0] += 12 * 60 * 1000
+    dec.ok("youssefnasser168")
+    ok(len(sent) == 2 and sent[1].startswith("🟢 IG @youssefnasser168 — recovered from 'checkpoint' by itself"),
+       f"a clean read at last: ONE 'recovered' (the phone heard the start): {sent[1:]!r}")
+    dec.on("", account="youssefnasser168", exc=ChallengeRequired("blip")); dec.ok("youssefnasser168")
+    ok(len(sent) == 2, "a blip that re-opens and closes within minutes is not news either way")
+    clock[0] += 25 * 3600 * 1000
+    dec.on("", account="youssefnasser168", exc=ChallengeRequired("next day"))
+    ok(len(sent) == 3 and sent[2].startswith("🔴 IG @youssefnasser168 — CHECKPOINT"),
+       "a day later the same condition is a new story and pages again")
+
+    print("== one 'still open' ping at 24h, then silence ==")
+    for h in (6, 12, 6, 1):
+        clock[0] += h * 3600 * 1000
+        dec.on("", account="youssefnasser168", exc=ChallengeRequired("still"))
+    ok(len(sent) == 4 and sent[3].startswith("🟠 IG @youssefnasser168 — still 'checkpoint' after 24h")
+       and "last ping about it" in sent[3],
+       f"open a day: one 'still open' ping, and it says it is the last ({len(sent)}): {sent[3:]!r}")
+    for h in (12, 24, 24):
+        clock[0] += h * 3600 * 1000
+        dec.on("", account="youssefnasser168", exc=ChallengeRequired("still"))
+    ok(len(sent) == 4, "…and never another until it closes")
+
+    print("== a change of kind is logged, not paged ==")
+    sent.clear()
+    dec.on("", account="sana", exc=ChallengeRequired("x"))
+    ok(len(sent) == 1, "checkpoint on sana pages")
+    n = len(lines)
+    dec.on("session_missing", account="sana", detail="no sidecar")
+    ok(any("(was 'checkpoint'" in l for l in lines[n:]), "the change is logged")
+    ok(len(sent) == 2 and not any("now 'session_missing'" in t for t in sent)
+       and sent[1].startswith("🔴 IG @sana — no working session"),
+       f"and only the NEW condition's own ping goes out — no 'recovered (now …)': {sent[1:]!r}")
+
+    print("== a one-shot decider (Fetch-now) never pages ==")
+    q = decider.Decider("instagram", log=lines.append, db=None, notify=rec, now=now, quiet=True)
+    sent.clear(); n = len(lines)
+    q.on("", account="omar", exc=ChallengeRequired("x"))
+    q.on("session_missing", detail="nobody")
+    ok(sent == [], "nothing on the phone")
+    ok(sum("operator not paged from a one-shot pass" in l for l in lines[n:]) == 1,
+       "the log says so, once")
+    import collect_ig, store_ig
+    rp = str(pathlib.Path(tmp) / "ig_results.db")
+    with store_ig.Store(rp):
+        pass
+    import unittest.mock as _m
+    with _m.patch.object(decider, "_default_notify", rec):
+        asyncio.run(collect_ig.run_once(rp, log=lines.append))       # no dec: the one-shot path
+    ok(sent == [], "run_once without a shared decider (Fetch-now) pages nobody")
+
+    print("== the admin bot is its own channel ==")
+    for k in ("ADMIN_TELEGRAM_BOT_TOKEN", "TELEGRAM_BOT_TOKEN", "ADMIN_TELEGRAM_CHAT_ID", "TELEGRAM_CHAT_ID"):
+        os.environ.pop(k, None)
+    os.environ["TELEGRAM_BOT_TOKEN"] = "111111111:AAdelivery_bot_token_xxxxxxxxxxxxxxxxx"
+    ok(decider.admin_token().startswith("111111111:"), "no admin bot: the delivery bot is used (older .env)")
+    os.environ["ADMIN_TELEGRAM_BOT_TOKEN"] = "222222222:AAadmin_bot_token_xxxxxxxxxxxxxxxxxxxx"
+    ok(decider.admin_token().startswith("222222222:"), "the admin bot wins when set")
+    os.environ["ADMIN_TELEGRAM_CHAT_ID"] = "2126402349"
+    ok(decider.notify_ready(), "admin token + admin chat = ready")
+    calls = []
+    def fake_tg(token, method, payload, timeout=10.0):
+        calls.append((token, method, payload))
+        if method == "getUpdates":
+            return True, {"ok": True, "result": [
+                {"update_id": 1, "message": {"chat": {"id": -100999, "type": "supergroup", "title": "g"}, "text": "hi"}},
+                {"update_id": 2, "message": {"chat": {"id": 2126402349, "type": "private", "first_name": "Tilak", "last_name": "Tiwari"}, "text": "/start"}},
+            ]}
+        return True, {"ok": True, "result": {}}
+    with _m.patch.object(decider, "_tg", fake_tg):
+        ok(decider.send_admin("🔴 IG @x — test") == (True, ""), "send_admin sends")
+        tok, meth, payload = calls[-1]
+        ok(tok.startswith("222222222:") and meth == "sendMessage" and payload["chat_id"] == "2126402349"
+           and payload["text"] == "🔴 IG @x — test",
+           "through the admin bot, to the admin chat, the text exactly as composed (no name prefix)")
+        os.environ.pop("ADMIN_TELEGRAM_CHAT_ID", None)
+        ok(decider.discover_chat() == ("2126402349", "Tilak Tiwari"),
+           "discover_chat reads the admin's private chat off the bot's updates, skipping groups")
+        with _m.patch.object(decider, "_tg", lambda *a, **k: (True, {"ok": True, "result": []})):
+            cid, why = decider.discover_chat()
+            ok(cid == "" and "press Start" in why, "nobody wrote to the bot yet: says what to do")
+    for k in ("ADMIN_TELEGRAM_BOT_TOKEN", "TELEGRAM_BOT_TOKEN", "ADMIN_TELEGRAM_CHAT_ID", "TELEGRAM_CHAT_ID"):
+        os.environ.pop(k, None)
+    ok(decider.send_admin("x") == (False, "ADMIN_TELEGRAM_BOT_TOKEN / ADMIN_TELEGRAM_CHAT_ID not set"),
+       "nothing set: the reason names the variables")
 
 
 def test_resolve(tmp):
@@ -6419,6 +6561,8 @@ def main():
         test_decider(fresh("decider"))
         section("pager (links, snooze, resolve, recovery ping, failover)")
         test_pager(fresh("pager"))
+        section("pager, phase 2 (short pings; once a day; one still-open; quiet one-shot; the admin bot)")
+        test_pager_quiet(fresh("pager2"))
         section("resolve (no retries into a 429, hold-off, following list)")
         test_resolve(fresh("resolve"))
 

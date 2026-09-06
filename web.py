@@ -3334,9 +3334,19 @@ def _save_telegram(body):
         return {"error": "a chat id is a number like -1001234567890, "
                          "or a public channel like @mychannel"}
 
+    _env_set((("TELEGRAM_BOT_TOKEN", token), ("TELEGRAM_CHAT_ID", chat)))
+    return {"ok": True, "has_token": bool(os.getenv("TELEGRAM_BOT_TOKEN")),
+            "chat_id": os.getenv("TELEGRAM_CHAT_ID", "")}
+
+
+def _env_set(pairs) -> None:
+    """Write KEY=value lines into .env (replace or append; empty values are
+    skipped) and into this process, so the change is live without a
+    restart. Secrets live here and nowhere else (RULEBOOK §5)."""
     env_path = _CFG.root / ".env"
     cur = env_path.read_text() if env_path.exists() else ""
-    for key, val in (("TELEGRAM_BOT_TOKEN", token), ("TELEGRAM_CHAT_ID", chat)):
+    for key, val in pairs:
+        val = (val or "").strip()
         if not val:
             continue
         lines, done = [], False
@@ -3355,8 +3365,69 @@ def _save_telegram(body):
         env_path.chmod(0o600)
     except OSError:
         pass
-    return {"ok": True, "has_token": bool(os.getenv("TELEGRAM_BOT_TOKEN")),
-            "chat_id": os.getenv("TELEGRAM_CHAT_ID", "")}
+
+
+_TG_TOKEN_RE = r"\d{6,12}:[A-Za-z0-9_-]{30,50}"
+
+
+def _pager_status():
+    """What the pager is set up with — never the token itself."""
+    import decider
+    tok = decider.admin_token()
+    return {"ready": decider.notify_ready(),
+            "has_token": bool(tok),
+            # which bot: its own, or borrowed from delivery
+            "own_bot": bool(os.getenv("ADMIN_TELEGRAM_BOT_TOKEN", "").strip()),
+            "token_hint": (tok.split(":")[0] if tok else ""),
+            "admin": decider.admin_name(),
+            "admin_chat": decider.admin_chat()}
+
+
+def _save_pager(body):
+    """The admin bot: token, chat id, name → .env. A missing chat id is
+    looked up from the bot's own updates (the admin pressed Start), so
+    nobody has to find their id by hand."""
+    import decider
+    token = (body.get("token") or "").strip()
+    chat = (body.get("chat_id") or "").strip()
+    name = (body.get("name") or "").strip()
+    if token and not re.fullmatch(_TG_TOKEN_RE, token):
+        return {"error": "That does not look like a bot token. BotFather gives "
+                         "you something like 123456789:AAH... — paste the whole line."}
+    if chat and not re.fullmatch(r"-?\d{1,20}", chat):
+        return {"error": "the admin chat id is a number (your own user id)"}
+    _env_set((("ADMIN_TELEGRAM_BOT_TOKEN", token),
+              ("ADMIN_TELEGRAM_CHAT_ID", chat),
+              ("ADMIN_NAME", name)))
+    found = ""
+    if not decider.admin_chat():
+        cid, who = decider.discover_chat()
+        if cid:
+            _env_set((("ADMIN_TELEGRAM_CHAT_ID", cid),))
+            found = f"chat id {cid} ({who}) read from the bot's updates"
+        else:
+            found = f"no chat id yet — {who}"
+    return {"ok": True, "found": found, **_pager_status()}
+
+
+def _test_pager(body):
+    """One test ping through the admin bot, exactly as a real one is sent."""
+    import decider
+    if not decider.admin_token():
+        return {"error": "No admin bot token saved yet."}
+    chat = decider.admin_chat()
+    if not chat:
+        cid, who = decider.discover_chat()
+        if not cid:
+            return {"error": f"No chat id — {who}"}
+        _env_set((("ADMIN_TELEGRAM_CHAT_ID", cid),))
+        chat = cid
+    ok, err = decider.send_admin(
+        "🟢 Vedic Scraper Admin is connected. Pings arrive here — one per "
+        "condition, the first move, a link to the fix.", chat=chat)
+    if not ok:
+        return {"error": f"Telegram refused: {err}", **_pager_status()}
+    return {"ok": True, **_pager_status()}
 
 
 # How many real tweets "Send a test" puts in the channel. Three is enough to
@@ -3996,7 +4067,11 @@ def _decider_after_signin(login: str, identity: str):
                         st.set_active(c["account"], bool(row.get("active")), error="")
             except Exception:
                 pass
-            decider.resolve(c["id"], db=adb, who="sign-in", log=log)
+            # quiet: a sign-in is a STEP of the fix, not its outcome. The
+            # next clean read pages "recovered" by itself; paging here, and
+            # again when the adopted session re-opened the checkpoint, is
+            # how one checkpoint became five messages (2026-09-06).
+            decider.resolve(c["id"], db=adb, who="sign-in", log=log, quiet=True)
     except Exception as e:
         print(f"[decider] after-signin hook: {type(e).__name__}: {e}")
 
@@ -4852,7 +4927,8 @@ def _decider_conditions(q):
     return {"conditions": conds, "base_url": decider.base_url(),
             "telegram": decider.notify_ready(),
             "admin": decider.admin_name(),
-            "admin_chat": decider.admin_chat()}
+            "admin_chat": decider.admin_chat(),
+            "pager": _pager_status()}
 
 
 def _decider_post(body):
@@ -5968,6 +6044,10 @@ class Handler(BaseHTTPRequestHandler):
                 # Not accounts_api's job: that module is a thin validator over
                 # the store and must not open sockets or spawn threads.
                 return self._send(200, _signin_start(body))
+            if u.path == "/api/pager/telegram":
+                return self._send(200, _save_pager(body))
+            if u.path == "/api/pager/test":
+                return self._send(200, _test_pager(body))
             if u.path == "/api/decider":
                 return self._send(200, _decider_post(body))
             if u.path == "/api/pool" or u.path.startswith("/api/pool/"):

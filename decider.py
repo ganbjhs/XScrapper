@@ -80,11 +80,25 @@ Scope. A condition belongs to (platform, account); platform-wide conditions
 open condition at a time: a pass that produces a different outcome closes
 the old one and says so.
 
-Telegram. The operator channel is the one alerts.py and webhook.py already
-use — TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID from .env. No token means the
-decision still logs and escalates, it just says (once) that it has nowhere to
-send. Sending never raises and never blocks collection for more than a few
-seconds.
+Telegram. The operator is paged through the ADMIN BOT — its own bot,
+ADMIN_TELEGRAM_BOT_TOKEN, to ADMIN_TELEGRAM_CHAT_ID (falling back to the
+delivery bot / chat so an older .env still pages someone; `python3
+decider.py test` proves the channel, `chat` finds the id). No token means the
+decision still logs and escalates, it just says (once) that it has nowhere
+to send. Sending never raises and never blocks collection for more than a
+few seconds.
+
+A ping is SHORT (2026-09-06): the condition in one line, "Do:" — the first
+move — in one line, "Now:" — what the collector already did — when there is
+one, and the links. The long steps live on the Fix panel the link opens. And
+a ping is RARE: once when the condition becomes due; the same condition on
+the same scope not again for REPING_COOLDOWN_S however often it closes and
+re-opens (a checkpoint that re-opens after every sign-in attempt is one
+story); one "still open" at STILL_OPEN_AFTER_S for a condition a human must
+clear, then silence until it closes; "recovered" only for a story the phone
+heard the start of. A one-shot decider (Fetch-now, the CLI) never pages —
+the reason is on the screen in front of the operator, and the service loop
+pages once if the condition persists.
 
 The pager (Phase 1, 2026-09-03). A ping is only useful if it ends in a fix,
 so every ping carries a LINK: `PUBLIC_BASE_URL/app/accounts?fix=<condition
@@ -110,7 +124,21 @@ DEFAULT_DB = os.getenv("ACTIVITY_LOG_DB", "activity.db")
 _LOCK = threading.Lock()
 
 H = 3600
-REMIND_EVERY_S = 6 * H
+REMIND_EVERY_S = 6 * H          # reminder LINES in the Activity Log
+
+# The phone (2026-09-06). A condition pages ONCE when it becomes due. The same
+# condition on the same scope pages again only after REPING_COOLDOWN_S, however
+# many times it closes and re-opens in between — a checkpoint that re-opens
+# after every sign-in attempt is one story, not five. A condition a human
+# must clear gets ONE "still open" ping at STILL_OPEN_AFTER_S, then silence
+# until it is closed. "Recovered" goes out only for a condition the phone
+# heard about; a re-open that was deliberately not paged twice earns one only
+# if it was open long enough to have been a story (RECOVERED_MIN_OPEN_S), and
+# never twice within RECOVERED_DEDUPE_S for the same scope.
+REPING_COOLDOWN_S = 24 * H
+STILL_OPEN_AFTER_S = 24 * H
+RECOVERED_MIN_OPEN_S = 10 * 60
+RECOVERED_DEDUPE_S = 1 * H
 
 # ---------------------------------------------------------------- the rules
 
@@ -122,7 +150,10 @@ class Rule:
     escalate_after_s: int = -1  # -1 never; 0 at once; N after N seconds open
     escalate_after_n: int = 0   # or after this many occurrences (0 = off)
     level: str = "warn"         # activity-log level for the opening line
-    human: str = ""             # what to tell the operator, in their words
+    title: str = ""             # the ping's first line, after "IG @acct —".
+                                # Empty = this rule never pages.
+    short: str = ""             # the ping's "Do:" line — the FIRST move, in
+                                # one line. The long steps stay on the panel.
     remind_every_s: int = REMIND_EVERY_S
     fix: tuple = ()             # the steps the Fix panel shows, in order
     actions: tuple = ()         # panel buttons: signin | add_source |
@@ -137,16 +168,15 @@ RULES = {
     "ok": Rule("collect", 0, level="info"),
     "paused": Rule(
         "idle", 60, level="info",
-        human="",           # the operator did this; never escalate
+        # no title: the operator did this; never page
         fix=("Collection is paused from the dashboard.",
              "Resume it in Watchlists → Network & settings when you are ready."),
         actions=("resume",),
     ),
     "no_sources": Rule(
         "idle", 30 * 60, escalate_after_s=2 * H, level="warn",
-        human="has had nothing to collect for {open_for} — no enabled "
-              "source in any project. Add one in Watchlists → + New "
-              "watchlist → Instagram.",
+        title="nothing to collect for {open_for} (no enabled source)",
+        short="Watchlists → + New watchlist → Instagram, or re-enable one",
         fix=("No Instagram source is enabled in any project, so the collector "
              "has nothing to do.",
              "Add a source: Watchlists → + New watchlist → Instagram, or "
@@ -156,9 +186,8 @@ RULES = {
     ),
     "session_missing": Rule(
         "idle", 30 * 60, escalate_after_s=0, level="error",
-        human="cannot load the saved session for @{account}: {detail}. "
-              "Sign the account in again (Accounts & Sessions) — nothing "
-              "is collected until then.{extra}",
+        title="no working session — nothing collected until signed in",
+        short="Accounts & Sessions → @{account} → Sign in",
         fix=("There is no working saved session for this account.",
              "Sign in below — paste the cookies from your own browser (safest) "
              "or run the background sign-in with the stored password."),
@@ -167,8 +196,8 @@ RULES = {
     ),
     "session_rejected": Rule(
         "idle", 1 * H, escalate_after_s=0, level="error",
-        human="session for @{account} was rejected and a re-login did not "
-              "fix it: {detail}. Sign in again from Accounts & Sessions.{extra}",
+        title="session rejected; one re-login failed",
+        short="Accounts & Sessions → @{account} → Sign in with a fresh session",
         fix=("Instagram rejected the session and one automatic re-login did "
              "not fix it (a second attempt is never made — it earns a "
              "checkpoint).",
@@ -178,10 +207,9 @@ RULES = {
     ),
     "checkpoint": Rule(
         "quarantine", 6 * H, escalate_after_s=0, level="error",
-        human="@{account} hit a CHECKPOINT and has been pulled out of "
-              "rotation. Open the Instagram app or web as @{account}, clear "
-              "the challenge, then re-enable it in Accounts & Sessions. "
-              "Nothing will knock on it until you do.{extra}",
+        title="CHECKPOINT — out of rotation, nothing knocks on it",
+        short="Accounts & Sessions → @{account} → Sign in → Open this "
+              "account's browser → clear \"confirm it's you\"",
         fix=("Instagram is asking a human to confirm it's really @{account}. "
              "No code can answer that, and every automatic retry makes it "
              "worse, so the account is out of rotation.",
@@ -197,10 +225,9 @@ RULES = {
     "rate_limited": Rule(
         "backoff", 15 * 60, max_wait_s=4 * H, escalate_after_s=6 * H,
         level="warn",
-        human="@{account} has been rate-limited (PleaseWaitFewMinutes) for "
-              "{open_for}. Backing off up to 4h between tries; if this "
-              "persists the account is warming too fast — lower "
-              "IG_DAILY_BUDGET or rest it a day.",
+        title="rate-limited for {open_for} (backing off up to 4h)",
+        short="nothing yet; if it lasts a day, lower IG_DAILY_BUDGET or "
+              "rest the account",
         fix=("Instagram asked this account to slow down. The collector is "
              "already backing off (15m, doubling to 4h) and will clear this "
              "by itself.",
@@ -210,7 +237,7 @@ RULES = {
     ),
     "budget_spent": Rule(
         "rest", 1 * H, level="info",
-        human="",           # by design; a person doesn't open the app 500×/day
+        # no title: by design; a person doesn't open the app 500×/day
     ),
     "lookup_throttled": Rule(
         # ONE condition per ACCOUNT (scope account/lookups), not one per
@@ -224,12 +251,9 @@ RULES = {
         # relents, a proxy is set, or the ids are pasted.
         "hold", 6 * H, max_wait_s=24 * H, escalate_after_n=2, level="warn",
         loop_wait=False,
-        human="name lookups from @{account} are refused ({detail}) — "
-              "{count} probes in a row. {extra} Sources that already have an "
-              "id keep collecting; the rest wait. The account is probed once "
-              "a day now, no more. Paste ids on the Fix panel for the ones "
-              "you need today, or put the account behind its residential "
-              "proxy so lookups stop being refused.",
+        title="name lookups refused {count}× ({detail}) — probed once a day now",
+        short="Edit @{account} → set its residential proxy; or paste ids on "
+              "the Fix panel",
         fix=("Instagram is refusing to translate handles into ids from this "
              "account's session — a throttle (429) or a login-bounce, which "
              "is what a datacenter IP gets. Every extra attempt makes it "
@@ -248,12 +272,8 @@ RULES = {
     "unresolved_source": Rule(
         "skip", 1 * H, max_wait_s=24 * H, escalate_after_n=3, level="warn",
         loop_wait=False,
-        human="cannot turn the handle '{detail}' into a numeric Instagram id "
-              "from @{account}'s session ({count} tries).{extra} The other "
-              "sources still collect; this one is left alone for a while "
-              "(1h, doubling to 24h) instead of being asked again every pass. "
-              "Paste the id on the Fix panel, or follow @{detail} from the "
-              "collecting account and it resolves itself.",
+        title="'{detail}' has no numeric id ({count} tries); the rest collect",
+        short="paste the id on the Fix panel, or follow @{detail} from @{account}",
         fix=("Instagram refused to translate this handle into its numeric "
              "id. Name lookup is a separate permission from reading posts, "
              "and a restricted session loses it first — so a cleaner account "
@@ -280,9 +300,8 @@ RULES = {
         # webshare session IN-32.)
         "backoff", 30 * 60, max_wait_s=4 * H, escalate_after_s=0,
         level="error",
-        human="nothing from @{account} reaches Instagram — {detail}.{extra} "
-              "Every source on this account is skipped (ids or not) until "
-              "the proxy is fixed; one probe every 30m, doubling to 4h.",
+        title="nothing reaches Instagram — the proxy ({detail})",
+        short="Edit @{account} → proxy: a different exit, then Retry",
         fix=("Every request from @{account} dies on the way to Instagram, "
              "before Instagram answers: {detail}. So this is NOT a handle "
              "problem, not a throttle and not a checkpoint — it is the "
@@ -308,8 +327,8 @@ RULES = {
     "pass_error": Rule(
         "backoff", 10 * 60, max_wait_s=1 * H, escalate_after_n=3,
         level="error",
-        human="the collector has failed {count} passes in a row: {detail}. "
-              "Check `journalctl -u xscraper-ig`.",
+        title="collector failed {count} passes in a row ({detail})",
+        short="on the server: journalctl -u xscraper-ig -n 100",
         fix=("The whole collection pass is crashing, which is a code or "
              "server problem rather than an Instagram one.",
              "On the server: journalctl -u xscraper-ig -n 100 — the traceback "
@@ -491,6 +510,7 @@ class _State:
     def __init__(self, db=DEFAULT_DB):
         self.db = db
         self.mem = {}
+        self.mem_pinged = {}        # (scope, kind) -> ms, in-memory mode
 
     def _con(self):
         con = sqlite3.connect(self.db, timeout=10)
@@ -515,7 +535,38 @@ class _State:
                         "snoozed_until_ms INTEGER NOT NULL DEFAULT 0")
         if "meta" not in have:
             con.execute("ALTER TABLE decider_state ADD COLUMN meta TEXT")
+        # What the phone has heard, and when — kept AFTER a condition closes,
+        # which is the point: it is what stops a re-open from paging again.
+        con.execute(
+            "CREATE TABLE IF NOT EXISTS decider_pinged ("
+            "  scope TEXT NOT NULL, kind TEXT NOT NULL, ms INTEGER NOT NULL,"
+            "  PRIMARY KEY (scope, kind))")
         return con
+
+    def pinged_ms(self, scope, kind) -> int:
+        """When the phone last heard `kind` on `scope` (0 = never)."""
+        if self.db is None:
+            return int(self.mem_pinged.get((scope, kind), 0))
+        con = self._con()
+        try:
+            r = con.execute("SELECT ms FROM decider_pinged WHERE scope=? AND kind=?",
+                            (scope, kind)).fetchone()
+            return int(r["ms"]) if r else 0
+        finally:
+            con.close()
+
+    def mark_pinged(self, scope, kind, ms) -> None:
+        if self.db is None:
+            self.mem_pinged[(scope, kind)] = int(ms)
+            return
+        con = self._con()
+        try:
+            con.execute("INSERT INTO decider_pinged(scope, kind, ms) VALUES(?,?,?) "
+                        "ON CONFLICT(scope, kind) DO UPDATE SET ms=excluded.ms",
+                        (scope, kind, int(ms)))
+            con.commit()
+        finally:
+            con.close()
 
     def get(self, scope):
         if self.db is None:
@@ -608,11 +659,82 @@ def _wait_for(rule: Rule, count: int) -> int:
     return int(rule.wait_s)
 
 
+_PLAT = {"instagram": "IG", "facebook": "FB", "x": "X"}
+_EMOJI = {"error": "🔴", "warn": "🟠", "info": "🔵"}
+
+
+def _plat(platform: str) -> str:
+    return _PLAT.get((platform or "").lower(), (platform or "?").upper())
+
+
+def _who_text(account: str, source: str = "") -> str:
+    s = f"@{account}" if account else "collector"
+    return s + (f" · {source}" if source else "")
+
+
+def _links(cid: str) -> str:
+    link = fix_url(cid)
+    if link:
+        return f"Fix → {link}\nSnooze 6h → {fix_url(cid, snooze_h=6)}"
+    return "(set PUBLIC_BASE_URL in .env and this carries a link to the fix)"
+
+
+def _ping_text(rule: Rule, ev, row: dict, now: int, cid: str) -> str:
+    """The whole ping, in the fewest lines that still say what to do:
+
+        🔴 IG @youssefnasser168 — CHECKPOINT — out of rotation, nothing knocks on it
+        Do: Accounts & Sessions → @youssefnasser168 → Sign in → Open this account's browser → clear "confirm it's you"
+        Now: Collection failed over to @sanaakhtar221.
+        Fix → https://…/app/accounts?fix=instagram:youssefnasser168:checkpoint
+        Snooze 6h → https://…&snooze=6
+
+    Title, the first move, what the collector already did, the links. The
+    paragraph this replaced (2026-09-06) said the same thing in 60 words and
+    a phone showed the first 20."""
+    fmt = dict(account=ev.account or "-", detail=(row.get("detail") or "-")[:80],
+               open_for=_fmt_dur((now - row["first_ms"]) / 1000),
+               count=row["count"])
+    lines = [f"{_EMOJI.get(rule.level, '🟠')} {_plat(ev.platform)} "
+             f"{_who_text(ev.account, ev.source)} — {rule.title.format(**fmt)}"]
+    if rule.short:
+        lines.append("Do: " + rule.short.format(**fmt))
+    note = (_loads(row.get("meta")).get("note") or "").strip()
+    if note:
+        lines.append("Now: " + note)
+    lines.append(_links(cid))
+    return "\n".join(lines)
+
+
+def _still_open_text(rule: Rule, ev, row: dict, now: int, cid: str) -> str:
+    return (f"🟠 {_plat(ev.platform)} {_who_text(ev.account, ev.source)} — still "
+            f"'{ev.kind}' after {_fmt_dur((now - row['first_ms']) / 1000)} "
+            f"({row['count']}×). Nothing new; this is the last ping about it.\n"
+            f"{_links(cid)}")
+
+
 def _recovered_text(platform, account, prev, now, how="") -> str:
-    who = f"@{account}" if account else platform
-    return (f"Collector · {platform}: recovered — '{prev['kind']}' on {who} "
-            f"is closed{how} after {_fmt_dur((now - prev['first_ms']) / 1000)}. "
+    return (f"🟢 {_plat(platform)} {_who_text(account)} — recovered from "
+            f"'{prev['kind']}'{how} after {_fmt_dur((now - prev['first_ms']) / 1000)}. "
             f"Collection continues.")
+
+
+def _worth_telling(state, scope, prev: dict, now: int) -> bool:
+    """Should the phone hear this condition END? Only if it heard it start —
+    this instance was paged, or it was a re-open that was deliberately not
+    paged twice (then only if it lasted RECOVERED_MIN_OPEN_S: a blip that
+    closes in a minute was never news) — and not if a 'recovered' for this
+    scope already went out within RECOVERED_DEDUPE_S."""
+    meta = _loads(prev.get("meta"))
+    if prev.get("notified_ms"):
+        heard = True
+    elif meta.get("not_paged_ms"):
+        heard = (now - prev["first_ms"]) / 1000 >= RECOVERED_MIN_OPEN_S
+    else:
+        heard = False
+    if not heard:
+        return False
+    last = state.pinged_ms(scope, "recovered")
+    return not (last and now - last < RECOVERED_DEDUPE_S * 1000)
 
 
 def decide(state: _State, ev: Event, now_ms=None, meta=None) -> Decision:
@@ -640,26 +762,26 @@ def decide(state: _State, ev: Event, now_ms=None, meta=None) -> Decision:
                 f"{who} recovered from '{prev['kind']}' after "
                 f"{_fmt_dur((now - prev['first_ms']) / 1000)} "
                 f"({prev['count']} occurrence(s))")
-            # The phone saw the start of this story; let it see the end.
-            if prev.get("notified_ms"):
+            # The phone saw the start of this story; let it see the end —
+            # once, and only for a story it saw (see _worth_telling).
+            if _worth_telling(state, ev.scope, prev, now):
                 d.notify = _recovered_text(
                     ev.platform, ev.account + (" · " + ev.source if ev.source else ""),
                     prev, now, " by itself")
+                state.mark_pinged(ev.scope, "recovered", now)
             state.clear(ev.scope)
         return d
 
     # --- a different condition than the one open: close it, open this ----
     changed = prev is not None and prev["kind"] != ev.kind
     if prev is None or changed:
+        # A change of kind is logged, never paged: the new condition pages
+        # on its own terms if it is one that pages. (Until 2026-09-06 a paged
+        # condition turning into another one sent "recovered (now X)" AND
+        # then X's own ping — two messages for one change of state.)
         row = {"kind": ev.kind, "first_ms": now, "last_ms": now, "count": 1,
                "reminded_ms": now, "notified_ms": 0, "detail": ev.detail,
                "snoozed_until_ms": 0, "meta": {}}
-        if changed and prev.get("notified_ms"):
-            d_note = _recovered_text(
-                ev.platform, ev.account + (" · " + ev.source if ev.source else ""),
-                prev, now, f" (now '{ev.kind}')")
-        else:
-            d_note = ""
     else:
         row = dict(prev)
         row["last_ms"] = now
@@ -681,8 +803,6 @@ def decide(state: _State, ev: Event, now_ms=None, meta=None) -> Decision:
                  reason=f"{ev.kind}: {ev.detail}" if ev.detail else ev.kind,
                  kind=ev.kind, count=count, open_since_ms=row["first_ms"],
                  cond_id=cid)
-    if d_note:
-        d.notify = d_note
 
     detail = f" — {ev.detail}" if ev.detail else ""
     if snoozed:
@@ -690,7 +810,7 @@ def decide(state: _State, ev: Event, now_ms=None, meta=None) -> Decision:
     elif prev is None or changed:
         pre = (f"(was '{prev['kind']}' for "
                f"{_fmt_dur((now - prev['first_ms']) / 1000)}) " if changed else "")
-        if not rule.human:
+        if not rule.title:
             tell = ""
         elif rule.escalate_after_n:
             tell = f"; operator will be told after {rule.escalate_after_n} in a row"
@@ -713,28 +833,35 @@ def decide(state: _State, ev: Event, now_ms=None, meta=None) -> Decision:
             f"{count} occurrence(s), {rule.action} continues, next try in "
             f"{_fmt_dur(wait)}")
 
-    # escalate to the operator — once per open condition, never while snoozed
-    if rule.human and not row["notified_ms"] and not snoozed:
+    # Page the operator — once per open condition, never while snoozed, and
+    # never twice within REPING_COOLDOWN_S for the same condition on the same
+    # scope, however many times it closed and re-opened in between.
+    mt = _loads(row.get("meta"))
+    told = bool(row["notified_ms"]) or bool(mt.get("not_paged_ms"))
+    if rule.title and not told and not snoozed:
         due = False
         if rule.escalate_after_n:
             due = count >= rule.escalate_after_n
         elif rule.escalate_after_s >= 0:
             due = open_for_s >= rule.escalate_after_s
         if due:
-            row["notified_ms"] = now
-            note = _loads(row.get("meta")).get("note") or ""
-            body = rule.human.format(
-                account=ev.account or "-", detail=row["detail"] or "-",
-                open_for=_fmt_dur(open_for_s), count=count,
-                extra=(" " + note) if note else "")
-            text = f"Collector · {ev.platform}: {body}"
-            link = fix_url(cid)
-            if link:
-                text += f"\n\nFix it → {link}\nSnooze 6h → {fix_url(cid, snooze_h=6)}"
+            last = state.pinged_ms(ev.scope, ev.kind)
+            if last and now - last < REPING_COOLDOWN_S * 1000:
+                mt["not_paged_ms"] = now
+                d.say.append(
+                    f"{who} operator NOT paged again — '{ev.kind}' was paged "
+                    f"{_fmt_dur((now - last) / 1000)} ago; the Fix panel has it")
             else:
-                text += ("\n\n(set PUBLIC_BASE_URL in .env and this message "
-                         "carries a link straight to the fix)")
-            d.notify = text
+                row["notified_ms"] = now
+                d.notify = _ping_text(rule, ev, row, now, cid)
+                state.mark_pinged(ev.scope, ev.kind, now)
+    elif (rule.title and rule.needs_human and row["notified_ms"] and not snoozed
+          and not mt.get("still_open_ms")
+          and open_for_s >= STILL_OPEN_AFTER_S):
+        # ONE "still open" ping, then nothing more until it closes.
+        mt["still_open_ms"] = now
+        d.notify = _still_open_text(rule, ev, row, now, cid)
+    row["meta"] = mt
 
     state.put(ev.scope, row)
     return d
@@ -793,9 +920,12 @@ def snooze(cid: str, hours: float = 6, *, db=DEFAULT_DB, now_ms=None) -> dict:
 
 
 def resolve(cid: str, *, db=DEFAULT_DB, who="operator", log=None,
-            notify=None, now_ms=None) -> dict:
+            notify=None, now_ms=None, quiet=False) -> dict:
     """Close one open condition by hand. Logs it, and if the phone was pinged
-    about it, pings once more so the story ends there too."""
+    about it, pings once more so the story ends there too — unless `quiet`:
+    a sign-in closes conditions as a STEP of the fix, not as its outcome (the
+    outcome is the next clean read, which pages 'recovered' by itself), and
+    paging on the step is how one checkpoint became five messages."""
     plat, whom, kind = parse_cond_id(cid)
     acct, src = _split_who(whom)
     now = int(time.time() * 1000) if now_ms is None else int(now_ms)
@@ -814,11 +944,12 @@ def resolve(cid: str, *, db=DEFAULT_DB, who="operator", log=None,
             log(line)
         except Exception:
             pass
-    if row.get("notified_ms"):
+    if not quiet and _worth_telling(st, scope, row, now):
         text = _recovered_text(plat, acct + (" · " + src if src else ""), row, now,
                                f" by {who}")
         try:
             (notify or _default_notify)(text)
+            st.mark_pinged(scope, "recovered", now)
         except Exception:
             pass
     return {"ok": True, "message": line}
@@ -840,32 +971,78 @@ def admin_name() -> str:
     return os.getenv("ADMIN_NAME", "").strip() or "Admin"
 
 
+def admin_token() -> str:
+    """The ADMIN BOT — its own bot, for the one person the collector pages
+    (ADMIN_TELEGRAM_BOT_TOKEN, "Vedic Scraper Admin"). Falls back to the
+    delivery bot (TELEGRAM_BOT_TOKEN) so an older .env still pages someone;
+    set explicitly on purpose: the delivery bot posts collected content to
+    a group, and "sign this account in" does not belong in that voice."""
+    return (os.getenv("ADMIN_TELEGRAM_BOT_TOKEN", "").strip()
+            or os.getenv("TELEGRAM_BOT_TOKEN", "").strip())
+
+
 def notify_ready() -> bool:
-    return bool(os.getenv("TELEGRAM_BOT_TOKEN", "").strip() and admin_chat())
+    return bool(admin_token() and admin_chat())
+
+
+def _tg(token: str, method: str, payload: dict, timeout=10.0):
+    """One Telegram Bot API call → (ok, json_or_error)."""
+    import httpx
+    rep = httpx.post(f"https://api.telegram.org/bot{token}/{method}",
+                     json=payload, timeout=timeout)
+    try:
+        body = rep.json()
+    except Exception:
+        body = {"description": rep.text}
+    if rep.status_code == 200 and body.get("ok", True):
+        return True, body
+    return False, f"HTTP {rep.status_code}: {str(body.get('description') or body)[:200]}"
+
+
+def send_admin(text: str, *, token: str = "", chat: str = ""):
+    """Send one message to the admin through the admin bot → (ok, error)."""
+    token = token or admin_token()
+    chat = chat or admin_chat()
+    if not token or not chat:
+        return False, "ADMIN_TELEGRAM_BOT_TOKEN / ADMIN_TELEGRAM_CHAT_ID not set"
+    try:
+        ok, body = _tg(token, "sendMessage",
+                       {"chat_id": chat, "text": text,
+                        "disable_web_page_preview": True})
+        return (True, "") if ok else (False, body)
+    except Exception as e:
+        return False, f"{type(e).__name__}: {e}"
+
+
+def discover_chat(token: str = ""):
+    """The private chat that last wrote to the admin bot → (chat_id, name),
+    or ("", why). Telegram will not let a bot start a conversation, so the
+    admin presses Start (or sends any message) once; this reads it back so
+    nobody has to look up their own chat id."""
+    token = token or admin_token()
+    if not token:
+        return "", "no admin bot token"
+    try:
+        ok, body = _tg(token, "getUpdates", {"limit": 100, "timeout": 0})
+    except Exception as e:
+        return "", f"{type(e).__name__}: {e}"
+    if not ok:
+        return "", str(body)
+    for upd in reversed(body.get("result") or []):
+        msg = upd.get("message") or upd.get("edited_message") or {}
+        chat = msg.get("chat") or {}
+        if chat.get("type") == "private" and chat.get("id"):
+            name = " ".join(x for x in (chat.get("first_name"), chat.get("last_name")) if x) \
+                or chat.get("username") or ""
+            return str(chat["id"]), name
+    return "", ("nobody has messaged the bot yet — open it in Telegram, press "
+                "Start, then try again")
 
 
 def _default_notify(text: str):
-    """Telegram, to the admin, with the bot alerts.py and webhook.py use."""
-    token = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
-    chat = admin_chat()
-    if not token or not chat:
-        return False, "TELEGRAM_BOT_TOKEN / ADMIN_TELEGRAM_CHAT_ID not set"
-    try:
-        import httpx
-        rep = httpx.post(
-            f"https://api.telegram.org/bot{token}/sendMessage",
-            json={"chat_id": chat, "text": f"{admin_name()} — {text}",
-                  "disable_web_page_preview": True},
-            timeout=10.0)
-        if rep.status_code == 200:
-            return True, ""
-        try:
-            detail = rep.json().get("description") or rep.text
-        except Exception:
-            detail = rep.text
-        return False, f"HTTP {rep.status_code}: {str(detail)[:200]}"
-    except Exception as e:
-        return False, f"{type(e).__name__}: {e}"
+    """Telegram, to the admin, through the admin bot — the message as
+    composed, no prefix (the bot's own name is the sender line)."""
+    return send_admin(text)
 
 
 class Decider:
@@ -881,15 +1058,23 @@ class Decider:
     """
 
     def __init__(self, platform="instagram", *, log=print, db=DEFAULT_DB,
-                 notify=None, now=None):
+                 notify=None, now=None, quiet=False):
         self.platform = platform
         self.log = log
         self.state = _State(db)
         self.notify = notify or _default_notify
         self.now = now
+        # quiet: decide and log, never page. The dashboard's Fetch-now and
+        # the CLI's one-shot run use it — the operator is looking at the
+        # screen that shows the reason, and a one-shot decider has no memory
+        # of having paged, so until 2026-09-06 every click paged again. The
+        # service loop's persistent decider pages once if the condition
+        # persists.
+        self.quiet = bool(quiet)
         self._pass_wait = 0
         self._platform_wait = 0
         self._said_nowhere = False
+        self._said_quiet = False
 
     def begin_pass(self):
         self._pass_wait = 0
@@ -916,7 +1101,12 @@ class Decider:
             d = decide(self.state, ev, self.now() if self.now else None, meta)
         for line in d.say:
             self._log(line)
-        if d.notify:
+        if d.notify and self.quiet:
+            if not self._said_quiet:
+                self._said_quiet = True
+                self._log(f"[{self.platform}] operator not paged from a one-shot "
+                          f"pass — the service loop pages once if this persists")
+        elif d.notify:
             ok, err = self.notify(d.notify)
             if ok:
                 self._log(f"[{self.platform}] operator told (Telegram): "
@@ -998,3 +1188,51 @@ class Decider:
             self.log(line)
         except Exception:
             pass
+
+
+# ------------------------------------------------------------------ the CLI
+
+def _cli(argv) -> int:
+    """
+    python3 decider.py test    send one test ping through the admin bot
+    python3 decider.py chat    print the chat id of whoever last wrote to
+                               the admin bot (press Start on it first)
+
+    Reads .env from the working directory like the services do.
+    """
+    try:
+        from dotenv import load_dotenv
+        load_dotenv()
+    except Exception:
+        pass
+    cmd = (argv[1] if len(argv) > 1 else "").strip()
+    if cmd == "chat":
+        cid, name = discover_chat()
+        if not cid:
+            print(f"no chat found: {name}")
+            return 1
+        print(f"ADMIN_TELEGRAM_CHAT_ID={cid}    # {name}")
+        return 0
+    if cmd == "test":
+        chat = admin_chat()
+        if not chat:
+            chat, name = discover_chat()
+            if not chat:
+                print(f"no admin chat: {name}")
+                return 1
+            print(f"(no ADMIN_TELEGRAM_CHAT_ID set — using {chat} / {name} from the bot's updates; "
+                  f"put it in .env to make it permanent)")
+        ok, err = send_admin(
+            f"🟢 Vedic Scraper Admin is connected. Pings arrive here, one per "
+            f"condition, with the first move and a link to the fix.", chat=chat)
+        print("sent" if ok else f"not sent: {err}")
+        return 0 if ok else 1
+    if cmd not in ("", "-h", "--help"):
+        print(f"unknown command {cmd!r}")
+    print(_cli.__doc__)
+    return 0 if cmd in ("", "-h", "--help") else 2
+
+
+if __name__ == "__main__":
+    import sys
+    raise SystemExit(_cli(sys.argv))

@@ -973,6 +973,71 @@ function FixCard({ c, focus, accounts, onAdopt, onChanged, onSignin }) {
   );
 }
 
+// The pager: which bot pages the admin, to which chat, and a test button.
+// One line when it is set up; the fields open only when asked. The token is
+// written to .env on the server and never shown back (the id before the colon
+// is enough to tell two bots apart).
+function PagerBox({ pager, onChanged }) {
+  const [open, setOpen] = useState(false);
+  const [token, setToken] = useState("");
+  const [chat, setChat] = useState("");
+  const [name, setName] = useState("");
+  const [msg, setMsg] = useState("");
+  const [busy, setBusy] = useState(false);
+  if (!pager) return null;
+
+  const run = async (fn, okText) => {
+    setBusy(true); setMsg("…");
+    try {
+      const r = await fn();
+      if (r.error) setMsg(r.error);
+      else { setMsg(okText(r)); setToken(""); onChanged(); }
+    } catch (e) { setMsg(String(e.message || e)); }
+    setBusy(false);
+  };
+  const save = () => run(() => api.pagerSave({ token, chat_id: chat, name }),
+    (r) => `saved${r.found ? " · " + r.found : ""}`);
+  const test = () => run(() => api.pagerTest(), () => "sent — check Telegram");
+
+  const line = pager.ready
+    ? `pages ${pager.admin}${pager.admin_chat ? ` (chat ${pager.admin_chat})` : ""} via `
+      + (pager.own_bot ? `the admin bot ${pager.token_hint}…` : `the delivery bot (no admin bot set)`)
+    : pager.has_token ? "bot set, no admin chat id — press Start on the bot in Telegram, then Send test"
+    : "not set — nobody is paged when an account needs a human";
+
+  return (
+    <div className={pager.ready && pager.own_bot ? "banner-ok" : "banner-warn"}
+         style={{ marginBottom: 12, display: "flex", flexDirection: "column", gap: 8 }}>
+      <div style={{ display: "flex", gap: 10, alignItems: "center", flexWrap: "wrap" }}>
+        <b>Pager</b>
+        <span style={{ flex: 1 }}>{line}</span>
+        <button className="btn btn-ghost" disabled={busy || !pager.has_token} onClick={test}>Send test</button>
+        <button className="btn btn-ghost" disabled={busy} onClick={() => setOpen((v) => !v)}>
+          {open ? "Close" : pager.has_token ? "Change" : "Set up"}
+        </button>
+      </div>
+      {open && (
+        <div style={{ display: "flex", gap: 8, flexWrap: "wrap", alignItems: "flex-end" }}>
+          <div className="field" style={{ flex: "2 1 280px", margin: 0 }}>
+            <label>Admin bot token (from @BotFather — the “Vedic Scraper Admin” bot)</label>
+            <input value={token} onChange={(e) => setToken(e.target.value)} placeholder="123456789:AAH…" />
+          </div>
+          <div className="field" style={{ flex: "1 1 160px", margin: 0 }}>
+            <label>Your chat id (blank = read from the bot after you press Start)</label>
+            <input value={chat} onChange={(e) => setChat(e.target.value)} placeholder={pager.admin_chat || "auto"} />
+          </div>
+          <div className="field" style={{ flex: "1 1 120px", margin: 0 }}>
+            <label>Your name</label>
+            <input value={name} onChange={(e) => setName(e.target.value)} placeholder={pager.admin || "Admin"} />
+          </div>
+          <button className="btn" disabled={busy || (!token && !chat && !name)} onClick={save}>Save</button>
+        </div>
+      )}
+      {msg && <div style={{ fontSize: 12.5, color: "var(--ink-3)" }}>{msg}</div>}
+    </div>
+  );
+}
+
 function FixPanel({ conds, focusId, accounts, onAdopt, onChanged, telegram }) {
   const [signin, setSignin] = useState(null);
   if (!conds) return null;
@@ -990,7 +1055,7 @@ function FixPanel({ conds, focusId, accounts, onAdopt, onChanged, telegram }) {
             <h2>Needs attention</h2>
             <span className="right" style={{ fontSize: 12.5, color: "var(--ink-3)" }}>
               {list.filter((c) => c.needs_human).length} need you · {list.filter((c) => !c.needs_human).length} self-healing
-              {!telegram && " · Telegram not configured — set TELEGRAM_BOT_TOKEN and ADMIN_TELEGRAM_CHAT_ID in .env"}
+              {!telegram && " · nobody is paged — set the admin bot above"}
             </span>
           </div>
           {list.map((c) => (
@@ -1129,6 +1194,7 @@ export default function Accounts({ onMenu }) {
         </div>
       )}
 
+      <PagerBox pager={conds.data?.pager} onChanged={reload} />
       <FixPanel conds={conds.data} focusId={focusId} accounts={accounts}
                 telegram={!!conds.data?.telegram}
                 onAdopt={(initial) => setAdding(initial)} onChanged={reload} />
