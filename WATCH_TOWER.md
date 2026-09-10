@@ -311,6 +311,18 @@ point of view it did not happen.
 8. `/api/delivery` exposes raw webhook URLs (Apps Script `/exec` URLs are
    capability URLs) to a key — mask to host if that is not wanted.
 
+**Not for them, but they can feel it (2026-09-09):** `links` watchlists
+(`X_LINKS_PLAN.md`) re-fetch specific posts daily and overwrite their
+counters in `tweets`. `collected_ms` is never touched (R3 holds), so a
+refresh never re-delivers through their cursor and they never see the new
+numbers — which is intended: that data is for a second consumer behind a
+project-locked key (`/api/links`, `LINKS_CONSUMER_HANDOVER.md`). The one
+rule for operators: **keep links watchlists in a project Watch-Tower has
+NOT bound.** They mirror whole projects, and a links list inside a bound
+project would push those posts into their feed on first fetch. The
+`author_followers` COALESCE refresh is R4/R5-safe (a number stays a number,
+null never overwrites known).
+
 ---
 
 ## 8. Where to look

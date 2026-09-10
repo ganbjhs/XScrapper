@@ -384,6 +384,72 @@ to restamp ownership.
   for `forget_stream`; the last project cannot be deleted. Dashboard-only —
   the API-key allowlist is unchanged, so a consumer's key cannot reach
   `/api/projects/delete`. Test: `test_delete_project`.
+- **A `links` watchlist re-fetches the POST ITSELF, and the collector keeps
+  no counter history** (2026-09-09, `X_LINKS_PLAN.md`). The fourth X
+  watchlist kind holds specific post URLs (from every tab of a bound Google
+  Sheet, keyed on the tab's gid, or pasted) rather than handles. The rules
+  that make it safe to run beside everything else:
+    - *It is not a stream.* It compiles to ONE stream `wl:<id>:0` with an
+      EMPTY query and `watched = 0`, so neither `main._telegram_streams` nor
+      `Collector.discover_new_streams` ever polls it; the stream exists only
+      so the posts join the project through `tweet_hits` / `project_streams`
+      like every other post. The collector's third clock
+      (`Collector.refresh_links`, `LINKS_TICK_S`) finds its work through
+      `watchlist_links`, never through `streams`.
+    - *One `TweetDetail` per post per cycle, trickled.* `Engine.tweet_detail`
+      is twscrape's `tweet_details_raw` — its own rate bucket, one account
+      lock per call, no generator to close. Passes take `LINKS_BATCH` links
+      `LINKS_GAP_S` apart under the shared semaphore and the global pause.
+      Never batch, never burst, never put it on the search bucket.
+    - *Counters overwrite in place; first-sight fields never move.* A found
+      post goes through `upsert_tweets` like a search hit, so likes /
+      retweets / replies / quotes / views / bookmarks update and
+      `collected_ms` stays frozen (WATCH_TOWER.md R3 — a refresh must never
+      re-deliver). The one addition is `author_followers =
+      COALESCE(new, old)`: followers drift and reach math wants the current
+      number, but null is "unknown", never "zero", and unknown may not blank
+      known (R5). **No history table, anywhere.** The consumer of
+      `/api/links` keeps its own; `refresh_count` / `last_refresh_ms` on the
+      link row are telemetry, not history.
+    - *Only the focal post is stored.* `parse_detail` pins the result set to
+      the id asked for; the replies and ancestors X sends around it are
+      context, never rows. A links refresh cannot grow the corpus by a thread.
+    - *Adds never delete.* A link that leaves the sheet or is removed by hand
+      becomes `status = 'removed'` and stops refreshing; its `tweets` row
+      stays. An unavailable post (deleted / protected / suspended — X's
+      tombstone or its 200-with-"No status found", which twscrape passes
+      through and `links.classify_detail` reads) keeps its last counters, is
+      retried on cadence three times, then weekly. A transient miss (no
+      account, network, an unrecognised payload) bumps a streak and backs off
+      30 min × streak, capped at 6 h — it never becomes "unavailable" by
+      guesswork.
+    - *The dashboard is read every tick.* Pause is the one stream's `paused`
+      flag, cadence is `watchlists.refresh_every_s` (floor one hour), Refresh
+      now is a `force` flag on the rows, Sync now clears the sheet's
+      `last_sync_ms`; `links_due` and `link_sheets_due` read them from the
+      database on every tick, nothing is cached in the collector.
+    - *The sheet is read with the service account, shared as Viewer*, every
+      cell of every non-hidden tab, on `sync_every_s` (10 min). A 403 names
+      the address to share with. Script mode is not a read transport. The
+      A1 range is URL-encoded (a tab called "Q3/Q4" or "what?" is a path
+      segment). A tab title that is a date (`6/9/26`, day-first; ISO; "8
+      Sep") becomes the list's `sheet_day`; a one-cell text row is a
+      section heading and every link below it carries it (`section`). Both
+      ride out on `/api/links` as `day` / `section`; the consumer groups on
+      them, the collector never does.
+    - *One fetch per post per pass.* The same post sits on a day tab AND a
+      master tab; `refresh_links` fetches it once and lets every list's row
+      reuse the answer (each row keeps its own status and clocks, each
+      list its own hit edge).
+    - *It leaves no trace where it should not.* A links pass's rate-limit
+      headers are the TweetDetail bucket and `guard._budget` ignores
+      `kind='links'` polls; retention (`maintain`) never prunes a post a
+      live link tracks (the next refresh would re-insert it with a new
+      `collected_ms`); `delete_project` drops the project's link rows and
+      bound sheets, or the watcher would re-read a sheet for a project that
+      no longer exists every ten minutes.
+  Tests: `tests/test_links.py` (run by `test_all.py`). Live check before
+  trusting a deployment: `tools/links_probe.py <url>`.
 
 - **A STOP decision made in a pass stands at the end of that pass, and every
   shared store opens in WAL** (2026-09-06). Live, 12:52:30: @shoaibakhtar4915
@@ -566,6 +632,20 @@ to restamp ownership.
   control. The proxy is the one that bites hardest: silently dropping it puts
   the account back on the server IP, which is the sign-in/collect fingerprint
   mismatch the residential pool exists to avoid (`ACCOUNTS.md` §7).
+- **A second consumer gets a PROJECT-LOCKED key, never a Watch-Tower key**
+  (2026-09-09; BLUEPRINT parked this as "mandatory before a second
+  consumer", and the reach tracker reading `/api/links` is that consumer).
+  `API_KEYS_SCOPED=<key>=<project_id>,…` in `.env`. At the gate
+  (`_require_auth`) a scoped key may only `GET` the paths in
+  `API_KEY_SCOPED_PATHS` (`/api/links`, `/api/tweets`, `/api/watchlists`,
+  `/api/export`) and only with `?project=<its id>`; anything else is a 403
+  that names the project and the four paths. It can never list projects,
+  read another project, or spend budget on `/api/fetch`. Keys in `API_KEYS`
+  keep the whole read allowlist exactly as before — the two sets do not
+  interact. Both are compared in constant time over every key. The links
+  write paths (`/api/watchlists/links*`, `/api/links/sheets*`) are in
+  neither set: a consumer's key cannot add a link, re-time a list or make
+  the server read a sheet. Test: `test_links.test_web`.
 
 ## 6. Per-platform hard rules
 
@@ -1318,7 +1398,14 @@ before changing the engine; nearly every "obvious" idea has been tried.)
   X List; FB: pages/favorites; IG: user/hashtag/following). A new platform
   adds one entry to PLATFORM_KINDS, one detail component, and a `/api/<p>/source`
   endpoint — it must NOT invent its own page structure or scatter controls
-  back onto the main surface.
+  back onto the main surface. Two sidebar rules (2026-09-10): **every
+  platform has a row even when it has nothing** — X shows "X (Twitter)
+  watchlists · none yet" exactly as Facebook and Instagram show their empty
+  rows, with the empty panel offering "+ New watchlist", so an empty
+  platform is a place to start from, never a gap; and **a group past five
+  rows scrolls inside its own box** (a day-wise sheet makes a list per day —
+  thirty of them must not push Facebook and Instagram off the page), with
+  the count in the group label and a filter box past eight.
 - **The dashboard ships built.** The VPS runs no Node — `frontend/dist/` is
   committed on purpose. After any UI change: `cd frontend && npm run build` and
   commit `dist/`. New capability = store method → thin `web.py` validator →
@@ -1446,6 +1533,11 @@ wording. Every change appends an entry in the same commit (2026-08-25).
 **Collection**
 - X watchlists: handles / keywords (AND, quoted phrases) / X Lists, with
   per-watchlist check intervals and collection-time filters.
+- X `links` watchlists: post URLs from every tab of a bound Google Sheet or
+  pasted, re-fetched on their own cadence with counters overwritten in
+  place and no history kept (§3); the links panel (rows per post, group by
+  author, Refresh now / Sync sheet / cadence / Pause); `GET /api/links` and
+  project-locked keys (§5).
 - Instagram sources: user / hashtag / home-feed, managed from the dashboard
   (`/api/ig/source`), collected by the IG service.
 - Project scoping on IG and FB, defaulting CLOSED (§2). No endpoint may be

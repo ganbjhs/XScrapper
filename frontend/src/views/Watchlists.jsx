@@ -13,7 +13,7 @@
 //     A future platform adds one entry to PLATFORM_KINDS and one detail
 //     component — the shell does not change.
 import React, { useMemo, useState } from "react";
-import { api, fmtAgo, fmtN, useApi } from "../api/client.js";
+import { api, fmtAgo, fmtN, fmtPosted, useApi } from "../api/client.js";
 import { PageHead, useProject } from "../App.jsx";
 import { Empty, ErrorState, Loading, Modal } from "../components/ui.jsx";
 
@@ -56,6 +56,7 @@ const PLATFORM_KINDS = {
     ["query", "Handles (built here — no X List needed)"],
     ["keywords", "Keywords (comma = any, AND = both required)"],
     ["xlist", "Existing X List (fastest polling)"],
+    ["links", "Post links (from a Google Sheet, or pasted — re-fetched daily)"],
   ],
   fb: [
     ["pages", "Pages (each page checked on its own cadence)"],
@@ -80,6 +81,8 @@ function AddModal({ pid, onDone, onClose }) {
   const [owner, setOwner] = useState("");
   const [handles, setHandles] = useState("");
   const [igValue, setIgValue] = useState("");
+  const [sheet, setSheet] = useState("");
+  const [synced, setSynced] = useState(null);   // links+sheet: the first sync's report
   const [err, setErr] = useState("");
   const [busy, setBusy] = useState(false);
 
@@ -88,7 +91,16 @@ function AddModal({ pid, onDone, onClose }) {
   const create = async () => {
     setBusy(true); setErr("");
     try {
-      if (platform === "x") {
+      if (platform === "x" && kind === "links") {
+        // A sheet names its own watchlists (one per tab) and is read on this
+        // click, so the report below says what it found before the modal
+        // closes. A pasted list is an ordinary create.
+        const body = { project: pid, kind: "links", name, links: handles };
+        if (sheet.trim()) body.sheet = sheet.trim();
+        const made = await api.createWatchlist(body);
+        if (made.warning) { setErr(made.warning); return; }
+        if (body.sheet) { setSynced(made); onDone(platform); return; }
+      } else if (platform === "x") {
         const body = { project: pid, name, kind };
         if (kind === "xlist") { body.list_id = listId; body.owner_handle = owner; }
         else if (kind === "keywords")
@@ -118,9 +130,42 @@ function AddModal({ pid, onDone, onClose }) {
   };
 
   const canCreate =
-    platform === "x" ? name.trim() && (kind === "xlist" ? listId.trim() : true)
+    platform === "x" && kind === "links" ? (sheet.trim() || (name.trim() && handles.trim()))
+      : platform === "x" ? name.trim() && (kind === "xlist" ? listId.trim() : true)
       : platform === "fb" ? (kind === "favorites" || handles.trim())
       : (kind === "following" || handles.trim());
+
+  if (synced) {
+    const wl = synced.watchlists || [];
+    return (
+      <Modal title="Sheet connected" onClose={onClose}
+             sub={synced.sheet?.title ? `“${synced.sheet.title}”` : "The sheet was read once now; it is re-read every 10 minutes."}>
+        {synced.error ? (
+          <div className="err">{synced.error}</div>
+        ) : (
+          <div style={{ fontSize: 13.5, lineHeight: 1.6 }}>
+            <b>{synced.tabs}</b> tab{synced.tabs === 1 ? "" : "s"} → <b>{wl.length}</b> watchlist{wl.length === 1 ? "" : "s"}
+            {" · "}<b>{synced.found}</b> post link{synced.found === 1 ? "" : "s"} found
+            {synced.added ? <> · <b>{synced.added}</b> new</> : null}
+            {synced.skipped ? <> · {synced.skipped} skipped (not X post links)</> : null}
+            {synced.tco_unresolved ? <> · {synced.tco_unresolved} t.co link{synced.tco_unresolved === 1 ? "" : "s"} could not be resolved</> : null}
+            <ul style={{ margin: "8px 0 0", paddingLeft: 18, color: "var(--ink-2)" }}>
+              {wl.map((t) => (
+                <li key={t.watchlist_id}>{t.name}{t.tab !== t.name ? ` (tab “${t.tab}”)` : ""} — {t.found} link{t.found === 1 ? "" : "s"}</li>
+              ))}
+            </ul>
+            <div style={{ color: "var(--ink-3)", fontSize: 12, marginTop: 10 }}>
+              New rows are picked up on the next sync and fetched within a couple of
+              minutes. A link removed from the sheet is marked, never deleted.
+            </div>
+          </div>
+        )}
+        <div className="row">
+          <button className="btn btn-brand" onClick={onClose}>Done</button>
+        </div>
+      </Modal>
+    );
+  }
 
   return (
     <Modal title="New watchlist" onClose={onClose}
@@ -142,7 +187,44 @@ function AddModal({ pid, onDone, onClose }) {
         </select>
       </div>
 
-      {platform === "x" && (
+      {platform === "x" && kind === "links" && (
+        <>
+          <div className="field">
+            <label>Google Sheet URL — every tab becomes a watchlist named after it (optional)</label>
+            <input value={sheet} autoFocus onChange={(e) => setSheet(e.target.value)}
+                   placeholder="https://docs.google.com/spreadsheets/d/…/edit" />
+            <div style={{ color: "var(--ink-3)", fontSize: 12, marginTop: 6, lineHeight: 1.5 }}>
+              Share the sheet with the collector's service account as <b>Viewer</b>{" "}
+              (the same account Sheet delivery uses). Every cell of every tab is
+              scanned for x.com post links; other columns are ignored. Re-read
+              every 10 minutes — paste a row and it starts within a couple of minutes.
+            </div>
+          </div>
+          {!sheet.trim() && (
+            <>
+              <div className="field">
+                <label>Name</label>
+                <input value={name} onChange={(e) => setName(e.target.value)}
+                       placeholder="e.g. Launch week posts" />
+              </div>
+              <div className="field">
+                <label>Post links — one per line</label>
+                <textarea rows="5" value={handles} onChange={(e) => setHandles(e.target.value)}
+                          placeholder={"https://x.com/nasa/status/1789…\nhttps://x.com/isro/status/1790…"} />
+              </div>
+            </>
+          )}
+          <div style={{ color: "var(--ink-3)", fontSize: 12, marginTop: 4, lineHeight: 1.5 }}>
+            Each post is re-fetched once a day (12h/24h/48h per list) and its likes,
+            reposts, replies, quotes, <b>views</b> and bookmarks are overwritten with
+            the latest numbers. No history is kept here — the tool reading{" "}
+            <code>/api/links</code> keeps its own. Use a project that is <b>not</b> bound
+            to Watch-Tower: they mirror whole projects.
+          </div>
+        </>
+      )}
+
+      {platform === "x" && kind !== "links" && (
         <>
           <div className="field">
             <label>Name</label>
@@ -740,6 +822,330 @@ function XDetail({ w, onChanged }) {
       {confirming && (
         <Modal title={`Delete “${w.name}”?`} onClose={() => setConfirming(false)}
                sub="Collection stops. Everything already collected stays in the database.">
+          <div className="row">
+            <button className="btn btn-ghost" onClick={() => setConfirming(false)}>Keep it</button>
+            <button className="btn btn-danger"
+                    onClick={async () => {
+                      await api.removeWatchlist(w.watchlist_id);
+                      setConfirming(false); onChanged();
+                    }}>
+              Delete
+            </button>
+          </div>
+        </Modal>
+      )}
+    </div>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// Links detail panel — post URLs re-fetched on a cadence (X_LINKS_PLAN.md §7).
+//
+// The links PANEL: one row per link, the way the handles box shows handles —
+// author, the post, its current counters, its state, when it was last read.
+// Group-by-author gives the "see it like handles" view without changing what
+// is collected: the list is the posts, not the people.
+// ---------------------------------------------------------------------------
+
+const LINK_REFRESH = [["43200", "12 hours"], ["86400", "24 hours"], ["172800", "48 hours"]];
+const fmtDay = (iso) => {
+  const t = Date.parse(iso + "T00:00:00");
+  return t ? new Date(t).toLocaleDateString("en-IN", { day: "numeric", month: "short", year: "numeric" }) : iso;
+};
+const LINK_SORTS = [["", "added"], ["views", "views"], ["likes", "likes"],
+                    ["posted", "posted"], ["refreshed", "last refreshed"]];
+const LINK_STATUS_CHIP = { ok: "good", pending: "", unavailable: "warn", removed: "" };
+
+function LinkStatus({ row }) {
+  const cls = LINK_STATUS_CHIP[row.status] ?? "";
+  const title = row.status_note || (row.status === "pending"
+    ? (row.fail_streak ? `${row.fail_streak} miss${row.fail_streak === 1 ? "" : "es"} — retrying with back-off` : "not fetched yet")
+    : row.status === "ok" ? "last fetch returned the post" : "");
+  return (
+    <span className={`chip ${cls}`} title={title}
+          style={row.status === "removed" ? { opacity: 0.6 } : undefined}>
+      {row.status}{row.status === "pending" && row.fail_streak ? ` ·${row.fail_streak}` : ""}
+    </span>
+  );
+}
+
+function LinkRow({ row, onRemove, busy, showSection = true }) {
+  const handle = row.author_username;
+  const text = (row.text || "").replace(/\s+/g, " ").trim();
+  return (
+    <tr style={row.status === "removed" ? { opacity: 0.55 } : undefined}>
+      <td style={{ minWidth: 220, maxWidth: 340 }}>
+        <div style={{ display: "flex", gap: 9, alignItems: "flex-start" }}>
+          {row.author_avatar
+            ? <img src={row.author_avatar} alt="" style={{ width: 26, height: 26, borderRadius: "50%", flex: "none", marginTop: 1 }} />
+            : <span className="pfp" style={{ width: 26, height: 26, fontSize: 11, background: "var(--brand)" }}>
+                {(handle || "?").slice(0, 1).toUpperCase()}
+              </span>}
+          <div style={{ minWidth: 0 }}>
+            <div style={{ fontSize: 13 }}>
+              {handle ? <b>@{handle}</b>
+                : <span style={{ color: "var(--ink-3)" }}>
+                    {row.status === "unavailable" ? "post unavailable" : "not fetched yet"}
+                  </span>}
+              {row.created_at && <span style={{ color: "var(--ink-3)", marginLeft: 8, fontSize: 12 }}>{fmtPosted(row.created_at)}</span>}
+              {row.section && showSection && (
+                <span className="badge rt" style={{ marginLeft: 8, fontWeight: 600 }} title="section heading in the sheet">{row.section}</span>
+              )}
+            </div>
+            <div style={{ color: row.fetched ? "var(--ink-2)" : "var(--ink-3)", fontSize: 12.5, lineHeight: 1.4,
+                          overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", maxWidth: 290 }}
+                 title={text || row.status_note || row.url}>
+              {text || (row.status === "unavailable" && row.status_note ? row.status_note : row.url)}
+            </div>
+          </div>
+        </div>
+      </td>
+      <td className="num">{fmtN(row.like_count)}</td>
+      <td className="num">{fmtN(row.retweet_count)}</td>
+      <td className="num" title={row.quote_count != null ? `${fmtN(row.quote_count)} quotes` : ""}>{fmtN(row.reply_count)}</td>
+      <td className="num"><b>{fmtN(row.view_count)}</b></td>
+      <td><LinkStatus row={row} /></td>
+      <td style={{ whiteSpace: "nowrap", color: "var(--ink-3)", fontSize: 12 }}
+          title={row.last_refresh_ms ? new Date(row.last_refresh_ms).toLocaleString() : ""}>
+        {row.last_refresh_ms ? fmtAgo(row.last_refresh_ms) : "—"}
+        {row.refresh_count > 1 && <span style={{ marginLeft: 4 }}>·{row.refresh_count}</span>}
+        {row.force && <span className="chip warn" style={{ marginLeft: 6 }}>queued</span>}
+      </td>
+      <td style={{ whiteSpace: "nowrap", paddingLeft: 4, paddingRight: 6 }}>
+        <a className="btn btn-ghost btn-sm" style={{ padding: "3px 7px" }} href={row.url} target="_blank" rel="noreferrer" title="open on X">↗</a>
+        {row.status !== "removed" && (
+          <button className="btn btn-ghost btn-sm" disabled={busy} style={{ marginLeft: 3, padding: "3px 7px" }}
+                  title="stop refreshing this post (its numbers stay)" onClick={() => onRemove(row)}>✕</button>
+        )}
+      </td>
+    </tr>
+  );
+}
+
+function LinksDetail({ pid, w, onChanged }) {
+  const [sort, setSort] = useState("");
+  const [status, setStatus] = useState("");
+  const [groupBy, setGroupBy] = useState("");   // "" | "author" | "section"
+  const [search, setSearch] = useState("");
+  const [adding, setAdding] = useState("");
+  const [msg, setMsg] = useState("");
+  const [err, setErr] = useState("");
+  const [busy, setBusy] = useState(false);
+  const [confirming, setConfirming] = useState(false);
+
+  const rows = useApi(
+    () => api.links({ project: pid, watchlist: w.watchlist_id, sort, status, limit: 500 }),
+    [pid, w.watchlist_id, sort, status], { every: 30_000 },
+  );
+  const data = rows.data?.rows || [];
+  const shown = search
+    ? data.filter((r) => `${r.author_username || ""} ${r.text || ""} ${r.url}`.toLowerCase().includes(search.toLowerCase()))
+    : data;
+  const summ = w.links || {};
+  const sheet = w.sheet;
+  const paused = !!w.paused;
+
+  const act = async (fn, okMsg) => {
+    setBusy(true); setErr(""); setMsg("");
+    try {
+      const r = await fn();
+      if (okMsg) setMsg(typeof okMsg === "function" ? okMsg(r) : okMsg);
+      rows.reload(); onChanged();
+    } catch (e) { setErr(String(e.message || e)); }
+    finally { setBusy(false); }
+  };
+
+  const groups = useMemo(() => {
+    if (!groupBy) return null;
+    const m = new Map();
+    for (const r of shown) {
+      const k = groupBy === "author"
+        ? (r.author_username ? `@${r.author_username}` : "(not fetched yet)")
+        : (r.section || "(no section)");
+      if (!m.has(k)) m.set(k, { key: k, avatar: groupBy === "author" ? r.author_avatar : null,
+                                followers: groupBy === "author" ? r.author_followers : null,
+                                rows: [], views: 0, likes: 0 });
+      const g = m.get(k);
+      g.rows.push(r); g.views += r.view_count || 0; g.likes += r.like_count || 0;
+      if (!g.avatar && groupBy === "author" && r.author_avatar) g.avatar = r.author_avatar;
+    }
+    const out = [...m.values()];
+    // Sections keep the sheet's own order (first row wins); authors sort by reach.
+    if (groupBy === "author") out.sort((a, b) => b.views - a.views);
+    return out;
+  }, [groupBy, shown]);
+  const hasSections = data.some((r) => r.section);
+
+  const head = (
+    <tr>
+      <th>Post</th><th className="num" title="likes">❤</th><th className="num" title="reposts">↻</th>
+      <th className="num" title="replies">💬</th>
+      <th className="num" title="views (reach)">👁</th><th>State</th><th>Read</th><th></th>
+    </tr>
+  );
+
+  return (
+    <div className="panel">
+      <div className="phead" style={{ alignItems: "center", flexWrap: "wrap", rowGap: 8 }}>
+        <h3>{w.name}</h3>
+        <span className="badge platform-x">links</span>
+        <span className="chip">{fmtN(summ.total ?? 0)} link{summ.total === 1 ? "" : "s"}</span>
+        {summ.ok > 0 && <span className="chip good" title="last fetch returned the post">{fmtN(summ.ok)} ok</span>}
+        {summ.pending > 0 && <span className="chip" title="not fetched yet, or retrying">{fmtN(summ.pending)} pending</span>}
+        {summ.unavailable > 0 && <span className="chip warn" title="deleted, protected or suspended — last numbers kept">{fmtN(summ.unavailable)} unavailable</span>}
+        {paused && <span className="chip warn">paused</span>}
+        <span className="right" style={{ display: "flex", gap: 8, alignItems: "center", flexWrap: "wrap" }}>
+          <label className="fpill" style={{ padding: "5px 6px 5px 11px" }}
+                 title={"How often every post on this list is re-fetched.\n\nOne TweetDetail "
+                        + "request per post per cycle, trickled through the day on its own "
+                        + "rate budget — it never slows the handle watchlists."}>
+            <span>every</span>
+            <select value={String(w.refresh_every_s || 86400)} disabled={busy}
+                    onChange={(e) => act(() => api.linksInterval(w.watchlist_id, Number(e.target.value)))}>
+              {LINK_REFRESH.map(([v, t]) => <option key={v} value={v}>{t}</option>)}
+              {!LINK_REFRESH.some(([v]) => v === String(w.refresh_every_s)) && w.refresh_every_s
+                && <option value={String(w.refresh_every_s)}>{Math.round(w.refresh_every_s / 3600)} hours</option>}
+            </select>
+          </label>
+          <button className="btn btn-ghost btn-sm" disabled={busy || !summ.total}
+                  title="Queue every post on this list for a fetch on the next pass (within a minute)"
+                  onClick={() => act(() => api.linksRefreshNow(w.watchlist_id),
+                                     (r) => `${r.queued} post${r.queued === 1 ? "" : "s"} queued — the collector picks them up on its next pass`)}>
+            Refresh now
+          </button>
+          {sheet && (
+            <button className="btn btn-ghost btn-sm" disabled={busy}
+                    title="Re-read the Google Sheet now (every tab)"
+                    onClick={() => act(() => api.syncLinkSheet(sheet.link_sheet_id),
+                                       (r) => r.error ? r.error : `sheet read: ${r.found} link${r.found === 1 ? "" : "s"} across ${r.tabs} tab${r.tabs === 1 ? "" : "s"}, ${r.added} new, ${r.removed} gone`)}>
+              Sync sheet
+            </button>
+          )}
+          <button className="btn btn-ghost btn-sm" disabled={busy}
+                  onClick={() => act(() => api.streamSettings({ label: `wl:${w.watchlist_id}:0`, paused: !paused }))}>
+            {paused ? "Resume" : "Pause"}
+          </button>
+          <button className="btn btn-danger btn-sm" onClick={() => setConfirming(true)}>Delete</button>
+        </span>
+      </div>
+
+      <div style={{ color: "var(--ink-3)", fontSize: 12.5, lineHeight: 1.5 }}>
+        {sheet ? (
+          <>
+            {w.sheet_day && <><b>Day {fmtDay(w.sheet_day)}</b> · </>}
+            Mirrors tab <b>“{w.sheet_tab || w.name}”</b> of sheet <b>“{sheet.title || sheet.sheet_id}”</b>
+            {" · "}synced {sheet.last_sync_ms ? fmtAgo(sheet.last_sync_ms) : "never"}
+            {" · "}re-read every {Math.round((sheet.sync_every_s || 600) / 60)} min
+            {" · "}<a href={`https://docs.google.com/spreadsheets/d/${sheet.sheet_id}`} target="_blank" rel="noreferrer">open sheet ↗</a>
+          </>
+        ) : (
+          <>Pasted list — add more links below. Every post is re-fetched on the cadence above; the numbers you see are the latest read.</>
+        )}
+        {w.last_refresh_ms ? <> · last pass {fmtAgo(w.last_refresh_ms)}</> : null}
+      </div>
+      {sheet?.last_error && (
+        <div className="banner-warn" style={{ marginTop: 10 }}>
+          <b>Sheet not read:</b> {sheet.last_error}
+        </div>
+      )}
+
+      <div className="filters" style={{ margin: "12px 0 0" }}>
+        <input value={search} placeholder={`search ${data.length} post${data.length === 1 ? "" : "s"}…`}
+               style={{ flex: 1, minWidth: 160 }} onChange={(e) => setSearch(e.target.value)} />
+        <select value={sort} onChange={(e) => setSort(e.target.value)} title="sort">
+          {LINK_SORTS.map(([v, t]) => <option key={v} value={v}>sort: {t}</option>)}
+        </select>
+        <select value={status} onChange={(e) => setStatus(e.target.value)} title="state">
+          <option value="">all states</option>
+          <option value="ok">ok</option>
+          <option value="pending">pending</option>
+          <option value="unavailable">unavailable</option>
+          <option value="removed">removed</option>
+        </select>
+        <select value={groupBy} onChange={(e) => setGroupBy(e.target.value)} title="group rows">
+          <option value="">no grouping</option>
+          <option value="author">group by author</option>
+          {hasSections && <option value="section">group by section</option>}
+        </select>
+      </div>
+
+      <div className="members-box" style={{ maxHeight: 520, padding: 0, margin: "8px 0", overflow: "auto" }}>
+        {rows.loading && !rows.data && <Loading />}
+        {rows.error && <ErrorState error={rows.error} retry={rows.reload} />}
+        {rows.data && data.length === 0 && (
+          <div style={{ color: "var(--ink-3)", fontSize: 13, padding: 14 }}>
+            {status ? `No ${status} links.` : sheet
+              ? "No x.com post links found in this tab yet — paste some into the sheet, or below."
+              : "No links yet — paste some below."}
+          </div>
+        )}
+        {rows.data && data.length > 0 && shown.length === 0 && (
+          <div style={{ color: "var(--ink-3)", fontSize: 13, padding: 14 }}>no match for “{search}”</div>
+        )}
+        {shown.length > 0 && !groupBy && (
+          <table className="tbl">
+            <thead>{head}</thead>
+            <tbody>
+              {shown.map((r) => (
+                <LinkRow key={r.tweet_id} row={r} busy={busy}
+                         onRemove={(row) => act(() => api.removeLink(w.watchlist_id, row.tweet_id))} />
+              ))}
+            </tbody>
+          </table>
+        )}
+        {shown.length > 0 && groupBy && groups.map((g) => (
+          <div key={g.key} style={{ borderBottom: "1px solid var(--ring)" }}>
+            <div style={{ display: "flex", alignItems: "center", gap: 9, padding: "9px 10px 4px", fontSize: 13 }}>
+              {groupBy === "author" && (g.avatar
+                ? <img src={g.avatar} alt="" style={{ width: 22, height: 22, borderRadius: "50%" }} />
+                : <span className="pfp" style={{ width: 22, height: 22, fontSize: 10, background: "var(--brand)" }}>{g.key.slice(1, 2).toUpperCase()}</span>)}
+              <b>{g.key}</b>
+              {g.followers != null && <span style={{ color: "var(--ink-3)", fontSize: 12 }}>{fmtN(g.followers)} followers</span>}
+              <span className="chip" style={{ marginLeft: "auto" }}>{g.rows.length} post{g.rows.length === 1 ? "" : "s"}</span>
+              <span className="chip" title="views summed over these posts">👁 {fmtN(g.views)}</span>
+              <span className="chip" title="likes summed over these posts">❤ {fmtN(g.likes)}</span>
+            </div>
+            <table className="tbl">
+              <tbody>
+                {g.rows.map((r) => (
+                  <LinkRow key={r.tweet_id} row={r} busy={busy} showSection={groupBy !== "section"}
+                           onRemove={(row) => act(() => api.removeLink(w.watchlist_id, row.tweet_id))} />
+                ))}
+              </tbody>
+            </table>
+          </div>
+        ))}
+      </div>
+
+      <div className="filters" style={{ marginBottom: 0, alignItems: "flex-start" }}>
+        <textarea rows="2" value={adding} style={{ flex: 1, minWidth: 220, font: "inherit" }}
+                  placeholder={"paste x.com post links — one per line, or several separated by spaces"}
+                  onChange={(e) => setAdding(e.target.value)} />
+        <button className="btn btn-brand btn-sm" disabled={busy || !adding.trim()}
+                onClick={() => act(() => api.addLinks(w.watchlist_id, adding),
+                                   (r) => { setAdding(""); return `${r.added} added${r.revived ? `, ${r.revived} revived` : ""}${r.existing ? `, ${r.existing} already listed` : ""}${r.skipped ? `, ${r.skipped} skipped (not X post links)` : ""}${r.note ? ` — ${r.note}` : ""}`; })}>
+          Add
+        </button>
+      </div>
+      {msg && <div style={{ color: "var(--good-text)", fontSize: 13, marginTop: 8 }}>{msg}</div>}
+      {err && <div style={{ color: "var(--critical)", fontSize: 13, marginTop: 8 }}>{err}</div>}
+
+      <details className="help">
+        <summary>How a links watchlist works</summary>
+        <p>
+          Each post is fetched by id once per cycle and its counters are
+          overwritten with the latest numbers; <b>views</b> is the reach figure.
+          Nothing is kept as history here — the tool reading <code>/api/links</code>
+          keeps its own. A deleted or protected post is marked <i>unavailable</i>
+          and keeps its last numbers. A link that leaves the sheet, or that you
+          remove, is marked and never fetched again, but its post stays.
+          {sheet ? " New rows in the sheet start within a couple of minutes of the next sync." : ""}
+        </p>
+      </details>
+
+      {confirming && (
+        <Modal title={`Delete “${w.name}”?`} onClose={() => setConfirming(false)}
+               sub="Refreshing stops for these links. The posts already collected stay in the database.">
           <div className="row">
             <button className="btn btn-ghost" onClick={() => setConfirming(false)}>Keep it</button>
             <button className="btn btn-danger"
@@ -1433,9 +1839,20 @@ export default function Watchlists({ onMenu }) {
       id: `x:${w.watchlist_id}`, platform: "x", name: w.name,
       sub: w.kind === "xlist"
         ? `X List${w.owner_handle ? ` \u00b7 @${w.owner_handle}` : ""}`
+        : w.kind === "links"
+        ? `${w.links?.total ?? 0} links \u00b7 every ${Math.round((w.refresh_every_s || 86400) / 3600)}h`
+          + (w.sheet ? (w.sheet_day ? ` \u00b7 day ${fmtDay(w.sheet_day)}` : ` \u00b7 sheet tab \u201c${w.sheet_tab || w.name}\u201d`) : "")
         : `${w.members.length} ${w.kind === "keywords" ? "keywords" : "handles"}`,
       live: w.streams.some((s) => !s.paused), w,
     }));
+    if (out.length === 0) {
+      // X is a row even with nothing in it, like the Facebook and Instagram
+      // rows below — an empty platform is a place to start from, not a gap.
+      out.push({
+        id: "x", platform: "x", name: "X (Twitter) watchlists",
+        sub: "none yet — handles, keywords, an X List, or post links", live: false,
+      });
+    }
     out.push({
       id: "fb", platform: "fb", name: "Facebook pages",
       sub: `${(fb.data?.sources || []).length} pages · ${fmtN(fb.data?.totals?.posts ?? 0)} collected`,
@@ -1451,8 +1868,12 @@ export default function Watchlists({ onMenu }) {
 
   const selected = items.find((i) => i.id === sel) || items[0] || null;
   const reloadAll = () => { wls.reload(); fb.reload(); ig.reload(); };
+  const [listFilter, setListFilter] = useState("");
 
   const groups = [["x", "X (Twitter)"], ["fb", "Facebook"], ["ig", "Instagram"]];
+  // A group past this many rows scrolls in its own box; past FILTER_AT it
+  // also gets a filter box, because thirty day-tabs are not scanned by eye.
+  const SCROLL_AT = 5, FILTER_AT = 8;
 
   return (
     <>
@@ -1478,25 +1899,45 @@ export default function Watchlists({ onMenu }) {
             <div className="wl-layout">
               <div className="wl-list">
                 {groups.map(([p, label]) => {
-                  const rows = items.filter((i) => i.platform === p);
-                  if (rows.length === 0) return null;
+                  const all = items.filter((i) => i.platform === p);
+                  if (all.length === 0) return null;
+                  const filterable = p === "x" && xLists.length > FILTER_AT;
+                  const q = filterable ? listFilter.trim().toLowerCase() : "";
+                  const rows = q
+                    ? all.filter((i) => `${i.name} ${i.sub}`.toLowerCase().includes(q))
+                    : all;
+                  const scroll = all.length > SCROLL_AT;
                   return (
                     <React.Fragment key={p}>
-                      <div className="wl-group">{label}</div>
-                      {rows.map((i) => (
-                        <button key={i.id}
-                                className={`wl-item ${selected?.id === i.id ? "sel" : ""}`}
-                                onClick={() => setSel(i.id)}>
-                          <span className={`badge platform-${i.platform}`}>
-                            {{ x: "𝕏", fb: "f", ig: "IG" }[i.platform]}
-                          </span>
-                          <span className="nm">
-                            <b>{i.name}</b>
-                            <small>{i.sub}</small>
-                          </span>
-                          <span className={`dot${i.live ? "" : " off"}`} />
-                        </button>
-                      ))}
+                      <div className="wl-group">
+                        {label}
+                        {p === "x" && xLists.length > 0 && <span className="cnt">· {xLists.length}</span>}
+                        {filterable && (
+                          <input value={listFilter} placeholder={`filter ${xLists.length} watchlists…`}
+                                 onChange={(e) => setListFilter(e.target.value)} />
+                        )}
+                      </div>
+                      <div className={`wl-rows${scroll ? " scroll" : ""}`}>
+                        {rows.map((i) => (
+                          <button key={i.id}
+                                  className={`wl-item ${selected?.id === i.id ? "sel" : ""}`}
+                                  onClick={() => setSel(i.id)}>
+                            <span className={`badge platform-${i.platform}`}>
+                              {{ x: "𝕏", fb: "f", ig: "IG" }[i.platform]}
+                            </span>
+                            <span className="nm">
+                              <b>{i.name}</b>
+                              <small>{i.sub}</small>
+                            </span>
+                            <span className={`dot${i.live ? "" : " off"}`} />
+                          </button>
+                        ))}
+                        {q && rows.length === 0 && (
+                          <div style={{ color: "var(--ink-3)", fontSize: 12.5, padding: "8px 12px" }}>
+                            no watchlist matches “{listFilter}”
+                          </div>
+                        )}
+                      </div>
                     </React.Fragment>
                   );
                 })}
@@ -1514,7 +1955,24 @@ export default function Watchlists({ onMenu }) {
                     works for X, Facebook, and Instagram alike.
                   </Empty>
                 )}
-                {selected?.platform === "x" && (
+                {selected?.id === "x" && (
+                  <div className="panel">
+                    <Empty title="No X watchlists in this project yet">
+                      An X watchlist is a set of handles, a keyword search, an existing
+                      X List, or a list of post links from a Google Sheet. Posts start
+                      flowing into the Live Feed as soon as one exists.
+                      <div style={{ marginTop: 14 }}>
+                        <button className="btn btn-brand" onClick={() => setCreating(true)}>
+                          + New watchlist
+                        </button>
+                      </div>
+                    </Empty>
+                  </div>
+                )}
+                {selected?.platform === "x" && selected.w?.kind === "links" && (
+                  <LinksDetail pid={pid} w={selected.w} onChanged={reloadAll} />
+                )}
+                {selected?.platform === "x" && selected.w && selected.w.kind !== "links" && (
                   <XDetail w={selected.w} onChanged={reloadAll} />
                 )}
                 {selected?.id === "fb" && (

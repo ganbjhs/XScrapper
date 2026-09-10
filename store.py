@@ -556,6 +556,56 @@ CREATE TABLE IF NOT EXISTS project_streams (
   PRIMARY KEY (project_id, stream_id)
 ) WITHOUT ROWID;
 
+-- Post LINKS as a watchlist (kind='links'; see X_LINKS_PLAN.md).
+--
+-- A links watchlist holds specific post URLs, not handles. Its one compiled
+-- stream, 'wl:<id>:0', has an EMPTY query and watched=0: nothing polls it.
+-- The collector's links clock finds its work through this table instead,
+-- fetches each post by id on the watchlist's own cadence, and writes the
+-- result through upsert_tweets like any poll — so the post is one row in
+-- `tweets`, its counters overwrite in place, collected_ms stays frozen, and
+-- the tweet_hits edge makes it a member of the project like any other post.
+--
+-- Links arrive from a Google Sheet (link_sheets: one sheet bound to one
+-- project; every non-hidden tab becomes one links watchlist keyed on the
+-- tab's numeric gid, so a rename keeps its links) or are pasted in
+-- (added_via='manual'). A link that leaves the sheet is marked 'removed',
+-- never deleted — the same rule as "shrinking a watchlist pauses". No
+-- counter history is kept anywhere here: the consumer of /api/links does
+-- that. The collector's job is the latest true number.
+CREATE TABLE IF NOT EXISTS link_sheets (
+  link_sheet_id INTEGER PRIMARY KEY AUTOINCREMENT,
+  project_id    INTEGER NOT NULL,
+  sheet_id      TEXT NOT NULL,                 -- the /d/<id>/ part of the URL
+  title         TEXT,                          -- the spreadsheet's own title
+  sync_every_s  INTEGER NOT NULL DEFAULT 600,
+  last_sync_ms  INTEGER,
+  last_error    TEXT,
+  paused        INTEGER NOT NULL DEFAULT 0,
+  created_at    TEXT NOT NULL,
+  UNIQUE(project_id, sheet_id)
+);
+
+CREATE TABLE IF NOT EXISTS watchlist_links (
+  watchlist_id    INTEGER NOT NULL,
+  tweet_id        INTEGER NOT NULL,            -- parsed from the URL at insert
+  url             TEXT NOT NULL,               -- as written, for the panel/API
+  added_at        TEXT NOT NULL,
+  added_via       TEXT NOT NULL DEFAULT 'manual',   -- 'sheet' | 'manual'
+  sheet_row       INTEGER,                     -- 1-based, when added_via='sheet'
+  section         TEXT,                        -- the sheet heading it sits under
+  status          TEXT NOT NULL DEFAULT 'pending',
+                  -- pending | ok | unavailable | removed (links.STATUSES)
+  status_note     TEXT,
+  fail_streak     INTEGER NOT NULL DEFAULT 0,
+  last_attempt_ms INTEGER,                     -- any fetch, including a miss
+  last_refresh_ms INTEGER,                     -- a fetch that learned something
+  refresh_count   INTEGER NOT NULL DEFAULT 0,
+  force           INTEGER NOT NULL DEFAULT 0,  -- the panel's Refresh now
+  PRIMARY KEY (watchlist_id, tweet_id)
+) WITHOUT ROWID;
+CREATE INDEX IF NOT EXISTS ix_links_status ON watchlist_links(status, last_refresh_ms);
+
 -- Collections: curation boards. An editor pins posts from the feed or search
 -- into a named board ("Floods — day 2") and hands the board off (CSV today;
 -- other shapes can follow). Pinning is a REFERENCE to the tweets table, never
@@ -1146,7 +1196,27 @@ class Store:
                   # table comment). NULL on every pre-existing row, which
                   # reads as "not recorded" -- the honest answer for a list
                   # added before anyone was asked.
-                  "watchlists": {"filters": "TEXT", "owner_handle": "TEXT"},
+                  "watchlists": {"filters": "TEXT", "owner_handle": "TEXT",
+                                 # kind='links' (X_LINKS_PLAN.md): which
+                                 # bound sheet and which tab (by gid — a
+                                 # rename keeps the links) this watchlist
+                                 # mirrors, NULL for a pasted-only list; how
+                                 # often its posts are re-fetched; when the
+                                 # last pass touched it.
+                                 "link_sheet_id": "INTEGER",
+                                 "sheet_gid": "INTEGER",
+                                 "sheet_tab": "TEXT",
+                                 "refresh_every_s": "INTEGER NOT NULL DEFAULT 86400",
+                                 "last_refresh_ms": "INTEGER",
+                                 # The tab's title parsed as a date (ISO),
+                                 # NULL when it is not one: a day-wise sheet
+                                 # names its tabs 6/9/26, 7/9/26, … and the
+                                 # consumer groups on this.
+                                 "sheet_day": "TEXT"},
+                  # The heading a link sits under in its tab ("National X
+                  # Influencers", "Counter Comments Links"). Arrived after
+                  # the table did.
+                  "watchlist_links": {"section": "TEXT"},
                   "streams": {"list_id": "TEXT",
                               # The watchlist's collection filters, as JSON,
                               # copied onto each compiled stream so the
@@ -1673,6 +1743,13 @@ class Store:
             self.db.execute(
                 "DELETE FROM watchlist_members WHERE watchlist_id IN "
                 "(SELECT watchlist_id FROM watchlists WHERE project_id = ?)", (pid,))
+            # Links watchlists: their rows are instructions, and a bound
+            # sheet left behind would be re-read every sync_every_s forever,
+            # failing on "no project" each time.
+            self.db.execute(
+                "DELETE FROM watchlist_links WHERE watchlist_id IN "
+                "(SELECT watchlist_id FROM watchlists WHERE project_id = ?)", (pid,))
+            self.db.execute("DELETE FROM link_sheets WHERE project_id = ?", (pid,))
             self.db.execute("DELETE FROM watchlists WHERE project_id = ?", (pid,))
             for t in ("collection_items", "collection_posts"):
                 self.db.execute(
@@ -1801,6 +1878,19 @@ class Store:
                 d["filters"] = json.loads(d.get("filters") or "{}")
             except (TypeError, ValueError):
                 d["filters"] = {}
+            if w["kind"] == "links":
+                # The panel's sidebar line and header come from here: how
+                # many links in which state, the sheet it mirrors, and
+                # whether its one stream is paused.
+                d["links"] = await self.links_summary(w["watchlist_id"])
+                d["paused"] = bool(streams and streams[0]["paused"])
+                sheet = None
+                if d.get("link_sheet_id"):
+                    row = self.db.execute(
+                        "SELECT * FROM link_sheets WHERE link_sheet_id = ?",
+                        (int(d["link_sheet_id"]),)).fetchone()
+                    sheet = dict(row) if row else None
+                d["sheet"] = sheet
             out.append(d)
         return out
 
@@ -1831,8 +1921,8 @@ class Store:
         name = (name or "").strip()
         if not name:
             return {"error": "a watchlist needs a name"}
-        if kind not in ("query", "xlist", "keywords"):
-            return {"error": "kind must be 'query', 'keywords' or 'xlist'"}
+        if kind not in ("query", "xlist", "keywords", "links"):
+            return {"error": "kind must be 'query', 'keywords', 'xlist' or 'links'"}
         if kind == "xlist" and not (list_id or "").strip():
             return {"error": "an xlist watchlist needs the X List id"}
         owner, err = _owner_handle(kind, owner_handle)
@@ -1850,7 +1940,7 @@ class Store:
         except sqlite3.IntegrityError:
             return {"error": f"this project already has a watchlist called {name!r}"}
         wid = cur.lastrowid
-        if kind == "xlist":
+        if kind in ("xlist", "links"):
             await self.compile_watchlist(wid)
         return {"watchlist_id": wid, "name": name, "kind": kind,
                 "owner_handle": owner}
@@ -1972,6 +2062,18 @@ class Store:
             self.db.execute(
                 "UPDATE streams SET watched = 1, paused = 0, filters = ? "
                 "WHERE stream_id = ?", (flt_json, sid))
+            await self.attach_stream(w["project_id"], sid)
+            labels.append(label)
+        elif w["kind"] == "links":
+            # One stream so the posts belong to the project through the same
+            # tweet_hits/project_streams join as everything else — but with an
+            # EMPTY query and watched=0, so neither the watcher's startup scan
+            # (main._telegram_streams) nor discover_new_streams ever tries to
+            # poll it. The links clock is what fetches; see links_due.
+            # `paused` is left alone: it is the panel's Pause for this list.
+            label = f"wl:{w['watchlist_id']}:0"
+            sid = await self.ensure_stream(label, "", "Latest", True)
+            self.db.execute("UPDATE streams SET watched = 0 WHERE stream_id = ?", (sid,))
             await self.attach_stream(w["project_id"], sid)
             labels.append(label)
         elif w["kind"] == "keywords":
@@ -2126,9 +2228,487 @@ class Store:
             (f"wl:{w['watchlist_id']}:%",))
         self.db.execute("DELETE FROM watchlist_members WHERE watchlist_id = ?",
                         (int(watchlist_id),))
+        # A links watchlist's rows are ITS list, not collected data: the
+        # posts stay in `tweets`; only the "fetch these" instruction goes.
+        self.db.execute("DELETE FROM watchlist_links WHERE watchlist_id = ?",
+                        (int(watchlist_id),))
         self.db.execute("DELETE FROM watchlists WHERE watchlist_id = ?",
                         (int(watchlist_id),))
         return {"removed": True, "streams_paused": True, "tweets_kept": True}
+
+    # ----------------------------------------------------------------------
+    # links watchlists (kind='links') — see the schema comment and
+    # X_LINKS_PLAN.md. links.py decides; this section writes.
+    # ----------------------------------------------------------------------
+
+    async def bind_link_sheet(self, project_id: int, sheet_ref: str,
+                              sync_every_s: int | None = None,
+                              claim_sync: bool = False) -> dict:
+        """
+        Bind a Google Sheet (URL or id) to a project. Idempotent.
+
+        claim_sync=True stamps last_sync_ms = now so the watcher's sheet tick
+        does not start a parallel first sync while the caller (the dashboard
+        request) is reading the sheet itself; the caller's sync overwrites
+        the stamp with its real result.
+        """
+        import links as _links
+        import sheets as _sheets
+
+        sid = _sheets.sheet_id(sheet_ref or "")
+        if not sid or "/" in sid or len(sid) < 10:
+            return {"error": "paste the Google Sheet's URL (or its /d/<id>/ part)"}
+        if not self.db.execute("SELECT 1 FROM projects WHERE project_id = ?",
+                               (int(project_id),)).fetchone():
+            return {"error": f"no project {project_id}"}
+        every = int(sync_every_s or _links.DEFAULT_SYNC_S)
+        every = max(_links.MIN_SYNC_S, every)
+        self.db.execute(
+            "INSERT INTO link_sheets(project_id, sheet_id, sync_every_s, created_at) "
+            "VALUES(?,?,?,?) ON CONFLICT(project_id, sheet_id) DO UPDATE SET "
+            "  paused = 0",
+            (int(project_id), sid, every, _iso_ms(int(time.time() * 1000))))
+        if claim_sync:
+            self.db.execute(
+                "UPDATE link_sheets SET last_sync_ms = ? WHERE project_id = ? AND sheet_id = ?",
+                (int(time.time() * 1000), int(project_id), sid))
+        row = self.db.execute(
+            "SELECT * FROM link_sheets WHERE project_id = ? AND sheet_id = ?",
+            (int(project_id), sid)).fetchone()
+        return dict(row)
+
+    async def link_sheets(self, project_id: int | None = None) -> list:
+        if project_id is None:
+            rows = self.db.execute(
+                "SELECT * FROM link_sheets ORDER BY link_sheet_id").fetchall()
+        else:
+            rows = self.db.execute(
+                "SELECT * FROM link_sheets WHERE project_id = ? ORDER BY link_sheet_id",
+                (int(project_id),)).fetchall()
+        return [dict(r) for r in rows]
+
+    async def link_sheet(self, link_sheet_id: int) -> dict | None:
+        row = self.db.execute("SELECT * FROM link_sheets WHERE link_sheet_id = ?",
+                              (int(link_sheet_id),)).fetchone()
+        return dict(row) if row else None
+
+    async def link_sheets_due(self, now_ms: int) -> list:
+        """Bound sheets whose sync cadence has elapsed (or never ran)."""
+        out = []
+        for r in self.db.execute(
+                "SELECT * FROM link_sheets WHERE paused = 0").fetchall():
+            last = r["last_sync_ms"]
+            if last is None or int(now_ms) >= int(last) + int(r["sync_every_s"] or 600) * 1000:
+                out.append(dict(r))
+        return out
+
+    async def link_sheet_synced(self, link_sheet_id: int, title: str | None = None,
+                                error: str | None = None, now_ms: int | None = None) -> None:
+        now_ms = int(now_ms or time.time() * 1000)
+        if title is not None:
+            self.db.execute(
+                "UPDATE link_sheets SET last_sync_ms = ?, last_error = ?, title = ? "
+                "WHERE link_sheet_id = ?",
+                (now_ms, error, title, int(link_sheet_id)))
+        else:
+            self.db.execute(
+                "UPDATE link_sheets SET last_sync_ms = ?, last_error = ? "
+                "WHERE link_sheet_id = ?",
+                (now_ms, error, int(link_sheet_id)))
+
+    async def request_sheet_sync(self, link_sheet_id: int) -> dict:
+        """Make the next links tick re-read this sheet (Sync now)."""
+        cur = self.db.execute(
+            "UPDATE link_sheets SET last_sync_ms = NULL WHERE link_sheet_id = ?",
+            (int(link_sheet_id),))
+        if not cur.rowcount:
+            return {"error": f"no sheet {link_sheet_id}"}
+        return {"link_sheet_id": int(link_sheet_id), "sync_requested": True}
+
+    async def unbind_link_sheet(self, link_sheet_id: int) -> dict:
+        """
+        Stop syncing a sheet. Its watchlists STAY, as pasted-only lists, and
+        keep refreshing — the operator asked to stop reading the sheet, not
+        to stop tracking the posts.
+        """
+        row = self.db.execute("SELECT * FROM link_sheets WHERE link_sheet_id = ?",
+                              (int(link_sheet_id),)).fetchone()
+        if not row:
+            return {"error": f"no sheet {link_sheet_id}"}
+        self.db.execute(
+            "UPDATE watchlists SET link_sheet_id = NULL, sheet_gid = NULL "
+            "WHERE link_sheet_id = ?", (int(link_sheet_id),))
+        self.db.execute("DELETE FROM link_sheets WHERE link_sheet_id = ?",
+                        (int(link_sheet_id),))
+        return {"removed": True, "watchlists_kept": True}
+
+    async def links_watchlist_for_tab(self, link_sheet_id: int, gid: int,
+                                      title: str, day: str | None = None) -> dict:
+        """
+        The links watchlist that mirrors one tab — created on first sight,
+        found by the tab's numeric gid afterwards so a rename keeps its
+        links. A renamed tab renames the watchlist when the new name is free
+        in the project; if it collides, the watchlist keeps its name and
+        `sheet_tab` records what the tab is called now.
+        """
+        sheet = await self.link_sheet(link_sheet_id)
+        if not sheet:
+            return {"error": f"no sheet {link_sheet_id}"}
+        title = " ".join(str(title or "").split()) or f"Tab {gid}"
+        row = self.db.execute(
+            "SELECT * FROM watchlists WHERE link_sheet_id = ? AND sheet_gid = ?",
+            (int(link_sheet_id), int(gid))).fetchone()
+        if row:
+            if row["sheet_tab"] != title:
+                try:
+                    self.db.execute(
+                        "UPDATE watchlists SET name = ?, sheet_tab = ? WHERE watchlist_id = ?",
+                        (title, title, row["watchlist_id"]))
+                except sqlite3.IntegrityError:
+                    self.db.execute(
+                        "UPDATE watchlists SET sheet_tab = ? WHERE watchlist_id = ?",
+                        (title, row["watchlist_id"]))
+            if (row["sheet_day"] or None) != (day or None):
+                self.db.execute("UPDATE watchlists SET sheet_day = ? WHERE watchlist_id = ?",
+                                (day, row["watchlist_id"]))
+            row = self.db.execute("SELECT * FROM watchlists WHERE watchlist_id = ?",
+                                  (row["watchlist_id"],)).fetchone()
+            return dict(row)
+
+        # New tab. The name is the tab's title; on a collision (a pasted list
+        # with that name, or a tab that was deleted and re-made under the
+        # same title but a new gid) suffix it rather than fail the sync.
+        name = title
+        for n in range(2, 50):
+            made = await self.create_watchlist(sheet["project_id"], name, "links")
+            if "error" not in made:
+                break
+            if "already has a watchlist called" not in made["error"]:
+                return made
+            # The name may be taken by THIS tab, made a moment ago by the
+            # other process (the dashboard's first sync and the watcher's
+            # tick can overlap once). Re-check the gid before suffixing, or
+            # one tab ends up with two watchlists.
+            row = self.db.execute(
+                "SELECT * FROM watchlists WHERE link_sheet_id = ? AND sheet_gid = ?",
+                (int(link_sheet_id), int(gid))).fetchone()
+            if row:
+                return dict(row)
+            name = f"{title} ({n})"
+        else:
+            return {"error": f"could not find a free name for tab {title!r}"}
+        self.db.execute(
+            "UPDATE watchlists SET link_sheet_id = ?, sheet_gid = ?, sheet_tab = ?, "
+            "  sheet_day = ? WHERE watchlist_id = ?",
+            (int(link_sheet_id), int(gid), title, day, made["watchlist_id"]))
+        row = self.db.execute("SELECT * FROM watchlists WHERE watchlist_id = ?",
+                              (made["watchlist_id"],)).fetchone()
+        return dict(row)
+
+    async def add_links(self, watchlist_id: int, items, via: str = "manual",
+                        now_ms: int | None = None) -> dict:
+        """
+        Add (tweet_id, url[, sheet_row[, section]]) tuples. INSERT OR IGNORE, so a link
+        already listed is left exactly as it is — its status, its counters,
+        its history of attempts. A link previously marked 'removed' that
+        comes back is REVIVED to pending: the operator (or the sheet) asked
+        for it again.
+        """
+        import links as _links
+
+        w = self.db.execute("SELECT * FROM watchlists WHERE watchlist_id = ?",
+                            (int(watchlist_id),)).fetchone()
+        if not w:
+            return {"error": f"no watchlist {watchlist_id}"}
+        if w["kind"] != "links":
+            return {"error": "that watchlist holds handles, not links"}
+        via = "sheet" if via == "sheet" else "manual"
+        now = _iso_ms(int(now_ms or time.time() * 1000))
+        added = revived = existing = 0
+        for it in items or []:
+            tid, url = int(it[0]), str(it[1] or "").strip()
+            row = it[2] if len(it) > 2 else None
+            section = (str(it[3]).strip()[:120] or None) if len(it) > 3 and it[3] else None
+            if not url:
+                url = _links.canonical_url(tid)
+            cur = self.db.execute(
+                "INSERT OR IGNORE INTO watchlist_links(watchlist_id, tweet_id, url, "
+                "added_at, added_via, sheet_row, section) VALUES(?,?,?,?,?,?,?)",
+                (int(watchlist_id), tid, url[:500], now, via, row, section))
+            if cur.rowcount:
+                added += 1
+                continue
+            cur = self.db.execute(
+                "UPDATE watchlist_links SET status = 'pending', status_note = NULL, "
+                "  fail_streak = 0, added_at = ?, added_via = ?, sheet_row = ?, url = ?, "
+                "  section = ? "
+                "WHERE watchlist_id = ? AND tweet_id = ? AND status = 'removed'",
+                (now, via, row, url[:500], section, int(watchlist_id), tid))
+            if cur.rowcount:
+                revived += 1
+            else:
+                existing += 1
+                if via == "sheet" and row is not None:
+                    # A link can move between sections; the sheet is the
+                    # truth for where it sits now.
+                    self.db.execute(
+                        "UPDATE watchlist_links SET sheet_row = ?, section = ? "
+                        "WHERE watchlist_id = ? AND tweet_id = ? AND added_via = 'sheet'",
+                        (row, section, int(watchlist_id), tid))
+        return {"watchlist_id": int(watchlist_id), "added": added,
+                "revived": revived, "existing": existing}
+
+    async def add_links_text(self, watchlist_id: int, text: str) -> dict:
+        """Paste box: every X post link found in the text, plus what was not one."""
+        import links as _links
+
+        scan = _links.scan_values([[line] for line in str(text or "").splitlines()])
+        items = [(i.tweet_id, i.url) for i in scan.items]
+        res = await self.add_links(watchlist_id, items, via="manual")
+        if "error" in res:
+            return res
+        res["found"] = len(items)
+        res["skipped"] = scan.skipped + len(scan.tco)
+        if scan.tco:
+            res["note"] = ("t.co short links are only resolved from a sheet; "
+                           "paste the full x.com link instead")
+        return res
+
+    async def sync_removed_links(self, watchlist_id: int, present_ids) -> int:
+        """
+        Sheet-added links that are no longer in the sheet -> 'removed'.
+        Manual adds are untouched: the sheet never spoke for them.
+        """
+        present = {int(x) for x in (present_ids or ())}
+        rows = self.db.execute(
+            "SELECT tweet_id FROM watchlist_links WHERE watchlist_id = ? "
+            "AND added_via = 'sheet' AND status != 'removed'",
+            (int(watchlist_id),)).fetchall()
+        gone = [r["tweet_id"] for r in rows if r["tweet_id"] not in present]
+        for tid in gone:
+            self.db.execute(
+                "UPDATE watchlist_links SET status = 'removed', force = 0, "
+                "  status_note = 'left the sheet' "
+                "WHERE watchlist_id = ? AND tweet_id = ?", (int(watchlist_id), tid))
+        return len(gone)
+
+    async def remove_link(self, watchlist_id: int, tweet_id: int) -> dict:
+        cur = self.db.execute(
+            "UPDATE watchlist_links SET status = 'removed', force = 0, "
+            "  status_note = 'removed by hand' "
+            "WHERE watchlist_id = ? AND tweet_id = ? AND status != 'removed'",
+            (int(watchlist_id), int(tweet_id)))
+        if not cur.rowcount:
+            return {"error": "no such link on this watchlist (or already removed)"}
+        return {"watchlist_id": int(watchlist_id), "tweet_id": str(int(tweet_id)),
+                "removed": True}
+
+    async def set_links_refresh(self, watchlist_id: int, seconds) -> dict:
+        """How often this list's posts are re-fetched. One hour is the floor."""
+        import links as _links
+
+        w = self.db.execute("SELECT kind FROM watchlists WHERE watchlist_id = ?",
+                            (int(watchlist_id),)).fetchone()
+        if not w:
+            return {"error": f"no watchlist {watchlist_id}"}
+        if w["kind"] != "links":
+            return {"error": "refresh cadence is for links watchlists; "
+                             "use the check interval for handles"}
+        if isinstance(seconds, str) and seconds in _links.REFRESH_CHOICES:
+            val = _links.REFRESH_CHOICES[seconds]
+        else:
+            try:
+                val = int(seconds)
+            except (TypeError, ValueError):
+                return {"error": "refresh must be 12h, 24h, 48h or a number of seconds"}
+        if val < _links.MIN_REFRESH_S:
+            return {"error": f"refresh cadence must be at least {_links.MIN_REFRESH_S // 3600}h "
+                             f"— one TweetDetail per post per cycle is the budget"}
+        self.db.execute("UPDATE watchlists SET refresh_every_s = ? WHERE watchlist_id = ?",
+                        (val, int(watchlist_id)))
+        return {"watchlist_id": int(watchlist_id), "refresh_every_s": val}
+
+    async def request_links_refresh(self, watchlist_id: int) -> dict:
+        """Refresh now: every live link on the list goes to the front of the queue."""
+        w = self.db.execute("SELECT kind FROM watchlists WHERE watchlist_id = ?",
+                            (int(watchlist_id),)).fetchone()
+        if not w or w["kind"] != "links":
+            return {"error": f"no links watchlist {watchlist_id}"}
+        cur = self.db.execute(
+            "UPDATE watchlist_links SET force = 1 "
+            "WHERE watchlist_id = ? AND status != 'removed'", (int(watchlist_id),))
+        return {"watchlist_id": int(watchlist_id), "queued": cur.rowcount}
+
+    async def links_due(self, now_ms: int, limit: int = 20) -> list:
+        """
+        The next batch of links to fetch, across every unpaused links
+        watchlist, in links.order_due order. Read every tick from the
+        database so a list paused, re-timed or extended from the dashboard is
+        honoured on the next cycle — never cached in the collector.
+        """
+        import links as _links
+
+        rows = self.db.execute(
+            "SELECT l.*, w.refresh_every_s, w.project_id "
+            "FROM watchlist_links l "
+            "JOIN watchlists w ON w.watchlist_id = l.watchlist_id "
+            "LEFT JOIN streams s ON s.label = 'wl:' || w.watchlist_id || ':0' "
+            "WHERE w.kind = 'links' AND l.status != 'removed' "
+            "AND COALESCE(s.paused, 0) = 0").fetchall()
+        due = _links.order_due([dict(r) for r in rows], int(now_ms))
+        return due[:max(1, int(limit))]
+
+    async def link_refreshed(self, watchlist_id: int, tweet_id: int, outcome: str,
+                             note: str = "", now_ms: int | None = None) -> None:
+        """
+        Record one fetch. ok and unavailable both count as a refresh (the
+        collector learned the truth); a transient miss only bumps the streak
+        and the attempt clock, so the row stays due after its back-off.
+
+        A link removed WHILE its batch was in flight stays removed: every
+        update is guarded on status != 'removed', so a pass that started
+        before the operator's click cannot undo it a minute later.
+        """
+        import links as _links
+
+        now_ms = int(now_ms or time.time() * 1000)
+        note = (note or "")[:200] or None
+        if outcome == _links.OUTCOME_OK:
+            self.db.execute(
+                "UPDATE watchlist_links SET status = 'ok', status_note = NULL, "
+                "  fail_streak = 0, last_attempt_ms = ?, last_refresh_ms = ?, "
+                "  refresh_count = refresh_count + 1, force = 0 "
+                "WHERE watchlist_id = ? AND tweet_id = ? AND status != 'removed'",
+                (now_ms, now_ms, int(watchlist_id), int(tweet_id)))
+        elif outcome == _links.OUTCOME_UNAVAILABLE:
+            self.db.execute(
+                "UPDATE watchlist_links SET status = 'unavailable', status_note = ?, "
+                "  fail_streak = fail_streak + 1, last_attempt_ms = ?, last_refresh_ms = ?, "
+                "  refresh_count = refresh_count + 1, force = 0 "
+                "WHERE watchlist_id = ? AND tweet_id = ? AND status != 'removed'",
+                (note, now_ms, now_ms, int(watchlist_id), int(tweet_id)))
+        else:
+            self.db.execute(
+                "UPDATE watchlist_links SET status_note = ?, "
+                "  fail_streak = fail_streak + 1, last_attempt_ms = ?, force = 0 "
+                "WHERE watchlist_id = ? AND tweet_id = ? AND status != 'removed'",
+                (note, now_ms, int(watchlist_id), int(tweet_id)))
+
+    async def links_watchlist_touched(self, watchlist_id: int,
+                                      now_ms: int | None = None) -> None:
+        self.db.execute("UPDATE watchlists SET last_refresh_ms = ? WHERE watchlist_id = ?",
+                        (int(now_ms or time.time() * 1000), int(watchlist_id)))
+
+    async def links_summary(self, watchlist_id: int) -> dict:
+        counts = {s: 0 for s in ("pending", "ok", "unavailable", "removed")}
+        for r in self.db.execute(
+                "SELECT status, COUNT(*) c FROM watchlist_links WHERE watchlist_id = ? "
+                "GROUP BY status", (int(watchlist_id),)):
+            counts[r["status"]] = r["c"]
+        row = self.db.execute(
+            "SELECT MIN(last_refresh_ms) oldest, MAX(last_refresh_ms) newest, "
+            "       SUM(force) forced "
+            "FROM watchlist_links WHERE watchlist_id = ? AND status != 'removed'",
+            (int(watchlist_id),)).fetchone()
+        live = counts["pending"] + counts["ok"] + counts["unavailable"]
+        return {"total": live, **counts,
+                "oldest_refresh_ms": row["oldest"], "newest_refresh_ms": row["newest"],
+                "forced": int(row["forced"] or 0)}
+
+    # The post's own columns joined onto a link row. Deliberately WITHOUT
+    # `url`: the link row's `url` is the one the operator wrote (and the one
+    # the consumer keys on); the post's canonical URL rides as `post_url`.
+    LINK_COLS = ("tweet_id", "created_at", "created_ms", "text", "lang",
+                 "author_username", "author_display_name", "author_id",
+                 "author_followers", "reply_count", "retweet_count", "like_count",
+                 "quote_count", "view_count", "bookmark_count", "is_retweet",
+                 "is_reply", "is_quote", "media_json", "collected_ms", "last_seen_at")
+
+    async def links_snapshot(self, project_id: int, watchlist_id: int | None = None,
+                             status: str | None = None, limit: int = 500,
+                             offset: int = 0, sort: str = "") -> dict:
+        """
+        Every link in the project's links watchlists joined with its post's
+        CURRENT row — the snapshot /api/links serves and the panel renders.
+        Stable order (watchlist, added, id) so offset paging is safe between
+        refreshes; the panel's sorts are whitelisted on top of that.
+        """
+        where = ["w.project_id = ?", "w.kind = 'links'"]
+        params: list = [int(project_id)]
+        if watchlist_id:
+            where.append("l.watchlist_id = ?")
+            params.append(int(watchlist_id))
+        if status:
+            where.append("l.status = ?")
+            params.append(str(status))
+        sorts = {"day": "w.sheet_day DESC NULLS LAST, l.section, l.added_at, l.tweet_id",
+                 "views": "t.view_count DESC NULLS LAST, l.tweet_id DESC",
+                 "likes": "t.like_count DESC NULLS LAST, l.tweet_id DESC",
+                 "added": "l.added_at DESC, l.tweet_id DESC",
+                 "refreshed": "l.last_refresh_ms DESC NULLS LAST, l.tweet_id DESC",
+                 "posted": "t.created_ms DESC NULLS LAST, l.tweet_id DESC"}
+        # Default = the sheet's own order (row), so sections come out in the
+        # order the operator wrote them; pasted links (no row) follow, by
+        # time added. Stable across refreshes, so offset paging is safe.
+        order = sorts.get(sort or "", "l.watchlist_id, l.sheet_row NULLS LAST, l.added_at, l.tweet_id")
+        limit = max(1, min(int(limit or 500), 500))
+        offset = max(0, int(offset or 0))
+        total = self.db.execute(
+            f"SELECT COUNT(*) c FROM watchlist_links l "
+            f"JOIN watchlists w ON w.watchlist_id = l.watchlist_id "
+            f"WHERE {' AND '.join(where)}", params).fetchone()["c"]
+        tcols = ", ".join(f"t.{c} AS t_{c}" for c in self.LINK_COLS if c != "tweet_id")
+        rows = self.db.execute(
+            f"SELECT l.*, w.name AS watchlist, w.sheet_tab AS tab, w.sheet_day AS day, "
+            f"       w.refresh_every_s, {tcols}, t.url AS post_url, "
+            f"       json_extract(COALESCE(r.raw_json, t.raw_json), "
+            f"                    '$.user.profileImageUrl') AS author_avatar "
+            f"FROM watchlist_links l "
+            f"JOIN watchlists w ON w.watchlist_id = l.watchlist_id "
+            f"LEFT JOIN tweets t ON t.tweet_id = l.tweet_id "
+            f"LEFT JOIN tweet_raw r ON r.tweet_id = l.tweet_id "
+            f"WHERE {' AND '.join(where)} ORDER BY {order} LIMIT ? OFFSET ?",
+            [*params, limit, offset]).fetchall()
+        out = []
+        for r in rows:
+            d = dict(r)
+            post = {c: d.pop(f"t_{c}", None) for c in self.LINK_COLS if c != "tweet_id"}
+            try:
+                media = json.loads(post.pop("media_json", None) or "[]")
+            except (TypeError, ValueError):
+                media = []
+            item = {
+                "watchlist_id": d["watchlist_id"], "watchlist": d["watchlist"],
+                "tab": d.get("tab"), "day": d.get("day"), "section": d.get("section"),
+                "refresh_every_s": d.get("refresh_every_s"),
+                "url": d["url"], "tweet_id": str(d["tweet_id"]),
+                "status": d["status"], "status_note": d.get("status_note"),
+                "added_at": d["added_at"], "added_via": d["added_via"],
+                "sheet_row": d.get("sheet_row"),
+                "last_refresh_ms": d.get("last_refresh_ms"),
+                "last_attempt_ms": d.get("last_attempt_ms"),
+                "refresh_count": d.get("refresh_count") or 0,
+                "fail_streak": d.get("fail_streak") or 0,
+                "force": bool(d.get("force")),
+                "fetched": post.get("collected_ms") is not None,
+                "post_url": d.get("post_url"),
+                "author_avatar": d.get("author_avatar"),
+                "media": media,
+            }
+            for c in ("is_retweet", "is_reply", "is_quote"):
+                v = post.get(c)
+                post[c] = bool(v) if v is not None else None
+            item.update(post)
+            out.append(item)
+        return {"total": total, "rows": out, "limit": limit, "offset": offset}
+
+    async def links_watchlists(self) -> list:
+        """Every links watchlist, across projects — the collector's view."""
+        rows = self.db.execute(
+            "SELECT w.*, COALESCE(s.paused, 0) AS paused FROM watchlists w "
+            "LEFT JOIN streams s ON s.label = 'wl:' || w.watchlist_id || ':0' "
+            "WHERE w.kind = 'links' ORDER BY w.watchlist_id").fetchall()
+        return [dict(r) for r in rows]
 
     # ----------------------------------------------------------------------
     # collections (curation boards)
@@ -3108,6 +3688,12 @@ class Store:
                 "  quote_count    = excluded.quote_count,"
                 "  view_count     = excluded.view_count,"
                 "  bookmark_count = excluded.bookmark_count,"
+                # Followers drift like the counters do, and reach math on the
+                # consumer's side wants the current number (X_LINKS_PLAN.md
+                # §2). COALESCE so a read that could not see the author never
+                # blanks a number we already had — null is "unknown", not zero
+                # (WATCH_TOWER.md R5), and unknown must not overwrite known.
+                "  author_followers = COALESCE(excluded.author_followers, tweets.author_followers),"
                 # A tweet first seen as quoted context can later turn up as a
                 # real search hit. Promote it; never demote.
                 "  source = CASE WHEN tweets.source = 'embedded' AND excluded.source = 'result' "
@@ -3230,9 +3816,15 @@ class Store:
                     # somehow missed it cannot be quietly hollowed out here.
                     # Getting this wrong deletes collected posts, which is the
                     # one thing retention is not allowed to do to a board.
+                    # A post tracked by a links watchlist is likewise kept:
+                    # pruning it would make the next daily refresh re-insert
+                    # it with a NEW collected_ms (R3 broken) and its
+                    # "unavailable keeps its last counters" promise empty.
                     "INSERT INTO _prune SELECT tweet_id FROM tweets "
                     "WHERE created_ms < ? AND tweet_id NOT IN "
                     "  (SELECT tweet_id FROM collection_items) "
+                    "AND tweet_id NOT IN "
+                    "  (SELECT tweet_id FROM watchlist_links WHERE status != 'removed') "
                     "AND CAST(tweet_id AS TEXT) NOT IN "
                     "  (SELECT post_id FROM collection_posts "
                     "   WHERE platform = 'x')", (cutoff,))

@@ -85,6 +85,13 @@ The organizing layer (in `store.py` + `web.py`):
   `(from:a OR from:b)` chunks ≤20 handles; `kind='keywords'` → rule streams;
   `kind='xlist'` → one X-List stream). Compiled streams carry `watched=1` so
   the watcher polls them with no config entry. Shrinking pauses, never deletes.
+  `kind='links'` (2026-09-09, `X_LINKS_PLAN.md`) is the exception that proves
+  it: specific post URLs — every tab of a bound Google Sheet (`link_sheets`,
+  keyed on the tab's gid) or pasted — held in `watchlist_links`, compiled to
+  ONE stream `wl:<id>:0` with an empty query and `watched=0` (nothing polls
+  it; it exists so the posts join the project). The collector's third clock
+  re-fetches each post by id on the list's own cadence and overwrites its
+  counters in place; no history is kept — the consumer of `/api/links` does.
 - **Collection** — a curation board; pins are references, never copies, keyed
   `(platform, post_id)` so one board holds X, IG and FB posts together. A board
   marked `auto` belongs to a label category and is filled by classify runs.
@@ -100,10 +107,11 @@ The organizing layer (in `store.py` + `web.py`):
 |---|---|
 | `main.py` | CLI: `serve`, `watch --all`, `login`, `doctor`, `guard`, `export`, `webhook`, `telegram` |
 | `auth.py` | X sessions via real Chromium + persistent profile; validates before marking active |
-| `engine.py` | Transport/parse seam over pinned `twscrape`; yields `Page` objects |
-| `collector.py` | X poll loop: watermark stop, dedup, stop-reasons, adaptive intervals |
-| `store.py` | `results.db`: tweets (hot row) + `tweet_raw` (payloads, LEFT JOIN when needed), streams, polls, projects/watchlists/collections/alerts, cross-platform pins (`collection_posts`), content labels (`post_labels`, `label_categories`, `label_runs`), settings, FTS5 search, retention |
+| `engine.py` | Transport/parse seam over pinned `twscrape`; yields `Page` objects; `tweet_detail()` / `parse_detail()` fetch ONE post by id for links watchlists |
+| `collector.py` | X poll loop: watermark stop, dedup, stop-reasons, adaptive intervals; the backfill clock; the links clock (`refresh_links` — one TweetDetail per due post, trickled; `sync_sheets`) |
+| `store.py` | `results.db`: tweets (hot row) + `tweet_raw` (payloads, LEFT JOIN when needed), streams, polls, projects/watchlists/collections/alerts, links watchlists (`link_sheets`, `watchlist_links`, `links_due` / `links_snapshot`), cross-platform pins (`collection_posts`), content labels (`post_labels`, `label_categories`, `label_runs`), settings, FTS5 search, retention |
 | `webhook.py` | Delivery loop: signed webhook push, Telegram, Google Sheet, alert ticking; cursor-based |
+| `links.py` | Post links as a watchlist: URL parsing, every-cell tab scanning, due/order planning, the Sheets READ (service account, every non-hidden tab) and `sync_sheet`, and `classify_detail` (found / gone / try later) — pure, offline-tested |
 | `sheets.py` | Google Sheets transport, two modes: Apps Script web app (no cloud project) or service-account JWT (no new deps); header-once, append-only `date\|link\|text\|media` |
 | `alerts.py` | Velocity-alert decision + tick (pure logic, testable) |
 | `classify.py` | Content labelling: builds the prompt from the project's categories, calls Grok over injectable async httpx, parses and validates the answer, prices it. Pure — no DB, no globals, never raises |
@@ -131,6 +139,7 @@ The organizing layer (in `store.py` + `web.py`):
 | `CHECKPOINT.md` | Running history of what changed, newest first — the evidence behind each rule's current wording. Protected: append every change, never delete |
 | `tests/` | The offline suite — no network, no budget spent. Run after every change |
 | `tools/ig_probe.py` | Instagram session diagnostic |
+| `tools/links_probe.py` | Fetch ONE post by link exactly as a links watchlist does — outcome, counters, serving account, TweetDetail budget left; `--store` writes it through the real upsert. The live check before trusting the links loop on a server |
 | `tools/diag_project.py` | "Why did this project stop collecting?" — read-only: prints the exact query each stream sends to X, recent polls with stop_reason/rate-limit, and checks every active collection filter against what the stream has actually collected |
 
 Data stores (all git-ignored): `accounts.db`, `results.db` (+ WAL),
@@ -178,8 +187,20 @@ collected-data and telemetry endpoint on GET, `API_KEY_WRITE_PATHS` is
 `/api/fetch` alone. The split is the safety property — most read paths also
 exist as a POST that writes, so a path-only check would grant the write half
 with the read. Keys never reach `/api/pool*`, `/api/stress/accounts` or
-`/api/login/*`: accounts and sessions are credentials, not data. Before any
-second consumer: project-locked keys.
+`/api/login/*`: accounts and sessions are credentials, not data.
+
+**Project-locked keys (the second consumer's door, 2026-09-09).**
+`API_KEYS_SCOPED=<key>=<project_id>,…`: such a key may only GET
+`API_KEY_SCOPED_PATHS` (`/api/links`, `/api/tweets`, `/api/watchlists`,
+`/api/export`) with `?project=<its id>`; everything else is a 403 that says
+so. `GET /api/links?project=P[&watchlist=W][&status=][&sort=][&limit=500]
+[&offset=]` is the snapshot a reach tracker pulls: every link in the
+project's links watchlists joined with its post's CURRENT counters — string
+ids, numbers-or-null, stable order, offset paging, `total`. No cursor by
+design: a refreshed post's `collected_ms` never changes, so a cursor would
+never re-deliver it. `LINKS_CONSUMER_HANDOVER.md` is what the consumer gets.
+The links write paths (`POST /api/watchlists/links[/refresh|/interval]`,
+`POST /api/links/sheets[/sync|/remove]`) are cookie-only.
 
 ## 6. Going live (VPS runbook)
 
@@ -315,11 +336,22 @@ board per category, one Excel export of every board (`xlsx_min.py`, no new
 dependency), and hand corrections the model can never overwrite; collection pins made cross-platform
 (`collection_posts`, migrated from `collection_items` on open).
 
+Links watchlists (2026-09-09, `X_LINKS_PLAN.md`): a fourth X kind holding
+post URLs — every tab of a bound Google Sheet becomes one list keyed on the
+tab's gid, or links are pasted — re-fetched one `TweetDetail` per post on a
+12h/24h/48h cadence by a third clock in the X watcher, counters overwritten
+in place through the same `upsert_tweets`, no history kept; the links panel
+(rows per post with author, counters, state, last read; group by author;
+Refresh now / Sync sheet / cadence / Pause); `GET /api/links` as a snapshot
+for a second consumer behind a project-locked key (`API_KEYS_SCOPED`).
+Instagram and Facebook links are the next phases (skipped and counted today).
+
 **Parked roadmap** (build when asked): media archiving (local copies so
 deleted posts keep evidence); DOCX rundown export; promote-to-X-List
-automation; project-locked API keys (mandatory before a second consumer);
-keyword alerts; users & roles; FB groups & keyword search; pull-parity
-delivery view for IG/FB.
+automation; keyword alerts; users & roles; FB groups & keyword search;
+pull-parity delivery view for IG/FB; Instagram / Facebook `links` phases
+(`X_LINKS_PLAN.md` §0); Apps-Script read transport for sheets on script-only
+deployments.
 
 *History note: git history holds the retired planning docs this file and the
 rulebook replaced.*

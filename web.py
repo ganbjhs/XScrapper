@@ -144,6 +144,9 @@ API_KEY_READ_PATHS = {
     "/api/identities", "/api/live",
     # Instagram and Facebook — same corpus, other platforms.
     "/api/ig/posts", "/api/ig/status", "/api/fb/posts", "/api/fb/status",
+    # Post links tracked for their counters (kind='links' watchlists), as a
+    # snapshot — no cursor, by design. X_LINKS_PLAN.md §6.
+    "/api/links",
     # Curated sets.
     "/api/collections", "/api/collections/items", "/api/collections/export",
     # Operational telemetry: health, throughput, alerts, delivery progress.
@@ -164,10 +167,51 @@ API_KEY_WRITE_PATHS = {"/api/fetch"}
 API_KEY_PATHS = API_KEY_READ_PATHS | API_KEY_WRITE_PATHS
 
 
+# Project-LOCKED keys — the second consumer's door (X_LINKS_PLAN.md §6;
+# BLUEPRINT §9 parked this as "mandatory before a second consumer").
+#
+#   API_KEYS_SCOPED=<key>=<project_id>,<key>=<project_id>
+#
+# A scoped key may GET only these paths, and only with ?project=<its id>.
+# Watch-Tower's keys in API_KEYS are untouched: they keep the whole read
+# allowlist, exactly as before. The two sets never overlap in what they can
+# see — a scoped key cannot list projects, cannot read another project's
+# posts, and cannot spend budget on /api/fetch.
+API_KEY_SCOPED_PATHS = {"/api/links", "/api/tweets", "/api/watchlists", "/api/export"}
+
+
 def _api_keys() -> set:
     raw = os.getenv("API_KEYS", "")
     return {k.strip() for k in raw.split(",")
             if len(k.strip()) >= MIN_API_KEY_LEN}
+
+
+def _scoped_keys() -> dict:
+    """{key: project_id} from API_KEYS_SCOPED. Malformed entries are skipped."""
+    out = {}
+    for part in os.getenv("API_KEYS_SCOPED", "").split(","):
+        k, _, pid = part.strip().rpartition("=")
+        k = k.strip()
+        try:
+            pid = int(pid.strip())
+        except ValueError:
+            continue
+        if len(k) >= MIN_API_KEY_LEN and pid > 0:
+            out[k] = pid
+    return out
+
+
+def _key_scope(presented: str):
+    """The project a scoped key is locked to, or None for an unscoped key.
+
+    Constant-time over every scoped key, like _valid_api_key: never break on
+    the first match.
+    """
+    hit = None
+    for k, pid in _scoped_keys().items():
+        if hmac.compare_digest(presented, k):
+            hit = pid
+    return hit
 
 
 def _presented_key(headers) -> str:
@@ -186,6 +230,9 @@ def _valid_api_key(presented: str) -> bool:
     # guessed key would sit.
     hit = False
     for k in _api_keys():
+        if hmac.compare_digest(presented, k):
+            hit = True
+    for k in _scoped_keys():
         if hmac.compare_digest(presented, k):
             hit = True
     return hit
@@ -1860,11 +1907,26 @@ def _watchlist_post(body):
         except ConfigError as e:
             return {"error": str(e)}
 
+    if kind == "links" and str(body.get("sheet") or "").strip():
+        # A sheet names its own watchlists (one per tab); the form's name, if
+        # any, is ignored. Bind + first sync happen in one request so the
+        # panel can report "3 tabs → 128 links" on the click.
+        return _links_sheet_post({"project": pid, "sheet": body.get("sheet")})
+
     async def go(st):
         made = await st.create_watchlist(pid, body.get("name") or "", kind,
                                          raw_list,
                                          body.get("owner_handle") or "")
         if "error" in made:
+            return made
+        if kind == "links":
+            text = str(body.get("links") or "")
+            if text.strip():
+                upd = await st.add_links_text(made["watchlist_id"], text)
+                if "error" in upd:
+                    made["warning"] = upd["error"]
+                else:
+                    made.update(upd)
             return made
         handles = body.get("handles") or []
         if handles and kind in ("query", "keywords"):
@@ -2066,6 +2128,158 @@ def _watchlist_remove(body):
     except (TypeError, ValueError):
         return {"error": "watchlist_id must be a number"}
     return _with_store(lambda st: st.delete_watchlist(wid))
+
+
+# --------------------------------------------------------------------------
+# links watchlists — post URLs tracked for their counters (X_LINKS_PLAN.md)
+#
+# Thin validators over store + links.py, like every watchlist endpoint. The
+# one thing that happens HERE rather than in the watcher is the first sync of
+# a newly bound sheet (and "Sync now"): the operator is looking at the panel
+# and wants "3 tabs → 128 links" back on the same click, so the sheet is read
+# on this request with the same credentials the watcher will use afterwards.
+# --------------------------------------------------------------------------
+
+def _int_or(v, default=0):
+    try:
+        return int(v)
+    except (TypeError, ValueError):
+        return default
+
+
+def _links_json(q):
+    """
+    GET /api/links?project=P[&watchlist=W][&status=ok][&sort=views]
+                   [&limit=500][&offset=0]
+
+    The snapshot the second consumer pulls: every link in the project's
+    links watchlists with its post's CURRENT counters. No cursor, on
+    purpose — a refreshed post's collected_ms never changes (WATCH_TOWER.md
+    R3), so a cursor would never re-deliver it. Offset paging on a stable
+    order; `total` says when the caller has everything.
+    """
+    import links as _links
+
+    pid = _int_or(q.get("project"))
+    if not pid:
+        return {"error": "which project? pass ?project=<id>"}
+    status = (q.get("status") or "").strip()
+    if status and status not in _links.STATUSES:
+        return {"error": f"status must be one of: {', '.join(_links.STATUSES)}"}
+    if not _CFG.db_results.exists():
+        return {"total": 0, "rows": [], "limit": 500, "offset": 0}
+    wid = _int_or(q.get("watchlist"))
+    return _with_store(lambda st: st.links_snapshot(
+        pid, watchlist_id=wid or None, status=status or None,
+        limit=_int_or(q.get("limit"), 500), offset=_int_or(q.get("offset"), 0),
+        sort=(q.get("sort") or "").strip()))
+
+
+def _links_sheets_json(q):
+    pid = _int_or(q.get("project"))
+    if not pid:
+        return {"error": "which project? pass ?project=<id>"}
+    return {"sheets": _with_store(lambda st: st.link_sheets(pid))}
+
+
+async def _sync_sheet_now(st, sheet: dict) -> dict:
+    """Read one bound sheet on this request. Same code path as the watcher."""
+    import httpx
+    import links as _links
+
+    async with httpx.AsyncClient() as client:
+        return await _links.sync_sheet(st, client, sheet, log=None)
+
+
+def _links_sheet_post(body):
+    """
+    POST /api/links/sheets {project, sheet[, sync_every_s]}
+
+    Bind a Google Sheet to a project and read it at once: every non-hidden
+    tab becomes one links watchlist named after it. Adds never delete, so
+    binding the same sheet twice is harmless.
+    """
+    pid = _int_or(body.get("project"))
+    if not pid:
+        return {"error": "which project?"}
+    ref = str(body.get("sheet") or body.get("sheet_id") or "").strip()
+    if not ref:
+        return {"error": "paste the Google Sheet's URL"}
+    import sheets as _sheets
+    if not _sheets.load_creds():
+        return {"error": f"{_sheets.CREDS_ENV} is not set in .env on the server, or "
+                         f"does not point at a readable service-account key — the "
+                         f"sheet is read with the service account, shared as Viewer",
+                "email": _sheets.service_account_email()}
+
+    async def go(st):
+        bound = await st.bind_link_sheet(pid, ref, body.get("sync_every_s"),
+                                         claim_sync=True)
+        if "error" in bound:
+            return bound
+        res = await _sync_sheet_now(st, bound)
+        res["sheet"] = await st.link_sheet(bound["link_sheet_id"])
+        res["email"] = _sheets.service_account_email()
+        return res
+    return _with_store(go)
+
+
+def _links_sheet_sync(body):
+    """POST /api/links/sheets/sync {link_sheet_id} — Sync now, on this request."""
+    lsid = _int_or(body.get("link_sheet_id"))
+    if not lsid:
+        return {"error": "link_sheet_id must be a number"}
+
+    async def go(st):
+        sheet = await st.link_sheet(lsid)
+        if not sheet:
+            return {"error": f"no sheet {lsid}"}
+        res = await _sync_sheet_now(st, sheet)
+        res["sheet"] = await st.link_sheet(lsid)
+        return res
+    return _with_store(go)
+
+
+def _links_sheet_remove(body):
+    lsid = _int_or(body.get("link_sheet_id"))
+    if not lsid:
+        return {"error": "link_sheet_id must be a number"}
+    return _with_store(lambda st: st.unbind_link_sheet(lsid))
+
+
+def _links_post(body):
+    """
+    POST /api/watchlists/links {watchlist_id, add: "<text with links>"}
+                               {watchlist_id, remove: "<tweet_id>"}
+    """
+    wid = _int_or(body.get("watchlist_id"))
+    if not wid:
+        return {"error": "watchlist_id must be a number"}
+    if body.get("remove") not in (None, ""):
+        tid = _int_or(body.get("remove"))
+        if not tid:
+            return {"error": "remove must be a tweet id"}
+        return _with_store(lambda st: st.remove_link(wid, tid))
+    text = str(body.get("add") or "")
+    if not text.strip():
+        return {"error": "paste one or more x.com post links"}
+    return _with_store(lambda st: st.add_links_text(wid, text))
+
+
+def _links_refresh(body):
+    """POST /api/watchlists/links/refresh {watchlist_id} — Refresh now."""
+    wid = _int_or(body.get("watchlist_id"))
+    if not wid:
+        return {"error": "watchlist_id must be a number"}
+    return _with_store(lambda st: st.request_links_refresh(wid))
+
+
+def _links_interval(body):
+    """POST /api/watchlists/links/interval {watchlist_id, refresh: "24h"|seconds}"""
+    wid = _int_or(body.get("watchlist_id"))
+    if not wid:
+        return {"error": "watchlist_id must be a number"}
+    return _with_store(lambda st: st.set_links_refresh(wid, body.get("refresh")))
 
 
 # --------------------------------------------------------------------------
@@ -5523,6 +5737,30 @@ class Handler(BaseHTTPRequestHandler):
             # that WRITES (GET /api/projects lists, POST /api/projects creates),
             # so a path-only check would grant the write half along with the read.
             method = (self.command or "").upper()
+            # A project-locked key (API_KEYS_SCOPED) sees one project and a
+            # handful of paths; say exactly which of the two it tripped on.
+            scope = _key_scope(presented)
+            if scope is not None:
+                q = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
+                asked = (q.get("project") or [""])[0]
+                if method != "GET" or path not in API_KEY_SCOPED_PATHS:
+                    self._send(403, {
+                        "error": f"this key cannot {method} {path}",
+                        "allowed_get": sorted(API_KEY_SCOPED_PATHS),
+                        "allowed_post": [],
+                        "detail": (f"This key is locked to project {scope} and may only "
+                                   f"GET {', '.join(sorted(API_KEY_SCOPED_PATHS))} "
+                                   f"with ?project={scope}."),
+                    })
+                    return False
+                if str(asked).strip() != str(scope):
+                    self._send(403, {
+                        "error": f"this key is locked to project {scope}",
+                        "detail": f"pass ?project={scope} — this key sees no other project",
+                    })
+                    return False
+                self._via_api_key = True
+                return True
             allowed = (method == "GET" and path in API_KEY_READ_PATHS) \
                 or path in API_KEY_WRITE_PATHS
             if not allowed:
@@ -5835,6 +6073,10 @@ class Handler(BaseHTTPRequestHandler):
                 return self._send(200, _projects_json())
             if u.path == "/api/watchlists":
                 return self._send(200, _watchlists_json(q))
+            if u.path == "/api/links":
+                return self._send(200, _links_json(q))
+            if u.path == "/api/links/sheets":
+                return self._send(200, _links_sheets_json(q))
             if u.path == "/api/delivery":
                 return self._send(200, _delivery_json(q, mask=self._via_api_key))
             if u.path == "/api/streams/assignments":
@@ -5969,6 +6211,21 @@ class Handler(BaseHTTPRequestHandler):
                 return self._send(200, _watchlist_backfill(body))
             if u.path == "/api/watchlists/remove":
                 return self._send(200, _watchlist_remove(body))
+            # Links watchlists (X_LINKS_PLAN.md). Dashboard-only: none of
+            # these is in API_KEY_WRITE_PATHS, so a consumer's key cannot
+            # add a link, re-time a list or make the server read a sheet.
+            if u.path == "/api/watchlists/links":
+                return self._send(200, _links_post(body))
+            if u.path == "/api/watchlists/links/refresh":
+                return self._send(200, _links_refresh(body))
+            if u.path == "/api/watchlists/links/interval":
+                return self._send(200, _links_interval(body))
+            if u.path == "/api/links/sheets":
+                return self._send(200, _links_sheet_post(body))
+            if u.path == "/api/links/sheets/sync":
+                return self._send(200, _links_sheet_sync(body))
+            if u.path == "/api/links/sheets/remove":
+                return self._send(200, _links_sheet_remove(body))
             if u.path == "/api/streams/attach":
                 return self._send(200, _stream_assign(body, True))
             if u.path == "/api/streams/detach":

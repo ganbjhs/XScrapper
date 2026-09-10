@@ -244,6 +244,28 @@ def check() -> Report:
     except (OSError, TypeError):
         r.check("could read API.search_raw source", False)
 
+    # --- links refresh (one TweetDetail per post) ---
+    r.check(
+        "API.tweet_details_raw() exists (a `links` watchlist fetches posts by id through it)",
+        callable(getattr(API, "tweet_details_raw", None)),
+    )
+    try:
+        src = inspect.getsource(API.tweet_details_raw)
+        r.check(
+            "tweet_details_raw goes through _gql_item (one account lock per call, no generator)",
+            "_gql_item" in src and "focalTweetId" in src,
+        )
+        import twscrape.queue_client as _qc
+
+        src = inspect.getsource(_qc)
+        r.check(
+            "a deleted post's 'No status found' error is passed through, not retried "
+            "(classify_detail reads it)",
+            "No status found with that ID" in src,
+        )
+    except (OSError, TypeError, AttributeError):
+        r.check("could read API.tweet_details_raw source", False)
+
     # --- response annotations we read off each page ---
     try:
         import twscrape.queue_client as qc
@@ -510,6 +532,49 @@ def parse_page(rep, page_no: int) -> Page:
     return page
 
 
+@dataclass
+class Detail:
+    """What one TweetDetail call said about the ONE tweet we asked for."""
+
+    tweet_id: int
+    outcome: str                 # links.OUTCOME_OK | _UNAVAILABLE | _TRANSIENT
+    note: str = ""
+    page: Page | None = None     # carries collected_ms + rate-limit headers
+    tweet: Tweet | None = None   # set only when outcome == "ok"
+
+    @property
+    def entry(self) -> dict | None:
+        return self.page.entries_by_id.get(self.tweet_id) if self.page else None
+
+
+def parse_detail(rep, tweet_id: int) -> Detail:
+    """
+    One TweetDetail response -> the focal tweet, or the reason it is not there.
+
+    Goes through parse_page on purpose: the same header handling, the same
+    to_old_rep + Tweet.parse harvest, the same Page the store's upsert already
+    consumes. The only thing a detail page changes is the RESULT SET — it is
+    exactly the one id we asked for, never the replies and ancestors X sends
+    around it. Those stay in page.tweets as context (parse_page keeps
+    everything) but are not offered to the store, so a links refresh writes
+    one row's counters and never grows the corpus with a thread.
+    """
+    import links as _links
+
+    tid = int(tweet_id)
+    page = parse_page(rep, 1)
+    tweet = page.tweets.get(tid)
+    # Pin the result set to the focal tweet. Its entry (if X sent one) rides
+    # along for raw_entry_json; a tweet harvested with no entry of its own
+    # still counts as found — the counters are on the object, not the entry.
+    entry = page.entries_by_id.get(tid)
+    page.result_ids = [tid] if tweet is not None else []
+    page.entries_by_id = {tid: entry} if (tweet is not None and entry) else {}
+    outcome, note = _links.classify_detail(page.raw, tid, tweet is not None)
+    return Detail(tweet_id=tid, outcome=outcome, note=note, page=page,
+                  tweet=tweet if outcome == _links.OUTCOME_OK else None)
+
+
 # --------------------------------------------------------------------------
 # engine
 # --------------------------------------------------------------------------
@@ -605,6 +670,35 @@ class Engine:
                 yield parse_page(rep, page_no)
                 if max_pages and page_no >= max_pages:
                     return
+
+    async def tweet_detail(self, tweet_id: int) -> "Detail":
+        """
+        Fetch ONE post by id — the transport behind a `links` watchlist.
+
+        twscrape's TweetDetail op, raw, so the response goes through our own
+        parser like every search page does. Three things worth knowing:
+
+        1. SEPARATE BUDGET. The queue name is the op name ("TweetDetail"), so
+           this spends its own ~150/15min per account and never competes
+           with the SearchTimeline budget the watchlists poll on.
+        2. NO GENERATOR, NO aclosing TRAP. _gql_item is one `async with
+           QueueClient`, so the account lock is taken and released inside
+           this call. Nothing to close.
+        3. None MEANS "TRY LATER", NOT "GONE". twscrape returns None when no
+           account is available or the request was aborted (Cloudflare).
+           A deleted post comes back as a 200 with an errors[] entry, which
+           _check_rep deliberately passes through; a protected or suspended
+           author comes back as a tombstone entry. links.classify_detail
+           tells those apart.
+        """
+        import links as _links
+
+        tid = int(tweet_id)
+        rep = await self.api.tweet_details_raw(tid)
+        if rep is None:
+            return Detail(tweet_id=tid, outcome=_links.OUTCOME_TRANSIENT,
+                          note="no account available (pool empty, locked, or request aborted)")
+        return parse_detail(rep, tid)
 
     def pages_for(self, stream, **kw):
         """

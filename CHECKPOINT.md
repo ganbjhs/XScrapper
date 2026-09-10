@@ -19,6 +19,130 @@ must respect belongs in the rulebook, not here.
 
 ---
 
+## 2026-09-09 — Links watchlists: post URLs re-fetched daily, counters overwritten, no history (X_LINKS_PLAN.md, Phase 1: X)
+
+**Changed**
+
+- `links.py` (new) — URL parsing (`x.com` / `twitter.com` / the fixer
+  mirrors, `/status/` and `/statuses/`, `i/web`, photo/video tails,
+  scheme-less), `scan_values` (every cell of a tab, first occurrence wins,
+  non-X links counted as skipped, t.co reported), `is_due` / `order_due`
+  (forced → never-fetched → longest-waiting; transient back-off 30 min ×
+  streak capped 6 h; unavailable on cadence ×3 then weekly), `read_sheet`
+  (two Sheets API GETs, service account) + `sync_sheet` (tab → watchlist by
+  gid, adds never delete, t.co resolved by HEAD), `classify_detail`
+  (found / "No status found" / tombstone / TweetUnavailable / else transient).
+- `engine.py` — `Detail`, `parse_detail` (through `parse_page`, result set
+  pinned to the focal id), `Engine.tweet_detail` over
+  `api.tweet_details_raw`; `check()` asserts the op exists, rides
+  `_gql_item`, and that twscrape passes the deleted-post error through.
+- `store.py` — `link_sheets` + `watchlist_links` tables; `watchlists` gains
+  `link_sheet_id` / `sheet_gid` / `sheet_tab` / `refresh_every_s` /
+  `last_refresh_ms`; `kind='links'` in `create_watchlist` (compiles to
+  `wl:<id>:0`, empty query, `watched=0`), `compile_watchlist`,
+  `watchlists()` (`links` summary, `paused`, `sheet`), `delete_watchlist`
+  (drops link rows, keeps tweets); the links section (`bind_link_sheet`,
+  `links_watchlist_for_tab`, `add_links[_text]`, `sync_removed_links`,
+  `remove_link`, `set_links_refresh`, `request_links_refresh`, `links_due`,
+  `link_refreshed`, `links_summary`, `links_snapshot`, …).
+  `upsert_tweets`: `author_followers = COALESCE(excluded, existing)`.
+- `collector.py` — the third clock: `refresh_links` (one poll row per
+  watchlist per pass, kind `links`; `LINKS_BATCH` links `LINKS_GAP_S`
+  apart under `self.sem` and the global pause) and `sync_sheets`, driven
+  from `run_forever` every `LINKS_TICK_S` / `LINKS_SYNC_TICK_S`;
+  `links_enabled` for tests; the HTTP client opens on first sheet use.
+- `main.py` — `watch` starts with zero poll streams when links watchlists
+  exist (`_links_watchlist_count`).
+- `web.py` — `GET /api/links` (+ `/api/links/sheets`), `POST
+  /api/watchlists/links` (add / remove), `/links/refresh`, `/links/interval`,
+  `/api/links/sheets` (bind + first sync on the request), `/sync`, `/remove`;
+  `_watchlist_post` accepts `kind=links` with `sheet` or `links`;
+  `API_KEYS_SCOPED` + `API_KEY_SCOPED_PATHS` + the scoped branch in
+  `_require_auth`; `/api/links` in `API_KEY_READ_PATHS`.
+- `frontend/src/views/Watchlists.jsx` — `PLATFORM_KINDS.x` += links; the
+  Add modal's links form (sheet URL or name + pasted links) and the
+  post-sync report; `LinksDetail` (header chips, cadence, Refresh now, Sync
+  sheet, Pause, Delete; sheet line + error banner; search / sort / state /
+  group-by-author; the rows table; paste box; help). `client.js` +9 calls.
+- `tools/links_probe.py` (new) — the one-link live check.
+- `tests/test_links.py` (new, 170+ checks) run from `test_all.py`.
+- `guard.py` — `_budget` ignores `kind='links'` polls: a links pass reports
+  the TweetDetail bucket (~150/15 min), which must never be read as the
+  search budget.
+- `.env.example` — `API_KEYS_SCOPED`. Docs: RULEBOOK §3 / §5 / §8,
+  BLUEPRINT §2 / §3 / §5 / §9, WATCH_TOWER §7, README,
+  `LINKS_CONSUMER_HANDOVER.md` (new).
+
+**Day + section, same day.** The real sheet ("Varansi Day Wise Data
+Testing") names its tabs by date (`7/9/26`, `6/9/26`, … `16/8/26`) beside
+three master tabs, and splits each day into headed sections. `links.py`
+gained `parse_tab_day` (day-first slash/dash, ISO, month names) and heading
+detection in `scan_values` (a one-cell text row); `watchlists.sheet_day` and
+`watchlist_links.section` (both migrated on open); `/api/links` rows carry
+`day` and `section`, sort `day`, and default to the sheet's row order;
+the panel shows the day in the sidebar and header, a section badge per row,
+and "group by section" beside "group by author"; `refresh_links` fetches a
+post once per pass however many lists carry it (`reused` in the summary).
+Tests added for each.
+
+**Sidebar (2026-09-10).** With a day-wise sheet the X group is thirty rows
+long: it now scrolls in its own box past five rows (`.wl-rows.scroll`),
+shows its count, and gets a filter box past eight. And X has a row even
+when the project has no X watchlist yet — "X (Twitter) watchlists · none
+yet" with an empty panel that offers "+ New watchlist" — matching the
+Facebook and Instagram rows, which were always there.
+
+**Review fixes, same day** (an independent review of the diff found eight;
+all fixed and each has a test): `/api/links` returned the post's URL — null
+before a fetch — instead of the link's own (`LINK_COLS` no longer carries
+`url`; the post's is `post_url`); a tab title with `? # / %` broke the whole
+sheet's sync forever (the A1 range is now URL-encoded); a fetch landing
+after a removal resurrected the link (`link_refreshed` is guarded on
+`status != 'removed'`); `delete_project` left the bound sheet behind, to be
+re-read and fail every 10 min (it now drops `link_sheets` and
+`watchlist_links`); the guard read a links pass's headers as the search
+budget; `STATUS_RE` had no left boundary (`notx.com/…/status/…`,
+`spacex.com/updates/status/…`, `example.com/x.com/…` all matched);
+retention would have pruned tracked posts and let the next refresh re-insert
+them with a new `collected_ms` (tracked links are excluded from `_prune`);
+and a ms-wide race between the dashboard's first sync and the watcher's
+tick could make two watchlists for one tab (`bind_link_sheet(claim_sync=
+True)` + a gid re-check on name collision).
+
+**Why**
+
+A second tool needs the daily reach of specific posts, growing over time,
+and keeps its own history. Adding the post's author to a handles watchlist
+would not do it: a handle stream polls forward from a watermark and never
+re-reads an old post, so its counters never refresh; it also collects every
+future post on the search bucket. The plan chose a per-post fetch on its own
+bucket, one row per post, counters overwritten, nothing snapshotted here.
+
+**Verified**
+
+`python3 tests/test_all.py` green at 1288 (links section: parsing, planning,
+classify, parse_detail, store lifecycle, collector pass — counters move and
+`collected_ms` does not, unavailable keeps numbers, transient backs off,
+exception on one link does not abort the pass, global pause stops it,
+`run_forever` drives it with no poll streams — sync_sheet against a fake
+Sheets API incl. rename / removal / 403 / no creds, scoped-key gate).
+`engine.check()` OK on twscrape 0.20.0. Panel rendered against a seeded
+database (list, grouped, Add modal) at 1440 px. **Not yet verified live:**
+`tools/links_probe.py <url>` on the server with a signed-in account is the
+remaining step.
+
+**Still open**
+
+- Run the probe on the server; then bind the real sheet in a dedicated
+  project (not one Watch-Tower has bound) and watch the first pass in the
+  Activity Log.
+- Give the consumer a scoped key (`API_KEYS_SCOPED`) and the handover.
+- Instagram and Facebook links (phases 2/3): today they are counted as
+  "skipped" by the sheet scan.
+- Script-mode deployments cannot read a sheet; service account only.
+
+---
+
 ## 2026-09-06 (III) — IG: a STOP decision stands for the whole pass; every shared store opens in WAL
 
 **Changed**

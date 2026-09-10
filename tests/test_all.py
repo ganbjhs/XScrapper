@@ -6694,6 +6694,10 @@ def main():
         section("web (shared event loop)")
         test_web_event_loop(fresh("web"))
 
+        section("links watchlists (post URLs re-fetched on a cadence — X_LINKS_PLAN.md)")
+        import test_links
+        test_links.run(fresh("links"), ok)
+
         section("no undefined names (the import that systemd found first)")
         test_no_undefined_names()
 

@@ -149,6 +149,11 @@ def _budget(cfg, queue: str = "search") -> dict:
                 pred = "1" if queue == "search" else "0"
             join = "JOIN streams s USING(stream_id)"
 
+            # A links pass (kind='links') runs on the TweetDetail bucket, a
+            # different budget with different numbers (~150/15min); its
+            # headers must never be read as the search budget, or a healthy
+            # search pool blocks a Fetch — or an exhausted one waves it on.
+            pred = f"({pred}) AND p.kind != 'links'"
             row = con.execute(
                 f"SELECT {', '.join('p.' + c for c in cols)} FROM polls p {join} "
                 f"WHERE p.rl_remaining IS NOT NULL AND {pred} "

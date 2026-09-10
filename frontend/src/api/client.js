@@ -189,6 +189,23 @@ export const api = {
   watchlistFetchNow: (watchlist_id, ack) =>
     request("/api/watchlists/fetch-now",
             { method: "POST", body: { watchlist_id, ack: !!ack } }),
+  // Links watchlists (post URLs re-fetched on a cadence — X_LINKS_PLAN.md).
+  links: (p) => request(`/api/links${qs(p)}`),
+  linkSheets: (project) => request(`/api/links/sheets${qs({ project })}`),
+  bindLinkSheet: (project, sheet) =>
+    request("/api/links/sheets", { method: "POST", body: { project, sheet } }),
+  syncLinkSheet: (link_sheet_id) =>
+    request("/api/links/sheets/sync", { method: "POST", body: { link_sheet_id } }),
+  unbindLinkSheet: (link_sheet_id) =>
+    request("/api/links/sheets/remove", { method: "POST", body: { link_sheet_id } }),
+  addLinks: (watchlist_id, add) =>
+    request("/api/watchlists/links", { method: "POST", body: { watchlist_id, add } }),
+  removeLink: (watchlist_id, remove) =>
+    request("/api/watchlists/links", { method: "POST", body: { watchlist_id, remove } }),
+  linksRefreshNow: (watchlist_id) =>
+    request("/api/watchlists/links/refresh", { method: "POST", body: { watchlist_id } }),
+  linksInterval: (watchlist_id, refresh) =>
+    request("/api/watchlists/links/interval", { method: "POST", body: { watchlist_id, refresh } }),
 
   streamSettings: (body) => request("/api/stream/settings", { method: "POST", body }),
 

@@ -1184,6 +1184,23 @@ def _telegram_streams(cfg, existing_labels, log=None) -> list:
     return out
 
 
+def _links_watchlist_count(cfg) -> int:
+    """How many links watchlists the database holds; 0 if none or unreadable."""
+    path = cfg.db_results
+    if not path.exists():
+        return 0
+    import sqlite3
+    try:
+        con = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
+        try:
+            return int(con.execute(
+                "SELECT COUNT(*) FROM watchlists WHERE kind = 'links'").fetchone()[0])
+        finally:
+            con.close()
+    except sqlite3.Error:
+        return 0
+
+
 async def cmd_watch(args) -> int:
     cfg = load_config(args.config)
 
@@ -1201,11 +1218,17 @@ async def cmd_watch(args) -> int:
         streams = streams + extra
 
     if not streams:
-        raise ConfigError(
-            "No streams to watch. Declare [[streams]] in config.toml "
-            "(see config.toml.example), or switch Telegram on for a search in "
-            "the dashboard."
-        )
+        # A deployment that only tracks post LINKS has nothing to poll and is
+        # still a watcher: the links clock (collector.refresh_links) is what
+        # fetches for it. Refuse only when there is truly nothing to do.
+        n_links = _links_watchlist_count(cfg)
+        if not n_links:
+            raise ConfigError(
+                "No streams to watch. Declare [[streams]] in config.toml "
+                "(see config.toml.example), or switch Telegram on for a search in "
+                "the dashboard."
+            )
+        _log(f"[watch] no poll streams — {n_links} links watchlist(s) only")
     streams = [_apply_overrides(s, args) for s in streams]
 
     try:

@@ -83,6 +83,23 @@ BACKFILL_LOW_HEADROOM = 10   # rl_remaining below this = slow down
 # enough to be invisible next to the polling itself.
 MAINTAIN_EVERY_S = 300
 
+# ---- links: the third clock (X_LINKS_PLAN.md §5) -------------------------
+#
+# A `links` watchlist is re-fetched one post at a time on its own cadence
+# (12h/24h/48h), through TweetDetail — a separate rate bucket from search, so
+# it never slows the watchlists. The scheduler looks for due links every
+# LINKS_TICK_S, hands a batch of LINKS_BATCH to one task, and that task
+# trickles through them LINKS_GAP_S apart: a thousand links finish in a
+# couple of hours, well inside a 24h window, and never arrive as a burst.
+LINKS_TICK_S = 30.0
+LINKS_BATCH = 20
+LINKS_GAP_S = 7.0
+LINKS_FETCH_TIMEOUT_S = 120.0     # a TweetDetail that waits on the pool this
+                                  # long is "try later", not "hold the slot"
+# Bound Google Sheets are re-read on their own cadence (link_sheets.sync_every_s,
+# 10 min by default); this is only how often the scheduler asks which are due.
+LINKS_SYNC_TICK_S = 20.0
+
 
 def describe_error(e: BaseException) -> str:
     """
@@ -623,6 +640,12 @@ class Collector:
         # minute, and collapsing them into one clock would make the operator
         # choose between the two.
         self.bf_state: dict[str, dict] = {}
+        # Links (kind='links' watchlists): on by default, switched off by
+        # tests that drive run_forever with a fake engine that has no
+        # tweet_detail. The HTTP client for sheet syncs is made on first use
+        # so a watcher with no bound sheet never opens one.
+        self.links_enabled = True
+        self._http = None
 
     async def prepare(self):
         for s in self.streams:
@@ -906,6 +929,148 @@ class Collector:
             await asyncio.gather(*(self.poll_stream(s) for s in self.streams))
         )
 
+    # ------------------------------------------------------------------
+    # links: one TweetDetail per due post, trickled (X_LINKS_PLAN.md §5)
+    # ------------------------------------------------------------------
+
+    async def _links_stream_id(self, watchlist_id: int) -> int:
+        """The links watchlist's one stream, 'wl:<id>:0' (made at compile)."""
+        label = f"wl:{int(watchlist_id)}:0"
+        row = self.store.db.execute(
+            "SELECT stream_id FROM streams WHERE label = ?", (label,)).fetchone()
+        if row:
+            return row["stream_id"]
+        return await self.store.ensure_stream(label, "", "Latest", True)
+
+    async def refresh_links(self, batch: list) -> dict:
+        """
+        Fetch each link in `batch` (rows from store.links_due), one at a
+        time, LINKS_GAP_S apart, under the shared semaphore and the global
+        pause. One poll row per watchlist per pass — not per link — so the
+        polls table records "a links pass ran" the way it records a poll,
+        without growing by a thousand rows a day.
+
+        A found post goes through upsert_tweets exactly like a search hit:
+        counters overwrite, collected_ms stays frozen, a tweet_hits edge
+        makes it the project's. Anything else is recorded on the link row
+        and never touches the corpus.
+        """
+        import links as _links
+
+        summary = {"fetched": 0, "ok": 0, "unavailable": 0, "transient": 0,
+                   "new": 0, "dup": 0, "reused": 0}
+        by_wl: dict[int, list] = {}
+        for link in batch:
+            by_wl.setdefault(int(link["watchlist_id"]), []).append(link)
+        # The same post is often on several lists — a day tab AND a master
+        # tab. One TweetDetail per post per pass: the first list that needs
+        # it fetches, the rest reuse the answer. The row bookkeeping is still
+        # per list (each gets its own status, note and clocks).
+        fetched: dict[int, object] = {}
+
+        for wid, items in by_wl.items():
+            sid = await self._links_stream_id(wid)
+            poll_id = await self.store.begin_poll(sid, kind="links")
+            ok = unavailable = transient = new = dup = 0
+            account = None
+            rl = (None, None, None)
+            err = None
+            for link in items:
+                if self._paused():
+                    break
+                tid = int(link["tweet_id"])
+                now_ms = int(time.time() * 1000)
+                det = None
+                reused = tid in fetched
+                if reused:
+                    det = fetched[tid]
+                    summary["reused"] += 1
+                    if det is None:
+                        outcome, note = _links.OUTCOME_TRANSIENT, "fetch failed earlier this pass"
+                else:
+                    async with self.sem:
+                        try:
+                            det = await asyncio.wait_for(
+                                self.engine.tweet_detail(tid), LINKS_FETCH_TIMEOUT_S)
+                        except asyncio.TimeoutError:
+                            outcome, note = _links.OUTCOME_TRANSIENT, "timed out waiting for an account"
+                        except asyncio.CancelledError:
+                            raise
+                        except Exception as e:
+                            outcome, note = _links.OUTCOME_TRANSIENT, describe_error(e)
+                            err = note
+                    fetched[tid] = det
+                if det is not None:
+                    outcome, note = det.outcome, det.note
+                    if det.page is not None:
+                        account = det.page.account or account
+                        rl = (det.page.rl_limit, det.page.rl_remaining, det.page.rl_reset)
+                        now_ms = det.page.collected_ms
+                    if outcome == _links.OUTCOME_OK:
+                        try:
+                            counts = await self.store.upsert_tweets(
+                                [(det.tweet, det.page, "result", det.entry)], sid, poll_id)
+                            new += counts.new
+                            dup += counts.dup
+                        except Exception as e:
+                            outcome, note = _links.OUTCOME_TRANSIENT, f"store: {describe_error(e)}"
+                            err = note
+                summary["fetched"] += 1
+                if outcome == _links.OUTCOME_OK:
+                    ok += 1
+                elif outcome == _links.OUTCOME_UNAVAILABLE:
+                    unavailable += 1
+                else:
+                    transient += 1
+                await self.store.link_refreshed(wid, tid, outcome, note, now_ms)
+                if not reused:
+                    await asyncio.sleep(jittered(LINKS_GAP_S))
+
+            await self.store.finish_poll(
+                poll_id, pages=ok + unavailable + transient, results=ok,
+                new_tweets=new, dup_tweets=dup, orphans=unavailable,
+                stop_reason="links", account=account,
+                rl_limit=rl[0], rl_remaining=rl[1], rl_reset=rl[2], error=err)
+            await self.store.links_watchlist_touched(wid)
+            summary["ok"] += ok
+            summary["unavailable"] += unavailable
+            summary["transient"] += transient
+            summary["new"] += new
+            summary["dup"] += dup
+            self.log(f"[links] wl:{wid}:0  fetched {ok + unavailable + transient}  "
+                     f"ok {ok}  unavailable {unavailable}  retry-later {transient}"
+                     + (f"  rl={rl[1]}/{rl[0]}" if rl[0] is not None else ""))
+        if summary["reused"]:
+            self.log(f"[links] {summary['reused']} row(s) reused a fetch made earlier "
+                     f"in this pass (same post on several lists)")
+        return summary
+
+    async def sync_sheets(self, sheets: list) -> list:
+        """Re-read every due Google Sheet; adds never delete (links.sync_sheet)."""
+        import links as _links
+
+        if self._http is None:
+            import httpx
+            self._http = httpx.AsyncClient()
+        out = []
+        for sheet in sheets:
+            if self._paused():
+                break
+            try:
+                res = await _links.sync_sheet(self.store, self._http, sheet, log=self.log)
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                res = {"error": describe_error(e), "link_sheet_id": sheet.get("link_sheet_id")}
+                try:
+                    await self.store.link_sheet_synced(sheet["link_sheet_id"], error=res["error"])
+                except Exception:
+                    pass
+            if res.get("error"):
+                self.log(f"[links] sheet {str(sheet.get('sheet_id'))[:8]}…: {res['error']}")
+            out.append(res)
+        return out
+
     async def run_forever(self, duration: float | None = None):
         """Poll every stream on its own schedule until stopped."""
         deadline = (time.time() + duration) if duration else None
@@ -917,6 +1082,13 @@ class Collector:
         bf_tasks: dict[str, asyncio.Task] = {}
         last_backfill_scan = 0.0
         backfill_labels: set[str] = set()
+        # The third clock: links watchlists (X_LINKS_PLAN.md §5). One refresh
+        # task and one sheet-sync task at a time, each started only when the
+        # previous is done, so the trickle stays a trickle.
+        links_task: asyncio.Task | None = None
+        sync_task: asyncio.Task | None = None
+        last_links_tick = 0.0
+        last_sync_tick = 0.0
         last_discover = 0.0
         last_maintain = time.time()   # not at boot — opening the DB just ran
                                       # the migration; let polls start first
@@ -1003,10 +1175,54 @@ class Collector:
                             and now_ms >= self.bf_state.get(s.label, {}).get("next_ms", 0)):
                         bf_tasks[s.label] = asyncio.create_task(self.backfill_stream(s))
 
+                # Links: due posts, one batch at a time. Read from the
+                # database every tick (never cached) so a list paused,
+                # re-timed, extended or force-refreshed from the dashboard is
+                # honoured on the next cycle. Gated by the same global pause.
+                if self.links_enabled and time.time() - last_links_tick >= LINKS_TICK_S:
+                    last_links_tick = time.time()
+                    if links_task is not None and links_task.done():
+                        exc = links_task.exception() if not links_task.cancelled() else None
+                        if exc:
+                            self.log(f"[links] refresh task failed: {exc!r}")
+                        links_task = None
+                    if not paused and links_task is None:
+                        try:
+                            due = await self.store.links_due(now_ms, LINKS_BATCH)
+                        except Exception as e:
+                            due = []
+                            self.log(f"[links] scan error: {e!r}")
+                        if due:
+                            links_task = asyncio.create_task(self.refresh_links(due))
+
+                # Bound sheets, on their own cadence.
+                if self.links_enabled and time.time() - last_sync_tick >= LINKS_SYNC_TICK_S:
+                    last_sync_tick = time.time()
+                    if sync_task is not None and sync_task.done():
+                        exc = sync_task.exception() if not sync_task.cancelled() else None
+                        if exc:
+                            self.log(f"[links] sheet sync task failed: {exc!r}")
+                        sync_task = None
+                    if not paused and sync_task is None:
+                        try:
+                            sheets_due = await self.store.link_sheets_due(now_ms)
+                        except Exception as e:
+                            sheets_due = []
+                            self.log(f"[links] sheet scan error: {e!r}")
+                        if sheets_due:
+                            sync_task = asyncio.create_task(self.sync_sheets(sheets_due))
+
                 await asyncio.sleep(0.25)
         finally:
-            for t in list(tasks.values()) + list(bf_tasks.values()):
+            extra = [t for t in (links_task, sync_task) if t is not None]
+            for t in list(tasks.values()) + list(bf_tasks.values()) + extra:
                 t.cancel()
-            if tasks or bf_tasks:
-                await asyncio.gather(*tasks.values(), *bf_tasks.values(),
+            if tasks or bf_tasks or extra:
+                await asyncio.gather(*tasks.values(), *bf_tasks.values(), *extra,
                                      return_exceptions=True)
+            if self._http is not None:
+                try:
+                    await self._http.aclose()
+                except Exception:
+                    pass
+                self._http = None

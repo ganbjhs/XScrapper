@@ -12,6 +12,13 @@ highlighting; per-source check intervals and Start/Pause; velocity alerts and
 collections; per-project delivery to Watch-Tower with a durable, at-least-once
 cursor.
 
+One more X watchlist kind, for a different consumer: **links** — specific
+post URLs, read from every tab of a Google Sheet (or pasted), re-fetched once
+a day with their likes / reposts / replies / views overwritten in place and no
+history kept, served as a snapshot on `GET /api/links` behind a project-locked
+key. `X_LINKS_PLAN.md` is the design, `LINKS_CONSUMER_HANDOVER.md` is what
+the consumer gets; keep these lists in a project Watch-Tower has not bound.
+
 One thing it does that is NOT collection: **content labelling**. Press Classify
 and the unlabelled posts in a project go to Grok once, come back with one
 category each (the categories are yours, edited in the dashboard), and land on

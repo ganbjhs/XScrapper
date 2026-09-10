@@ -486,6 +486,15 @@ table.tbl td.num { font-variant-numeric: tabular-nums; text-align: right; }
 .wl-item .nm b { display: block; font-size: 13.5px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .wl-item .nm small { color: var(--ink-3); font-size: 11.5px; }
 .wl-item .dot { margin-left: auto; }
+/* A platform group with many lists (a day-wise sheet makes one per day)
+   scrolls inside its own box — about five rows tall — so the sidebar never
+   outgrows the page. The group label shows the count; past eight rows a
+   filter box appears in the header. */
+.wl-rows.scroll { max-height: 300px; overflow-y: auto; border: 1px solid var(--ring); border-radius: 10px; padding: 2px; margin: 0 4px; }
+.wl-group .cnt { font-weight: 600; letter-spacing: 0; text-transform: none; margin-left: 6px; color: var(--ink-3); }
+.wl-group input { display: block; width: 100%; margin-top: 6px; font: inherit; font-size: 12px; letter-spacing: 0;
+  text-transform: none; font-weight: 500; padding: 5px 8px; border: 1px solid var(--ring); border-radius: 8px;
+  background: var(--page); color: var(--ink-1); }
 
 /* The members area: bounded height, scrolls itself, searchable. */
 .members-box {
