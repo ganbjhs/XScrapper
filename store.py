@@ -26,7 +26,7 @@ import re
 import sqlite3
 import time
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 
 # ==========================================================================
@@ -195,6 +195,37 @@ def _best_variant(variants):
         if best_key is None or key > best_key:
             best_key, best = key, url
     return best
+
+
+# IST is the campaign day everywhere in this system: the sheets are written in
+# it, the report tool groups on it (clients.tz defaults to Asia/Kolkata) and
+# the client reads the dashboard in it. Fixed +05:30 on purpose — India has no
+# DST, so this needs no tz database and cannot drift with one.
+_IST = timezone(timedelta(hours=5, minutes=30))
+
+
+def _ist_day_of(when) -> str:
+    """
+    The IST calendar date of an ISO timestamp or epoch (s or ms), as
+    YYYY-MM-DD. Empty string when it cannot be read — the caller decides what
+    an unknown day means; guessing today here would silently file a two-month
+    -old post as today's, which is the exact failure this whole column exists
+    to prevent.
+    """
+    if when is None or when == "":
+        return ""
+    try:
+        if isinstance(when, (int, float)):
+            n = float(when)
+            return datetime.fromtimestamp(n / 1000 if n > 2e10 else n,
+                                          _IST).date().isoformat()
+        t = str(when).strip().replace("Z", "+00:00")
+        dt = datetime.fromisoformat(t)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt.astimezone(_IST).date().isoformat()
+    except (TypeError, ValueError, OverflowError, OSError):
+        return ""
 
 
 def _media_urls(media):
@@ -583,6 +614,21 @@ CREATE TABLE IF NOT EXISTS link_sheets (
   last_error    TEXT,
   paused        INTEGER NOT NULL DEFAULT 0,
   created_at    TEXT NOT NULL,
+  -- How this sheet is READ. Empty script_url = the Sheets REST API with the
+  -- service-account key from .env; a script_url = the sheet's own Apps Script
+  -- web app, which runs as the sheet's OWNER (no cloud project, no JSON key,
+  -- no sharing step, and the sheet stays private).
+  --
+  -- The mode is DERIVED from script_url rather than stored beside it: a mode
+  -- column and a URL column can disagree, and then the row says one thing and
+  -- does another.
+  --
+  -- script_token_env is the NAME of the .env variable, never the token —
+  -- delivery_targets.secret_env for the same reason, and the same rule
+  -- webhooks follow: a credential in the database is a credential in every
+  -- backup of it.
+  script_url       TEXT,
+  script_token_env TEXT,
   UNIQUE(project_id, sheet_id)
 );
 
@@ -1217,6 +1263,13 @@ class Store:
                   # Influencers", "Counter Comments Links"). Arrived after
                   # the table did.
                   "watchlist_links": {"section": "TEXT"},
+                  # Reading a sheet through its own Apps Script instead of the
+                  # Sheets REST API (2026-09-10). CREATE TABLE IF NOT EXISTS is
+                  # a no-op on a database that already has the table, so these
+                  # must be here as well as in the DDL or a deployed server
+                  # never grows the columns.
+                  "link_sheets": {"script_url": "TEXT",
+                                  "script_token_env": "TEXT"},
                   "streams": {"list_id": "TEXT",
                               # The watchlist's collection filters, as JSON,
                               # copied onto each compiled stream so the
@@ -2243,7 +2296,9 @@ class Store:
 
     async def bind_link_sheet(self, project_id: int, sheet_ref: str,
                               sync_every_s: int | None = None,
-                              claim_sync: bool = False) -> dict:
+                              claim_sync: bool = False,
+                              script_url: str | None = None,
+                              script_token_env: str | None = None) -> dict:
         """
         Bind a Google Sheet (URL or id) to a project. Idempotent.
 
@@ -2251,6 +2306,12 @@ class Store:
         does not start a parallel first sync while the caller (the dashboard
         request) is reading the sheet itself; the caller's sync overwrites
         the stamp with its real result.
+
+        `script_url` + `script_token_env` bind the sheet to its own Apps Script
+        instead of the service account. Passing None for either LEAVES THE
+        STORED VALUE ALONE — re-binding a sheet to change its cadence must not
+        silently drop the script it reads through. Pass "" to clear one
+        deliberately and fall back to the REST API.
         """
         import links as _links
         import sheets as _sheets
@@ -2263,11 +2324,24 @@ class Store:
             return {"error": f"no project {project_id}"}
         every = int(sync_every_s or _links.DEFAULT_SYNC_S)
         every = max(_links.MIN_SYNC_S, every)
+        if script_url:
+            u = script_url.strip()
+            if not u.startswith(_sheets.SCRIPT_URL_PREFIX):
+                return {"error": f"an Apps Script URL starts with "
+                                 f"{_sheets.SCRIPT_URL_PREFIX} — paste the /exec "
+                                 f"address from Deploy → Manage deployments"}
         self.db.execute(
-            "INSERT INTO link_sheets(project_id, sheet_id, sync_every_s, created_at) "
-            "VALUES(?,?,?,?) ON CONFLICT(project_id, sheet_id) DO UPDATE SET "
-            "  paused = 0",
-            (int(project_id), sid, every, _iso_ms(int(time.time() * 1000))))
+            "INSERT INTO link_sheets(project_id, sheet_id, sync_every_s, created_at, "
+            "  script_url, script_token_env) "
+            "VALUES(?,?,?,?,?,?) ON CONFLICT(project_id, sheet_id) DO UPDATE SET "
+            "  paused = 0, "
+            # COALESCE, not the excluded value: None means "not specified" and
+            # must keep what is there, or re-binding to change the cadence
+            # would unhook the script the sheet is read through.
+            "  script_url = COALESCE(?, script_url), "
+            "  script_token_env = COALESCE(?, script_token_env)",
+            (int(project_id), sid, every, _iso_ms(int(time.time() * 1000)),
+             script_url, script_token_env, script_url, script_token_env))
         if claim_sync:
             self.db.execute(
                 "UPDATE link_sheets SET last_sync_ms = ? WHERE project_id = ? AND sheet_id = ?",
@@ -2677,12 +2751,38 @@ class Store:
                 media = json.loads(post.pop("media_json", None) or "[]")
             except (TypeError, ValueError):
                 media = []
+            # `day` is REQUIRED by the report tool and drives every day-wise
+            # view it renders, so it may never be null. It is the tab's date
+            # when the tab is named like one; for a tab that is not
+            # ('Tweet LInks'), fall back to the IST date the link was first
+            # seen and SAY SO in status_note, rather than send the scrape date
+            # and pile every historical post onto today.
+            day, day_note = d.get("day"), None
+            if not day:
+                day = _ist_day_of(d.get("added_at"))
+                day_note = (f"day inferred from added_at: tab "
+                            f"{d.get('tab') or '?'!r} is not a date")
+            note = d.get("status_note")
+            if day_note:
+                note = f"{note}; {day_note}" if note else day_note
+            for m in media:
+                # The report tool reads media.0.thumbnail_url; we have always
+                # called it `thumb`. Serve both names, never rename.
+                if isinstance(m, dict) and "thumb" in m:
+                    m.setdefault("thumbnail_url", m.get("thumb"))
             item = {
+                # Explicit, so a consumer never has to guess from the URL. The
+                # report tool's platform_of() falls through to "x" for anything
+                # it does not recognise, which would misfile FB/IG/YouTube.
+                "platform": "x",
                 "watchlist_id": d["watchlist_id"], "watchlist": d["watchlist"],
-                "tab": d.get("tab"), "day": d.get("day"), "section": d.get("section"),
+                "tab": d.get("tab"), "day": day, "section": d.get("section"),
+                # `group` is the report tool's name for the sheet heading
+                # (-> post_metrics.category_raw). Same value as `section`.
+                "group": d.get("section"),
                 "refresh_every_s": d.get("refresh_every_s"),
                 "url": d["url"], "tweet_id": str(d["tweet_id"]),
-                "status": d["status"], "status_note": d.get("status_note"),
+                "status": d["status"], "status_note": note,
                 "added_at": d["added_at"], "added_via": d["added_via"],
                 "sheet_row": d.get("sheet_row"),
                 "last_refresh_ms": d.get("last_refresh_ms"),
@@ -2700,7 +2800,92 @@ class Store:
                 post[c] = bool(v) if v is not None else None
             item.update(post)
             out.append(item)
-        return {"total": total, "rows": out, "limit": limit, "offset": offset}
+        # `items` is the consumer's array key and `rows` is ours. Their
+        # portal/scraper.py: normalize_many() accepts posts|data|items|results|
+        # records and NOTHING else, so a body carrying only `rows` fails their
+        # sync outright with "Expected a JSON array of posts". Same list object,
+        # not a copy. `rows` stays because Watch-Tower and the panel read it and
+        # LINKS_CONSUMER_HANDOVER.md promises fields are added, never renamed.
+        return {"total": total, "rows": out, "items": out,
+                "limit": limit, "offset": offset}
+
+    async def project(self, project_id: int) -> dict | None:
+        """One project row, or None. The handshake's 404 turns on this."""
+        r = self.db.execute(
+            "SELECT project_id, name, archived, created_at FROM projects "
+            "WHERE project_id = ?", (int(project_id),)).fetchone()
+        return dict(r) if r else None
+
+    async def links_handshake(self, project_id: int, project: dict) -> dict:
+        """
+        What the report tool's "Test connection" needs to prove the wiring is
+        right BEFORE a scheduled sync runs unattended for a week.
+
+        Everything here is a count the operator can check against the sheet
+        with their own eyes. `skipped_non_x` is the one that matters most and
+        is the one nobody asks for: a sheet whose links are 40% Facebook and
+        Instagram reports "1869 links" and says nothing about the 900 it
+        dropped, and that gap is what gets asked about in a client meeting.
+        """
+        import links as _links
+
+        pid = int(project_id)
+        counts = {s: 0 for s in ("ok", "pending", "unavailable", "removed")}
+        for r in self.db.execute(
+                "SELECT l.status s, COUNT(*) c FROM watchlist_links l "
+                "JOIN watchlists w ON w.watchlist_id = l.watchlist_id "
+                "WHERE w.project_id = ? AND w.kind = 'links' GROUP BY l.status",
+                (pid,)).fetchall():
+            counts[r["s"]] = r["c"]
+        total = sum(counts.values())
+
+        tabs = self.db.execute(
+            "SELECT COUNT(*) c, SUM(sheet_day IS NOT NULL) d FROM watchlists "
+            "WHERE project_id = ? AND kind = 'links'", (pid,)).fetchone()
+        sheet = self.db.execute(
+            "SELECT sheet_id, title, last_sync_ms, last_error, paused "
+            "FROM link_sheets WHERE project_id = ? "
+            "ORDER BY link_sheet_id LIMIT 1", (pid,)).fetchone()
+        fresh = self.db.execute(
+            "SELECT MAX(l.last_refresh_ms) m FROM watchlist_links l "
+            "JOIN watchlists w ON w.watchlist_id = l.watchlist_id "
+            "WHERE w.project_id = ? AND w.kind = 'links'", (pid,)).fetchone()
+
+        out = {
+            "project": {"id": pid, "name": project.get("name"), "platform": "x",
+                        "archived": bool(project.get("archived"))},
+            "watchlist": {
+                "tabs": (tabs["c"] if tabs else 0) or 0,
+                "dated_tabs": (tabs["d"] if tabs else 0) or 0,
+                "tab_mode": "dated",
+                "links": total,
+            },
+            "counters": {**counts, "total": total},
+            "last_refresh_ms": (fresh["m"] if fresh else None),
+            "limits": {"max_limit": _links.MAX_LIMIT,
+                       "requests_per_minute": _links.RATE_PER_MIN},
+        }
+        if sheet:
+            out["watchlist"].update({
+                "sheet_url": f"https://docs.google.com/spreadsheets/d/{sheet['sheet_id']}/edit",
+                "sheet_title": sheet["title"] or "",
+                "last_sheet_read_ms": sheet["last_sync_ms"],
+                "sheet_error": sheet["last_error"] or "",
+                "sheet_paused": bool(sheet["paused"]),
+            })
+            # A pull taken mid-scrape snapshots a half-refreshed watchlist and
+            # records it as a real day. The consumer is told to skip instead.
+            out["refresh_in_progress"] = bool(
+                self.db.execute(
+                    "SELECT 1 FROM watchlist_links l "
+                    "JOIN watchlists w ON w.watchlist_id = l.watchlist_id "
+                    "WHERE w.project_id = ? AND w.kind = 'links' "
+                    "  AND l.last_attempt_ms IS NOT NULL "
+                    "  AND l.last_attempt_ms > ? LIMIT 1",
+                    (pid, int(time.time() * 1000) - 5 * 60_000)).fetchone())
+        else:
+            out["refresh_in_progress"] = False
+        return out
 
     async def links_watchlists(self) -> list:
         """Every links watchlist, across projects — the collector's view."""

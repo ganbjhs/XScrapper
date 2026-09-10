@@ -888,7 +888,17 @@ def test_web(ok):
               "/api/watchlists/links/interval", "/api/links/sheets",
               "/api/links/sheets/sync", "/api/links/sheets/remove"):
         ok(p not in web.API_KEY_READ_PATHS and p not in web.API_KEY_WRITE_PATHS,
-           f"{p} is dashboard-only")
+           f"{p} is closed to an UNSCOPED key")
+    # …but binding a sheet is open to a PROJECT-LOCKED key, deliberately
+    # (REPORT_TOOL_PLAN.md Part 2.2): the report tool hands us the sheet an
+    # operator already pasted there, for its own project only.
+    ok(web.API_KEY_SCOPED_WRITE_PATHS == {"/api/links/sheets"},
+       "the scoped write set is exactly one path, and it is the sheet binding")
+    ok("/api/projects" not in web.API_KEY_SCOPED_WRITE_PATHS,
+       "a machine key still cannot CREATE a project — a duplicate project would "
+       "silently split one campaign's history in two")
+    ok("/api/project" in web.API_KEY_SCOPED_PATHS and "/api/project" in web.API_KEY_READ_PATHS,
+       "the handshake is readable by both key kinds")
     src = pathlib.Path(web.__file__).read_text()
     ok('u.path == "/api/links"' in src and 'u.path == "/api/watchlists/links"' in src,
        "the new paths are routed")
@@ -921,6 +931,19 @@ def test_web(ok):
         ok(not a and sent[0] == 403, "scoped key: POST /api/fetch is refused (no budget spend)")
         a, sent = go("POST", "/api/watchlists/links?project=7", K2)
         ok(not a and sent[0] == 403, "scoped key: cannot add links")
+        h = _FakeHandler("POST", "/api/links/sheets", K2)
+        ok(web.Handler._require_auth(h) and h.sent is None and h._key_project == 7,
+           "scoped key: POST /api/links/sheets passes the door, carrying its project")
+        ok(web._links_sheet_post({"project": 8, "sheet": "x"}, 7)[0] == 403,
+           "…and the handler refuses another project named in the BODY, which the "
+           "path allowlist cannot see")
+        h2 = _FakeHandler("GET", "/api/links?project=7", K1)
+        web.Handler._require_auth(h2)
+        ok(h2._key_project is None,
+           "an unscoped key carries no project, so the body check never binds it")
+        a, sent = go("POST", "/api/links/sheets/sync", K2)
+        ok(not a and sent[0] == 403,
+           "scoped key: the other sheet routes stay shut (only the bind is granted)")
         ok(go("GET", "/api/links?project=8", K1) == (True, None), "an unscoped key still reads any project")
         ok(go("GET", "/api/projects", K1) == (True, None), "…and the whole read allowlist")
         a, sent = go("GET", "/api/links?project=7", "k_" + "z" * 40)
@@ -935,13 +958,27 @@ def test_web(ok):
     orig = web._CFG
     web._CFG = Cfg()
     try:
-        ok("error" in web._links_json({}), "/api/links without ?project= is an error")
-        ok(web._links_json({"project": "3"}) == {"total": 0, "rows": [], "limit": 500, "offset": 0},
-           "/api/links on a fresh install is an empty snapshot, not a 500")
-        ok("error" in web._links_json({"project": "3", "status": "lost"}), "an unknown status is refused")
+        # These handlers answer (http_status, body): a consumer that cannot tell
+        # "no such project" from "no links yet" from "your key is wrong" retries
+        # the same broken URL forever.
+        code, body = web._links_json({})
+        ok(code == 400 and "error" in body, "/api/links without ?project= is 400, not 200")
+        code, body = web._links_json({"project": "3"})
+        ok(code == 200 and body == {"total": 0, "rows": [], "items": [],
+                                    "limit": 500, "offset": 0},
+           f"/api/links on a fresh install is an empty snapshot, not a 500 ({body})")
+        ok(body["items"] == body["rows"],
+           "…and even the empty envelope carries `items`, so their normalize_many() "
+           "parses it instead of raising")
+        code, body = web._links_json({"project": "3", "status": "lost"})
+        ok(code == 400 and "error" in body, "an unknown status is refused with 400")
+        code, body = web._project_json({})
+        ok(code == 400 and "error" in body, "/api/project without ?project= is 400")
         ok("error" in web._links_post({}) and "error" in web._links_post({"watchlist_id": 1})
-           and "error" in web._links_refresh({}) and "error" in web._links_sheet_post({"project": 1}),
+           and "error" in web._links_refresh({}),
            "the write validators refuse empty bodies")
+        ok(web._links_sheet_post({"project": 1})[0] == 400,
+           "…and the sheet binding refuses a body with no sheet URL")
     finally:
         web._CFG = orig
 

@@ -6698,6 +6698,18 @@ def main():
         import test_links
         test_links.run(fresh("links"), ok)
 
+        section("report tool pull contract (REPORT_TOOL_PLAN.md)")
+        import test_report_contract
+        test_report_contract.run(fresh("report"), ok)
+
+        section("reading a sheet through its own Apps Script (no service account)")
+        import test_script_read
+        test_script_read.run(fresh("script_read"), ok)
+
+        section("naming post links on every platform (Phase 2, step 1)")
+        import test_platform_urls
+        test_platform_urls.run(None, ok)
+
         section("no undefined names (the import that systemd found first)")
         test_no_undefined_names()
 

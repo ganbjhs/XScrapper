@@ -146,7 +146,7 @@ API_KEY_READ_PATHS = {
     "/api/ig/posts", "/api/ig/status", "/api/fb/posts", "/api/fb/status",
     # Post links tracked for their counters (kind='links' watchlists), as a
     # snapshot — no cursor, by design. X_LINKS_PLAN.md §6.
-    "/api/links",
+    "/api/links", "/api/project",
     # Curated sets.
     "/api/collections", "/api/collections/items", "/api/collections/export",
     # Operational telemetry: health, throughput, alerts, delivery progress.
@@ -177,7 +177,25 @@ API_KEY_PATHS = API_KEY_READ_PATHS | API_KEY_WRITE_PATHS
 # allowlist, exactly as before. The two sets never overlap in what they can
 # see — a scoped key cannot list projects, cannot read another project's
 # posts, and cannot spend budget on /api/fetch.
-API_KEY_SCOPED_PATHS = {"/api/links", "/api/tweets", "/api/watchlists", "/api/export"}
+API_KEY_SCOPED_PATHS = {"/api/links", "/api/project", "/api/tweets",
+                        "/api/watchlists", "/api/export"}
+
+# The ONE write a project-locked key may perform: point its own project at a
+# Google Sheet. It exists so the report tool can hand us the sheet an operator
+# already pasted there, instead of a human pasting the same URL into two
+# systems and one of them being forgotten.
+#
+# Note what is NOT here, and why: POST /api/projects. A machine key may point an
+# EXISTING project at more data; it may not bring a project into existence. A
+# retry or a client re-added under a slightly different name would otherwise
+# create a second project, and a second project silently splits one campaign's
+# link history in two with no error anywhere. A human creating the project once
+# per campaign costs ten seconds and removes that failure entirely.
+#
+# The project in the BODY is checked against the key's scope inside the handler
+# (_links_sheet_post) — this allowlist cannot see a body, and a path-only grant
+# would let a key bind a sheet to somebody else's project.
+API_KEY_SCOPED_WRITE_PATHS = {"/api/links/sheets"}
 
 
 def _api_keys() -> set:
@@ -212,6 +230,42 @@ def _key_scope(presented: str):
         if hmac.compare_digest(presented, k):
             hit = pid
     return hit
+
+
+# A per-key request ceiling. There was none: a consumer stuck in a retry loop
+# could spend a night walking the same 4 pages and we would find out from the
+# access log. 60/min is far above anything the contract needs — a full walk of
+# 1,869 links at limit=500 is FOUR requests — so this constrains no correct
+# caller and stops an incorrect one.
+#
+# In-process and per-worker on purpose: it is a courtesy brake on a trusted
+# integration, not a security control, and a shared counter would mean a store
+# round-trip on every authenticated request to bound something that has never
+# yet gone wrong. Keys are hashed so a memory dump is not a key list.
+_RATE_HITS: dict = {}
+_RATE_LOCK = threading.Lock()
+
+
+def _rate_ok(presented: str, now: float | None = None) -> tuple:
+    """(allowed, retry_after_seconds). Sliding 60 s window per key."""
+    import links as _links
+
+    now = time.time() if now is None else now
+    k = hashlib.sha256(presented.encode()).hexdigest()[:16]
+    with _RATE_LOCK:
+        hits = [t for t in _RATE_HITS.get(k, ()) if now - t < 60]
+        if len(hits) >= _links.RATE_PER_MIN:
+            _RATE_HITS[k] = hits
+            return False, max(1, int(60 - (now - hits[0])) + 1)
+        hits.append(now)
+        _RATE_HITS[k] = hits
+        # Keys come and go (revoked, rotated); without this the dict is a slow
+        # leak keyed on every key ever presented.
+        if len(_RATE_HITS) > 512:
+            for dead in [kk for kk, v in _RATE_HITS.items()
+                         if not v or now - v[-1] > 300]:
+                _RATE_HITS.pop(dead, None)
+    return True, 0
 
 
 def _presented_key(headers) -> str:
@@ -2157,22 +2211,71 @@ def _links_json(q):
     purpose — a refreshed post's collected_ms never changes (WATCH_TOWER.md
     R3), so a cursor would never re-deliver it. Offset paging on a stable
     order; `total` says when the caller has everything.
+
+    Returns (http_status, body). A consumer that cannot tell "no such
+    project" from "no links yet" from "your key is wrong" retries the same
+    broken URL forever, so each of those gets its own code and a sentence a
+    human can act on — the report tool puts this text straight in front of an
+    admin (client_sources.last_error).
     """
     import links as _links
 
     pid = _int_or(q.get("project"))
     if not pid:
-        return {"error": "which project? pass ?project=<id>"}
+        return 400, {"error": "which project? pass ?project=<id>"}
     status = (q.get("status") or "").strip()
     if status and status not in _links.STATUSES:
-        return {"error": f"status must be one of: {', '.join(_links.STATUSES)}"}
+        return 400, {"error": f"status must be one of: {', '.join(_links.STATUSES)}"}
     if not _CFG.db_results.exists():
-        return {"total": 0, "rows": [], "limit": 500, "offset": 0}
+        return 200, {"total": 0, "rows": [], "items": [], "limit": 500, "offset": 0}
     wid = _int_or(q.get("watchlist"))
-    return _with_store(lambda st: st.links_snapshot(
-        pid, watchlist_id=wid or None, status=status or None,
-        limit=_int_or(q.get("limit"), 500), offset=_int_or(q.get("offset"), 0),
-        sort=(q.get("sort") or "").strip()))
+
+    async def go(st):
+        if not await st.project(pid):
+            return 404, {"error": f"Project {pid} does not exist."}
+        return 200, await st.links_snapshot(
+            pid, watchlist_id=wid or None, status=status or None,
+            limit=_int_or(q.get("limit"), _links.MAX_LIMIT),
+            offset=_int_or(q.get("offset"), 0),
+            sort=(q.get("sort") or "").strip())
+    code, body = _with_store(go)
+    # store.links_snapshot() owns the envelope (rows + items). Only the
+    # explanation for an empty one belongs here.
+    if code == 200 and isinstance(body, dict) \
+            and not body.get("total") and not body.get("offset"):
+        body.setdefault("note", f"Project {pid} has no links watchlist yet.")
+    return code, body
+
+
+def _project_json(q):
+    """
+    GET /api/project?project=P — the handshake.
+
+    What "Test connection" in the report tool calls. It answers the question a
+    staff member actually has at wiring time: did I point the right key at the
+    right project, and is the right sheet behind it? Today a wrong key or a
+    wrong project surfaces only as an opaque 401/403 hours later, inside a
+    scheduled sync nobody is watching.
+    """
+    pid = _int_or(q.get("project"))
+    if not pid:
+        return 400, {"error": "which project? pass ?project=<id>"}
+
+    async def go(st):
+        proj = await st.project(pid)
+        if not proj:
+            return 404, {"error": f"Project {pid} does not exist."}
+        body = await st.links_handshake(pid, project=proj)
+        if not body["counters"]["total"]:
+            # 409, not an empty 200: "the sheet is not bound yet" and "the sheet
+            # is bound and genuinely empty" need different actions from a human,
+            # and an empty 200 reads as the second when it is nearly always the
+            # first.
+            body["error"] = (f"Project {pid} has no X links watchlist yet — "
+                             f"bind a Google Sheet to it first.")
+            return 409, body
+        return 200, body
+    return _with_store(go)
 
 
 def _links_sheets_json(q):
@@ -2191,36 +2294,73 @@ async def _sync_sheet_now(st, sheet: dict) -> dict:
         return await _links.sync_sheet(st, client, sheet, log=None)
 
 
-def _links_sheet_post(body):
+def _links_sheet_post(body, key_project=None):
     """
     POST /api/links/sheets {project, sheet[, sync_every_s]}
 
     Bind a Google Sheet to a project and read it at once: every non-hidden
     tab becomes one links watchlist named after it. Adds never delete, so
-    binding the same sheet twice is harmless.
+    binding the same sheet twice is harmless — which is what makes it safe
+    for a remote caller to retry.
+
+    `key_project` is set when the caller is a project-locked key. The project
+    in the body must match it: this allowlisted write is the one place a
+    machine can change what a project watches, and a key that could name any
+    project in the body would be no better than an unscoped one.
+
+    Returns (http_status, body).
     """
     pid = _int_or(body.get("project"))
     if not pid:
-        return {"error": "which project?"}
+        return 400, {"error": "which project?"}
+    if key_project is not None and pid != int(key_project):
+        return 403, {"error": f"this key is locked to project {key_project}",
+                     "detail": f"it cannot bind a sheet to project {pid}"}
     ref = str(body.get("sheet") or body.get("sheet_id") or "").strip()
     if not ref:
-        return {"error": "paste the Google Sheet's URL"}
+        return 400, {"error": "paste the Google Sheet's URL"}
     import sheets as _sheets
-    if not _sheets.load_creds():
-        return {"error": f"{_sheets.CREDS_ENV} is not set in .env on the server, or "
-                         f"does not point at a readable service-account key — the "
-                         f"sheet is read with the service account, shared as Viewer",
-                "email": _sheets.service_account_email()}
+
+    # Two doors, and the sheet's own Apps Script is the one to prefer: it runs
+    # as the sheet's OWNER, so there is no cloud project, no JSON key and no
+    # sharing step, and the sheet stays private. The service-account key is
+    # only required when no script is bound.
+    script_url = str(body.get("script_url") or "").strip()
+    token_env = str(body.get("script_token_env") or "").strip()
+    if script_url and not token_env:
+        return 400, {"error": "name the .env variable holding this sheet's Apps "
+                              "Script token (script_token_env) — the token "
+                              "itself is never stored in the database"}
+    if token_env and not os.getenv(token_env, "").strip():
+        return 400, {"error": f"{token_env} is not set in .env on the server"}
 
     async def go(st):
         bound = await st.bind_link_sheet(pid, ref, body.get("sync_every_s"),
-                                         claim_sync=True)
+                                         claim_sync=True,
+                                         script_url=script_url or None,
+                                         script_token_env=token_env or None)
         if "error" in bound:
-            return bound
+            return 400, bound
+        # The service-account key is checked HERE, not before the bind, and
+        # against the STORED row: a sheet already bound to a script is read
+        # through that script, so re-binding it to change its cadence must not
+        # fail on a credential this route never uses.
+        if not bound.get("script_url") and not _sheets.load_creds():
+            # 503, not 400: the caller did nothing wrong and retrying the same
+            # request will work the moment the server is configured.
+            return 503, {
+                "error": f"{_sheets.CREDS_ENV} is not set in .env on the server, or "
+                         f"does not point at a readable service-account key — the "
+                         f"sheet is read with the service account, shared as Viewer. "
+                         f"Or bind the sheet's own Apps Script instead "
+                         f"(script_url + script_token_env), which needs no key.",
+                "email": _sheets.service_account_email()}
         res = await _sync_sheet_now(st, bound)
         res["sheet"] = await st.link_sheet(bound["link_sheet_id"])
         res["email"] = _sheets.service_account_email()
-        return res
+        # The sheet was read but we could not see it: the single most common
+        # wiring failure, and one that otherwise looks like success.
+        return (502 if res.get("error") else 200), res
     return _with_store(go)
 
 
@@ -5724,6 +5864,7 @@ class Handler(BaseHTTPRequestHandler):
         # Reset per request: this handler instance is reused across a keep-alive
         # connection, so a stale True would mask a later cookie request.
         self._via_api_key = False
+        self._key_project = None
 
         # A machine key gets an explicit allowlist of endpoints, never "whatever
         # a signed-in human can do". Checked before the cookie so an API client
@@ -5732,6 +5873,15 @@ class Handler(BaseHTTPRequestHandler):
         if presented:
             if not _valid_api_key(presented):
                 self._send(401, {"error": "invalid API key"})
+                return False
+            ok, retry = _rate_ok(presented)
+            if not ok:
+                import links as _links
+                self._send(429, {
+                    "error": f"rate limit: {_links.RATE_PER_MIN} requests per minute",
+                    "detail": f"retry in {retry}s — a full walk of a watchlist at "
+                              f"limit={_links.MAX_LIMIT} is only a few requests",
+                }, extra={"Retry-After": str(retry)})
                 return False
             # Method matters: nearly every read path here also exists as a POST
             # that WRITES (GET /api/projects lists, POST /api/projects creates),
@@ -5743,16 +5893,26 @@ class Handler(BaseHTTPRequestHandler):
             if scope is not None:
                 q = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
                 asked = (q.get("project") or [""])[0]
-                if method != "GET" or path not in API_KEY_SCOPED_PATHS:
+                write_ok = (method == "POST" and path in API_KEY_SCOPED_WRITE_PATHS)
+                if not write_ok and (method != "GET"
+                                     or path not in API_KEY_SCOPED_PATHS):
                     self._send(403, {
                         "error": f"this key cannot {method} {path}",
                         "allowed_get": sorted(API_KEY_SCOPED_PATHS),
-                        "allowed_post": [],
+                        "allowed_post": sorted(API_KEY_SCOPED_WRITE_PATHS),
                         "detail": (f"This key is locked to project {scope} and may only "
                                    f"GET {', '.join(sorted(API_KEY_SCOPED_PATHS))} "
-                                   f"with ?project={scope}."),
+                                   f"with ?project={scope}, or POST "
+                                   f"{', '.join(sorted(API_KEY_SCOPED_WRITE_PATHS))} "
+                                   f"for that same project."),
                     })
                     return False
+                # A POST carries its project in the body, which this method
+                # cannot read. The handler enforces it against _key_project.
+                if write_ok:
+                    self._via_api_key = True
+                    self._key_project = scope
+                    return True
                 if str(asked).strip() != str(scope):
                     self._send(403, {
                         "error": f"this key is locked to project {scope}",
@@ -5848,6 +6008,11 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
 
     _head_only = False
+    # The project a scoped key is locked to, or None for a cookie or an
+    # unscoped key. Set per request by _require_auth; read by the handlers that
+    # take a project in the body.
+    _key_project = None
+
     # Set per request by _require_auth. Cookie (a signed-in human) sees the
     # delivery addresses; a machine key does not.
     _via_api_key = False
@@ -6073,8 +6238,10 @@ class Handler(BaseHTTPRequestHandler):
                 return self._send(200, _projects_json())
             if u.path == "/api/watchlists":
                 return self._send(200, _watchlists_json(q))
+            if u.path == "/api/project":
+                return self._send(*_project_json(q))
             if u.path == "/api/links":
-                return self._send(200, _links_json(q))
+                return self._send(*_links_json(q))
             if u.path == "/api/links/sheets":
                 return self._send(200, _links_sheets_json(q))
             if u.path == "/api/delivery":
@@ -6221,7 +6388,7 @@ class Handler(BaseHTTPRequestHandler):
             if u.path == "/api/watchlists/links/interval":
                 return self._send(200, _links_interval(body))
             if u.path == "/api/links/sheets":
-                return self._send(200, _links_sheet_post(body))
+                return self._send(*_links_sheet_post(body, self._key_project))
             if u.path == "/api/links/sheets/sync":
                 return self._send(200, _links_sheet_sync(body))
             if u.path == "/api/links/sheets/remove":

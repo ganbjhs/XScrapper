@@ -461,6 +461,15 @@ def service_account_email() -> str:
 
 SCRIPT_URL_PREFIX = "https://script.google.com/"
 
+# The protocol version SCRIPT_SOURCE speaks. Must match `var VERSION` in it —
+# the test asserts they are equal, because a script that says 2 and cannot read
+# is worse than one that admits it says 1.
+SCRIPT_VERSION = 2
+
+# The version that first understood {"action": "tabs"} / {"action": "values"}.
+# Below this a deployment can only append, and the fix is a re-paste.
+SCRIPT_READ_VERSION = 2
+
 # The paste-into-the-sheet half of this feature. Kept HERE, beside the code
 # that talks to it, because the two are one protocol: change the body shape in
 # via_script() and this must change in the same commit or every sheet silently
@@ -478,6 +487,12 @@ SCRIPT_SOURCE = r"""/**
  */
 
 var TOKEN = '%TOKEN%';
+
+// Bumped when the protocol this script speaks changes. 1 = append only (every
+// deployment pasted before 2026-09-10); 2 = append + the 'tabs'/'values'
+// reads. A deployment reports it from doGet, so the Collector can say "this
+// sheet's script is version 1, re-paste it" instead of "unknown action".
+var VERSION = 2;
 var HEADER = ['date', 'link', 'text', 'media'];
 
 // Keep the newest post at the top and the oldest at the bottom, by POST date.
@@ -504,6 +519,29 @@ var SORT_NEWEST_FIRST = true;
 var SKIP_DUPLICATES = true;
 
 function doPost(e) {
+  // Parse and authenticate BEFORE any lock: a read touches nothing, and
+  // queueing reads behind a 30-second append lock would make a 53-tab read
+  // wait on every delivery batch.
+  var body;
+  try {
+    body = JSON.parse(e.postData.contents);
+  } catch (err) {
+    return reply({ error: 'body is not JSON' });
+  }
+  if (!TOKEN || body.token !== TOKEN) {
+    return reply({ error: 'bad token' });
+  }
+
+  // 'append' is the original and only action, so a caller that sends none
+  // still appends — an older Collector talking to a newer script is
+  // unchanged, which is the whole point of defaulting here.
+  var action = String(body.action || 'append');
+  if (action === 'tabs') { return reply(readTabs()); }
+  if (action === 'values') { return reply(readValues(body)); }
+  if (action !== 'append') {
+    return reply({ error: 'unknown action: ' + action, v: VERSION });
+  }
+
   // One writer at a time. A live batch and a "send past posts" run can
   // overlap, and two appends computing the same last row would overwrite
   // each other.
@@ -514,10 +552,6 @@ function doPost(e) {
     return reply({ error: 'busy — another batch is still writing' });
   }
   try {
-    var body = JSON.parse(e.postData.contents);
-    if (!TOKEN || body.token !== TOKEN) {
-      return reply({ error: 'bad token' });
-    }
     var name = String(body.tab || 'Sheet1');
     var book = SpreadsheetApp.getActiveSpreadsheet();
     var sheet = book.getSheetByName(name) || book.insertSheet(name);
@@ -570,10 +604,54 @@ function doPost(e) {
   }
 }
 
+/**
+ * Read: the tab list, and one tab's cells.
+ *
+ * This is the credential-free half of reading a sheet. The script runs AS THE
+ * OWNER, so there is no service account, no cloud project, no JSON key and no
+ * sharing step -- and, unlike scraping the published HTML, the sheet stays
+ * PRIVATE and the tab list is a documented API rather than a regex over
+ * Google's minified markup.
+ */
+function readTabs() {
+  var book = SpreadsheetApp.getActiveSpreadsheet();
+  var sheets = book.getSheets();
+  var out = [];
+  for (var i = 0; i < sheets.length; i++) {
+    var s = sheets[i];
+    // isSheetHidden() is why this beats the CSV/htmlview route: a published
+    // sheet does not say which tabs are hidden, and a hidden tab is an
+    // operator saying "not this one".
+    out.push({ gid: s.getSheetId(), title: s.getName(),
+               hidden: s.isSheetHidden() });
+  }
+  return { ok: true, v: VERSION, title: book.getName(), tabs: out };
+}
+
+function readValues(body) {
+  var name = String(body.tab || '');
+  if (!name) { return { error: 'which tab? pass {action:"values", tab:"..."}', v: VERSION }; }
+  var book = SpreadsheetApp.getActiveSpreadsheet();
+  var sheet = book.getSheetByName(name);
+  if (!sheet) { return { error: 'no tab named ' + name, v: VERSION }; }
+  var rows = sheet.getLastRow(), cols = sheet.getLastColumn();
+  if (rows === 0 || cols === 0) {
+    return { ok: true, v: VERSION, tab: name, values: [] };
+  }
+  // getDisplayValues(), not getValues(): the REST path this replaces sends no
+  // valueRenderOption, so Google gives it FORMATTED_VALUE -- the strings a
+  // human sees. Matching that keeps both routes returning identical cells.
+  return { ok: true, v: VERSION, tab: name,
+           values: sheet.getRange(1, 1, rows, cols).getDisplayValues() };
+}
+
 function doGet() {
   // Visiting the URL in a browser should say something, not 404. It
-  // deliberately does not confirm the token.
-  return reply({ ok: true, note: 'X Collector sheet endpoint. POST only.' });
+  // deliberately does not confirm the token. `v` lets the Collector tell an
+  // old deployment (append-only) from one that can also read, and say so,
+  // instead of reporting "unknown action" as if the sheet were broken.
+  return reply({ ok: true, v: VERSION,
+                 note: 'X Collector sheet endpoint. POST only.' });
 }
 
 function reply(obj) {

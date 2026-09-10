@@ -19,6 +19,114 @@ must respect belongs in the rulebook, not here.
 
 ---
 
+## 2026-09-10 — The report tool's pull contract, reading a sheet without the Sheets API, and naming a link on every platform
+
+**Changed**
+
+- `store.py` — `links_snapshot()` serves the array under `items` AS WELL AS
+  `rows`; every row states `platform`, carries `group` beside `section` and
+  `thumbnail_url` beside `thumb`, and `day` is never null (the tab's date, else
+  the IST date the link was first seen, with `status_note` saying it was
+  inferred). New `_ist_day_of()` (fixed +05:30), `Store.project()`,
+  `Store.links_handshake()`. `link_sheets` gains `script_url` +
+  `script_token_env`, in the DDL **and** the migrate-on-open block.
+- `web.py` — `/api/links` answers real HTTP codes (400/404/409) instead of 200
+  with an `{"error": …}` body; new `GET /api/project` handshake carrying the
+  counts, `skipped_non_x` and `refresh_in_progress`;
+  `API_KEY_SCOPED_WRITE_PATHS = {"/api/links/sheets"}` with the body's project
+  checked against the key's scope inside the handler; a per-key rate limit
+  (60/min, hashed keys, `429` + `Retry-After`).
+- `sheets.py` — `SCRIPT_SOURCE` gains `{"action":"tabs"}` and
+  `{"action":"values"}`; `var VERSION = 2`, mirrored as `SCRIPT_VERSION` /
+  `SCRIPT_READ_VERSION`. Reads take no lock; an action-less POST still appends.
+- `links.py` — `read_sheet_via_script()`; `sync_sheet()` chooses its door from
+  the bound row. `parse_post_url()` / `find_post_links()` /
+  `find_short_links()` / `WATCHED_PLATFORMS` name a post on X, Instagram,
+  Facebook and YouTube. `MAX_LIMIT`, `RATE_PER_MIN`.
+- `tests/` — `test_report_contract.py`, `test_script_read.py` +
+  `appsscript_harness.js`, `test_platform_urls.py`, all registered in
+  `test_all.py`. `test_links.py` updated: its `/api/links/sheets` assertion had
+  started passing for the wrong reason after the grant changed.
+- `RULEBOOK.md` §2 and §5 — six rules. `LINKS_CONSUMER_HANDOVER.md`,
+  `REPORT_TOOL_PLAN.md` (new, the reply to `REPORT_TOOL_ANSWERS.md`).
+
+**Why**
+
+`/api/links` returned its array under `rows`, and the consumer's
+`normalize_many()` accepts `posts|data|items|results|records` and nothing else
+— so its sync failed on the first call, every time, with "Expected a JSON array
+of posts". Everything else in Phase 1 followed from reading their code against
+ours: a `403` that names the project is useless if it arrives as an opaque
+`200`, and a wrong key or wrong sheet surfaced only hours later inside a
+scheduled sync nobody watches, which is what the handshake is for.
+
+Reading a sheet needed a door that is not the Sheets REST API, because the
+service-account route wants a cloud project, a JSON key, a sharing step and a
+credential of ours that reaches every sheet that account was ever given. The
+sheet's own Apps Script runs as its owner and needs none of them, and the sheet
+stays private. The published-CSV route was tested and rejected: it works, but
+it requires the sheet to be world-readable forever, cannot see hidden tabs, and
+would rest tab discovery on a regex over Google's minified markup.
+
+40% of the links on a day tab of the live sheet are Facebook, Instagram or
+YouTube, and none of them could be named at all.
+
+**Verified**
+
+- `tests/test_all.py` — **All checks passed**, 1,403 checks, on Python 3.11.15
+  against a staged copy (the local VM is still 3.10; `config.py` needs
+  `tomllib`).
+- The pull contract was exercised over real HTTP against the real handler, with
+  the exact headers `portal/scraper.py: fetch_raw()` sends — both
+  `Authorization: Bearer` and `X-API-Key` together, `X-Signature-Name`,
+  `User-Agent: VedicReport-portal/1.0`. `tweet_id` was checked to be quoted
+  **on the wire**, not merely a Python `str`. The 70th request in a minute came
+  back `429` with `Retry-After`.
+- The Apps Script is tested by RUNNING IT: `appsscript_harness.js` executes the
+  real `SCRIPT_SOURCE` in node behind an HTTP server, and the real
+  `read_sheet_via_script` talks to it over httpx. A Python re-implementation
+  would have proved nothing about the source operators paste.
+- **That harness caught a live bug in this change.** A version-1 deployment does
+  not know `action`, so it read a read request as an append and answered
+  `{ok:true, appended:0}` with no tab list — and `read_sheet_via_script` built
+  an EMPTY snapshot with no error. Since a link absent from the sheet is marked
+  `removed`, one such read would have emptied every watchlist in the project;
+  the same POST would also have inserted a stray "Sheet1" tab into the
+  operator's spreadsheet. Fixed with a GET version probe before any POST (doGet
+  touches nothing) plus refusing a reply that carries no tab list.
+- `parse_post_url` was run over **all 3,159 distinct URLs in the live sheet**
+  (`1xTDykt5z6x9oEs0_46g353CM75oQ5zgZNtAiXstBfP0`): x 2230, facebook 502,
+  instagram 355, youtube 44, fb-short 28, **unparsed 0**. Two real shapes were
+  missing on the first pass — `instagram.com/<author>/reel/<code>` (the
+  browser's own share sheet) and `facebook.com/share/p/<code>` (a short link
+  whose code never joins to a post).
+- The 50 dated tab names of the live sheet were run through `parse_tab_day`:
+  49 correct, 3 archive tabs null by design, and one typo (`24/7/25`, since
+  renamed by the operator).
+
+**Still open**
+
+- Phase 2 proper: a watchlist row for a non-X post.
+  `watchlist_links` is `PRIMARY KEY (watchlist_id, tweet_id INTEGER)` and
+  `WITHOUT ROWID`, so a string post id needs a widened key or a second table.
+  The pattern to follow is `collection_posts` + `web._resolve_pins` — pins
+  keyed `(platform, post_id)` and three lookups merged in Python, because X, IG
+  and FB posts live in three separate SQLite files and nothing here joins
+  across them.
+- Resolution (IG shortcode → media pk, FB reel id → page), once per post and
+  cached; then refresh BY AUTHOR, paced by `ig_human` — 335 IG posts and 339 FB
+  reels come from only 15 distinct FB pages, so the author feed is ~20 reads a
+  day against 335.
+- YouTube (44 links) parses but is outside `WATCHED_PLATFORMS`: there is no
+  engine for it on either side.
+- The report tool's own P0 is unbuilt on their side: `post_metric_days` and
+  stopping `_fold_scraper` back-updating past `sheet_date`s. Until both land, a
+  daily pull rewrites yesterday instead of building history.
+- `origin` carries a GitHub personal access token in plain text in
+  `.git/config`.
+
+---
+
 ## 2026-09-09 — Links watchlists: post URLs re-fetched daily, counters overwritten, no history (X_LINKS_PLAN.md, Phase 1: X)
 
 **Changed**

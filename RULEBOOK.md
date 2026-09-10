@@ -202,6 +202,75 @@ change to the delivery contract. The write endpoint
 (`POST /api/watchlists/owner`) is cookie-only: a read integration does not get
 to restamp ownership.
 
+**The consumer's envelope is `rows` AND `items`, and neither may be renamed
+(2026-09-10).** `/api/links` serves the same list object under both keys.
+`rows` is ours and Watch-Tower reads it; `items` is the report tool's, because
+`portal/scraper.py: normalize_many()` accepts `posts|data|items|results|records`
+and nothing else — a body carrying only `rows` fails their sync outright with
+"Expected a JSON array of posts". The same additive rule governs every field
+added for that consumer: `group` beside `section`, `thumbnail_url` beside
+`thumb`, `platform` stated explicitly on every row rather than inferred
+(their `platform_of()` files anything unrecognised as X, so silence misfiles
+Facebook, Instagram and YouTube). `LINKS_CONSUMER_HANDOVER.md` promises fields
+are added, never renamed, removed or retyped; this is that promise in force.
+Test: `test_report_contract`.
+
+**`day` is required and may never be null (2026-09-10).** It is the tab's date
+when the tab is named like one (`links.parse_tab_day`, D/M/YY), and otherwise
+the IST date the link was first seen — with `status_note` saying the day was
+inferred. It is NEVER the scrape date: the scrape date would pile every
+historical post onto today, which is the exact failure the column exists to
+prevent. IST is fixed +05:30 (`store._IST`); India has no DST, so this needs no
+timezone database and cannot drift with one.
+
+**A bound sheet is read through ONE of two doors, and the row says which
+(2026-09-10).** `link_sheets.script_url` empty = the Sheets REST API with the
+service-account key from `.env`; set = the sheet's own Apps Script web app,
+which runs as the sheet's OWNER — no cloud project, no JSON key, no sharing
+step, and the sheet stays PRIVATE. The mode is DERIVED from `script_url`, never
+stored beside it: a mode column and a URL column can disagree, and then the row
+says one thing and does another. `script_token_env` holds the NAME of the
+`.env` variable, never the token — `delivery_targets.secret_env` for the same
+reason, and the same rule webhooks follow.
+
+**Never POST a read to a script whose version is unknown (2026-09-10).** A
+version-1 deployment does not know about `action`, so it reads a read request
+as an append: it replies `{ok:true, appended:0}` with no tab list, and — since
+it takes the tab name from `body.tab` — inserts a sheet called "Sheet1" into
+the operator's spreadsheet on the way. So `read_sheet_via_script` probes with a
+GET (which runs `doGet` and touches nothing) and refuses below
+`sheets.SCRIPT_READ_VERSION`, naming the fix. A reply that says ok but carries
+no tab list is refused for the same reason. **An empty snapshot is never the
+honest reading of a failed read**: a link that is no longer in the sheet is
+marked `removed`, so one bad read would empty every watchlist in the project.
+`sheets.SCRIPT_VERSION` and `var VERSION` in `SCRIPT_SOURCE` must match — the
+test asserts it, because a script claiming a version it cannot speak is worse
+than one that admits it is old. Test: `test_script_read`.
+
+**Publishing a sheet to the web is NOT an accepted way to read it
+(2026-09-10).** The CSV export plus a scrape of `/htmlview` does work with no
+credentials, and was rejected on purpose: it requires the sheet to stay
+world-readable forever, it cannot see which tabs are hidden, and tab discovery
+would rest on a regex over Google's minified markup — an undocumented shape
+that, when it changes, returns zero tabs silently and marks every link
+`removed`. The Apps Script door costs one paste and has none of those
+properties.
+
+**A link is NAMED before it is fetched, and a platform is never guessed from a
+URL (2026-09-10).** `links.parse_post_url` returns `(platform, reference)` for
+X, Instagram, Facebook and YouTube; `WATCHED_PLATFORMS` is the subset we can
+actually collect. YouTube parses and is deliberately outside that set: a link
+filed under a platform we do not collect is honest, while one guessed as X is
+not — which is exactly what the consumer's `platform_of()` does when a row does
+not state its platform. The `reference` is what the URL carries, NOT the
+platform's own id: Instagram gives a shortcode and its key is a numeric media
+pk, so resolving one to the other is a network call and happens once per post,
+cached — never in a parser. Facebook `/share/` and `fb.watch` links are
+followed like a `t.co` (`find_short_links`) rather than parsed: the code in
+them never joins to a post, so minting a row from it would look tracked and be
+silently dead. Verified against all 3,159 distinct URLs in the live sheet.
+Test: `test_platform_urls`.
+
 ## 3. Collection rules
 
 - **Watermark, newest-first, stop at the first already-seen post.** Every poll
@@ -642,10 +711,33 @@ to restamp ownership.
   that names the project and the four paths. It can never list projects,
   read another project, or spend budget on `/api/fetch`. Keys in `API_KEYS`
   keep the whole read allowlist exactly as before — the two sets do not
-  interact. Both are compared in constant time over every key. The links
-  write paths (`/api/watchlists/links*`, `/api/links/sheets*`) are in
-  neither set: a consumer's key cannot add a link, re-time a list or make
-  the server read a sheet. Test: `test_links.test_web`.
+  interact. Both are compared in constant time over every key.
+  `/api/project` (the handshake) joins the scoped read set.
+  Test: `test_links.test_web`.
+- **A machine key may point an EXISTING project at more data; it may never
+  bring a project into existence** (2026-09-10). `API_KEY_SCOPED_WRITE_PATHS`
+  is exactly `{"/api/links/sheets"}` — the one write a project-locked key may
+  perform, so the report tool can hand us the Google Sheet an operator already
+  pasted there instead of a human pasting the same URL into two systems and
+  forgetting one. Everything else under `/api/watchlists/links*` and
+  `/api/links/sheets/{sync,remove}` stays closed to every key.
+  `POST /api/projects` is closed hardest of all: a retry, or a client re-added
+  under a slightly different name, would create a second project, and a second
+  project silently splits one campaign's link history in two with no error
+  anywhere. A human creating the project once per campaign costs ten seconds
+  and removes that failure entirely.
+  The project on a scoped write arrives in the BODY, which the path allowlist
+  cannot see, so `_require_auth` stops at the path, records the key's project
+  on the handler (`_key_project`), and the handler compares it. A path-only
+  grant here would let any scoped key bind a sheet to somebody else's project.
+  Test: `test_links.test_web`.
+- **A per-key request ceiling exists, and it is a courtesy brake, not a
+  security control** (2026-09-10). `links.RATE_PER_MIN` (60/min), enforced
+  in-process per worker on a hash of the key, answered as `429` with
+  `Retry-After`. It is far above anything the contract needs — a full walk of
+  1,869 links at `limit=500` is four requests — so it constrains no correct
+  caller and stops a retry loop from spending a night. One key's exhaustion
+  never throttles another. Test: `test_report_contract.test_rate_limit`.
 
 ## 6. Per-platform hard rules
 

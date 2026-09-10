@@ -27,6 +27,7 @@ Sheet access is the service-account route sheets.py already has (MODE_API):
 reading is a subset of the scope we already request, and Viewer is enough.
 """
 
+import os
 import re
 import time
 import urllib.parse
@@ -89,6 +90,145 @@ def canonical_url(tweet_id: int, handle: str | None = None) -> str:
 
 def looks_like_url(text) -> bool:
     return bool(_ANY_URL_RE.search(str(text or "")))
+
+
+# --------------------------------------------------------------------------
+# 1b. The other platforms (REPORT_TOOL_PLAN.md Part 8)
+# --------------------------------------------------------------------------
+#
+# 40% of the links on a day tab of the live sheet are Facebook, Instagram or
+# YouTube. Parsing them is the first step and it is deliberately separate from
+# fetching them: a link we can NAME is a link we can show the operator as
+# `pending`, count in the handshake, and hand to the report tool with `—` for
+# its numbers. A link we cannot even name is one that vanishes silently, which
+# is the failure this whole module exists to prevent.
+#
+# What comes out is a REFERENCE, not an id: `code` for Instagram is the
+# shortcode from the URL (Dc8iUCeR4Ri), and Instagram's own key is the numeric
+# media pk. Turning one into the other costs a network call, so it happens once
+# per post, later, and is cached — never here.
+
+# instagram.com/p/<code>, /reel/<code>, /reels/<code>, /tv/<code> — and the
+# same four with the AUTHOR in the path first
+# (instagram.com/political_chashma/reel/Dc00Zc6tgq4), which is what the share
+# sheet in a browser produces and what operators paste. The optional segment
+# excludes the four keywords so /p/<code> cannot be read as user "p".
+_IG_RE = re.compile(
+    r"(?i)" + _LEFT + r"(?:https?://)?(?:(?:www|m)\.)?instagram\.com"
+    r"/(?:(?!p/|reel/|reels/|tv/)[A-Za-z0-9_.]{1,30}/)?"
+    r"(?:p|reel|reels|tv)/([A-Za-z0-9_\-]{5,30})")
+
+# Facebook is several shapes and they do NOT share an id space:
+#   /reel/<digits>                      a reel
+#   /<page>/posts/<pfbid…|digits>       a page post
+#   /watch/?v=<digits>                  a video
+#   /permalink.php?story_fbid=…&id=…    the old permalink
+#   /photo?fbid=<digits>                a photo
+# fb.watch/<code> and facebook.com/share/{p,v,r}/<code> are SHORT links: the
+# code in them is not a post id and never resolves against fb posts, so they
+# are followed like a t.co rather than parsed — see find_short_links.
+_FB_REEL_RE = re.compile(
+    r"(?i)" + _LEFT + r"(?:https?://)?(?:(?:www|m|web)\.)?facebook\.com"
+    r"/reel/(\d{5,25})")
+_FB_POST_RE = re.compile(
+    r"(?i)" + _LEFT + r"(?:https?://)?(?:(?:www|m|web)\.)?facebook\.com"
+    r"/([A-Za-z0-9.\-]{1,64})/(?:posts|videos)/(pfbid[A-Za-z0-9]+|\d{5,25})")
+_FB_WATCH_RE = re.compile(
+    r"(?i)" + _LEFT + r"(?:https?://)?(?:(?:www|m|web)\.)?facebook\.com"
+    r"/watch/?\?(?:[^\s]*&)?v=(\d{5,25})")
+_FB_STORY_RE = re.compile(
+    r"(?i)" + _LEFT + r"(?:https?://)?(?:(?:www|m|web)\.)?facebook\.com"
+    r"/permalink\.php\?(?:[^\s]*&)?story_fbid=(\d{5,25})")
+_FB_PHOTO_RE = re.compile(
+    r"(?i)" + _LEFT + r"(?:https?://)?(?:(?:www|m|web)\.)?facebook\.com"
+    r"/photo(?:\.php)?/?\?(?:[^\s]*&)?fbid=(\d{5,25})")
+
+# youtube.com/shorts/<id>, /watch?v=<id>, youtu.be/<id>
+_YT_RE = re.compile(
+    r"(?i)" + _LEFT + r"(?:https?://)?(?:(?:www|m)\.)?"
+    r"(?:youtube\.com/(?:shorts/|live/|watch/?\?(?:[^\s]*&)?v=)|youtu\.be/)"
+    r"([A-Za-z0-9_\-]{6,20})")
+
+_FB_SHORT_RE = re.compile(
+    r"(?i)" + _LEFT + r"(?:https?://)?(?:"
+    r"fb\.watch/[A-Za-z0-9_\-]{3,}"
+    r"|(?:www\.)?facebook\.com/share/[pvr]/[A-Za-z0-9_\-]{3,})")
+
+
+def find_short_links(text) -> list:
+    """
+    Facebook short links in one cell, to be followed like a t.co.
+
+    Kept OUT of parse_post_url on purpose: the code in a /share/p/ link is not
+    a post id, so returning it as one would mint a watchlist row that can never
+    join to a post — a link that looks tracked and is silently dead.
+    """
+    # The pattern has no capture group, so findall returns whole matches —
+    # which is the URL to follow.
+    return _FB_SHORT_RE.findall(str(text or ""))
+
+
+PLATFORM_X = "x"
+PLATFORM_IG = "instagram"
+PLATFORM_FB = "facebook"
+PLATFORM_YT = "youtube"
+
+# What a links watchlist can hold. YouTube parses but is NOT collectable — it
+# is here so those links are counted and shown as such rather than mistaken for
+# X, which is what happens downstream when a platform is left to be guessed
+# from a URL (the report tool's platform_of() ends `return "x"`).
+WATCHED_PLATFORMS = (PLATFORM_X, PLATFORM_IG, PLATFORM_FB)
+
+
+def parse_post_url(text) -> tuple | None:
+    """
+    (platform, reference) for one post URL, or None.
+
+    `reference` is what the URL carries, which is not always the platform's own
+    id: Instagram gives a shortcode, Facebook a reel/post/video id, X a numeric
+    status id as a string. Resolving a reference to an id is a network call and
+    belongs nowhere near a parser.
+
+    X is tried FIRST and unchanged, so nothing about the existing watchlist
+    moves: this only ever adds an answer where there used to be None.
+    """
+    s = str(text or "")
+    tid = parse_status_url(s)
+    if tid:
+        return PLATFORM_X, str(tid)
+    m = _IG_RE.search(s)
+    if m:
+        return PLATFORM_IG, m.group(1)
+    for rx in (_FB_REEL_RE, _FB_WATCH_RE, _FB_STORY_RE, _FB_PHOTO_RE):
+        m = rx.search(s)
+        if m:
+            return PLATFORM_FB, m.group(1)
+    m = _FB_POST_RE.search(s)
+    if m:
+        # The page is part of the address here, and a pfbid is only unique
+        # under its page — so the reference keeps both.
+        return PLATFORM_FB, f"{m.group(1)}/{m.group(2)}"
+    m = _YT_RE.search(s)
+    if m:
+        return PLATFORM_YT, m.group(1)
+    return None
+
+
+def find_post_links(text) -> list:
+    """
+    Every post link in one cell as (platform, reference, url), first-seen order.
+
+    A cell can hold more than one link and the sheet's do — the X scanner
+    already assumes that, and this keeps the same promise for the rest.
+    """
+    out, seen = [], set()
+    for raw in _ANY_URL_RE.findall(str(text or "")):
+        hit = parse_post_url(raw)
+        if not hit or hit in seen:
+            continue
+        seen.add(hit)
+        out.append((hit[0], hit[1], raw))
+    return out
 
 
 @dataclass
@@ -244,6 +384,13 @@ STATUSES = (STATUS_PENDING, STATUS_OK, STATUS_UNAVAILABLE, STATUS_REMOVED)
 # store; these are the named ones.
 REFRESH_CHOICES = {"12h": 43_200, "24h": 86_400, "48h": 172_800}
 DEFAULT_REFRESH_S = 86_400
+
+# What a consumer of /api/links may ask for. Declared here so the handshake can
+# publish them and the limiter can enforce them from one place: a limit a caller
+# has to discover by being throttled is one they discover at 3am, in a
+# scheduled run nobody is watching.
+MAX_LIMIT = 500
+RATE_PER_MIN = 60
 MIN_REFRESH_S = 3_600
 
 # An unavailable post is retried on its normal cadence up to this many
@@ -426,6 +573,110 @@ async def read_sheet(client, token: str, sheet_id: str,
     return snap, ""
 
 
+async def read_sheet_via_script(client, exec_url: str, token: str,
+                                include_hidden: bool = False
+                                ) -> tuple[Snapshot | None, str]:
+    """
+    (snapshot, error). The same Snapshot `read_sheet` returns, read through the
+    sheet's own Apps Script instead of the Sheets REST API.
+
+    Why this exists, and why it is the default for a new sheet: the script runs
+    AS THE SHEET'S OWNER. There is no service account, no cloud project, no
+    JSON key and no sharing step — and, unlike the published-CSV route, the
+    sheet stays PRIVATE. `sheets.via_script` already delivers rows this way;
+    this is the same door in the other direction, and it holds the same
+    bargain: a shared token over TLS to a Google-hosted endpoint.
+
+    One POST for the tab list, one per tab for its cells — the same shape and
+    the same request count as the REST path, so the caller cannot tell which
+    route ran except by what it had to be configured with.
+    """
+    async def call(payload, what):
+        try:
+            # An /exec URL ALWAYS 302s to script.googleusercontent.com, so
+            # redirects must be followed here — see sheets.via_script.
+            rep = await client.post(exec_url, json={"token": token, **payload},
+                                    timeout=60.0, follow_redirects=True)
+        except Exception as e:
+            return None, f"{what}: {type(e).__name__}: {e}"
+        try:
+            data = rep.json()
+        except Exception:
+            import sheets as _sheets
+            return None, _sheets._script_hint(rep, getattr(rep, "text", "") or "")
+        if not isinstance(data, dict):
+            return None, f"{what}: the script did not answer with an object"
+        if data.get("error"):
+            err = str(data["error"])
+            if err == "bad token":
+                err = ("the script rejected our token — the sheet's script and "
+                       "the .env variable named by this sheet hold different "
+                       "strings; which one is wrong is not knowable from here")
+            elif err.startswith("unknown action"):
+                import sheets as _sheets
+                err = (f"this sheet's Apps Script is version "
+                       f"{data.get('v') or 1} and can only append. Re-paste the "
+                       f"script (version {_sheets.SCRIPT_VERSION}) and redeploy "
+                       f"it to let the Collector read the sheet.")
+            return None, f"{what}: {err}"
+        return data, ""
+
+    # Check the version with a GET before POSTing anything, because a
+    # version-1 script does not KNOW about `action`: it would read our read
+    # request as an append, reply {ok:true, appended:0} with no tabs at all —
+    # and, since it takes the tab name from `body.tab`, quietly insert a sheet
+    # called "Sheet1" into the operator's spreadsheet on the way. A GET runs
+    # doGet, which touches nothing.
+    import sheets as _sheets
+    try:
+        probe = await client.get(exec_url, timeout=30.0, follow_redirects=True)
+        pdata = probe.json()
+        ver = int((pdata or {}).get("v") or 1)
+    except Exception:
+        # Unreachable or unparseable: fall through and let the real call
+        # produce the precise error rather than guessing at one here.
+        ver = _sheets.SCRIPT_READ_VERSION
+    if ver < _sheets.SCRIPT_READ_VERSION:
+        return None, (f"this sheet's Apps Script is version {ver} and can only "
+                      f"append. Re-paste the script (version "
+                      f"{_sheets.SCRIPT_VERSION}) and redeploy it — Deploy → "
+                      f"Manage deployments → edit → New version — to let the "
+                      f"Collector read the sheet.")
+
+    meta, err = await call({"action": "tabs"}, "tab list")
+    if err:
+        return None, err
+    # Belt and braces for the same failure: a reply that says ok but carries no
+    # tab list is not an empty spreadsheet. Treating it as one would empty every
+    # watchlist in the project on the next sync, because a link that is no
+    # longer in the sheet is marked 'removed'.
+    if not isinstance(meta.get("tabs"), list):
+        return None, (f"the script answered without a tab list — it is probably "
+                      f"an older deployment that can only append. Re-paste the "
+                      f"script (version {_sheets.SCRIPT_VERSION}) and redeploy it.")
+
+    snap = Snapshot(title=str(meta.get("title") or ""))
+    for t in meta.get("tabs") or []:
+        hidden = bool(t.get("hidden"))
+        if hidden and not include_hidden:
+            continue
+        tab = Tab(gid=int(t.get("gid") or 0), title=str(t.get("title") or ""),
+                  hidden=hidden)
+        vals, err = await call({"action": "values", "tab": tab.title},
+                               repr(tab.title))
+        if err:
+            return None, err
+        rows = vals.get("values")
+        # The REST path gives ROWS of strings and scan_values expects exactly
+        # that. Anything else is a script that has drifted from this contract,
+        # and an empty tab is not the honest reading of it.
+        if not isinstance(rows, list):
+            return None, f"{tab.title!r}: the script returned no values array"
+        tab.values = rows
+        snap.tabs.append(tab)
+    return snap, ""
+
+
 async def resolve_tco(client, url: str) -> str | None:
     """Follow a t.co redirect to its status URL, or None. One request, no auth."""
     u = url if url.lower().startswith("http") else "https://" + url
@@ -461,19 +712,37 @@ async def sync_sheet(store, client, sheet: dict, now_ms: int | None = None,
                "watchlists": [], "found": 0, "added": 0, "revived": 0,
                "removed": 0, "skipped": 0, "tco_unresolved": 0, "error": ""}
 
-    creds = _sheets.load_creds()
-    if not creds:
-        summary["error"] = (f"{_sheets.CREDS_ENV} is not set in .env on the server, "
-                            f"or does not point at a readable service-account key")
-        await store.link_sheet_synced(lsid, error=summary["error"], now_ms=now_ms)
-        return summary
-    token, err = await _sheets.access_token(client, creds)
-    if err:
-        summary["error"] = err
-        await store.link_sheet_synced(lsid, error=err, now_ms=now_ms)
-        return summary
-
-    snap, err = await read_sheet(client, token, sid)
+    # Which door: the sheet's own Apps Script, or the Sheets REST API.
+    # A bound sheet that carries a script URL uses it — the mode is derived
+    # from the row rather than stored as its own column, so the two can never
+    # disagree about which one is in force.
+    exec_url = str(sheet.get("script_url") or "").strip()
+    if exec_url:
+        env_name = str(sheet.get("script_token_env") or "").strip()
+        tok = os.getenv(env_name, "").strip() if env_name else ""
+        if not env_name:
+            summary["error"] = ("this sheet has an Apps Script URL but names no "
+                                ".env variable for its token")
+        elif not tok:
+            summary["error"] = (f"{env_name} is not set in .env on the server — "
+                                f"it holds this sheet's Apps Script token")
+        if summary["error"]:
+            await store.link_sheet_synced(lsid, error=summary["error"], now_ms=now_ms)
+            return summary
+        snap, err = await read_sheet_via_script(client, exec_url, tok)
+    else:
+        creds = _sheets.load_creds()
+        if not creds:
+            summary["error"] = (f"{_sheets.CREDS_ENV} is not set in .env on the server, "
+                                f"or does not point at a readable service-account key")
+            await store.link_sheet_synced(lsid, error=summary["error"], now_ms=now_ms)
+            return summary
+        token, err = await _sheets.access_token(client, creds)
+        if err:
+            summary["error"] = err
+            await store.link_sheet_synced(lsid, error=err, now_ms=now_ms)
+            return summary
+        snap, err = await read_sheet(client, token, sid)
     if err or snap is None:
         summary["error"] = err or "empty response"
         await store.link_sheet_synced(lsid, error=summary["error"], now_ms=now_ms)

@@ -41,8 +41,10 @@ refreshes, so offset paging is safe.
 
 ```json
 {
+  "platform": "x",
   "watchlist_id": 15, "watchlist": "6/9/26", "tab": "6/9/26", "day": "2026-09-06",
-  "section": "National X Influencers", "sheet_row": 31,
+  "section": "National X Influencers", "group": "National X Influencers",
+  "sheet_row": 31,
   "refresh_every_s": 86400,
   "url": "https://x.com/nasa/status/1789…",   "tweet_id": "1789…",
   "post_url": "https://x.com/NASA/status/1789…",
@@ -57,10 +59,40 @@ refreshes, so offset paging is safe.
   "like_count": 1200, "retweet_count": 300, "reply_count": 80,
   "quote_count": 25, "view_count": 410000, "bookmark_count": 90,
   "is_retweet": false, "is_reply": false, "is_quote": false,
-  "media": [ { "type": "photo", "url": "https://pbs.twimg.com/…" } ],
+  "media": [ { "type": "photo", "url": "https://pbs.twimg.com/…",
+               "thumb": "https://pbs.twimg.com/…",
+               "thumbnail_url": "https://pbs.twimg.com/…" } ],
   "collected_ms": 1788363997000, "last_seen_at": "2026-09-09T02:00:00.000000+00:00"
 }
 ```
+
+**Added 2026-09-10 for the report tool, and additive by promise — nothing was
+renamed, so a consumer written against the first version still works:**
+
+- **The envelope carries the array under `rows` AND `items`.** Same list, two
+  keys. Read whichever your parser wants.
+- `platform` — `"x"` on every row today. Stated rather than left to be guessed
+  from the URL, so other platforms can join later without a consumer changing.
+- `group` — the same value as `section` (the sheet heading), under the name a
+  metrics consumer expects for its category dimension.
+- `thumbnail_url` — beside `thumb` in each `media[]` element. Same URL.
+- `day` **is now guaranteed non-empty.** It is the tab's date when the tab is
+  named like one; otherwise it is the IST date the link was first seen and
+  `status_note` says so, e.g. `"day inferred from added_at: tab 'Tweet LInks'
+  is not a date"`. It is never the date the counters were read.
+
+**Error codes (2026-09-10).** These used to be `200` with an `{"error": …}`
+body, which is indistinguishable from a real answer to a parser: `400` (no
+`project`, or a bad `status`), `401` (unknown key), `403` (a key locked to
+another project), `404` (no such project), `409` (the project has no links
+watchlist yet), `429` (over 60 requests/minute — carries `Retry-After`).
+Every body holds a plain-English sentence meant to be shown to a human.
+
+**The handshake: `GET /api/project?project=<P>`.** Same key. Returns the
+project's name, its sheet's title and URL, the tab and link counts, the status
+breakdown, `refresh_in_progress`, and the limits. Call it once when an operator
+wires the key up: a wrong key or a wrong project shows up here, in front of the
+person who can fix it, instead of six hours later inside a scheduled sync.
 
 Rules you can rely on:
 
