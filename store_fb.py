@@ -115,6 +115,12 @@ class Store:
     def open(self):
         self.db = sqlite3.connect(self.path, timeout=10)
         self.db.row_factory = sqlite3.Row
+        # WAL: the web server reads while the collector writes (see
+        # store_ig._wal for the 2026-09-06 lock this ends).
+        try:
+            self.db.execute("PRAGMA journal_mode=WAL")
+        except sqlite3.OperationalError:
+            pass
         self.db.executescript(SCHEMA)
         # Additive migrations for databases created before a column existed.
         for table, col, ddl in _MIGRATIONS:

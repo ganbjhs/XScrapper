@@ -19,6 +19,33 @@ must respect belongs in the rulebook, not here.
 
 ---
 
+## 2026-09-06 (III) — IG: a STOP decision stands for the whole pass; every shared store opens in WAL
+
+**Changed**
+
+- `decider.py` / `collect_ig.py` — a BACKOFF (or any stop) decided
+  mid-pass is not closed by the end-of-pass `ok()`; the condition stays
+  open, the admin is paged once, the back-off runs.
+- `store_ig.py`, `store_fb.py`, `ig.py`, `activity_log.py` — every shared
+  SQLite store sets `journal_mode = WAL` on open, as `results.db` always did.
+- `tests/test_all.py` — `test_ig_stop_stands`.
+
+**Why**
+
+Live server, 2026-09-06 12:52:30: four sources read, the fifth died on the
+proxy (502), BACKOFF 30m + page — then one second later "recovered from
+'proxy_broken' after 0s", a second page, and the back-off cancelled. And at
+14:42 a "database is locked" pass_error while the dashboard read the same
+store the collector was writing.
+
+**Verified**
+
+`python3 tests/test_all.py` green (`test_ig_stop_stands`: every store
+reports `wal`; a pass whose fifth source raises the proxy error ends with the
+BACKOFF condition still open and exactly one page).
+
+---
+
 ## 2026-09-06 (II) — Watch-Tower "silent Collector list": a slow-request log, and a bounded mirror count
 
 **Changed**

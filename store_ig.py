@@ -208,6 +208,7 @@ class Store:
         # the live path. The write itself is serialised by _wlock.
         self.db = sqlite3.connect(self.path, timeout=10, check_same_thread=False)
         self.db.row_factory = sqlite3.Row
+        _wal(self.db)
         self.db.executescript(SCHEMA)
         self._migrate()
         self.db.commit()
@@ -685,6 +686,21 @@ class Store:
 
 def _now() -> int:
     return int(time.time())
+
+
+def _wal(con) -> None:
+    """Readers and the one writer coexist. The web server reads this file
+    (the feed, Watch-Tower's pull, the status card) while the collector
+    writes it, and in rollback-journal mode either side blocks the other —
+    live on 2026-09-06 14:42: `OperationalError: database is locked` on a
+    post write, the pass went to BACKOFF for nothing. WAL is persistent
+    in the file, so this is one-time per database; results.db (X) has been
+    WAL since the start. Best effort: a read-only mount keeps the journal."""
+    try:
+        con.execute("PRAGMA journal_mode=WAL")
+        con.execute("PRAGMA busy_timeout=10000")
+    except sqlite3.OperationalError:
+        pass
 
 
 # -- external JSON shape: the stable contract Watch-Tower consumes -----------

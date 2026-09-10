@@ -4030,6 +4030,82 @@ def test_ig_browser_door(tmp):
        "once past it: signed in, hint cleared, name read")
 
 
+def test_ig_stop_stands(tmp):
+    """
+    2026-09-06, 12:52:30 on the live server: @shoaibakhtar4915 read four
+    sources, the fifth died on the proxy (502), the decider said BACKOFF 30m
+    and paged the admin — and one second later the end-of-pass ok() closed
+    the condition ("recovered from 'proxy_broken' after 0s"), paged the admin
+    AGAIN and cancelled the backoff. A STOP decision made in a pass stands
+    at the end of that pass. And the stores the web server reads while a
+    collector writes are WAL, so "database is locked" (14:42 the same day)
+    stops being a pass_error.
+    """
+    import activity_log, collect_ig, decider, ig, ig_session, store_fb, store_ig
+    root = pathlib.Path(tmp).resolve()
+    tmp = str(root)
+    (root / "profiles").mkdir(exist_ok=True)
+    rp, ap = str(root / "ig_results.db"), str(root / "ig_accounts.db")
+
+    print("== every shared store opens in WAL ==")
+    with store_ig.Store(rp) as st:
+        ok(st.db.execute("PRAGMA journal_mode").fetchone()[0] == "wal", "ig_results.db is WAL")
+        st.add_source("A", "user", "ha", project_id=1); st.set_platform_id("A", "11")
+        st.add_source("B", "user", "hb", project_id=1); st.set_platform_id("B", "22")
+        st.add_source("C", "user", "hc", project_id=1); st.set_platform_id("C", "33")
+    with store_fb.Store(str(root / "fb_results.db")) as st:
+        ok(st.db.execute("PRAGMA journal_mode").fetchone()[0] == "wal", "fb_results.db is WAL")
+    with ig.Store(ap) as st:
+        ok(st.db.execute("PRAGMA journal_mode").fetchone()[0] == "wal", "ig_accounts.db is WAL")
+        st.save(ig.Session(username="sana", user_id="1", user_agent="ua", cookies={"sessionid": "1:x"}),
+                label="ig_sana", active=True)
+    con = activity_log._con(str(root / "activity.db"))
+    ok(con.execute("PRAGMA journal_mode").fetchone()[0] == "wal", "activity.db is WAL")
+    con.close()
+
+    print("== a STOP decision made mid-pass stands at the end of the pass ==")
+    (root / "profiles" / "ig_sana.json").write_text(json.dumps({"meta": {"label": "ig_sana"}, "settings": {}}))
+    from instagrapi.exceptions import ClientConnectionError
+
+    class Page:
+        def __init__(self, pks):
+            self.result_ids = list(pks)
+            self.entries_by_id = {pk: {"pk": pk, "code": f"c{pk}", "url": "", "taken_at": 1700000000 + pk,
+                                       "media_type": 1, "user_pk": 1, "username": "u"} for pk in pks}
+
+    reads = []
+    class FakeEngine:
+        def __init__(self, cl, account=None, on_resolved=None): self.account = account
+        def resolve_from_following(self, names): return {}
+        async def pages_for(self, source, page_size=12, max_pages=2):
+            reads.append(source.label)
+            if source.label == "B":
+                raise ClientConnectionError("ConnectionError: Max retries exceeded (Caused by ProxyError('Unable to connect to proxy', OSError('Tunnel connection failed: 502 Bad Gateway')))")
+            yield Page([1000 + len(reads)])
+
+    import unittest.mock as _m
+    sent, lines = [], []
+    cwd = os.getcwd(); os.chdir(tmp)
+    try:
+        with _m.patch.object(collect_ig, "IGEngine", FakeEngine), \
+             _m.patch.object(ig_session, "load_client", lambda acct, **k: object()), \
+             _m.patch.object(collect_ig.ig_human, "source_gap", lambda rng=None: 0.0), \
+             _m.patch.object(collect_ig.ig_human, "maybe_long_break", lambda rng=None: 0.0), \
+             _m.patch.object(collect_ig, "STAGGER_S", (0.0, 0.01)):
+            dec = decider.Decider("instagram", log=lines.append, db=None,
+                                  notify=lambda t: (sent.append(t) or (True, "")))
+            n = asyncio.run(collect_ig.run_once(rp, dec=dec, log=lines.append, accounts_path=ap, root=tmp))
+            ok(reads == ["A", "B"] and n == 1, f"A read fine, B died on the proxy, C was left for later ({reads}, new={n})")
+            oc = dec.open_conditions()
+            ok([c["kind"] for c in oc] == ["proxy_broken"], f"the proxy condition is STILL open after the pass: {[c['kind'] for c in oc]}")
+            ok(dec.account_wait("sana") > 0, f"and the account rests (backoff {dec.account_wait('sana')}s) instead of being knocked on next pass")
+            ok(len(sent) == 1 and "recovered" not in sent[0] and "reaches Instagram" in sent[0],
+               f"ONE ping, the proxy one — no 'recovered after 0s' ({len(sent)}): {sent}")
+            ok(not any("recovered from 'proxy_broken'" in l for l in lines), "and no 'recovered' line in the log")
+    finally:
+        os.chdir(cwd)
+
+
 def test_ig_identity(tmp):
     """
     Every device seed this project ever minted was instagrapi's default — a
@@ -6548,6 +6624,8 @@ def main():
         test_ig_avatar(fresh("igav"))
         section("instagram rhythm (phone-time sessions, one visit at a time)")
         test_ig_rhythm(fresh("igrhythm"))
+        section("instagram: a stop decision stands; shared stores are WAL")
+        test_ig_stop_stands(fresh("igstop"))
         section("instagram identity (one coherent phone per account, minted once)")
         test_ig_identity(fresh("igid"))
         section("instagram sign-in from the server (code relay, exit check, browser door)")

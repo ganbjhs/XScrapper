@@ -385,6 +385,18 @@ to restamp ownership.
   the API-key allowlist is unchanged, so a consumer's key cannot reach
   `/api/projects/delete`. Test: `test_delete_project`.
 
+- **A STOP decision made in a pass stands at the end of that pass, and every
+  shared store opens in WAL** (2026-09-06). Live, 12:52:30: @shoaibakhtar4915
+  read four Instagram sources, the fifth died on the proxy (502), the decider
+  said BACKOFF 30m and paged the admin — and one second later the
+  end-of-pass `ok()` closed the condition ("recovered from 'proxy_broken'
+  after 0s"), paged the admin AGAIN and cancelled the back-off. A pass that
+  ended on a stop decision must leave that decision standing; the pass-level
+  ok() is for passes that ended well. And `ig_results.db`, `fb_results.db`,
+  `ig_accounts.db` and `activity.db` open in WAL like `results.db`, so the
+  web server reading while a collector writes is no longer a "database is
+  locked" pass_error (14:42 the same day). Test: `test_ig_stop_stands`.
+
 ## 4. Delivery rules
 
 - **The delivery cursor keys on `collected_ms`, NEVER on `created_ms`.** This is

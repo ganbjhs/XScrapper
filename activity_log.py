@@ -44,6 +44,12 @@ _WARN_RE = re.compile(
 
 def _con(db=None):
     con = sqlite3.connect(db or DEFAULT_DB, timeout=10)
+    # WAL: three collectors and the web server all write here (log lines,
+    # decider state); see store_ig._wal for the 2026-09-06 lock this ends.
+    try:
+        con.execute("PRAGMA journal_mode=WAL")
+    except sqlite3.OperationalError:
+        pass
     con.execute(
         "CREATE TABLE IF NOT EXISTS events ("
         "  id       INTEGER PRIMARY KEY AUTOINCREMENT,"

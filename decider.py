@@ -300,7 +300,7 @@ RULES = {
         # webshare session IN-32.)
         "backoff", 30 * 60, max_wait_s=4 * H, escalate_after_s=0,
         level="error",
-        title="nothing reaches Instagram — the proxy ({detail})",
+        title="nothing reaches Instagram — {detail}",
         short="Edit @{account} → proxy: a different exit, then Retry",
         fix=("Every request from @{account} dies on the way to Instagram, "
              "before Instagram answers: {detail}. So this is NOT a handle "
@@ -515,6 +515,10 @@ class _State:
     def _con(self):
         con = sqlite3.connect(self.db, timeout=10)
         con.row_factory = sqlite3.Row
+        try:
+            con.execute("PRAGMA journal_mode=WAL")   # shared with activity_log
+        except sqlite3.OperationalError:
+            pass
         con.execute(
             "CREATE TABLE IF NOT EXISTS decider_state ("
             "  scope       TEXT PRIMARY KEY,"
@@ -663,6 +667,15 @@ _PLAT = {"instagram": "IG", "facebook": "FB", "x": "X"}
 _EMOJI = {"error": "🔴", "warn": "🟠", "info": "🔵"}
 
 
+def _clip(text: str, n: int) -> str:
+    """At most n characters, cut at a word, with an ellipsis when cut."""
+    text = str(text or "")
+    if len(text) <= n:
+        return text
+    cut = text[:n].rsplit(" ", 1)[0]
+    return (cut or text[:n]).rstrip(",;:(-") + "…"
+
+
 def _plat(platform: str) -> str:
     return _PLAT.get((platform or "").lower(), (platform or "?").upper())
 
@@ -691,16 +704,20 @@ def _ping_text(rule: Rule, ev, row: dict, now: int, cid: str) -> str:
     Title, the first move, what the collector already did, the links. The
     paragraph this replaced (2026-09-06) said the same thing in 60 words and
     a phone showed the first 20."""
-    fmt = dict(account=ev.account or "-", detail=(row.get("detail") or "-")[:80],
+    fmt = dict(account=ev.account or "-", detail=_clip(row.get("detail") or "-", 110),
                open_for=_fmt_dur((now - row["first_ms"]) / 1000),
                count=row["count"])
     lines = [f"{_EMOJI.get(rule.level, '🟠')} {_plat(ev.platform)} "
              f"{_who_text(ev.account, ev.source)} — {rule.title.format(**fmt)}"]
     if rule.short:
         lines.append("Do: " + rule.short.format(**fmt))
+    # "Now:" is ONE line: the first sentence of the note the collector
+    # attached (a failover, a stop), never the advice paragraph the Fix
+    # panel shows in full.
     note = (_loads(row.get("meta")).get("note") or "").strip()
     if note:
-        lines.append("Now: " + note)
+        first = note.split(". ")[0].rstrip(".")
+        lines.append("Now: " + _clip(first, 160) + ".")
     lines.append(_links(cid))
     return "\n".join(lines)
 

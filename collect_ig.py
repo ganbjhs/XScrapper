@@ -308,7 +308,14 @@ def _proxy_broken(dec, acct, group, e, why, *, log=print):
         detail = (f"TLS verification failed through {where} — the exit "
                   f"intercepts HTTPS (\"unable to get local issuer certificate\")")
     else:
-        detail = f"connection dies through {where} before Instagram answers ({type(e).__name__})"
+        # The proxy's own answer, when it gave one, is the whole diagnosis:
+        # "407 Proxy Authentication Required" is dead credentials or an
+        # expired sub-user (2026-09-06, resi-in-21 all night), "502 Bad
+        # Gateway" is the exit itself. Say that, not the exception's name.
+        import re as _re
+        m = _re.search(r"\b([45]\d\d [A-Za-z][A-Za-z ]{2,40}?)['\")]", str(e))
+        detail = (f"{where} answered {m.group(1).strip()}" if m
+                  else f"connection dies through {where} before Instagram answers")
     pending = sorted(x.label for x in group
                      if x.type == "user" and not x.platform_id
                      and not str(x.value).isdigit())
@@ -533,6 +540,8 @@ async def _collect_account(acct, group, store, dec, *, page_size, max_pages,
     engine = IGEngine(cl, account=acct,
                       on_resolved=store.cache_platform_id)
     refreshed = False       # relogin is attempted at most ONCE per pass
+    stopped = False         # the pass ended on a STOP decision (backoff /
+                            # quarantine / hold) — that condition stands
     # Did this account manage a single clean source this pass? That is
     # the honest definition of "the session still works", and it is what
     # stamps last_success_at in the pool (pool_link.record_success).
@@ -611,6 +620,7 @@ async def _collect_account(acct, group, store, dec, *, page_size, max_pages,
             if d.stop_account:
                 log(f"  @{acct}: {d.action} — leaving the remaining "
                     f"{len(group) - i - 1} source(s) for the next pass")
+                stopped = True
                 break
             continue
 
@@ -643,13 +653,22 @@ async def _collect_account(acct, group, store, dec, *, page_size, max_pages,
                 f"{type(e).__name__}: {e}")
             d = _decide_exc(dec, acct, full, e, fallback="session_rejected", log=log, src=s)
             if d.stop_account:
+                stopped = True
                 break
 
     # One write per account per pass, not one per post: the column means
     # "this account was working at this time".
     if acct_ok:
         pool_link.record_success("ig", acct)
-        dec.ok(acct)        # closes any open condition on this account
+    # ok() closes whatever is open on this account — unless this very pass
+    # ended on a STOP decision. Live on 2026-09-06 12:52:30: four sources read
+    # fine, the fifth died on the proxy (502), the decider said BACKOFF 30m
+    # and paged the admin — and one second later this ok() closed it,
+    # "recovered from 'proxy_broken' after 0s", paged the admin AGAIN, and
+    # cancelled the backoff. The reads before the failure are the SESSION
+    # working (record_success, above); the failure is the account's state.
+    if acct_ok and not stopped:
+        dec.ok(acct)
     return total, acct_ok
 
 
