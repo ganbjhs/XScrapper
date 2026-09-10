@@ -14,6 +14,7 @@ Offline: node + httpx, no Google. Run: python3 tests/test_script_read.py
 
 import asyncio
 import json
+import os
 import pathlib
 import re
 import socket
@@ -217,6 +218,75 @@ def _has_node():
         return False
 
 
+async def run_dated_only(tmp, ok):
+    """
+    tabs_mode='dated' — the fix for what the live sheet did on 2026-09-10.
+
+    Binding the real sheet took its two ARCHIVE tabs as watchlists: 674 links
+    that duplicate the day tabs, re-fetched daily against the X budget, with a
+    `day` that could only be inferred (a 4 July post landed on 10 September)
+    and a `section` of "Date- 4-7-26" — the date label in column A, handed to a
+    metrics consumer as a category.
+    """
+    import httpx
+    from store import Store
+
+    print("== tabs_mode='dated' skips the archive tabs ==")
+    h = Harness(tmp)
+    st = Store(str(pathlib.Path(tmp) / "results.db"))
+    await st.open()
+    try:
+        proj = await st.create_project("Varanasi Client")
+        pid = proj["project_id"]
+
+        bound = await st.bind_link_sheet(pid, "1xTDykt5z6x9oEs0_46g353CM75oQ5zgZNtAiXstBfP0",
+                                         script_url=None, script_token_env=None,
+                                         tabs_mode="dated")
+        ok(bound.get("tabs_mode") == "dated", f"the mode is stored ({bound.get('tabs_mode')})")
+
+        async with httpx.AsyncClient() as client:
+            snap, err = await links_mod.read_sheet_via_script(client, h.url, TOKEN)
+            ok(not err, "the sheet still reads")
+            # sync_sheet needs the bound row; feed it the one we just made,
+            # with the script fields pointed at the harness.
+            sheet = dict(bound)
+            sheet["script_url"] = h.url
+            sheet["script_token_env"] = "HARNESS_TOKEN"
+            os.environ["HARNESS_TOKEN"] = TOKEN
+            res = await links_mod.sync_sheet(st, client, sheet)
+
+        names = [w["name"] for w in res["watchlists"]]
+        ok(names == ["8/9/26"],
+           f"ONLY the dated tab became a watchlist: {names}")
+        ok(res.get("tabs_skipped") == 1 and res.get("skipped_tabs") == ["Tweet LInks"],
+           f"…and the archive tab is COUNTED as skipped, not hidden: "
+           f"{res.get('tabs_skipped')} {res.get('skipped_tabs')}")
+
+        rows = (await st.links_snapshot(pid))["items"]
+        ok(all(r["day"] == "2026-09-08" for r in rows),
+           f"every row carries the tab's real day: {sorted({r['day'] for r in rows})}")
+        ok(all("inferred" not in (r["status_note"] or "") for r in rows),
+           "no row needs an inferred day any more — that note was the symptom")
+        ok(all(r["group"] != "Date- 4-7-26" for r in rows),
+           "and no row's category is a DATE LABEL scraped from column A")
+
+        print("== 'all' is still the default, so nothing already bound changes ==")
+        st2 = Store(str(pathlib.Path(tmp) / "other.db"))
+        await st2.open()
+        p2 = await st2.create_project("Legacy")
+        b2 = await st2.bind_link_sheet(p2["project_id"], "1xTDykt5z6x9oEs0_46g353CM75oQ5zgZNtAiXstBfP0")
+        ok(not b2.get("tabs_mode"),
+           "a sheet bound without the field keeps NULL, which reads as 'all'")
+        bad = await st2.bind_link_sheet(p2["project_id"],
+                                        "1xTDykt5z6x9oEs0_46g353CM75oQ5zgZNtAiXstBfP0",
+                                        tabs_mode="sometimes")
+        ok("error" in bad, f"an unknown mode is refused rather than stored ({bad.get('error')})")
+        await st2.close()
+    finally:
+        await st.close()
+        h.close()
+
+
 def run(tmp, ok=_ok):
     tmp = pathlib.Path(tmp)
     # The source checks are pure text and always run — they are the ones that
@@ -229,6 +299,8 @@ def run(tmp, ok=_ok):
     asyncio.run(run_read(d, ok))
     d = tmp / "old"; d.mkdir(parents=True, exist_ok=True)
     asyncio.run(run_old_deployment(d, ok))
+    d = tmp / "dated"; d.mkdir(parents=True, exist_ok=True)
+    asyncio.run(run_dated_only(d, ok))
 
 
 def main():

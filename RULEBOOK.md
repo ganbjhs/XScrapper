@@ -256,6 +256,26 @@ that, when it changes, returns zero tabs silently and marks every link
 `removed`. The Apps Script door costs one paste and has none of those
 properties.
 
+**A day-wise sheet's ARCHIVE tabs are not watchlists (2026-09-10).**
+`link_sheets.tabs_mode` is `all` (the default, and every sheet bound before
+this date) or `dated`, which binds only tabs whose title parses as a date.
+Found in production on the first real bind: the live sheet's `Tweet LInks` and
+`Counter Links` tabs repeat the day tabs' posts with the date written in
+column A instead of the tab name, and binding them did three kinds of damage at
+once — 674 duplicate links re-fetched daily against the X budget; a `day` that
+could only be inferred, so a 4 July post was filed on 10 September; and a
+`section` of `"Date- 4-7-26"`, i.e. the date label handed to a metrics consumer
+as a category. Skipped tabs are COUNTED (`tabs_skipped`, `skipped_tabs`) and
+logged, never silently dropped: an operator who wonders where a tab went must
+be able to see that we chose not to read it. Switching the mode stops future
+syncs touching those watchlists; it does not delete what is already there —
+removing collected data stays an explicit act. Test: `test_script_read`.
+
+**A mode we do not implement is never reported as if we did (2026-09-10).**
+The handshake hardcoded `"tab_mode": "dated"` while the binder read every tab.
+It now reads the stored value. A consumer that trusts a capability we only
+claim is worse off than one told the plain truth.
+
 **A link is NAMED before it is fetched, and a platform is never guessed from a
 URL (2026-09-10).** `links.parse_post_url` returns `(platform, reference)` for
 X, Instagram, Facebook and YouTube; `WATCHED_PLATFORMS` is the subset we can

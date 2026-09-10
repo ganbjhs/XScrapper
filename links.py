@@ -709,6 +709,7 @@ async def sync_sheet(store, client, sheet: dict, now_ms: int | None = None,
     lsid = int(sheet["link_sheet_id"])
     sid = str(sheet["sheet_id"])
     summary = {"link_sheet_id": lsid, "sheet_id": sid, "tabs": 0,
+               "tabs_skipped": 0, "skipped_tabs": [],
                "watchlists": [], "found": 0, "added": 0, "revived": 0,
                "removed": 0, "skipped": 0, "tco_unresolved": 0, "error": ""}
 
@@ -748,10 +749,26 @@ async def sync_sheet(store, client, sheet: dict, now_ms: int | None = None,
         await store.link_sheet_synced(lsid, error=summary["error"], now_ms=now_ms)
         return summary
 
+    # 'dated' binds only tabs whose title IS a date. A day-wise sheet also
+    # carries archive tabs that repeat the same posts with the date written in
+    # column A — bound, they duplicate every link (re-fetched daily, against
+    # the X budget), take a `day` that can only be inferred, and hand their
+    # date label to the consumer as a category. Skipped tabs are counted, not
+    # hidden: an operator who wonders where a tab went should be able to see
+    # that we chose not to read it.
+    dated_only = str(sheet.get("tabs_mode") or "all") == "dated"
     for tab in snap.tabs:
         summary["tabs"] += 1
+        day = parse_tab_day(tab.title)
+        if dated_only and not day:
+            summary["tabs_skipped"] = summary.get("tabs_skipped", 0) + 1
+            summary.setdefault("skipped_tabs", []).append(tab.title)
+            if log:
+                log(f"[links] tab {tab.title!r} skipped — not a date, and this "
+                    f"sheet reads dated tabs only")
+            continue
         w = await store.links_watchlist_for_tab(lsid, tab.gid, tab.title,
-                                                day=parse_tab_day(tab.title))
+                                                day=day)
         if "error" in w:
             summary["error"] = w["error"]
             continue

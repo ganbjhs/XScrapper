@@ -629,6 +629,18 @@ CREATE TABLE IF NOT EXISTS link_sheets (
   -- backup of it.
   script_url       TEXT,
   script_token_env TEXT,
+  -- WHICH TABS become watchlists. 'all' (the default, and what every sheet
+  -- bound before 2026-09-10 does) takes every non-hidden tab. 'dated' takes
+  -- only tabs whose title parses as a date.
+  --
+  -- 'dated' exists because a day-wise sheet also carries ARCHIVE tabs — in the
+  -- live sheet, 'Tweet LInks' and 'Counter Links' — that repeat the same posts
+  -- with the DATE written in column A instead of the tab name. Bound as
+  -- watchlists they do two kinds of damage: 674 duplicate links re-fetched
+  -- daily against the X budget, and rows whose `day` can only be inferred (so
+  -- a July post lands on today) and whose `section` becomes the date label
+  -- itself ("Date- 4-7-26"), which reaches a metrics consumer as a category.
+  tabs_mode        TEXT,
   UNIQUE(project_id, sheet_id)
 );
 
@@ -1269,7 +1281,8 @@ class Store:
                   # must be here as well as in the DDL or a deployed server
                   # never grows the columns.
                   "link_sheets": {"script_url": "TEXT",
-                                  "script_token_env": "TEXT"},
+                                  "script_token_env": "TEXT",
+                                  "tabs_mode": "TEXT"},
                   "streams": {"list_id": "TEXT",
                               # The watchlist's collection filters, as JSON,
                               # copied onto each compiled stream so the
@@ -2298,7 +2311,8 @@ class Store:
                               sync_every_s: int | None = None,
                               claim_sync: bool = False,
                               script_url: str | None = None,
-                              script_token_env: str | None = None) -> dict:
+                              script_token_env: str | None = None,
+                              tabs_mode: str | None = None) -> dict:
         """
         Bind a Google Sheet (URL or id) to a project. Idempotent.
 
@@ -2306,6 +2320,9 @@ class Store:
         does not start a parallel first sync while the caller (the dashboard
         request) is reading the sheet itself; the caller's sync overwrites
         the stamp with its real result.
+
+        `tabs_mode` is 'all' or 'dated' (see the schema comment). Like the two
+        script fields, None LEAVES THE STORED VALUE ALONE.
 
         `script_url` + `script_token_env` bind the sheet to its own Apps Script
         instead of the service account. Passing None for either LEAVES THE
@@ -2324,6 +2341,9 @@ class Store:
             return {"error": f"no project {project_id}"}
         every = int(sync_every_s or _links.DEFAULT_SYNC_S)
         every = max(_links.MIN_SYNC_S, every)
+        if tabs_mode is not None and tabs_mode not in ("", "all", "dated"):
+            return {"error": "tabs_mode must be 'all' (every non-hidden tab) or "
+                             "'dated' (only tabs whose title is a date)"}
         if script_url:
             u = script_url.strip()
             if not u.startswith(_sheets.SCRIPT_URL_PREFIX):
@@ -2332,16 +2352,18 @@ class Store:
                                  f"address from Deploy → Manage deployments"}
         self.db.execute(
             "INSERT INTO link_sheets(project_id, sheet_id, sync_every_s, created_at, "
-            "  script_url, script_token_env) "
-            "VALUES(?,?,?,?,?,?) ON CONFLICT(project_id, sheet_id) DO UPDATE SET "
+            "  script_url, script_token_env, tabs_mode) "
+            "VALUES(?,?,?,?,?,?,?) ON CONFLICT(project_id, sheet_id) DO UPDATE SET "
             "  paused = 0, "
             # COALESCE, not the excluded value: None means "not specified" and
             # must keep what is there, or re-binding to change the cadence
             # would unhook the script the sheet is read through.
             "  script_url = COALESCE(?, script_url), "
-            "  script_token_env = COALESCE(?, script_token_env)",
+            "  script_token_env = COALESCE(?, script_token_env), "
+            "  tabs_mode = COALESCE(?, tabs_mode)",
             (int(project_id), sid, every, _iso_ms(int(time.time() * 1000)),
-             script_url, script_token_env, script_url, script_token_env))
+             script_url, script_token_env, tabs_mode,
+             script_url, script_token_env, tabs_mode))
         if claim_sync:
             self.db.execute(
                 "UPDATE link_sheets SET last_sync_ms = ? WHERE project_id = ? AND sheet_id = ?",
@@ -2843,7 +2865,7 @@ class Store:
             "SELECT COUNT(*) c, SUM(sheet_day IS NOT NULL) d FROM watchlists "
             "WHERE project_id = ? AND kind = 'links'", (pid,)).fetchone()
         sheet = self.db.execute(
-            "SELECT sheet_id, title, last_sync_ms, last_error, paused "
+            "SELECT sheet_id, title, last_sync_ms, last_error, paused, tabs_mode "
             "FROM link_sheets WHERE project_id = ? "
             "ORDER BY link_sheet_id LIMIT 1", (pid,)).fetchone()
         fresh = self.db.execute(
@@ -2857,7 +2879,10 @@ class Store:
             "watchlist": {
                 "tabs": (tabs["c"] if tabs else 0) or 0,
                 "dated_tabs": (tabs["d"] if tabs else 0) or 0,
-                "tab_mode": "dated",
+                # The truth, read from the row. This used to be hardcoded
+                # "dated" while the binder read every tab — a mode we did not
+                # implement, reported as if we did.
+                "tab_mode": (sheet["tabs_mode"] if sheet else None) or "all",
                 "links": total,
             },
             "counters": {**counts, "total": total},

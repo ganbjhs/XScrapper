@@ -129,6 +129,18 @@ YouTube, and none of them could be named at all.
   route to it at once. The service-account door is the smaller ask here (one
   share, Viewer); the script stays the better door for sheets the agency owns.
   Both are built and selectable per sheet.
+- **First production bind, 10 Sep 2026, project 16.** 54 tabs, 2,288 X links
+  added, 929 non-X skipped (the estimate from the offline parse was ~930), no
+  errors, `email: ""` — the whole read went through the Apps Script and never
+  touched a service account. All 51 dated tabs took their own day, including
+  the renamed `24/7/26`.
+- **That bind also found a real bug**, which `tabs_mode` now fixes: the sheet's
+  two archive tabs were bound as watchlists (674 duplicate links), their rows
+  took an inferred `day` (a 4 July post filed on 10 September) and their
+  `section` became the column-A date label `"Date- 4-7-26"`. The decision to
+  skip those tabs had been recorded in REPORT_TOOL_PLAN.md and never
+  implemented; the handshake meanwhile reported `tab_mode: "dated"` as though
+  it had been.
 - The Apps Script is deployed and answers `{"ok":true,"v":2}` on GET, and
   `{"error":"bad token"}` to an anonymous POST — reachable exactly as the
   collector will call it. It was deployed from the sheet OWNER's Google

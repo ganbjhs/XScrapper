@@ -2327,6 +2327,9 @@ def _links_sheet_post(body, key_project=None):
     # only required when no script is bound.
     script_url = str(body.get("script_url") or "").strip()
     token_env = str(body.get("script_token_env") or "").strip()
+    tabs_mode = str(body.get("tabs_mode") or "").strip().lower()
+    if tabs_mode and tabs_mode not in ("all", "dated"):
+        return 400, {"error": "tabs_mode must be 'all' or 'dated'"}
     if script_url and not token_env:
         return 400, {"error": "name the .env variable holding this sheet's Apps "
                               "Script token (script_token_env) — the token "
@@ -2338,7 +2341,8 @@ def _links_sheet_post(body, key_project=None):
         bound = await st.bind_link_sheet(pid, ref, body.get("sync_every_s"),
                                          claim_sync=True,
                                          script_url=script_url or None,
-                                         script_token_env=token_env or None)
+                                         script_token_env=token_env or None,
+                                         tabs_mode=tabs_mode or None)
         if "error" in bound:
             return 400, bound
         # The service-account key is checked HERE, not before the bind, and
