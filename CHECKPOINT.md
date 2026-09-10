@@ -129,6 +129,16 @@ YouTube, and none of them could be named at all.
   route to it at once. The service-account door is the smaller ask here (one
   share, Viewer); the script stays the better door for sheets the agency owns.
   Both are built and selectable per sheet.
+- The Apps Script is deployed and answers `{"ok":true,"v":2}` on GET, and
+  `{"error":"bad token"}` to an anonymous POST — reachable exactly as the
+  collector will call it. It was deployed from the sheet OWNER's Google
+  account, because the operator's own account returned "This app is blocked"
+  (an account-level restriction, not a script problem). **The deployment
+  therefore lives in the owner's account**: if it is revoked, or the owner
+  leaves, the read stops and the fix is a re-deploy by whoever owns it then.
+- The dashboard cannot yet bind a sheet to a script: the "+ New watchlist"
+  modal posts only `{project, sheet}`, so `script_url` / `script_token_env`
+  are API-only. The first bind is a curl (`_secrets/bind_sheet.sh`).
 - `origin` carries a GitHub personal access token in plain text in
   `.git/config`.
 

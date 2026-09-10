@@ -77,3 +77,6 @@ _to_delete/
 
 # Scratch from Claude sessions (patches, tarballs, prompts).
 Claude outputs/
+
+# Generated secrets staged for the server (never committed).
+_secrets/
