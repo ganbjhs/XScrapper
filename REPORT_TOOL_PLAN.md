@@ -830,3 +830,111 @@ send states it.
 None of that changes anything in Parts 1–3. When those rows appear they will
 arrive through the same `/api/links`, in the same shape, with `platform` set to
 `instagram` or `facebook` and counters `null` until first fetched.
+
+---
+
+## Part 11 — It is live. Read this before you start.  ✅ 10 Sep 2026
+
+The Collector side is deployed and serving. **You can point a `client_sources`
+row at it now.** Real numbers from the first production bind:
+
+```
+project 16 "Varanasi Client"
+54 tabs · 51 dated · 2,288 X links added · 929 non-X skipped · no errors
+read entirely through the sheet's Apps Script — no service account involved
+```
+
+### 11.1 Your wiring, concretely
+
+```
+API URL   https://scraper.vedictech.in/api/links?project=16
+Auth      Authorization: Bearer      (a project-locked key; ask for it)
+Signature name   whatever names your side in our logs
+```
+
+Test it with the handshake first — `GET /api/project?project=16` with the same
+key. A live reply looks like:
+
+```json
+{"project": {"id": 16, "name": "Varanasi Client", "platform": "x"},
+ "watchlist": {"tabs": 54, "dated_tabs": 51, "tab_mode": "all",
+               "links": 2288, "sheet_title": "Varansi Day Wise Data",
+               "last_sheet_read_ms": 1789038218507, "sheet_error": ""},
+ "counters": {"ok": 15, "pending": 2273, "unavailable": 0, "removed": 0,
+              "total": 2288},
+ "paused": {"watchlists": 0, "links": 0},
+ "last_refresh_ms": 1789038463000,
+ "refresh_in_progress": true,
+ "limits": {"max_limit": 500, "requests_per_minute": 60}}
+```
+
+### 11.2 Three fields you should act on
+
+**`refresh_in_progress`.** True right now, and it will be true for a while:
+2,288 links are being fetched for the first time at 24 h cadence. **Skip the
+day's pull when it is true** rather than snapshotting a half-scraped watchlist
+(your §3.6). On a normal day it is false.
+
+**`counters.pending` will be large for weeks, and that is correct.** Every link
+starts `pending` and becomes `ok` when we have actually read the post. Per your
+§3.4 a `pending` row is shown with `—` for every number. Please make sure that
+does not render to a client as "broken" — it means "listed, not yet measured".
+
+**`paused`.** An operator can pause a watchlist in our dashboard. A paused list
+is fetched by nobody and served to nobody, so its rows simply stop appearing —
+they are NOT marked `removed`, because they have not left the sheet. Your
+upsert keeps their last state, which is the right outcome. `counters` count
+only what is served, so `counters.total` and `/api/links`' `total` always
+agree; `paused` tells you what is being withheld and why the two do not sum to
+the sheet's size.
+
+### 11.3 What a real row looks like now
+
+Verbatim from production, trimmed:
+
+```json
+{"platform": "x",
+ "watchlist": "8/9/26", "tab": "8/9/26", "day": "2026-09-08",
+ "section": "National X Influencers", "group": "National X Influencers",
+ "url": "https://x.com/anujakapurindia/status/2073389948066214090",
+ "tweet_id": "2073389948066214090",
+ "status": "pending", "status_note": null,
+ "added_at": "2026-09-10T11:03:38.507000+00:00", "sheet_row": 3,
+ "like_count": null, "retweet_count": null, "reply_count": null,
+ "view_count": null, "quote_count": null, "bookmark_count": null,
+ "media": []}
+```
+
+Note what is confirmed on the wire, not merely promised: `items` is present
+beside `rows`; `tweet_id` is a **quoted string** (so your `JSON.parse` cannot
+round it); every counter is `null` rather than `0` before the first read; and
+`day` is the tab's own date.
+
+### 11.4 A note on `status_note`
+
+If you ever see `"day inferred from added_at: tab '…' is not a date"`, that row
+came from a tab whose title is not a date, and its `day` is a fallback — the
+IST date we first saw the link, never the scrape date. Treat those rows with
+suspicion in any day-wise view. On this sheet they came from two archive tabs
+that repeat the day tabs' posts; the operator has paused those, so you should
+not see them at all. If they reappear, tell us — it means something was
+un-paused that should not have been.
+
+### 11.5 Still yours to build, in the same order as Part 4
+
+Nothing here has changed, and P0 is still the whole product:
+
+1. `post_metric_days`, and stop `_fold_scraper` back-updating past `sheet_date`s.
+   **Until both land, a daily pull rewrites yesterday instead of building
+   history**, and every growth chart is a flat line.
+2. Accept our envelope (`items` — you already accept it), honour `status`, and
+   drop the `[today-3, today]` window: this sheet reaches back to 21 July, so
+   `PORTAL_SYNC_DAYS_BACK = 4` would keep four days and silently discard 47.
+3. Offset paging. 2,288 links at `limit=500` is five pages; today you take one
+   and lose the rest without an error.
+4. The handshake button, the local-hour scheduler, the stale-`last_ok_at`
+   warning.
+
+And please confirm `PORTAL_KEY_SECRET` is set on your server before we hand
+over a key — with it unset, `sync_client` returns immediately and the scheduler
+skips the scraper leg in silence.
