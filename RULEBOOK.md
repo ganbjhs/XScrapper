@@ -256,6 +256,22 @@ that, when it changes, returns zero tabs silently and marks every link
 `removed`. The Apps Script door costs one paste and has none of those
 properties.
 
+**PAUSED is one decision, honoured in both directions (2026-09-10).**
+`links_due` already refused to FETCH a paused list; `links_snapshot` served one
+anyway. So an operator could pause a watchlist in the dashboard, watch the
+collector stop refreshing it, and still have its rows handed to a consumer —
+stale, and for an archive tab with an inferred day and a date label for a
+category. Pause is the operator's one visible "this list is not live" control,
+so it means that end to end: not fetched, not served, and the handshake's
+`counters` count only what IS served so its total and `/api/links`' cannot
+disagree. What is withheld is stated (`paused: {watchlists, links}`) rather
+than left as a gap in the numbers. Both queries use the SAME predicate
+expression — two spellings of "paused" are two things that can drift apart.
+Preferred over skipping tabs at read time, and for the operator's reason: a
+control that is visible and per-watchlist beats one that silently does the
+right thing for one sheet and the wrong thing for the next.
+Test: `test_report_contract`.
+
 **A day-wise sheet's ARCHIVE tabs are not watchlists (2026-09-10).**
 `link_sheets.tabs_mode` is `all` (the default, and every sheet bound before
 this date) or `dated`, which binds only tabs whose title parses as a date.
@@ -265,8 +281,10 @@ column A instead of the tab name, and binding them did three kinds of damage at
 once — 674 duplicate links re-fetched daily against the X budget; a `day` that
 could only be inferred, so a 4 July post was filed on 10 September; and a
 `section` of `"Date- 4-7-26"`, i.e. the date label handed to a metrics consumer
-as a category. Skipped tabs are COUNTED (`tabs_skipped`, `skipped_tabs`) and
-logged, never silently dropped: an operator who wonders where a tab went must
+as a category. `tabs_mode` stays available per sheet but is NOT the default answer — pausing
+the watchlist is (see the rule above), because it is visible in the dashboard
+and decided per list rather than per sheet. Skipped tabs are COUNTED
+(`tabs_skipped`, `skipped_tabs`) and logged, never silently dropped: an operator who wonders where a tab went must
 be able to see that we chose not to read it. Switching the mode stops future
 syncs touching those watchlists; it does not delete what is already there —
 removing collected data stays an explicit act. Test: `test_script_read`.

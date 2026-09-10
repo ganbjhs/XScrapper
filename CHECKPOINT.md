@@ -134,7 +134,16 @@ YouTube, and none of them could be named at all.
   errors, `email: ""` — the whole read went through the Apps Script and never
   touched a service account. All 51 dated tabs took their own day, including
   the renamed `24/7/26`.
-- **That bind also found a real bug**, which `tabs_mode` now fixes: the sheet's
+- **`/api/links` served paused watchlists.** `links_due` honoured the pause and
+  stopped fetching them; the snapshot did not, so a list the operator had
+  visibly switched off kept reaching the consumer. Now both use the same
+  predicate, the handshake counts only what is served, and `paused:
+  {watchlists, links}` states what is withheld. This — not skipping tabs at
+  read time — is the mechanism for the archive tabs: the operator's call, and
+  the right one, because a per-watchlist control that is visible in the
+  dashboard beats a per-sheet rule that would be wrong for the next sheet.
+- **That bind also found a real bug**, which `tabs_mode` can fix (kept, but not
+  the default answer): the sheet's
   two archive tabs were bound as watchlists (674 duplicate links), their rows
   took an inferred `day` (a 4 July post filed on 10 September) and their
   `section` became the column-A date label `"Date- 4-7-26"`. The decision to

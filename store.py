@@ -2729,7 +2729,19 @@ class Store:
         Stable order (watchlist, added, id) so offset paging is safe between
         refreshes; the panel's sorts are whitelisted on top of that.
         """
-        where = ["w.project_id = ?", "w.kind = 'links'"]
+        # PAUSED IS ONE DECISION, HONOURED IN BOTH DIRECTIONS.
+        #
+        # links_due already refuses to FETCH a paused list. Serving one anyway
+        # was the hole: the operator pauses a watchlist in the dashboard, the
+        # collector stops refreshing it, and the consumer keeps being handed
+        # its rows — stale, and (for an archive tab) with an inferred day and a
+        # date label for a category. Pause is the operator's one visible "this
+        # list is not live" control, so it has to mean that end to end.
+        #
+        # The predicate is deliberately the SAME expression links_due uses; two
+        # spellings of "paused" are two things that can disagree.
+        where = ["w.project_id = ?", "w.kind = 'links'",
+                 "COALESCE(s.paused, 0) = 0"]
         params: list = [int(project_id)]
         if watchlist_id:
             where.append("l.watchlist_id = ?")
@@ -2752,6 +2764,7 @@ class Store:
         total = self.db.execute(
             f"SELECT COUNT(*) c FROM watchlist_links l "
             f"JOIN watchlists w ON w.watchlist_id = l.watchlist_id "
+            f"LEFT JOIN streams s ON s.label = 'wl:' || w.watchlist_id || ':0' "
             f"WHERE {' AND '.join(where)}", params).fetchone()["c"]
         tcols = ", ".join(f"t.{c} AS t_{c}" for c in self.LINK_COLS if c != "tweet_id")
         rows = self.db.execute(
@@ -2761,6 +2774,7 @@ class Store:
             f"                    '$.user.profileImageUrl') AS author_avatar "
             f"FROM watchlist_links l "
             f"JOIN watchlists w ON w.watchlist_id = l.watchlist_id "
+            f"LEFT JOIN streams s ON s.label = 'wl:' || w.watchlist_id || ':0' "
             f"LEFT JOIN tweets t ON t.tweet_id = l.tweet_id "
             f"LEFT JOIN tweet_raw r ON r.tweet_id = l.tweet_id "
             f"WHERE {' AND '.join(where)} ORDER BY {order} LIMIT ? OFFSET ?",
@@ -2856,7 +2870,11 @@ class Store:
         for r in self.db.execute(
                 "SELECT l.status s, COUNT(*) c FROM watchlist_links l "
                 "JOIN watchlists w ON w.watchlist_id = l.watchlist_id "
-                "WHERE w.project_id = ? AND w.kind = 'links' GROUP BY l.status",
+                "LEFT JOIN streams s2 ON s2.label = 'wl:' || w.watchlist_id || ':0' "
+                "WHERE w.project_id = ? AND w.kind = 'links' "
+                # Counted the same way links_snapshot serves, so
+                # counters.total and /api/links `total` are the same number.
+                "  AND COALESCE(s2.paused, 0) = 0 GROUP BY l.status",
                 (pid,)).fetchall():
             counts[r["s"]] = r["c"]
         total = sum(counts.values())
@@ -2864,6 +2882,16 @@ class Store:
         tabs = self.db.execute(
             "SELECT COUNT(*) c, SUM(sheet_day IS NOT NULL) d FROM watchlists "
             "WHERE project_id = ? AND kind = 'links'", (pid,)).fetchone()
+        # What we are NOT serving, and why. A consumer seeing 1,614 links where
+        # the sheet holds 2,288 must be able to find out where the rest went
+        # without asking a human.
+        held = self.db.execute(
+            "SELECT COUNT(DISTINCT w.watchlist_id) lists, COUNT(l.tweet_id) links "
+            "FROM watchlists w "
+            "LEFT JOIN streams s ON s.label = 'wl:' || w.watchlist_id || ':0' "
+            "LEFT JOIN watchlist_links l ON l.watchlist_id = w.watchlist_id "
+            "WHERE w.project_id = ? AND w.kind = 'links' "
+            "  AND COALESCE(s.paused, 0) = 1", (pid,)).fetchone()
         sheet = self.db.execute(
             "SELECT sheet_id, title, last_sync_ms, last_error, paused, tabs_mode "
             "FROM link_sheets WHERE project_id = ? "
@@ -2886,6 +2914,10 @@ class Store:
                 "links": total,
             },
             "counters": {**counts, "total": total},
+            # Paused lists are fetched by nobody and served to nobody; these
+            # two say so out loud rather than leaving a gap in the numbers.
+            "paused": {"watchlists": (held["lists"] if held else 0) or 0,
+                       "links": (held["links"] if held else 0) or 0},
             "last_refresh_ms": (fresh["m"] if fresh else None),
             "limits": {"max_limit": _links.MAX_LIMIT,
                        "requests_per_minute": _links.RATE_PER_MIN},

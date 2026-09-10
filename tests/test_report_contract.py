@@ -123,6 +123,32 @@ async def run_snapshot(tmp, ok):
         ok(dated["tweet_id"] == str(tid),
            f"…and it is exact, digit for digit ({dated['tweet_id']})")
 
+        print("== a PAUSED watchlist is fetched by nobody and served to nobody ==")
+        # The operator's one visible "this list is not live" control. It
+        # already stopped the collector fetching; serving the rows anyway was
+        # the hole — stale numbers, and for an archive tab an inferred day and
+        # a date label for a category.
+        # create_watchlist already compiled the list to its stream; pausing is
+        # a flag on that row, exactly as the dashboard's Pause button sets it.
+        st.db.execute("UPDATE streams SET paused = 1 WHERE label = ?",
+                      (f"wl:{arc['watchlist_id']}:0",))
+        st.db.commit()
+        snap2 = await st.links_snapshot(pid)
+        ok(snap2["total"] == 1 and len(snap2["items"]) == 1,
+           f"the paused list's rows leave the snapshot ({snap2['total']} of 2 remain)")
+        ok(all(r["watchlist_id"] != arc["watchlist_id"] for r in snap2["items"]),
+           "…and it is the paused one that went")
+        hs2 = await st.links_handshake(pid, project=proj)
+        ok(hs2["counters"]["total"] == snap2["total"],
+           f"the handshake counts what is SERVED, so its total and /api/links "
+           f"agree ({hs2['counters']['total']} vs {snap2['total']})")
+        ok(hs2["paused"]["watchlists"] == 1 and hs2["paused"]["links"] == 1,
+           f"…and it says out loud what is being withheld: {hs2['paused']}")
+        # put it back for the checks below
+        st.db.execute("UPDATE streams SET paused = 0 WHERE label = ?",
+                      (f"wl:{arc['watchlist_id']}:0",))
+        st.db.commit()
+
         print("== /api/project: the handshake ==")
         hs = await st.links_handshake(pid, project=proj)
         ok(hs["project"]["id"] == pid and hs["project"]["name"] == "Varanasi Campaign",
