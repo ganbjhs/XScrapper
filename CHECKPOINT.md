@@ -122,6 +122,13 @@ YouTube, and none of them could be named at all.
 - The report tool's own P0 is unbuilt on their side: `post_metric_days` and
   stopping `_fold_scraper` back-updating past `sheet_date`s. Until both land, a
   daily pull rewrites yesterday instead of building history.
+- The live sheet is owned by `nishantsoron@gmail.com` and its only other
+  permission is `anyone: reader`. We hold no named grant and open it view-only,
+  so the Apps Script door — which needs edit access to deploy — cannot be
+  opened by us on THIS sheet, and removing the public link would cut every
+  route to it at once. The service-account door is the smaller ask here (one
+  share, Viewer); the script stays the better door for sheets the agency owns.
+  Both are built and selectable per sheet.
 - `origin` carries a GitHub personal access token in plain text in
   `.git/config`.
 

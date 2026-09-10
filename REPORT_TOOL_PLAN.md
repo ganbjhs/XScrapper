@@ -711,6 +711,44 @@ POST /api/links/sheets
   "script_token_env": "VARANASI_SHEET_TOKEN" }
 ```
 
+### 9.1b Which door THIS sheet has to use — checked, not assumed
+
+The live sheet's permissions, read from Drive on 10 Sep 2026:
+
+```
+owner : nishantsoron@gmail.com
+        { "role": "reader", "type": "anyone" }      ← the only other entry
+```
+
+There is no individual grant for anyone else, and the sheet opens **view-only**
+for the Collector's operator. Three things follow, and they reverse the
+recommendation this document made an hour earlier:
+
+1. **The Apps Script door cannot be opened by us.** A container-bound script
+   needs *edit* access to create and deploy. Only the owner, or someone the
+   owner makes an editor, can do it.
+2. **Turning off the public link would lock us out.** Access today comes from
+   `anyone: reader` and nothing else. If that is removed without adding a named
+   grant, every route to the sheet dies at once — including the CSV route and
+   any human who was reading it.
+3. **So the service-account door is now the smaller ask**, not the larger one.
+   It costs the owner a single action — share the sheet with one address, as
+   Viewer — against granting edit access or pasting and deploying a script
+   themselves. It also scales to the next client sheet, and the deployment does
+   not live inside one person's Google account.
+
+**Both doors are built and both are supported per sheet.** For sheets the
+agency owns, the Apps Script remains the better one for the reasons in 9.1. For
+this sheet, the service account is the one to use, and the request to its owner
+is two lines:
+
+> - share this sheet with `<service-account>@<project>.iam.gserviceaccount.com`
+>   (Viewer is enough — it only reads)
+> - add `ganbjhs@gmail.com` as a Viewer too, so the public "anyone with the
+>   link" setting can be turned off without locking anyone out
+
+The second line is the one that is easy to forget and expensive to discover.
+
 ### 9.2 The route we rejected, and why it matters to you
 
 A published sheet can be read with **no credentials at all**: `/export?format=csv&gid=…`
