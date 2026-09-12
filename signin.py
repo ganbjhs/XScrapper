@@ -393,6 +393,13 @@ def _fresh_phone_if_legacy(label: str, root, log) -> None:
                                             "US Pixel; a sign-in is the one "
                                             "time a new phone costs nothing "
                                             "extra", log=log)
+        return          # a fresh mint already reads the real Chrome major
+    # Not legacy: the handset stays (the account has earned trust on it), but
+    # the DERIVED browser version is brought up to the binary that will render
+    # this sign-in. A UA and Client Hints claiming Chrome 140 in front of a
+    # Chromium 151 render is the same kind of incoherence as a US Pixel on an
+    # Indian exit, and unlike the handset it costs nothing to correct.
+    ig_session.refresh_browser_version(label, root, log=log)
 
 
 # ---------------------------------------------------------------------------
@@ -611,6 +618,34 @@ def _carry_jar(cl, cookies: dict, log=lambda m: None) -> int:
     if n:
         log(f"carried {n} device cookie(s) from the browser: "
             f"{', '.join(k for k in IG_JAR if (cookies or {}).get(k))}")
+
+    # `mid` is ONE identifier on TWO surfaces: the browser sends it as a cookie,
+    # the app sends the same value as the X-MID header. instagrapi learns its
+    # own from the `ig-set-x-mid` RESPONSE header, never from the cookie jar —
+    # so setting the cookie above does not make the app agree with the browser
+    # it inherited the session from. Adopt the browser's when the app has none
+    # (it is the same machine, and instagrapi's own best-practice guidance is
+    # to carry a learned mid forward rather than arrive looking new). When both
+    # exist and disagree, say so and change NOTHING: the app's came from
+    # Instagram and is not ours to overwrite. 2026-09-12.
+    web_mid = (cookies or {}).get("mid") or ""
+    if web_mid:
+        try:
+            app_mid = getattr(cl, "mid", "") or (cl.get_settings() or {}).get("mid") or ""
+        except Exception:
+            app_mid = ""
+        if not app_mid:
+            try:
+                cl.mid = web_mid
+                log("adopted the browser's `mid` as the app's X-MID — one "
+                    "machine, one device id on both surfaces")
+            except Exception:
+                pass
+        elif str(app_mid) != str(web_mid):
+            log(f"note: the app's X-MID and the browser's `mid` cookie DIFFER "
+                f"(…{str(app_mid)[-6:]} vs …{str(web_mid)[-6:]}). This session "
+                f"presents two device ids. The app's is server-issued, so it "
+                f"stands — but it is worth watching if checkpoints follow.")
     return n
 
 
@@ -637,6 +672,21 @@ def ig_browser_adopt(cookies: dict, *, proxy: str = "", label: str = "ig_a",
     import ig_session
     from instagrapi.exceptions import ClientError
 
+    # DO NOT reseed here. The browser that just signed in did so AS the seed
+    # ig.InteractiveLogin._phone put in force when the window opened; minting a
+    # new handset now would adopt the session onto a phone Instagram has never
+    # seen — the exact "session moving between handsets" shape the seed exists
+    # to prevent. So this is a CHECK, not an action: if the seed is still the
+    # library default, _phone did not run, and that is worth saying out loud
+    # rather than silently papering over (the invariant lives in two places,
+    # which is one too many — see IG_DETECTION_ANALYSIS.md §4).
+    seed = ig_session.load_device(label, root)
+    if seed and ig_identity.is_legacy(seed):
+        log("warning: this label's seed is STILL instagrapi's default US Pixel. "
+            "The browser window should have replaced it before the login "
+            "(ig.InteractiveLogin._phone). Adopting anyway — the session is "
+            "real — but sign in again through the browser door to mint a "
+            "coherent phone.")
     cl = ig_session.new_client(label, proxy=proxy, root=root, log=log)
     log(f"adopting the browser's session on "
         f"{ig_identity.describe(ig_session.load_device(label, root))}")

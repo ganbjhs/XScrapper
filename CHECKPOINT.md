@@ -19,6 +19,113 @@ must respect belongs in the rulebook, not here.
 
 ---
 
+## 2026-09-12 — Instagram: the session ages instead of being re-enacted; the proxy's rotation becomes a number
+
+**Changed**
+
+- `IG_DETECTION_ANALYSIS.md` (new) — the deep-dive behind everything below:
+  what Instagram actually checks, graded DOCUMENTED / CORROBORATED / FOLKLORE
+  with sources, and why most of what is written publicly on this subject is
+  proxy-vendor marketing. Read §3 before changing anything here.
+- `ig_session.py` — `touch()`: the SESSION half of the sidecar, written at the
+  end of every pass. Fenced: never `save_device()`, never `ig.Store.save()`,
+  and it refuses a settings dict with no `sessionid`. `_read_sidecar` /
+  `_write_sidecar` (atomic: temp file + rename, then chmod).
+  `refresh_browser_version()` — the derived Chrome major, updated in place with
+  no reseed. `exit_due` / `sample_exit` / `exit_summary` + `EXIT_HISTORY`,
+  `EXIT_SAMPLE_H`. `persist()` now writes through `_write_sidecar` and keeps any
+  exit history a pass has accumulated.
+- `ig_identity.py` — `refresh_web_browser()`: rewrites `identity.chrome_major`
+  and the web UA built from it, and NOTHING else; refuses a legacy seed (that
+  wants a reseed, not a bump).
+- `collect_ig.py` — `_collect_account` ends with the write-back: `sample_exit`
+  in a thread (it is blocking), `touch(cl, acct, exit=chk)`, and a log line when
+  `exit_summary()["distinct"] > 1`. Never fatal — the posts are already stored.
+- `signin.py` — `_fresh_phone_if_legacy` refreshes the browser version when the
+  seed is NOT legacy (a legacy one is reseeded and a fresh mint already reads
+  the real major). `_carry_jar` makes the app's `X-MID` agree with the browser's
+  `mid` cookie, or says so when it cannot. `ig_browser_adopt` CHECKS the seed is
+  not legacy and warns — it must not reseed, which would adopt the session onto
+  a phone Instagram has never seen.
+- `ig.py` — `InteractiveLogin._phone` refreshes the browser version on a seed it
+  is not reseeding.
+- `auth.py` — `--force-webrtc-ip-handling-policy=disable_non_proxied_udp` and
+  the older spelling, in the launch args.
+- `fb_probe.py`, `fb_data_probe.py` — a real Webshare username and password were
+  sitting in the usage docstrings of two TRACKED files. Replaced with
+  placeholders and a note. **The credential is in git history; treat it as
+  burned and rotate it.**
+- `requirements.txt` — the `pyotp`/`cryptography` pair had been pasted three
+  times.
+- `tests/test_all.py` — `test_ig_writeback` (26 checks): the claim advances and
+  the advance is kept; the handset cannot change in a pass whatever the client
+  claims to be; the roster row is untouched; a client with no sessionid cannot
+  blank a good sidecar; the exit history counts distinct IPs; a re-sign-in keeps
+  the history; the browser version moves without a reseed and the Client Hints
+  follow it.
+- `PLATFORM_INSTAGRAM.md`, `PLATFORM_FACEBOOK.md`, `PLATFORM_X.md` (new,
+  **gitignored**) — one recovery file per platform: architecture, the data path,
+  the log line by line, every dead end we have hit and why, what works, the
+  checkpoint timeline, a failure playbook and a rebuild-from-nothing order.
+- `RULEBOOK.md` §6 — five new Instagram rules (write-back and its fences;
+  derived version vs identifier; `mid` on two surfaces; WebRTC; "one steady IP"
+  measured rather than asserted).
+
+**Why**
+
+The operator reported two symptoms: `proxy_broken` messages that sometimes
+cleared themselves and sometimes needed a browser, and Instagram still finding
+automated behaviour despite the rhythm layer. They are two different problems.
+
+`proxy_broken` is not Instagram — it is the pipe, and the classifier was already
+right about that: a connect-level exception means TLS never completed, so
+Instagram never saw the request. The cause was already in this file, filed under
+"Still open" on 2026-09-06: webshare's session-pinned exits are not steady, two
+sign-ins two minutes apart left through two different IPs. The self-healing IS
+the disease. That cannot be fixed in code — it needs a static residential / ISP
+proxy per account — so the code now MEASURES it instead of asserting the rule.
+
+The detection half was not a missing fingerprint. `ig_identity` is sound, and
+the collection path runs no JavaScript at all, so canvas/WebGL/audio are
+surfaces Instagram never sees from it. What was missing was CONTINUITY:
+`persist()` ran at a sign-in and nowhere else, so every pass restored the
+`x-ig-www-claim` minted at the last login and re-presented it — a value frozen
+at a login timestamp while a real client's advances on every round trip. Nothing
+raised; the session was simply coherent on day one and less so every day after.
+The same shape produced the other two: a `chrome_major` of 140 in front of a
+Chromium 151 render (recorded on 2026-09-06 and filed as "leave it", on the
+mistaken belief that fixing it needed a reseed — it is a derived field), and an
+app `X-MID` that never agreed with the browser `mid` cookie it inherited.
+
+**Verified**
+
+`tests/test_all.py` — **All checks passed (1,442)**, up from 1,416, on the
+pinned deps. The full suite cannot run over the desktop bridge (the FUSE mount
+gives aiosqlite `disk I/O error`); it was run from a copy on a real filesystem.
+
+**Still open**
+
+- **The proxies still rotate.** Everything above is maintenance; this is the
+  decision that changes the outcome. Static residential / ISP, one per account,
+  roughly $0.25–$3.50/IP/month.
+- **None of this has run against live Instagram.** All 1,442 checks are offline.
+  On the next deploy watch three things: `distinct == 1` in the exit summary, no
+  `proxy_broken`, and no `recovered … after 0s`.
+- The WebRTC flags are set but unmeasured — nobody has loaded a leak-test page
+  through an account's own proxy using the account's own `_launch` path. The
+  same run would say whether `--disable-blink-features=AutomationControlled`
+  still does anything on Chromium 151.
+- Production device seeds have not been audited for `ig_identity.is_legacy()`.
+  The seeds in this checkout are still the August US Pixel with no `.bak`.
+- The structural gap is untouched and unfixable by configuration: the browser
+  mints the session (real Chrome TLS, JS, telemetry) and instagrapi replays it
+  (python TLS, no JS, no telemetry) claiming to be the Android app.
+  `IG_DETECTION_ANALYSIS.md` §3.3 sets out the fork.
+- Instagram's Graph API + `business_discovery` has still not been costed. It is
+  the only option that ends this class of problem rather than managing it.
+
+---
+
 ## 2026-09-10 — The report tool's pull contract, reading a sheet without the Sheets API, and naming a link on every platform
 
 **Changed**

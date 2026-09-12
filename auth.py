@@ -427,6 +427,19 @@ async def _launch(pw, acct, headless: bool, log, extra: dict | None = None):
         "--disable-blink-features=AutomationControlled",
         "--no-first-run",
         "--no-default-browser-check",
+        # WebRTC does NOT go through the HTTP proxy. Chromium routes it over
+        # its own UDP path, so a page that opens an RTCPeerConnection can read
+        # the host's real public IP straight past a residential exit — the
+        # whole point of which is that the host's IP is never seen. For
+        # Instagram that is a datacenter IP sitting next to an Indian exit on
+        # one page load, which is worse than having no proxy at all, because it
+        # says the Indian exit is a disguise.
+        #
+        # Both spellings on purpose: Chromium renamed the switch, and the
+        # version that does not recognise one silently ignores it, so sending
+        # both is how this keeps working across an upgrade.
+        "--force-webrtc-ip-handling-policy=disable_non_proxied_udp",
+        "--webrtc-ip-handling-policy=disable_non_proxied_udp",
     ]
     if headless:
         # Chrome puts its shared-memory files in /dev/shm, which is 64 MB on a

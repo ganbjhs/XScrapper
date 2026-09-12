@@ -972,6 +972,68 @@ single request. These are hard rules, not tuning:
   sign-in and records the exit IP and country in the sidecar; the diag
   endpoint shows it. An exit in another country is said, not refused (geo
   databases are approximate); a dead or intercepting one is refused.
+- **A pass WRITES BACK what it learned. The session must age, not be
+  re-enacted (`ig_session.touch`, 2026-09-12).** `persist()` ran at a sign-in
+  and nowhere else, so every pass restored the session exactly as it stood at
+  the last login and threw away everything the pass itself learned. The cost is
+  `ig_www_claim`: Instagram issues the next claim in the `x-ig-set-www-claim`
+  response header and expects it echoed back as `X-IG-WWW-Claim` on the
+  following request, starting from the literal `"0"` for a client that has never
+  had one. Ours was frozen at a login timestamp and re-presented for weeks,
+  while a real client's claim advances on every round trip — a session coherent
+  the day it was made and decaying from there, invisibly, with nothing ever
+  raising. `touch()` now runs at the end of every pass and writes the SESSION
+  half of the sidecar. It is fenced, and the fences are the rule: it must NEVER
+  call `save_device()` (a pass cannot change the handset — that is the whole
+  point of the seed) and NEVER `ig.Store.save()` (a pass cannot touch the
+  roster, which is an operator's decision), and it REFUSES to write a settings
+  dict with no `sessionid`, so a pass that died before its first request cannot
+  blank a good sidecar. The sidecar is written atomically, because it is now
+  written hundreds of times more often than it used to be and a half-written one
+  is an account that cannot start. Test: `test_ig_writeback`.
+- **The browser VERSION is derived and moves; the HANDSET is an identifier and
+  does not (`ig_session.refresh_browser_version`, 2026-09-12).** `uuids` and
+  `device_settings` are what "the same phone" means to Instagram and may change
+  only in a deliberate reseed. `chrome_major` is not an identifier — it is a
+  fact about the binary that will render the sign-in window, and on a real phone
+  Chrome updates itself every few weeks without the handset changing. Seeds
+  minted before Chromium 151 was installed still claimed 140 in their web UA and
+  in every Client Hint while the engine rendering the page was 151; the string
+  and the thing behind it disagreed, which is exactly the incoherence
+  `ig_identity` exists to prevent, and a version frozen across a Chrome release
+  cycle is a stranger signal than one that moves. It is refreshed in place at a
+  sign-in — no reseed, no `.bak`, nothing identifying touched. Never in a pass:
+  the probe shells out to the browser binary.
+- **`mid` is ONE identifier on TWO surfaces, and they must agree
+  (`signin._carry_jar`, 2026-09-12).** The browser sends it as a cookie; the app
+  sends the same value as the `X-MID` header. instagrapi learns its own from the
+  `ig-set-x-mid` RESPONSE header and never from the cookie jar, so carrying the
+  cookie across does not make the app agree with the browser it inherited the
+  session from. The app adopts the browser's when it has none; when both exist
+  and differ it is SAID and nothing is changed — a server-issued value is not
+  ours to overwrite. One session presenting two device ids is worth a log line
+  every time.
+- **WebRTC never leaks past the proxy (`auth._launch`, 2026-09-12).** Chromium
+  routes WebRTC over its own UDP path, not through the configured HTTP proxy, so
+  a page that opens an `RTCPeerConnection` can read the host's real public IP
+  alongside the residential exit. For Instagram that is a datacenter IP sitting
+  next to an Indian exit on one page load — worse than having no proxy at all,
+  because it says the Indian exit is a disguise. Both spellings of the switch
+  are passed, because Chromium renamed it and an unrecognised switch is silently
+  ignored.
+- **"One steady IP" is now MEASURED, not asserted (`ig_session.exit_summary`,
+  2026-09-12).** The rule above it has always said one account : one steady
+  residential IP. The only evidence was `meta.exit`, written once at sign-in, so
+  a proxy rotating underneath us was invisible until Instagram said something —
+  and on 2026-09-06 two sign-ins two minutes apart left through two different
+  IPs on a session-pinned webshare exit. An exit sample is now recorded into
+  `meta.exits` at most once per ~20 h per account (three THIRD-PARTY requests,
+  never an Instagram one — it stays off the per-pass path, IG4), and a pass logs
+  a line whenever `distinct > 1`. The sample DECIDES nothing: a dead exit found
+  here is not raised as `proxy_broken`, because the pass's own requests are the
+  honest test of whether the pipe works. What it buys is a number. **A `distinct`
+  greater than 1 means the product is rotating whatever it is called, and the
+  fix is a static residential / ISP proxy — not a retry, not a code change.**
 - **N accounts collect in PARALLEL, and every source has exactly one owner
   (2026-09-04).** `ig_accounts.db.active` is a roster, not a crown: every
   active login with a session and no checkpoint is a collector, and

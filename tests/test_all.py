@@ -4238,6 +4238,142 @@ def test_ig_identity(tmp):
        f"same handle -> same shift ({o1:+.2f}h), different handles differ ({o2:+.2f}h)")
 
 
+def test_ig_writeback(tmp):
+    """A pass writes back what it LEARNED, and is fenced from what it must not
+    touch (2026-09-12).
+
+    persist() ran at a sign-in and nowhere else, so every pass restored the
+    x-ig-www-claim minted at the last login and re-presented it — frozen at a
+    login timestamp for as long as the session lived, while a real client's
+    claim advances on every round trip. Instagram issues the next claim in
+    `x-ig-set-www-claim` and expects it echoed back. touch() closes that, and
+    these checks hold it to its fences: it may never change the handset, never
+    touch the roster, and never overwrite a good sidecar with an empty one.
+    """
+    import ig_identity, ig_session
+    from unittest import mock as _m
+    root = pathlib.Path(tmp)
+    (root / "profiles").mkdir(parents=True, exist_ok=True)
+
+    class Cl:
+        """Only what persist()/touch() actually read off a client."""
+        def __init__(self, st):
+            self._st = dict(st)
+            self.user_agent = st.get("user_agent", "")
+            self.user_id = 5
+        def get_settings(self):
+            return dict(self._st)
+
+    dev = ig_session.ensure_device("ig_w", root)
+    base = dict(dev)
+    base.update({"cookies": {"sessionid": "5%3Aa%3A1", "ds_user_id": "5",
+                             "csrftoken": "c", "mid": "M1"},
+                 "authorization_data": {"ds_user_id": "5"},
+                 "ig_www_claim": "hmac.AR0"})
+    store_p = str(root / "ig_accounts.db")
+    ig_session.persist(Cl(base), "wuser", label="ig_w", proxy="http://u:p@h:1",
+                       root=root, store_path=store_p,
+                       exit={"exit_ip": "49.1.1.1", "country": "IN",
+                             "checked": "2026-09-12T00:00:00"})
+    side = ig_session.sidecar_path("wuser", root)
+    sc = json.loads(side.read_text())
+    ok(sc["settings"]["ig_www_claim"] == "hmac.AR0",
+       "the sign-in writes down the claim Instagram gave it")
+
+    print()
+    print("== a pass advances the claim, and the advance is kept ==")
+    moved = dict(base, ig_www_claim="hmac.AR9",
+                 cookies=dict(base["cookies"], mid="M2"))
+    wrote = ig_session.touch(Cl(moved), "wuser", root=root)
+    sc = json.loads(side.read_text())
+    ok(wrote and sc["settings"]["ig_www_claim"] == "hmac.AR9",
+       "touch() writes the ADVANCED claim back (was frozen at login before)")
+    ok(sc["settings"]["cookies"]["mid"] == "M2", "and the mid the pass learned")
+    ok(sc["meta"]["proxy"] == "http://u:p@h:1"
+       and sc["meta"]["exit"]["exit_ip"] == "49.1.1.1",
+       "while the meta the sign-in wrote survives untouched")
+    ok(sc["meta"].get("touched"), "and the pass stamps when it last wrote")
+
+    print()
+    print("== the two things a pass must NEVER do ==")
+    before = ig_session.load_device("ig_w", root)
+    liar = dict(moved, uuids={"phone_id": "ZZZ"},
+                device_settings={"model": "Nokia 3310"})
+    ig_session.touch(Cl(liar), "wuser", root=root)
+    ok(ig_session.load_device("ig_w", root) == before,
+       "the handset cannot change in a pass, whatever the client claims to be")
+    sc = json.loads(side.read_text())
+    ok(sc["settings"]["uuids"] == before["uuids"]
+       and sc["settings"]["device_settings"] == before["device_settings"],
+       "and the SEED, not the client, is what lands in the sidecar")
+    import ig
+    with ig.Store(store_p) as st:
+        row = st.get("wuser")
+    ok(row is not None and row["active"],
+       "the roster row is left exactly as the sign-in set it (touch never saves it)")
+
+    print()
+    print("== a client that died before its first request cannot blank a good sidecar ==")
+    good = side.read_text()
+    ok(not ig_session.touch(Cl({"cookies": {}}), "wuser", root=root),
+       "a settings dict with no sessionid is refused")
+    ok(side.read_text() == good, "and the good sidecar is byte-for-byte untouched")
+    ok(not ig_session.touch(Cl(moved), "nosuchuser", root=root),
+       "an account with no sidecar is a no-op, not a new file")
+
+    print()
+    print("== the exit history: 'one steady IP' becomes a number ==")
+    now_s = time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime())
+    ok(ig_session.exit_due("wuser", root), "an account with no samples is due one")
+    ig_session.touch(Cl(moved), "wuser", root=root,
+                     exit={"exit_ip": "49.1.1.1", "country": "IN", "checked": now_s})
+    ok(not ig_session.exit_due("wuser", root),
+       "and is not due again straight away (the sample costs three requests)")
+    ok(ig_session.exit_due("wuser", root, every_h=0.0),
+       "every_h=0 forces one, for an operator who wants to look now")
+    ig_session.touch(Cl(moved), "wuser", root=root,
+                     exit={"exit_ip": "49.1.1.2", "country": "IN", "checked": now_s})
+    summ = ig_session.exit_summary("wuser", root)
+    ok(summ["samples"] == 2 and summ["distinct"] == 2 and summ["last"] == "49.1.1.2",
+       "two samples through two different IPs — a rotating exit is now MEASURED")
+    ok(summ["minted_at"] == "49.1.1.1",
+       "and the exit the session was minted through is still named separately")
+    ig_session.persist(Cl(moved), "wuser", label="ig_w", proxy="http://u:p@h:1",
+                       root=root, store_path=store_p)
+    ok(ig_session.exit_summary("wuser", root)["samples"] == 2,
+       "a re-sign-in keeps the history rather than starting the count again")
+
+    print()
+    print("== the browser version is DERIVED, so it moves; the handset does not ==")
+    lines = []
+    with _m.patch.dict(os.environ, {"IG_WEB_CHROME_MAJOR": "140"}):
+        seed = ig_session.ensure_device("ig_v", root)
+    ok(seed["identity"]["chrome_major"] == "140", "minted against Chromium 140")
+    bumped = ig_session.refresh_browser_version("ig_v", root, chrome="151",
+                                                log=lines.append)
+    ok(bumped["identity"]["chrome_major"] == "151"
+       and "Chrome/151.0.0.0 Mobile" in bumped["web_user_agent"],
+       "a new major rewrites chrome_major AND the web UA built from it")
+    ok(bumped["uuids"] == seed["uuids"]
+       and bumped["device_settings"] == seed["device_settings"],
+       "and changes NOTHING that identifies the account")
+    ok(not any(p.name.startswith("ig_device_ig_v.json.bak")
+               for p in (root / "profiles").iterdir()),
+       "it is not a reseed — no .bak, because the phone did not change")
+    ok(ig_session.load_device("ig_v", root)["identity"]["chrome_major"] == "151",
+       "the bump is on disk, not just in the returned dict")
+    ok(any("UNCHANGED" in l for l in lines), "and the log says the handset is not moving")
+    ok(ig_identity.refresh_web_browser(bumped, chrome="151") is None,
+       "an unchanged major is a no-op")
+    ok(ig_identity.refresh_web_browser(
+        {"device_settings": {"model": "Pixel 8 Pro"}, "locale": "en_US"},
+        chrome="151") is None,
+       "a legacy seed is refused: that wants a reseed, not a version bump")
+    hints = ig_identity.web_headers(bumped)
+    ok('"151"' in hints["sec-ch-ua"] and "Chrome/151" in hints["User-Agent"],
+       "the Client Hints follow the same number — they are built from it")
+
+
 def test_ig_signin(tmp):
     """The three reasons a complete sign-in was impossible from the server,
     each now a code path: the emailed code had nowhere to go (CodeRelay);
@@ -6628,6 +6764,8 @@ def main():
         test_ig_stop_stands(fresh("igstop"))
         section("instagram identity (one coherent phone per account, minted once)")
         test_ig_identity(fresh("igid"))
+        section("instagram write-back (the claim advances; the handset cannot)")
+        test_ig_writeback(fresh("igwb"))
         section("instagram sign-in from the server (code relay, exit check, browser door)")
         test_ig_signin(fresh("igsignin"))
         section("instagram browser door (interstitials are a challenge; Save your login info is answered)")

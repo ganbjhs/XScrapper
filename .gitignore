@@ -35,6 +35,9 @@ fb_*.png
 *.bak
 *.bak-*
 
+# The suite's scratch root (tests/test_all.py: HERE/'.tmp').
+tests/.tmp/
+
 # Python
 __pycache__/
 *.py[cod]
@@ -80,3 +83,13 @@ Claude outputs/
 
 # Generated secrets staged for the server (never committed).
 _secrets/
+
+# Per-platform recovery files (operator's request, 2026-09-12). These hold the
+# whole story of each platform: architecture, every dead end, the log, the
+# playbook, the rebuild order. They are NOT in git — which means they exist on
+# ONE machine, with no backup, and they are precisely the files whose purpose is
+# recovery. Copy them somewhere durable and private (_secrets/, a private repo)
+# or the first disk failure takes the recovery plan with it.
+PLATFORM_INSTAGRAM.md
+PLATFORM_FACEBOOK.md
+PLATFORM_X.md

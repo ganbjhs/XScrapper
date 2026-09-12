@@ -669,6 +669,36 @@ async def _collect_account(acct, group, store, dec, *, page_size, max_pages,
     # working (record_success, above); the failure is the account's state.
     if acct_ok and not stopped:
         dec.ok(acct)
+
+    # Write back what this pass LEARNED, so the next one starts where this one
+    # ended instead of where the last sign-in did. Chiefly the x-ig-www-claim:
+    # Instagram hands out a new one in `x-ig-set-www-claim` and expects it
+    # echoed on the next request, so a session that reloads the login-time
+    # claim every pass re-presents a value frozen at a login timestamp for
+    # weeks (2026-09-12). touch() never logs in, never writes the device, and
+    # never touches the roster; it refuses outright if the live client has no
+    # sessionid, so a pass that died early cannot blank a good sidecar.
+    #
+    # The exit sample rides along because it is already paid for: at most one
+    # per account per ~20h, in a thread because it is blocking, and it decides
+    # nothing — the pass's own requests remain the test of whether the pipe
+    # works. What it buys is a NUMBER for the "one account : one steady IP"
+    # rule, which until now was asserted and never measured.
+    try:
+        chk = await _asyncio.to_thread(ig_session.sample_exit, acct, log=log)
+        ig_session.touch(cl, acct, exit=chk, log=log)
+        if chk:
+            summ = ig_session.exit_summary(acct)
+            if summ["distinct"] > 1:
+                log(f"  @{acct} has left through {summ['distinct']} different exit "
+                    f"IPs across {summ['samples']} checks ({', '.join(summ['ips'][:4])}"
+                    f"{' …' if len(summ['ips']) > 4 else ''}) — RULEBOOK 6 asks for "
+                    f"ONE. That is a rotating exit whatever the product is called; "
+                    f"a static residential / ISP proxy is the fix, not a retry.")
+    except Exception as e:
+        # Never fatal. The posts are already stored; this is bookkeeping.
+        log(f"  @{acct}: could not write the session back "
+            f"({type(e).__name__}: {e}) — collection itself was fine")
     return total, acct_ok
 
 

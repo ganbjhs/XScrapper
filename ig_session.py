@@ -54,6 +54,7 @@ paths are wired to instagrapi's documented hooks but only exercised once you
 run ig_login.py with a real account. Failures say what they saw, R6.
 """
 
+import calendar
 import json
 import os
 import time
@@ -231,6 +232,33 @@ def reseed(label: str, root: Path | str = ".", *, why: str = "",
     return dev
 
 
+def refresh_browser_version(label: str, root: Path | str = ".", *, chrome=None,
+                            log=lambda m: None) -> dict:
+    """Update the seed's DERIVED browser version in place — no reseed, no .bak,
+    no change to the handset. See ig_identity.refresh_web_browser for why that
+    distinction is the whole point.
+
+    Called at a SIGN-IN only, never in a collection pass: ig_identity's
+    chrome_major() shells out to the browser binary and can take tens of
+    seconds. Returns the seed now in force (unchanged when there was nothing to
+    do), so callers can use it directly."""
+    dev = load_device(label, root)
+    fresh = ig_identity.refresh_web_browser(dev, chrome=chrome)
+    if not fresh:
+        return dev
+    path = device_path(label, root)
+    data = _read_sidecar(path) or {"label": label, "created": _now()}
+    data["device"] = fresh
+    data["browser_refreshed"] = _now()
+    _write_sidecar(path, data)
+    was = (dev.get("identity") or {}).get("chrome_major") or "?"
+    log(f"[ig] '{label}': web browser version {was} -> "
+        f"{fresh['identity']['chrome_major']}. The handset is UNCHANGED — this "
+        f"is a derived field, not an identifier, and a UA frozen a Chrome "
+        f"release behind the engine rendering it is its own flag.")
+    return fresh
+
+
 def _splice_device(settings: dict, device: dict) -> dict:
     """Lay the seed over a settings dict. The seed wins; nulls in it do not."""
     out = dict(settings or {})
@@ -296,12 +324,13 @@ def persist(cl, username: str, *, label: str = "ig_a", proxy: str = "",
         # different exit has something to say (the "one steady IP" rule now
         # has a number to check against).
         meta["exit"] = dict(exit)
-    payload = {"meta": meta, "settings": settings}
-    path.write_text(json.dumps(payload, indent=2))
-    try:
-        path.chmod(0o600)   # holds live session cookies
-    except OSError:
-        pass
+    # A sign-in must not throw away the exit history a pass has been keeping;
+    # meta["exit"] stays "where this session was MINTED", meta["exits"] stays
+    # "where it has been leaving from since" (see touch()).
+    prior = (_read_sidecar(path).get("meta") or {})
+    if prior.get("exits"):
+        meta["exits"] = prior["exits"]
+    _write_sidecar(path, {"meta": meta, "settings": settings})
     log(f"[ig] saved reusable session -> {path}")
 
     cookies = (settings.get("cookies") or {})
@@ -315,6 +344,186 @@ def persist(cl, username: str, *, label: str = "ig_a", proxy: str = "",
     )
     with ig.Store(Path(root) / store_path) as st:
         st.save(sess, label=label, proxy=proxy or "", active=True)
+
+
+# --------------------------------------------------------------------------
+# the sidecar file itself
+# --------------------------------------------------------------------------
+
+def _read_sidecar(path: Path) -> dict:
+    """The sidecar as a dict, or {} if it is missing or unreadable. Never
+    raises: a corrupt sidecar is a session to re-mint, not a crash."""
+    try:
+        return json.loads(Path(path).read_text()) or {}
+    except (OSError, ValueError):
+        return {}
+
+
+def _write_sidecar(path: Path, payload: dict) -> None:
+    """Write the sidecar ATOMICALLY, then chmod it.
+
+    It used to be written only at a sign-in, a handful of times in an account's
+    life. touch() now writes it at the end of every pass, so the window in
+    which a crash could leave a half-written file is opened hundreds of times
+    more often — and a half-written sidecar is an account that cannot start.
+    Write to a temp file beside it and rename; rename is atomic on POSIX."""
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(path.name + ".tmp")
+    tmp.write_text(json.dumps(payload, indent=2))
+    try:
+        tmp.chmod(0o600)        # holds live session cookies
+    except OSError:
+        pass
+    tmp.replace(path)
+
+
+# How many exit samples to keep, and how long between them. The sample costs
+# three requests to THIRD PARTIES (ipify, ipapi, instagram.com's front page) —
+# never to Instagram's API — so it is bounded to roughly one a day per account
+# rather than run per pass (IG4: one extra request per pass buys nothing).
+EXIT_HISTORY = 30
+EXIT_SAMPLE_H = 20.0
+
+
+def touch(cl, username: str, *, root: Path | str = ".", exit: dict | None = None,
+          log=lambda m: None) -> bool:
+    """
+    Write the SESSION half of the sidecar back after a pass. This is NOT a login.
+
+    WHY THIS EXISTS (2026-09-12). persist() is called from the three sign-in
+    doors and nowhere else, so everything a collection pass learned was dropped
+    on the floor when the pass ended. Two things in particular:
+
+      * `ig_www_claim`. Instagram returns a value in the `x-ig-set-www-claim`
+        response header and expects the client to echo it back as the
+        `X-IG-WWW-Claim` request header on every following call, starting from
+        the literal string "0" if it has never been given one. instagrapi
+        implements that and keeps the value in settings. With no write-back,
+        the claim restored at the start of every pass is the one minted at the
+        last SIGN-IN — frozen at a login timestamp and re-presented for weeks,
+        while a real client's claim advances on every round trip. The session
+        was coherent the day it was made and decayed from there.
+      * `mid`, and the rest of the cookie jar, which drift the same way.
+
+    WHAT IT DELIBERATELY DOES NOT DO.
+      * `save_device()`. The seed is written once and read forever; a
+        collection pass must never be able to change the handset. That is the
+        rule ensure_device exists to hold, and this function must not be the
+        hole in it.
+      * `ig.Store.save()`. That row's `active` column is the ROSTER, and save()
+        sets it True. A pass that quietly un-benched an account would undo an
+        operator's decision.
+      * any network call. `exit`, when given, is a proxy_check the CALLER
+        already paid for (see exit_due).
+
+    SAFETY. It refuses to write a settings dict with no `sessionid` cookie. A
+    client that died before its first request hands back an empty jar, and
+    writing that over a good sidecar would destroy the very session this
+    function exists to preserve. Returns True when it wrote.
+    """
+    path = sidecar_path(username, root)
+    if not path.exists():
+        return False            # nothing to touch; a sign-in writes it first
+    try:
+        settings = cl.get_settings() or {}
+    except Exception as e:
+        log(f"[ig] @{username}: could not read the live settings "
+            f"({type(e).__name__}) — sidecar left alone")
+        return False
+    if not (settings.get("cookies") or {}).get("sessionid"):
+        log(f"[ig] @{username}: the live client has no sessionid — sidecar "
+            f"left alone (refusing to overwrite a good session with an empty one)")
+        return False
+
+    data = _read_sidecar(path)
+    if not data:
+        log(f"[ig] @{username}: sidecar unreadable — left alone")
+        return False
+    meta = dict(data.get("meta") or {})
+    # The seed stays authoritative over anything the session picked up, exactly
+    # as it is on the reuse path (new_client).
+    settings = _splice_device(settings, load_device(meta.get("label") or "ig_a", root))
+    meta["touched"] = _now()
+    if exit:
+        hist = list(meta.get("exits") or [])
+        hist.append({"ip": exit.get("exit_ip") or "", "country": exit.get("country") or "",
+                     "at": exit.get("checked") or _now()})
+        meta["exits"] = hist[-EXIT_HISTORY:]
+    try:
+        _write_sidecar(path, {"meta": meta, "settings": settings})
+    except OSError as e:
+        log(f"[ig] @{username}: could not write the sidecar ({type(e).__name__}) — "
+            f"the session is still good in memory, it just did not persist")
+        return False
+    return True
+
+
+def exit_due(username: str, root: Path | str = ".", *, every_h: float = EXIT_SAMPLE_H,
+             now: float | None = None) -> bool:
+    """Is this account due an exit sample? True when the last one is older than
+    `every_h` (or there has never been one). The caller runs proxy_check and
+    hands the result to touch(); nothing here touches the network."""
+    meta = (_read_sidecar(sidecar_path(username, root)).get("meta") or {})
+    hist = meta.get("exits") or []
+    if not hist:
+        return True
+    last = hist[-1].get("at") or ""
+    try:
+        # _now() formats gmtime, so it must be read back as UTC. mktime() would
+        # read it as local and put every sample 5h30m out on this project's
+        # servers — enough to make a fresh sample look stale, or a stale one
+        # look fresh, depending on the sign.
+        when = calendar.timegm(time.strptime(last, "%Y-%m-%dT%H:%M:%S"))
+    except (ValueError, TypeError):
+        return True
+    return ((now or time.time()) - when) >= every_h * 3600.0
+
+
+def sample_exit(username: str, root: Path | str = ".", *,
+                every_h: float = EXIT_SAMPLE_H, log=lambda m: None) -> dict | None:
+    """One exit check for this account, at most once per `every_h`.
+
+    BLOCKING (three third-party HTTP requests). An async caller must run it in
+    a thread. Returns the proxy_check result to hand to touch(), or None when
+    it is not due, there is no proxy on file, or the check itself failed —
+    none of which is a collection failure and none of which is worth a word.
+
+    It deliberately does NOT decide anything. A dead exit found here is not
+    raised as proxy_broken: the pass's own requests are the honest test of
+    whether the pipe works, and this check is only ever a witness."""
+    if not exit_due(username, root, every_h=every_h):
+        return None
+    meta = (_read_sidecar(sidecar_path(username, root)).get("meta") or {})
+    proxy = meta.get("proxy") or ""
+    if not proxy:
+        return None
+    try:
+        chk = proxy_check(proxy, expect_country=ig_identity.MARKET["country"])
+    except Exception as e:
+        log(f"[ig] @{username}: exit sample failed ({type(e).__name__}) — not a "
+            f"collection failure, the pass decides on its own requests")
+        return None
+    return chk if chk.get("exit_ip") else None
+
+
+def exit_summary(username: str, root: Path | str = ".") -> dict:
+    """Turns "is this account's IP moving?" from a suspicion into a number.
+
+    RULEBOOK 6 says one account : one steady residential IP, forever. Until now
+    the only evidence for that was meta["exit"], recorded once at sign-in — so a
+    proxy that rotated under us was invisible until Instagram said something.
+    `distinct` is the count that matters: 1 is the rule being kept; anything
+    else is a rotating exit, whatever the vendor calls the product."""
+    meta = (_read_sidecar(sidecar_path(username, root)).get("meta") or {})
+    hist = meta.get("exits") or []
+    ips = [h.get("ip") for h in hist if h.get("ip")]
+    countries = sorted({h.get("country") for h in hist if h.get("country")})
+    return {"samples": len(hist), "distinct": len(set(ips)),
+            "ips": sorted(set(ips)), "countries": countries,
+            "last": (ips[-1] if ips else ""),
+            "since": (hist[0].get("at") if hist else ""),
+            "minted_at": (meta.get("exit") or {}).get("exit_ip") or ""}
 
 
 # --------------------------------------------------------------------------

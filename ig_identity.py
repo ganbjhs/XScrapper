@@ -370,6 +370,42 @@ def cdp_user_agent_metadata(device: dict) -> dict:
     }
 
 
+def refresh_web_browser(device: dict, *, chrome=None) -> dict | None:
+    """Bring the DERIVED browser version on an EXISTING seed up to the binary
+    this machine actually has, touching nothing that identifies the account.
+
+    WHY THIS IS SAFE WHERE A RESEED IS NOT. `uuids` and `device_settings` ARE
+    the identity: Instagram has seen them, they are what "the same handset"
+    means, and they must never move outside a deliberate reseed. The Chrome
+    major is not an identifier. It is a fact about the browser that will render
+    the sign-in window, and on a real phone Chrome updates itself every few
+    weeks without the handset changing at all.
+
+    THE BUG THIS CLOSES (CHECKPOINT 2026-09-06, filed under "leave it"): seeds
+    minted before Chromium 151 was installed still carry `chrome_major: 140`,
+    the env fallback. So `web_headers`, `playwright_kwargs` and
+    `cdp_user_agent_metadata` all say 140 — in the UA string and in every
+    Client Hint — while the engine actually rendering the page is 151. The
+    string and the thing behind it disagree, which is precisely the incoherence
+    this module exists to prevent, and a frozen browser version across a Chrome
+    release cycle is a stranger signal than a version that moves.
+
+    Returns a NEW device dict when the major moved, None when there is nothing
+    to do (unchanged, or a legacy seed with no identity block — that wants a
+    reseed, not a bump).
+    """
+    if not device or not device.get("identity"):
+        return None
+    now = str(chrome or chrome_major())
+    was = str((device.get("identity") or {}).get("chrome_major") or "")
+    if not now.isdigit() or now == was:
+        return None
+    out = dict(device)
+    out["identity"] = dict(device["identity"], chrome_major=now)
+    out["web_user_agent"] = WEB_UA.format(major=now)
+    return out
+
+
 def stable_offset(username: str, span_h: float = 1.5) -> float:
     """A per-account shift, in hours, for the active-hours window: derived
     from the handle so it is the same every day (a person's habits) and

@@ -375,6 +375,13 @@ class InteractiveLogin:
             dev = ig_session.reseed(self.ig_label, self.root,
                                     why="legacy default phone; the browser "
                                         "sign-in mints the real one", log=log)
+        else:
+            # Same handset, current browser. The window about to render is
+            # whatever Chromium this machine has; the UA and Client Hints it
+            # announces must be that one, not the major that happened to be
+            # installed when the seed was minted.
+            dev = ig_session.refresh_browser_version(self.ig_label, self.root,
+                                                     log=log) or dev
         self.device = dev
         kw = ig_identity.playwright_kwargs(dev)
         self.viewport = dict(kw["viewport"])
