@@ -10,11 +10,15 @@ replay just that call directly, no browser, X-style.
 
 Run on the SERVER. Test TWICE:
   1) with the proxy (env WEBSHARE_USER set) — through residential IP
+  # NOTE: a real Webshare username and password were committed here in
+  # plaintext (2026-08) and are in git history, so that credential is
+  # burned whatever this file says now. Rotate it in Webshare; never
+  # paste another one into a tracked file. RULEBOOK 5.
   2) with no proxy (unset WEBSHARE_USER) — to see if a logged-in session works
      straight from the server's own big bandwidth, freeing the 1 GB pool
 
   export FB_C_USER=...  FB_XS='...'
-  export WEBSHARE_USER=moflqejy-in-1 WEBSHARE_PASS=jx9i38zp6za3   # run 1
+  export WEBSHARE_USER=<your-webshare-user>-in-1 WEBSHARE_PASS=<your-webshare-pass>   # run 1
   python3 fb_data_probe.py narendramodi
   unset WEBSHARE_USER                                            # run 2
   python3 fb_data_probe.py narendramodi

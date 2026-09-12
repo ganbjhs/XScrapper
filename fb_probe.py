@@ -10,8 +10,12 @@ engine_fb. Blocks images / video / fonts so a render costs far less bandwidth.
 Nothing in the live system imports this; it is a throwaway probe.
 
 Usage (on the server):
-  export WEBSHARE_USER=moflqejy-in-1
-  export WEBSHARE_PASS=jx9i38zp6za3
+  export WEBSHARE_USER=<your-webshare-user>-in-1
+  # NOTE: a real Webshare username and password were committed here in
+  # plaintext (2026-08) and are in git history, so that credential is
+  # burned whatever this file says now. Rotate it in Webshare; never
+  # paste another one into a tracked file. RULEBOOK 5.
+  export WEBSHARE_PASS=<your-webshare-pass>
   export FB_C_USER=61552330170395
   export FB_XS='5%3A...the xs value...'
   python3 fb_probe.py narendramodi
