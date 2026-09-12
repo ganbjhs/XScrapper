@@ -12,6 +12,7 @@ import Alerts from "./views/Alerts.jsx";
 import Delivery from "./views/Delivery.jsx";
 import Activity from "./views/Activity.jsx";
 import Accounts from "./views/Accounts.jsx";
+import Settings from "./views/Settings.jsx";
 import Guard from "./views/Guard.jsx";
 import StressTest from "./views/StressTest.jsx";
 
@@ -264,6 +265,7 @@ function Nav({ open, close }) {
       <div className="nav-label">GLOBAL</div>
       {item("/accounts", "accounts", "Accounts & Sessions")}
       {item("/guard", "guard", "Guard")}
+      {item("/settings", "settings", "Settings")}
       {item("/stress", "stress", "Stress Test")}
 
       <div className="nav-foot">
@@ -318,6 +320,7 @@ export default function App() {
             <Route path="/activity" element={<Activity onMenu={() => setNavOpen(true)} />} />
             <Route path="/accounts" element={<Accounts onMenu={() => setNavOpen(true)} />} />
             <Route path="/guard" element={<Guard onMenu={() => setNavOpen(true)} />} />
+            <Route path="/settings" element={<Settings onMenu={() => setNavOpen(true)} />} />
             <Route path="/stress" element={<StressTest onMenu={() => setNavOpen(true)} />} />
             <Route path="*" element={<Navigate to="/feed" replace />} />
           </Routes>

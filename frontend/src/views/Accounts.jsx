@@ -792,10 +792,14 @@ function PlatformSection({ platform, title, summary, accounts, orphans, liveFor,
         </div>
       )}
 
+      {/* A thin pool is worth knowing and is not an incident. It was a
+          banner-crit (a red bar, full width, every page load) for a platform
+          that might not even be in use this week — which is most of what made
+          this page feel like it was shouting. One muted line, in place. */}
       {summary.low && accounts.length > 0 && (
-        <div className="banner-crit" style={{ borderLeftColor: "var(--warning)" }}>
-          <b style={{ color: "var(--warn-text)" }}>Pool low.</b> Only {summary.backups} backup
-          {summary.backups === 1 ? "" : "s"} left for {title} — add another so a ban never causes an outage.
+        <div style={{ color: "var(--ink-3)", fontSize: 12.5, margin: "-2px 0 10px", lineHeight: 1.5 }}>
+          Pool is thin — {summary.backups} warm backup{summary.backups === 1 ? "" : "s"} for {title}.
+          Add another so a ban never causes an outage.
         </div>
       )}
 
@@ -973,75 +977,28 @@ function FixCard({ c, focus, accounts, onAdopt, onChanged, onSignin }) {
   );
 }
 
-// The pager: which bot pages the admin, to which chat, and a test button.
-// One line when it is set up; the fields open only when asked. The token is
-// written to .env on the server and never shown back (the id before the colon
-// is enough to tell two bots apart).
-function PagerBox({ pager, onChanged }) {
-  const [open, setOpen] = useState(false);
-  const [token, setToken] = useState("");
-  const [chat, setChat] = useState("");
-  const [name, setName] = useState("");
-  const [msg, setMsg] = useState("");
-  const [busy, setBusy] = useState(false);
-  if (!pager) return null;
-
-  const run = async (fn, okText) => {
-    setBusy(true); setMsg("…");
-    try {
-      const r = await fn();
-      if (r.error) setMsg(r.error);
-      else { setMsg(okText(r)); setToken(""); onChanged(); }
-    } catch (e) { setMsg(String(e.message || e)); }
-    setBusy(false);
-  };
-  const save = () => run(() => api.pagerSave({ token, chat_id: chat, name }),
-    (r) => `saved${r.found ? " · " + r.found : ""}`);
-  const test = () => run(() => api.pagerTest(), () => "sent — check Telegram");
-
-  const line = pager.ready
-    ? `pages ${pager.admin}${pager.admin_chat ? ` (chat ${pager.admin_chat})` : ""} via `
-      + (pager.own_bot ? `the admin bot ${pager.token_hint}…` : `the delivery bot (no admin bot set)`)
-    : pager.has_token ? "bot set, no admin chat id — press Start on the bot in Telegram, then Send test"
-    : "not set — nobody is paged when an account needs a human";
-
-  return (
-    <div className={pager.ready && pager.own_bot ? "banner-ok" : "banner-warn"}
-         style={{ marginBottom: 12, display: "flex", flexDirection: "column", gap: 8 }}>
-      <div style={{ display: "flex", gap: 10, alignItems: "center", flexWrap: "wrap" }}>
-        <b>Pager</b>
-        <span style={{ flex: 1 }}>{line}</span>
-        <button className="btn btn-ghost" disabled={busy || !pager.has_token} onClick={test}>Send test</button>
-        <button className="btn btn-ghost" disabled={busy} onClick={() => setOpen((v) => !v)}>
-          {open ? "Close" : pager.has_token ? "Change" : "Set up"}
-        </button>
-      </div>
-      {open && (
-        <div style={{ display: "flex", gap: 8, flexWrap: "wrap", alignItems: "flex-end" }}>
-          <div className="field" style={{ flex: "2 1 280px", margin: 0 }}>
-            <label>Admin bot token (from @BotFather — the “Vedic Scraper Admin” bot)</label>
-            <input value={token} onChange={(e) => setToken(e.target.value)} placeholder="123456789:AAH…" />
-          </div>
-          <div className="field" style={{ flex: "1 1 160px", margin: 0 }}>
-            <label>Your chat id (blank = read from the bot after you press Start)</label>
-            <input value={chat} onChange={(e) => setChat(e.target.value)} placeholder={pager.admin_chat || "auto"} />
-          </div>
-          <div className="field" style={{ flex: "1 1 120px", margin: 0 }}>
-            <label>Your name</label>
-            <input value={name} onChange={(e) => setName(e.target.value)} placeholder={pager.admin || "Admin"} />
-          </div>
-          <button className="btn" disabled={busy || (!token && !chat && !name)} onClick={save}>Save</button>
-        </div>
-      )}
-      {msg && <div style={{ fontSize: 12.5, color: "var(--ink-3)" }}>{msg}</div>}
-    </div>
-  );
-}
-
+// "Needs attention" means A HUMAN IS NEEDED — nothing else (2026-09-12).
+//
+// It used to mean "the decider has any open condition at all", and its own
+// subtitle admitted it: "N need you · M self-healing". So a rate limit that
+// clears itself in fifteen minutes, or a proxy exit that the pool will replace
+// on the next request, raised a heading that reads as an alarm. The operator's
+// complaint was exactly this: popups saying attention is needed when nothing
+// critical is happening.
+//
+// Now: conditions that need a human get the heading and the cards. Conditions
+// that heal themselves get ONE muted line, collapsed, because they are worth
+// being able to see and not worth being told. A condition the pager pinged
+// about is always a needs-human one by construction (Rule.needs_human), so the
+// ?fix= link still lands on an open card.
 function FixPanel({ conds, focusId, accounts, onAdopt, onChanged, telegram }) {
   const [signin, setSignin] = useState(null);
+  const [showSelf, setShowSelf] = useState(false);
   if (!conds) return null;
   const list = conds.conditions || [];
+  // A focused (linked-to) condition is always shown, whatever its kind.
+  const mine = list.filter((c) => c.needs_human || c.id === focusId);
+  const selfHealing = list.filter((c) => !(c.needs_human || c.id === focusId));
   return (
     <>
       {list.length === 0 && focusId && (
@@ -1049,19 +1006,39 @@ function FixPanel({ conds, focusId, accounts, onAdopt, onChanged, telegram }) {
           <b>Already closed.</b> The condition you were pinged about ({focusId}) is no longer open — it recovered or was fixed.
         </div>
       )}
-      {list.length > 0 && (
+      {mine.length > 0 && (
         <div style={{ marginBottom: 14 }}>
           <div className="feed-head" style={{ marginTop: 6 }}>
             <h2>Needs attention</h2>
             <span className="right" style={{ fontSize: 12.5, color: "var(--ink-3)" }}>
-              {list.filter((c) => c.needs_human).length} need you · {list.filter((c) => !c.needs_human).length} self-healing
-              {!telegram && " · nobody is paged — set the admin bot above"}
+              {mine.length} waiting on you
+              {!telegram && " · nobody is paged — set the admin bot in Settings"}
             </span>
           </div>
-          {list.map((c) => (
+          {mine.map((c) => (
             <FixCard key={c.id} c={c} focus={c.id === focusId} accounts={accounts}
                      onAdopt={onAdopt} onChanged={onChanged} onSignin={setSignin} />
           ))}
+        </div>
+      )}
+      {selfHealing.length > 0 && (
+        <div style={{ marginBottom: 12, fontSize: 12.5, color: "var(--ink-3)", lineHeight: 1.6 }}>
+          {selfHealing.length === 1
+            ? "1 condition is clearing itself"
+            : `${selfHealing.length} conditions are clearing themselves`}{" ("}
+          {selfHealing.map((c) => c.kind).filter((k, i, a) => a.indexOf(k) === i).join(", ")}
+          {") — the collector is backing off and nothing is needed from you. "}
+          <button className="btn btn-ghost btn-sm" onClick={() => setShowSelf((v) => !v)}>
+            {showSelf ? "Hide" : "Show anyway"}
+          </button>
+          {showSelf && (
+            <div style={{ marginTop: 8 }}>
+              {selfHealing.map((c) => (
+                <FixCard key={c.id} c={c} focus={false} accounts={accounts}
+                         onAdopt={onAdopt} onChanged={onChanged} onSignin={setSignin} />
+              ))}
+            </div>
+          )}
         </div>
       )}
       {signin && <SignInModal a={signin} onDone={onChanged} onClose={() => setSignin(null)} />}
@@ -1194,7 +1171,6 @@ export default function Accounts({ onMenu }) {
         </div>
       )}
 
-      <PagerBox pager={conds.data?.pager} onChanged={reload} />
       <FixPanel conds={conds.data} focusId={focusId} accounts={accounts}
                 telegram={!!conds.data?.telegram}
                 onAdopt={(initial) => setAdding(initial)} onChanged={reload} />
@@ -1225,10 +1201,20 @@ export default function Accounts({ onMenu }) {
               <div className="v">{backups}</div>
               <div className="d">take over on ban or checkpoint</div>
             </div>
+            {/* One tile, one meaning. It used to swap its own label and go red
+                whenever ANY account was needs_login / quarantined / dead — so a
+                burner retired weeks ago kept the page looking alarmed, and the
+                number under "Signed-in sessions" was sometimes not sessions at
+                all. Sessions is the number you read daily; anything waiting on
+                a human is said underneath, in words, only when it is true. */}
             <div className="stat">
-              <div className="k">{attention ? "Needs attention" : "Signed-in sessions"}</div>
-              <div className={`v ${attention ? "st-crit" : ""}`}>{attention || liveOn}</div>
-              <div className="d">{attention ? "needs login / quarantined / dead" : "live right now"}</div>
+              <div className="k">Signed-in sessions</div>
+              <div className="v">{liveOn}</div>
+              <div className={`d ${attention ? "st-warn" : ""}`}>
+                {attention
+                  ? `live right now · ${attention} account${attention === 1 ? "" : "s"} need a login`
+                  : "live right now"}
+              </div>
             </div>
           </div>
         );

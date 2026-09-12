@@ -687,6 +687,46 @@ Test: `test_platform_urls`.
   not the Telegram-token rule (one global value), because there is one token
   per sheet. `/exec` URLs are addresses and are stored; tokens are not.
 
+### The dashboard is a working surface, not a status board (2026-09-12)
+
+The operator reads these pages daily to answer one question per page. Anything
+that does not help answer that question is costing attention, and attention is
+the scarcest thing here — a page that shouts constantly trains the operator to
+stop reading it, and then to go poking at production to find out what is
+actually happening. That is not hypothetical: it is how a second Instagram
+session got opened on a live account (§6, "never signed in twice").
+
+- **"Needs attention" means A HUMAN IS NEEDED, and nothing else.** It used to
+  mean "the decider has any open condition", and its own subtitle admitted it:
+  "N need you · M self-healing". A rate limit that clears in fifteen minutes,
+  or a proxy exit the pool will replace on the next request, raised a heading
+  that reads as an alarm. Now conditions with `needs_human` get the heading and
+  the cards; the rest get one muted line that can be expanded on request. The
+  `?fix=` link from a ping always lands on an open card, because a condition
+  that pages is a `needs_human` one by construction.
+- **A banner is for something wrong RIGHT NOW.** Configuration, and facts that
+  are merely worth knowing, are not banners. "Pool low" was a red full-width
+  bar on every page load for a platform that might not be in use that week; it
+  is a muted line in place. `ACCOUNTS_SECRET_KEY` missing IS a banner — nothing
+  can be stored safely until it is fixed.
+- **A tile means one thing and keeps meaning it.** The sessions tile used to
+  swap its own label and go red whenever any account was needs_login /
+  quarantined / dead, so a burner retired weeks ago kept the page looking
+  alarmed, and the number printed under "Signed-in sessions" was sometimes not
+  sessions at all. One label, one number, and anything waiting on a human said
+  underneath in words.
+- **Admin configuration lives in Settings (`/settings`), not on the working
+  pages.** The pager — which bot messages whom — was a permanent amber banner
+  at the top of Accounts, because "amber unless a dedicated admin bot is set"
+  is its resting state. Set-once-a-quarter configuration does not belong above
+  the thing you read every day. Settings holds the pager, the secret-storage
+  status, and the system panel that `/api/ig/diag` had been serving to nobody
+  since it was written. Per-project wiring stays in Watchlists → Network &
+  settings; risk findings stay in Guard.
+- **`frontend/dist` is committed and the VPS runs no Node**, so a UI change
+  that is not rebuilt does not ship. `cd frontend && npm run build`, and check
+  that `dist/index.html` names the assets that are actually in `dist/assets`.
+
 ## 5. Security rules
 
 - **Secrets live in `.env` / `config.toml` and are git-ignored. Never commit a

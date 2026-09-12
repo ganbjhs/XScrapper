@@ -19,6 +19,78 @@ must respect belongs in the rulebook, not here.
 
 ---
 
+## 2026-09-12 (III) — Settings gets a home; Accounts stops shouting
+
+**Changed**
+
+- `frontend/src/views/Settings.jsx` (new) — `/settings`, under GLOBAL in the
+  nav. Three panels: **Pager** (moved off Accounts, now a panel rather than a
+  permanent banner, and it says that a ping which reads "Browser: no" means
+  there is nothing to clear), **Secret storage** (`ACCOUNTS_SECRET_KEY` state),
+  and **System** — build rev, instagrapi version, systemd units, whether
+  collection is paused, whether a pass is running, the loop heartbeat. That
+  last panel is `/api/ig/diag`, which has existed since 2026-09-04 with no UI
+  at all: the only way to read it was curl.
+- `frontend/src/views/Accounts.jsx` — `PagerBox` deleted (it lives in Settings).
+  `FixPanel` splits `needs_human` from self-healing: the first gets the "Needs
+  attention" heading and the cards, the second gets one muted line with a "Show
+  anyway" toggle. The sessions tile stops swapping its own label and going red.
+  "Pool low" drops from `banner-crit` to a muted line. The "nobody is paged"
+  hint points at Settings instead of "above".
+- `frontend/src/App.jsx`, `frontend/src/components/ui.jsx` — the route, the nav
+  item, a gear icon.
+- `frontend/dist` — rebuilt (`index-B65t0QUP.js`).
+- `RULEBOOK.md` §4 — a new "The dashboard is a working surface, not a status
+  board" subsection: five rules, including what a banner is for and where admin
+  configuration lives.
+
+**Why**
+
+The operator: *"remove the unnecessary popups like needs attention without
+having any critical issues"*, *"move the pager system ... to a new section
+called settings where all admin settings live"*, *"make accounts section
+clean"*.
+
+Reading /app/accounts, three things were shouting with nothing wrong: the
+pager's amber banner (amber is its resting state until a dedicated admin bot
+is configured), a "Needs attention" heading raised by any open condition at
+all including the self-healing ones, and a red "Pool low" bar for Facebook,
+which is not in use this week. The stats tile compounded it by relabelling
+itself and turning red for any needs_login / quarantined / **dead** account —
+so a burner retired weeks ago kept the page looking alarmed.
+
+This is the same thread as (II): a surface that shouts constantly gets
+ignored, and then the operator goes poking at production to find out what is
+really happening — which is how a second live session got opened on an
+Instagram account.
+
+**Verified**
+
+`npm run build` clean (vite 5, 51 modules) and `dist/index.html` names exactly
+the two assets in `dist/assets`. Python suite untouched by this commit and
+still green at 1,447.
+
+**NOT verified — say so plainly**
+
+The rendered page was not loaded. The Chrome extension was not connected this
+session and the dashboard needs its own login, so this is a build-and-review
+change, not a tested-in-browser one. What to look at on first load:
+`/settings` renders all three panels; Accounts shows no amber pager bar; with a
+`proxy_flaky` open, Accounts shows the muted "1 condition is clearing itself"
+line and NO "Needs attention" heading.
+
+**Still open**
+
+- The `st-good` / `st-warn` / `st-crit` classes exist; there is no `st-ok`
+  (Settings originally used it and was corrected). Worth a pass to make the
+  status-colour names consistent.
+- Deletion inside `frontend/` is refused over the desktop bridge even with the
+  session grant, so vite cannot empty `dist/`. Built to a path outside the
+  mount and copied in; the stale asset was moved to `_to_delete/`. A local
+  `npm run build` does this cleanly.
+
+---
+
 ## 2026-09-12 (II) — the pager stops crying wolf, and the browser door stops making a second session
 
 **Changed**
