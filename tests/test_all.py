@@ -4035,7 +4035,7 @@ def test_ig_stop_stands(tmp):
     2026-09-06, 12:52:30 on the live server: @shoaibakhtar4915 read four
     sources, the fifth died on the proxy (502), the decider said BACKOFF 30m
     and paged the admin — and one second later the end-of-pass ok() closed
-    the condition ("recovered from 'proxy_broken' after 0s"), paged the admin
+    the condition ("recovered from 'proxy_flaky' after 0s"), paged the admin
     AGAIN and cancelled the backoff. A STOP decision made in a pass stands
     at the end of that pass. And the stores the web server reads while a
     collector writes are WAL, so "database is locked" (14:42 the same day)
@@ -4097,11 +4097,12 @@ def test_ig_stop_stands(tmp):
             n = asyncio.run(collect_ig.run_once(rp, dec=dec, log=lines.append, accounts_path=ap, root=tmp))
             ok(reads == ["A", "B"] and n == 1, f"A read fine, B died on the proxy, C was left for later ({reads}, new={n})")
             oc = dec.open_conditions()
-            ok([c["kind"] for c in oc] == ["proxy_broken"], f"the proxy condition is STILL open after the pass: {[c['kind'] for c in oc]}")
+            ok([c["kind"] for c in oc] == ["proxy_flaky"], f"the proxy condition is STILL open after the pass: {[c['kind'] for c in oc]}")
             ok(dec.account_wait("sana") > 0, f"and the account rests (backoff {dec.account_wait('sana')}s) instead of being knocked on next pass")
-            ok(len(sent) == 1 and "recovered" not in sent[0] and "reaches Instagram" in sent[0],
-               f"ONE ping, the proxy one — no 'recovered after 0s' ({len(sent)}): {sent}")
-            ok(not any("recovered from 'proxy_broken'" in l for l in lines), "and no 'recovered' line in the log")
+            ok(len(sent) == 0,
+               f"NO ping: a dead exit that usually heals itself is not news until it has "
+               f"lasted 2h — this is the ~100-pings-a-day fix ({len(sent)}): {sent}")
+            ok(not any("recovered from 'proxy_flaky'" in l for l in lines), "and no 'recovered' line in the log")
     finally:
         os.chdir(cwd)
 
@@ -5146,11 +5147,15 @@ def test_pager(tmp):
         from instagrapi.exceptions import ClientConnectionError
         d = collect_ig._decide_exc(dec4, "yn", grp, ClientConnectionError("ConnectionError: Max retries exceeded (Caused by ProxyError(...))"),
                                    fallback="pass_error", log=lines.append, src=grp[2])
-        ok(d.kind == "proxy_broken" and d.count == 2 and d.wait_s == 60 * 60,
-           f"a post-read connection error is the same condition, doubling: {d.kind} #{d.count} {d.wait_s}s")
+        ok(d.kind == "proxy_flaky" and d.action == "backoff" and d.wait_s == 30 * 60,
+           f"a DEAD pipe is a different condition from an INTERCEPTING one — same "
+           f"stop, same backoff, different audience: {d.kind} {d.action} {d.wait_s}s")
+        ok(d.stop_account, "and it stops the account just the same: one more request is the same dead pipe")
+        ok(len(sent) == 1, f"still only the ONE ping from the TLS condition — the flaky one says nothing yet: {len(sent)}")
         sent.clear(); dec4.ok("yn")
-        ok(dec4.open_conditions() == [] and len(sent) == 1 and "recovered" in sent[0],
-           "a pass that gets through closes it and tells the admin")
+        ok(dec4.open_conditions() == [] and len(sent) == 0,
+           "a pass that gets through closes it in SILENCE: an exit that healed "
+           "itself is not a story the phone needed the start or the end of")
 
         # a non-checkpoint exception does not fail over
         with ig.Store("ig_accounts.db") as st:
@@ -5190,18 +5195,30 @@ def test_pager_quiet(tmp):
     dec.on("", account="youssefnasser168", exc=ChallengeRequired("Manual verification required via Instagram native challenge flow. This checkpoint is not handled by challenge_code_handler…"),
            meta={"sources": ["A"], "note": "Collection failed over to @sanaakhtar221; sources pinned to @youssefnasser168 wait."})
     t = sent[0].split("\n")
-    ok(len(t) == 5, f"five lines, not a paragraph ({len(t)}): {sent[0]!r}")
+    ok(len(t) == 6, f"six lines, not a paragraph ({len(t)}): {sent[0]!r}")
     ok(t[0] == "🔴 IG @youssefnasser168 — CHECKPOINT — out of rotation, nothing knocks on it",
        f"line 1: emoji, platform, account, the condition: {t[0]!r}")
     ok(t[1].startswith("Do: Accounts & Sessions → @youssefnasser168 → Sign in → Open this account's browser"),
        f"line 2 is the first move: {t[1]!r}")
     ok(t[2] == "Now: Collection failed over to @sanaakhtar221; sources pinned to @youssefnasser168 wait.",
        "line 3 is what the collector already did")
-    ok(t[3] == "Fix → https://scraper.example.in/app/accounts?fix=instagram:youssefnasser168:checkpoint"
-       and t[4].startswith("Snooze 6h → ") and t[4].endswith("&snooze=6"), "lines 4-5 are the links")
+    ok(t[3] == "Browser: YES — open @youssefnasser168's browser and clear it.",
+       f"line 4 answers the ONLY question the operator actually has when a ping "
+       f"arrives, and the one that used to send them to look for themselves: {t[3]!r}")
+    ok(t[4] == "Fix → https://scraper.example.in/app/accounts?fix=instagram:youssefnasser168:checkpoint"
+       and t[5].startswith("Snooze 6h → ") and t[5].endswith("&snooze=6"), "lines 5-6 are the links")
     ok("Manual verification" not in sent[0] and "challenge_code_handler" not in sent[0],
        "Instagram's own paragraph stays on the Fix panel, not on the phone")
-    ok(len("\n".join(t[:3])) < 300, f"the words (before the links) fit in 300 characters ({len(chr(10).join(t[:3]))})")
+    sent.clear()
+    dec.on("session_missing", account="pat")
+    ok(any(l == "Browser: YES — open @pat's browser and clear it." for l in sent[0].split("\n")),
+       "a condition that needs a human says so")
+    sent.clear()
+    dec.on("proxy_broken", account="pat", detail="the exit intercepts HTTPS")
+    ok(any(l.startswith("Browser: no —") for l in sent[0].split("\n")),
+       "and one that does not says THAT, which is the line that keeps the "
+       "operator from opening a second session just to find out")
+    ok(len("\n".join(t[:4])) < 400, f"the words (before the links) still fit on a phone ({len(chr(10).join(t[:4]))})")
 
     print("== the same condition re-opening pages ONCE a day, however it re-opens ==")
     # the sign-in hook closes it quietly (a step of the fix, not its outcome)

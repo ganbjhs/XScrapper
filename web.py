@@ -4060,6 +4060,40 @@ def _login_start(label="", account_id=None):
 
         mod = _login_module(acct.platform)
 
+        # INSTAGRAM: never two live sessions on one account (2026-09-12).
+        # A collection pass holds a session open through instagrapi. Opening
+        # this window signs in AGAIN, in a real browser, on the same account —
+        # two clients, two TLS fingerprints, one account, at the same moment.
+        # That is what Instagram restricted @sanaakhtar221 for, in its own
+        # words on the Account Status page: "You couldn't create multiple
+        # sessions". PassLock already stops two PASSES colliding (2026-09-03,
+        # a Fetch-now on top of the loop earned a ChallengeRequired two
+        # minutes later); it was never consulted here, so the browser-vs-pass
+        # collision stayed open. Refuse, say when it will be free, and say
+        # the alternative — never make the operator guess.
+        if acct.platform == "instagram":
+            try:
+                import collect_ig
+                lk = collect_ig.PassLock(str(_CFG.root))
+                if not lk.acquire("login-door"):
+                    h = lk.holder() or {}
+                    since = int((time.time() - float(h.get("since") or time.time())) // 60)
+                    return {"error": (
+                        f"A collection pass is running right now "
+                        f"({h.get('who', '?')}, started {since}m ago), and that "
+                        f"pass already holds a live Instagram session. Opening "
+                        f"this window would put a SECOND session on the account "
+                        f"at the same time — which is exactly what Instagram "
+                        f"restricts accounts for. Wait for the pass to finish "
+                        f"(usually under a minute), or pause collection in "
+                        f"Watchlists → Network & settings, then try again.")}
+                lk.release()
+            except Exception as e:
+                # Never let the guard itself block a sign-in the operator
+                # needs; if the lock cannot be read, say so and continue.
+                print(f"[signin:{label}] pass-lock check skipped "
+                      f"({type(e).__name__}: {e})", flush=True)
+
         # CAPTURE the launch diagnostics. _launch reports which browser it
         # tried, which failed and why, and every one of those lines used to go
         # into a default `lambda m: None` — so "it works on my laptop but the

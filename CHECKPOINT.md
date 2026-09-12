@@ -19,6 +19,80 @@ must respect belongs in the rulebook, not here.
 
 ---
 
+## 2026-09-12 (II) — the pager stops crying wolf, and the browser door stops making a second session
+
+**Changed**
+
+- `decider.py` — `Rule` gains `tell_recovered` (page when this CLOSES?) and
+  `browser` (does a human need to open this account's browser?). New condition
+  `proxy_flaky`: the connection died before Instagram answered, which on a
+  rotating residential pool heals itself — backs off identically to
+  `proxy_broken` but escalates only after 2h and never announces its recovery.
+  `proxy_broken` keeps the TLS-interception half and still pages at once.
+  `rate_limited` also stops announcing recoveries. `_worth_telling` honours
+  `tell_recovered`; `_ping_text` adds the Browser line to every ping.
+  `Decision.stop_account` lists BOTH proxy kinds.
+- `collect_ig.py` — `_proxy_broken` picks the kind from `why`
+  (`tls_intercepted` → `proxy_broken`, `network` → `proxy_flaky`).
+- `web.py` — `_login_start` refuses to open an Instagram browser door while a
+  collection pass holds the PassLock, and says how long the pass has been
+  running and what to do instead. A lock that cannot be read never blocks a
+  sign-in.
+- `ig.py` — `InteractiveLogin._prove_exit`: the window asks an IP echo before
+  it touches Instagram and logs `WINDOW EXIT <ip>` — through the proxy, a
+  different exit from the collector's last, or (no proxy on file) the server's
+  own address.
+- `tests/test_all.py` — updated for the split and the silence; new checks that
+  a human-needed condition says `Browser: YES` and a self-healing one says
+  `Browser: no`.
+- `RULEBOOK.md` §6 — three rules (never two sessions on one account; the window
+  proves its exit; a ping only when a human must act).
+
+**Why**
+
+The operator's report, in their words: *"it pings me 100 times in a day so I
+have to check it once is everything okay or not — I didn't understand what it
+pings me again and again, that's the issue, nothing else"*, and *"I opened
+[the browser] to check what's happening, is there any challenge which I have
+to remove"*.
+
+That is one causal chain, not two complaints. The pager paged on every proxy
+flap and again on every recovery; none of it said whether a human was needed;
+so the only way to find out was to open the account's browser window — and
+that window is a SECOND live session on the account. Instagram then said so
+in its own words on @sanaakhtar221's Account Status page: "You couldn't create
+multiple sessions", ended 11 Sep.
+
+So the fix runs the whole chain: fewer pings (the self-healing half of
+`proxy_broken` now backs off in silence), every remaining ping answers the
+browser question in one line, and the door refuses to make the second session
+even if someone opens it anyway.
+
+**Verified**
+
+`tests/test_all.py` — **All checks passed (1,447)**, up from 1,442. The split
+caught a genuine regression on the way: `Decision.stop_account` had a hardcoded
+kind list, so the new `proxy_flaky` let a pass carry on through a dead exit,
+source after source. `test_ig_stop_stands` failed within the hour and it is
+fixed.
+
+**Still open**
+
+- Unmeasured against live traffic. The honest test is the operator's phone
+  over a day: the count should fall to a handful, and each survivor should end
+  in an action.
+- `_prove_exit` costs one extra page load per window open (~2s) and reaches a
+  third party (api.ipify.org) from the account's proxy. Cheap, but it is a
+  request the account did not make before.
+- The browser-vs-pass guard is machine-wide, not per-account, because
+  `PassLock` is. Correct but slightly blunt: a pass on OTHER accounts also
+  blocks the door. If that turns out to be annoying in practice, the lock
+  would need to carry which accounts a pass is touching.
+- `@shoaibakhtar4915` is still quarantined and the Facebook pool still shows
+  0 backups.
+
+---
+
 ## 2026-09-12 — Instagram: the session ages instead of being re-enacted; the proxy's rotation becomes a number
 
 **Changed**

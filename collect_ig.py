@@ -286,7 +286,22 @@ def ig_failover(quarantined: str, reason: str, *, store_path="ig_accounts.db",
 
 
 def _proxy_broken(dec, acct, group, e, why, *, log=print):
-    """One 'proxy_broken' condition on the ACCOUNT, naming the proxy.
+    """One condition on the ACCOUNT for a request that never reached
+    Instagram, naming the proxy. TWO kinds, because the two causes want
+    opposite handling (2026-09-12):
+
+      tls_intercepted -> 'proxy_broken'. The exit re-signs HTTPS. It never
+                         heals on its own and a person must change the exit,
+                         so it pages at once.
+      network         -> 'proxy_flaky'. The exit died mid-flight. On a
+                         rotating residential pool this heals by itself
+                         within a back-off or two, so it backs off silently
+                         and only pages if the pipe stays dead for two hours.
+
+    Before the split, both paged instantly AND paged again on recovery, and
+    the second kind happens constantly — which is where the ~100 pings a day
+    came from. The collector's BEHAVIOUR is identical either way; only who
+    gets told has changed.
 
     `why` is 'tls_intercepted' (the exit re-signs HTTPS — a Sophos/ISP
     firewall; the server rightly refuses the forged certificate) or
@@ -319,9 +334,10 @@ def _proxy_broken(dec, acct, group, e, why, *, log=print):
     pending = sorted(x.label for x in group
                      if x.type == "user" and not x.platform_id
                      and not str(x.value).isdigit())
-    dec.fold(acct, "unresolved_source", "proxy_broken",
+    kind = "proxy_broken" if why == "tls_intercepted" else "proxy_flaky"
+    dec.fold(acct, "unresolved_source", kind,
              keep=lambda m: m.get("why") in ("tls_intercepted", "network", "unknown", None))
-    return dec.on("proxy_broken", acct, detail=detail,
+    return dec.on(kind, acct, detail=detail,
                   meta={"why": why, "proxy": pid, "pending": pending,
                         "note": NETWORK_ADVICE.get(why, "")})
 

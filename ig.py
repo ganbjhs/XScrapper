@@ -35,6 +35,8 @@ import auth   # _launch, and the state constants; the browser plumbing is shared
 
 LOGIN_URL = "https://www.instagram.com/accounts/login/"
 HOME_URL = "https://www.instagram.com/"
+# Asked by the WINDOW itself, once per open, before it goes near Instagram.
+IP_ECHO_URL = "https://api.ipify.org?format=json"
 
 # Instagram's public web client id. Not a secret — every browser sends it, and
 # the private endpoints answer 400 without it.
@@ -355,6 +357,7 @@ class InteractiveLogin:
         self.hint = ""          # what Instagram wants from a person, if anything
         self.viewport = dict(LOGIN_VIEWPORT)
         self.device = {}
+        self.exit_ip = ""       # proved by _prove_exit when the window opens
         self.ig_label = getattr(acct, "ig_label", "") or acct.label
 
     @property
@@ -405,6 +408,60 @@ class InteractiveLogin:
         except Exception as e:
             log(f"client hints not set ({type(e).__name__}); the UA alone is in force")
 
+    async def _prove_exit(self, log):
+        """Which IP does THIS WINDOW actually leave from?
+
+        auth._launch hands Chromium the account's proxy, but nothing has ever
+        checked that Chromium TOOK it. ig_session.proxy_check proves the
+        `requests` path only, and Chromium's proxy handling is a different
+        code path with its own failure modes — auth._proxy_kwargs exists
+        precisely because Chromium ignores credentials embedded in
+        --proxy-server and then 407s in a way that surfaces as a blank page.
+        So ask the window, once, before it touches Instagram. It also closes
+        the "are we signing in from the SERVER's IP?" question for good: the
+        answer is now printed in the sign-in trace every single time.
+
+        Best effort. A failed check is logged and never blocks a sign-in."""
+        self.exit_ip = ""
+        try:
+            await self.page.goto(IP_ECHO_URL, wait_until="domcontentloaded",
+                                 timeout=20000)
+            body = await self.page.evaluate(
+                "() => document.body ? document.body.innerText : ''")
+            import re as _re
+            m = _re.search(r"\d{1,3}(?:\.\d{1,3}){3}", body or "")
+            self.exit_ip = m.group(0) if m else ""
+        except Exception as e:
+            log(f"could not prove this window's exit ({type(e).__name__}) — "
+                f"carrying on; the sign-in is not blocked by this")
+            return
+        if not self.exit_ip:
+            log("the exit check returned nothing readable — carrying on")
+            return
+        if not getattr(self.acct, "proxy_or_none", None):
+            log(f"WINDOW EXIT {self.exit_ip} — this account has NO proxy on "
+                f"file, so that is the SERVER's own address. Instagram must "
+                f"never see it (RULEBOOK 6): set the proxy before signing in.")
+            return
+        expected = ""
+        try:
+            import ig_session
+            meta = (ig_session._read_sidecar(
+                ig_session.sidecar_path(self.acct.username, self.root)).get("meta") or {})
+            hist = meta.get("exits") or []
+            expected = ((hist[-1].get("ip") if hist else "")
+                        or (meta.get("exit") or {}).get("exit_ip") or "")
+        except Exception:
+            expected = ""
+        if expected and expected != self.exit_ip:
+            log(f"WINDOW EXIT {self.exit_ip} — but the collector last left "
+                f"through {expected}. Two exits for one account is the "
+                f"rotating-proxy problem, not a browser fault; a static "
+                f"residential / ISP proxy is what pins it.")
+        else:
+            log(f"WINDOW EXIT {self.exit_ip} — through this account's proxy, "
+                f"as intended (not the server's address)")
+
     async def start(self, log=lambda m: None):
         from playwright.async_api import async_playwright
 
@@ -414,6 +471,7 @@ class InteractiveLogin:
         self.page = self.ctx.pages[0] if self.ctx.pages else await self.ctx.new_page()
         await self._client_hints(log)
         await self.page.set_viewport_size(self.viewport)
+        await self._prove_exit(log)
         try:
             await self.page.goto(HOME_URL, wait_until="domcontentloaded", timeout=45000)
             await self.page.wait_for_timeout(2000)

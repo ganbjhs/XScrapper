@@ -159,6 +159,23 @@ class Rule:
     actions: tuple = ()         # panel buttons: signin | add_source |
                                 #   reenable_sources | resolve | resume | set_id
     needs_human: bool = False   # can code close this on its own? no → True
+    tell_recovered: bool = True  # page when this CLOSES? A condition that
+                                # heals itself constantly (a rotating proxy
+                                # exit, a rate limit expiring) turns every
+                                # heal into a 🟢 the operator did not need —
+                                # that, doubled with the opening ping, is how
+                                # a quiet week became ~100 pings a day
+                                # (2026-09-12). False = it closes in silence.
+    browser: str = "no"         # does the operator need to OPEN THIS
+                                # ACCOUNT'S BROWSER for this? Every ping says
+                                # so in as many words, because the honest
+                                # answer to "should I go and look?" was
+                                # nowhere in the message — so the operator
+                                # opened the window to find out, and opening
+                                # it puts a SECOND live session on the
+                                # account, which is the thing Instagram
+                                # restricted @sanaakhtar221 for ("You
+                                # couldn't create multiple sessions").
     loop_wait: bool = True      # does wait_s hold the whole LOOP (an account
                                 # or platform condition) or just this scope
                                 # (a per-source hold-off)? see Decider.holdoff
@@ -185,7 +202,7 @@ RULES = {
         needs_human=True,
     ),
     "session_missing": Rule(
-        "idle", 30 * 60, escalate_after_s=0, level="error",
+        "idle", 30 * 60, escalate_after_s=0, level="error", browser="yes",
         title="no working session — nothing collected until signed in",
         short="Accounts & Sessions → @{account} → Sign in",
         fix=("There is no working saved session for this account.",
@@ -195,7 +212,7 @@ RULES = {
         needs_human=True,
     ),
     "session_rejected": Rule(
-        "idle", 1 * H, escalate_after_s=0, level="error",
+        "idle", 1 * H, escalate_after_s=0, level="error", browser="yes",
         title="session rejected; one re-login failed",
         short="Accounts & Sessions → @{account} → Sign in with a fresh session",
         fix=("Instagram rejected the session and one automatic re-login did "
@@ -206,7 +223,7 @@ RULES = {
         needs_human=True,
     ),
     "checkpoint": Rule(
-        "quarantine", 6 * H, escalate_after_s=0, level="error",
+        "quarantine", 6 * H, escalate_after_s=0, level="error", browser="yes",
         title="CHECKPOINT — out of rotation, nothing knocks on it",
         short="Accounts & Sessions → @{account} → Sign in → Open this "
               "account's browser → clear \"confirm it's you\"",
@@ -224,7 +241,7 @@ RULES = {
     ),
     "rate_limited": Rule(
         "backoff", 15 * 60, max_wait_s=4 * H, escalate_after_s=6 * H,
-        level="warn",
+        level="warn", tell_recovered=False, browser="no",
         title="rate-limited for {open_for} (backing off up to 4h)",
         short="nothing yet; if it lasts a day, lower IG_DAILY_BUDGET or "
               "rest the account",
@@ -299,8 +316,8 @@ RULES = {
         # id" cards on @shoaibakhtar4915 that were one Sophos MITM on
         # webshare session IN-32.)
         "backoff", 30 * 60, max_wait_s=4 * H, escalate_after_s=0,
-        level="error",
-        title="nothing reaches Instagram — {detail}",
+        level="error", browser="no",
+        title="the proxy exit INTERCEPTS HTTPS — {detail}",
         short="Edit @{account} → proxy: a different exit, then Retry",
         fix=("Every request from @{account} dies on the way to Instagram, "
              "before Instagram answers: {detail}. So this is NOT a handle "
@@ -323,6 +340,57 @@ RULES = {
              "themselves on the next pass."),
         actions=("retry", "resolve"),
         needs_human=True,
+    ),
+    "proxy_flaky": Rule(
+        # The OTHER half of what used to be one 'proxy_broken' (2026-09-12).
+        # The connection died before Instagram answered — the residential
+        # exit went offline, the tunnel dropped, the endpoint answered 502.
+        # engine_ig.network_why already told these two apart; the rule table
+        # did not, and the consequences were wrong for this half:
+        #
+        #   * proxy_broken's comment says "nothing here self-heals; a person
+        #     changes the proxy exit". True of a Sophos MITM. FALSE of a dead
+        #     exit on a ROTATING residential pool, which heals by itself the
+        #     moment the pool hands out a different peer — usually within one
+        #     back-off.
+        #   * so it paged at once (escalate_after_s=0), healed itself, paged
+        #     again ("recovered"), and did it all over on the next flap. Two
+        #     pings per flap per account, gated only by RECOVERED_DEDUPE_S=1h.
+        #     Across the Instagram accounts that is where ~100 pings a day
+        #     came from, none of them actionable, which trained the operator
+        #     to open a browser window to find out what was going on — and
+        #     that window is a second session on the account.
+        #
+        # So: back off exactly as before (the collector's behaviour is
+        # unchanged and correct), but say nothing to the phone unless the
+        # pipe has been dead for two solid hours, and never announce the
+        # recovery. A flapping exit is not news; it is the rotating-proxy
+        # problem, and the pass already logs the exit-IP count for it.
+        "backoff", 30 * 60, max_wait_s=4 * H, escalate_after_s=2 * H,
+        level="warn", tell_recovered=False, browser="no",
+        title="nothing has reached Instagram for {open_for} — {detail}",
+        short="if this is constant, the exit is rotating: static residential "
+              "IPs are the fix, not a retry",
+        fix=("Requests from @{account} are dying on the way to Instagram, "
+             "before Instagram answers: {detail}. Instagram has not refused "
+             "anything and there is NOTHING TO CLEAR in the browser — the "
+             "pipe is broken, not the account.",
+             "Most of the time this fixes itself: on a rotating residential "
+             "pool the exit peer goes offline and the next request draws a "
+             "working one. The collector is already backing off (30m, "
+             "doubling to 4h) and will pick up by itself. You are only being "
+             "told because it has now lasted two hours.",
+             "If it is constant rather than occasional, the exit is churning "
+             "under a logged-in session. That is the problem a STATIC "
+             "residential / ISP proxy solves — one IP per account, forever. "
+             "Check the account's exit count: a healthy account shows ONE "
+             "distinct exit IP.",
+             "If it never recovers: Accounts & Sessions → @{account} → Edit → "
+             "proxy, change the session number in the username, then Retry. "
+             "Test first on the server: curl -x '<proxy URL>' -sS -o /dev/null "
+             "-w '%{{http_code}}\\n' https://www.instagram.com/ — you want 200 "
+             "or 302."),
+        actions=("retry", "resolve"),
     ),
     "pass_error": Rule(
         "backoff", 10 * 60, max_wait_s=1 * H, escalate_after_n=3,
@@ -451,9 +519,16 @@ class Decision:
         Quarantine, rest and a rate limit all mean "one more request makes it
         worse"; a broken proxy means "one more request is the same dead
         pipe"; a generic pass_error is neither, so the next source still runs.
+
+        BOTH proxy kinds stop the account. They differ only in who gets told
+        (proxy_flaky heals itself, so it pages late and never announces its
+        recovery) — never in what the collector does, because a dead pipe is
+        a dead pipe. Splitting the kinds in 2026-09-12 without adding the new
+        one here let a pass carry on through a dead exit, source after
+        source; test_ig_stop_stands caught it the same hour.
         """
         return (self.action in ("quarantine", "relogin", "rest")
-                or self.kind in ("rate_limited", "proxy_broken"))
+                or self.kind in ("rate_limited", "proxy_broken", "proxy_flaky"))
 
 
 def _fmt_dur(s: float) -> str:
@@ -718,6 +793,16 @@ def _ping_text(rule: Rule, ev, row: dict, now: int, cid: str) -> str:
     if note:
         first = note.split(". ")[0].rstrip(".")
         lines.append("Now: " + _clip(first, 160) + ".")
+    # The question the operator is ACTUALLY asking when a ping arrives, and
+    # the one the message never answered: is there something for me to clear?
+    # They went and opened the account's browser window to find out — and that
+    # window is a second live session on the account, which is what Instagram
+    # restricted @sanaakhtar221 for. A "no" is as valuable as a "yes" here and
+    # costs one line. 2026-09-12.
+    if rule.browser == "yes":
+        lines.append(f"Browser: YES — open @{ev.account or '-'}'s browser and clear it.")
+    else:
+        lines.append("Browser: no — nothing to clear; opening it = a 2nd session.")
     lines.append(_links(cid))
     return "\n".join(lines)
 
@@ -741,6 +826,13 @@ def _worth_telling(state, scope, prev: dict, now: int) -> bool:
     paged twice (then only if it lasted RECOVERED_MIN_OPEN_S: a blip that
     closes in a minute was never news) — and not if a 'recovered' for this
     scope already went out within RECOVERED_DEDUPE_S."""
+    # A condition that heals itself is not a story the phone needs the end of
+    # (2026-09-12). This single line is most of the ping-volume fix: a
+    # rotating proxy exit dying and coming back was producing a 🟢 every
+    # time, capped only by RECOVERED_DEDUPE_S.
+    r = RULES.get(prev.get("kind") or "")
+    if r is not None and not r.tell_recovered:
+        return False
     meta = _loads(prev.get("meta"))
     if prev.get("notified_ms"):
         heard = True

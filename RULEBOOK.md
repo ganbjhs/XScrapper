@@ -972,6 +972,50 @@ single request. These are hard rules, not tuning:
   sign-in and records the exit IP and country in the sidecar; the diag
   endpoint shows it. An exit in another country is said, not refused (geo
   databases are approximate); a dead or intercepting one is refused.
+- **One account is NEVER signed in twice at the same time (2026-09-12).** A
+  collection pass holds a live session through instagrapi. Opening the streamed
+  browser door signs the SAME account in AGAIN, in a real browser — two clients,
+  two TLS fingerprints, one account, at the same moment. Instagram named this
+  itself on @sanaakhtar221's Account Status page: *"You couldn't create multiple
+  sessions"*. `PassLock` had stopped two PASSES colliding since 2026-09-03 (a
+  Fetch-now on top of the loop earned a `ChallengeRequired` two minutes later)
+  but `web._login_start` never consulted it, so the browser-vs-pass collision
+  stayed wide open. The door now refuses while a pass is running, says how long
+  it has been going, and names the alternative (wait, or pause in Watchlists →
+  Network & settings). If the lock cannot be read the sign-in proceeds — a
+  broken guard must never be the reason a human cannot rescue an account.
+- **The window PROVES its own exit before it touches Instagram
+  (`ig.InteractiveLogin._prove_exit`, 2026-09-12).** `auth._launch` hands
+  Chromium the account's proxy, but nothing ever checked that Chromium TOOK it,
+  and `proxy_check` proves the `requests` path only — Chromium's proxy handling
+  is a different code path with its own failure modes (`_proxy_kwargs` exists
+  because Chromium ignores credentials in `--proxy-server` and then 407s as a
+  blank page). So the window asks an IP echo, once, before going anywhere near
+  Instagram, and prints `WINDOW EXIT <ip>` into the sign-in trace: through the
+  proxy as intended, or a different exit from the collector's last one (the
+  rotating-proxy problem), or — when no proxy is on file — the SERVER's own
+  address, which Instagram must never see. Best effort: a failed check is a log
+  line, never a blocked sign-in.
+- **A ping is sent only when a HUMAN must act, and it always says whether to
+  open the browser (2026-09-12).** The pager was already rare per condition
+  (`REPING_COOLDOWN_S` 24h), and still produced roughly a hundred messages a
+  day, none of them actionable. Two causes, both now fixed:
+  (1) `proxy_broken` was ONE condition covering two opposite causes.
+  `engine_ig.network_why` had always told them apart; the rule table had not.
+  A TLS-intercepting exit (`proxy_broken`) never heals and a person must change
+  it — page at once. A dead exit (`proxy_flaky`) heals itself the moment a
+  rotating pool hands out another peer — so back off exactly as before, but say
+  nothing unless the pipe stays dead for two hours. **Both still stop the
+  account: a dead pipe is a dead pipe, and only the audience differs.**
+  (2) `Rule.tell_recovered`: a condition that heals itself does not page a 🟢
+  when it closes. A flapping exit was sending an opening ping AND a recovery
+  ping per flap per account, capped only by `RECOVERED_DEDUPE_S` (1h).
+  And `Rule.browser` puts one line in EVERY ping — `Browser: YES — open @x's
+  browser and clear it.` or `Browser: no — nothing to clear; opening it = a 2nd
+  session.` The operator was opening windows to find out whether there was a
+  challenge to clear, because the message never said; and opening the window is
+  the second session in the rule above. A "no" is worth as much as a "yes" here
+  and costs one line.
 - **A pass WRITES BACK what it learned. The session must age, not be
   re-enacted (`ig_session.touch`, 2026-09-12).** `persist()` ran at a sign-in
   and nowhere else, so every pass restored the session exactly as it stood at
