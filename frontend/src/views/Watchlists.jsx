@@ -16,6 +16,7 @@ import React, { useMemo, useState } from "react";
 import { api, fmtAgo, fmtN, fmtPosted, useApi } from "../api/client.js";
 import { PageHead, useProject } from "../App.jsx";
 import { Empty, ErrorState, Loading, Modal } from "../components/ui.jsx";
+import { cleanHandle, cleanId, parseIgIds } from "../lib/parseIgIds.js";
 
 // Must match FB_SPEEDS in web.py — the named cadences a page can be checked at.
 const FB_SPEEDS = { "1h": "1 hour", "3h": "3 hours", "6h": "6 hours",
@@ -1333,6 +1334,213 @@ function FbDetail({ pid, data, reload, gotoSettings }) {
 }
 
 // ---------------------------------------------------------------------------
+// "Waiting for a profile id" — the manual way past a throttled name lookup.
+//
+// A user source Instagram has never resolved to a numeric platform_id cannot
+// be collected AT ALL: the media endpoint takes the numeric pk, and the handle
+// is only the thing a human reads (store_ig, "WHY label / value / platform_id
+// ARE THREE COLUMNS"). Normally `resolve-ids` fills it. When every collecting
+// account is refused on the lookup endpoint at once — 2026-09-17, 25 sources,
+// 0 posts — the ONLY way forward is an operator pasting ids in by hand, and
+// until now that meant shell access to `collect_ig.py set-id`.
+//
+// So: collapsed to ONE line when there is nothing to do, and hidden entirely
+// when every source is resolved. It never grows the panel it lives in.
+export function IgIdPending({ pid, sources, reload }) {
+  const [open, setOpen] = useState(false);
+  const [pasteOpen, setPasteOpen] = useState(false);
+  const [draft, setDraft] = useState({});
+  const [paste, setPaste] = useState("");
+  const [busy, setBusy] = useState("");
+  const [report, setReport] = useState(null);
+  const [err, setErr] = useState("");
+
+  // Only `user` sources carry an id. A hashtag or the following feed has no
+  // profile to resolve, so listing them here would be a permanent false alarm.
+  const pending = useMemo(
+    () => sources.filter((s) => (s.type || "user") === "user" && !s.platform_id),
+    [sources]);
+
+  // Handle -> label, over EVERY source (not just the pending ones): an
+  // operator re-pasting their whole list should be able to correct an id that
+  // was resolved wrong, not be told the row is unknown.
+  const byHandle = useMemo(() => {
+    const m = new Map();
+    for (const s of sources) {
+      for (const k of [s.value, s.label]) {
+        const h = cleanHandle(k);
+        if (h) m.set(h.toLowerCase(), s.label);
+      }
+    }
+    return m;
+  }, [sources]);
+
+  if (pending.length === 0) return null;
+
+  const handleOf = (s) => cleanHandle(s.value || s.label) || s.label;
+
+  const copy = async (text, what) => {
+    setErr("");
+    try { await navigator.clipboard.writeText(text); setReport({ note: `${what} copied` }); }
+    catch { window.prompt(`Copy ${what}:`, text); }
+  };
+
+  const saveOne = async (label, raw) => {
+    const id = cleanId(raw);
+    if (!id) { setErr(`${label}: a profile id is digits only`); return; }
+    setErr(""); setBusy(label); setReport(null);
+    try {
+      await api.igSource({ project: pid, action: "set-id", label, platform_id: id });
+      setDraft((d) => { const n = { ...d }; delete n[label]; return n; });
+      reload();
+    } catch (e) { setErr(String(e.message || e)); }
+    finally { setBusy(""); }
+  };
+
+  const applyPaste = async () => {
+    const { pairs, bad } = parseIgIds(paste);
+    // Last line wins, so a corrected id further down the paste is the one
+    // that lands rather than whichever the loop happened to write last.
+    const wanted = new Map();
+    for (const p of pairs) wanted.set(p.handle.toLowerCase(), p.id);
+
+    const hits = [], unknown = [];
+    for (const [handle, id] of wanted) {
+      const label = byHandle.get(handle);
+      if (label) hits.push({ label, handle, id }); else unknown.push(handle);
+    }
+    if (hits.length === 0) {
+      setReport({ saved: 0, unknown, bad, failed: [] });
+      return;
+    }
+    setErr(""); setBusy("paste"); setReport(null);
+    const failed = [];
+    for (const h of hits) {
+      try {
+        await api.igSource({ project: pid, action: "set-id",
+                             label: h.label, platform_id: h.id });
+      } catch (e) { failed.push(`${h.handle} (${String(e.message || e)})`); }
+    }
+    setBusy("");
+    setPaste("");
+    setReport({ saved: hits.length - failed.length, unknown, bad, failed });
+    reload();
+  };
+
+  const parsed = paste.trim() ? parseIgIds(paste) : null;
+
+  return (
+    <div className="idp">
+      <button className="idp-bar" onClick={() => setOpen(!open)}
+              aria-expanded={open}
+              title="These handles have no numeric Instagram id, so nothing can be collected for them">
+        <span className="chip warn">{pending.length} waiting for a profile id</span>
+        <span className="idp-hint">
+          no id means no posts — paste them in to unblock collection
+        </span>
+        <span className="idp-caret">{open ? "▴" : "▾"}</span>
+      </button>
+
+      {open && (
+        <div className="idp-body">
+          <div className="idp-tools">
+            <button className="btn btn-ghost btn-sm"
+                    onClick={() => copy(pending.map(handleOf).join("\n"), "handles")}>
+              Copy handles
+            </button>
+            <button className="btn btn-ghost btn-sm"
+                    onClick={() => copy(
+                      "{\n" + pending.map((s) => `  "${handleOf(s)}": ""`).join(",\n") + "\n}",
+                      "JSON template")}>
+              Copy JSON template
+            </button>
+            <span className="grow" />
+            <button className="btn btn-ghost btn-sm" onClick={() => setPasteOpen(!pasteOpen)}>
+              {pasteOpen ? "Close paste box" : "Paste a list →"}
+            </button>
+          </div>
+
+          {pasteOpen && (
+            <div className="idp-paste">
+              <textarea rows={4} value={paste} spellCheck={false}
+                        onChange={(e) => setPaste(e.target.value)}
+                        placeholder={'natgeo 787132       (also: natgeo,787132 · natgeo: 787132)\n'
+                          + 'nasa 528817151\n\n'
+                          + 'or JSON: {"natgeo": "787132", "nasa": "528817151"}'} />
+              <div className="idp-tools">
+                <span className="idp-hint">
+                  {parsed
+                    ? `${parsed.pairs.length} id${parsed.pairs.length === 1 ? "" : "s"} read`
+                      + (parsed.bad.length ? ` · ${parsed.bad.length} line${parsed.bad.length === 1 ? "" : "s"} unreadable` : "")
+                    : "Handles are matched to this watchlist — nothing new is created."}
+                </span>
+                <span className="grow" />
+                <button className="btn btn-brand btn-sm"
+                        disabled={busy === "paste" || !parsed || parsed.pairs.length === 0}
+                        onClick={applyPaste}>
+                  {busy === "paste" ? "Saving…" : "Apply ids"}
+                </button>
+              </div>
+            </div>
+          )}
+
+          {report && (
+            <div className="idp-report">
+              {report.note && <span>{report.note}</span>}
+              {report.saved > 0 && (
+                <b style={{ color: "var(--brand)" }}>
+                  {report.saved} id{report.saved === 1 ? "" : "s"} saved
+                </b>
+              )}
+              {report.saved === 0 && !report.note && <b>Nothing matched</b>}
+              {report.unknown?.length > 0 && (
+                <span> · not in this watchlist: {report.unknown.join(", ")}</span>
+              )}
+              {report.bad?.length > 0 && (
+                <span> · unreadable: {report.bad.slice(0, 5).map((b) => `“${b}”`).join(", ")}
+                  {report.bad.length > 5 ? ` +${report.bad.length - 5} more` : ""}</span>
+              )}
+              {report.failed?.length > 0 && (
+                <span className="st-crit"> · rejected: {report.failed.join(", ")}</span>
+              )}
+            </div>
+          )}
+
+          <div className="idp-list">
+            {pending.map((s) => {
+              const h = handleOf(s);
+              return (
+                <div className="idp-row" key={s.label}>
+                  <a className="idp-handle" href={`https://www.instagram.com/${h}/`}
+                     target="_blank" rel="noreferrer"
+                     title="Open the profile — the id is in the page source next to “profile_id”">
+                    {h}
+                  </a>
+                  <input value={draft[s.label] ?? ""} inputMode="numeric" spellCheck={false}
+                         placeholder="profile id"
+                         onChange={(e) => setDraft((d) => ({ ...d, [s.label]: e.target.value }))}
+                         onKeyDown={(e) => {
+                           if (e.key === "Enter" && (draft[s.label] || "").trim()) {
+                             saveOne(s.label, draft[s.label]);
+                           }
+                         }} />
+                  <button className="btn btn-brand btn-sm"
+                          disabled={busy === s.label || !cleanId(draft[s.label])}
+                          onClick={() => saveOne(s.label, draft[s.label])}>
+                    {busy === s.label ? "…" : "Save"}
+                  </button>
+                </div>
+              );
+            })}
+          </div>
+          {err && <div className="idp-err">{err}</div>}
+        </div>
+      )}
+    </div>
+  );
+}
+
+// ---------------------------------------------------------------------------
 // Instagram detail panel
 // ---------------------------------------------------------------------------
 
@@ -1442,6 +1650,7 @@ function IgDetail({ pid, data, reload, gotoSettings }) {
         runs one pass immediately. Use “+ New watchlist” above to add a user,
         hashtag, or the home feed.
       </div>
+      <IgIdPending pid={pid} sources={sources} reload={reload} />
       <div className="members-box" style={{ maxHeight: 320, padding: "0 12px" }}>
         {sources.map((s) => (
           <div className="wl-row" key={s.label} style={{ opacity: s.enabled ? 1 : 0.55 }}>

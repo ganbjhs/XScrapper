@@ -19,6 +19,66 @@ must respect belongs in the rulebook, not here.
 
 ---
 
+## 2026-09-18 — A pending Instagram id can be fixed from the watchlist
+
+**Changed**
+
+- `frontend/src/lib/parseIgIds.js` (new) — parses a pasted handle→id list.
+  Accepts JSON objects, JSON record arrays, JSON pair arrays, and plain lines
+  separated by space, comma, colon, tab, pipe or dash, with `@handle`, a
+  pasted `instagram.com/<handle>/` URL, and reversed `id handle` columns. It
+  never guesses: a line it cannot read with certainty is returned in `bad` and
+  shown to the operator rather than dropped.
+- `frontend/src/lib/parseIgIds.test.mjs` (new) — 23 cases, run with plain
+  `node src/lib/parseIgIds.test.mjs`. No test runner added to the frontend.
+- `frontend/src/views/Watchlists.jsx` — `IgIdPending`, mounted in `IgDetail`
+  above the sources list. Collapsed it is ONE line ("12 waiting for a profile
+  id"); it renders nothing at all when every user source is resolved. Expanded:
+  a scrolling list of pending handles each with an id box and Save, a bulk
+  paste box, and Copy handles / Copy JSON template for the round trip to
+  whoever is fetching the ids. Each handle links to its profile, where the id
+  is in the page source.
+- `frontend/src/styles.css` — `.idp-*`.
+
+**Why**
+
+2026-09-17: project 17 had 25 IG sources, 0 posts. All 25 were `id pending`
+and all six collecting accounts were refused on the name lookup at once. The
+only fix was `collect_ig.py set-id` over SSH, because the Fix panel's "Save id"
+box is per-handle and `collect_ig.py:386` folds those cards into the
+account-level `lookup_throttled` card — the input vanishes exactly when it is
+needed. This panel keys off `platform_id == ""` and no account state, so it is
+also there for the other way a source sits unresolved: added before any pass
+ran, or resolved wrong.
+
+**Verified**
+
+- 23 parser cases green; 24 component cases green (jsdom, the real component,
+  stubbed `api`) covering: hidden when all resolved, hashtag/`following` rows
+  excluded, Save disabled until the id is numeric, the post carrying the source
+  LABEL not the pasted handle, duplicate handle taking the last id, an
+  already-resolved id being correctable, an unknown handle reported and NOT
+  created, and a server rejection surfacing instead of being swallowed.
+- `vite build` clean. Light and dark checked by screenshot.
+- Frontend only — no Python touched. The `set-id` action already existed on
+  `/api/ig/source` (`web.py:_ig_source_post`) and `platform_id` already rode
+  along in `_ig_status`'s `sources` rows, so this is UI over shipped server
+  behavior.
+
+**Still open**
+
+- `frontend/dist` rebuilt and committed in this commit. The VPS runs no Node
+  and deploys by `git pull`, so a UI change that does not carry its rebuilt
+  bundle ships the OLD interface silently (.gitignore:50). A push to `main`
+  triggers `.github/workflows/deploy.yml`, which is the deploy.
+- The paced-lookup cap and the adaptive cadence multiplier (designed
+  2026-09-18) are still unimplemented; this panel is the manual door, not a
+  substitute for either.
+- `.git/index.lock` was stale from 2026-09-17 19:01 and blocked all git; removed
+  with the operator's permission.
+
+---
+
 ## 2026-09-12 (III) — Settings gets a home; Accounts stops shouting
 
 **Changed**

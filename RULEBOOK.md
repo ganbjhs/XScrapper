@@ -1265,6 +1265,32 @@ single request. These are hard rules, not tuning:
   untouched, §2). A clean collect of that source later closes it. Note that
   name lookup is the permission a restricted session loses first, so the
   cure is often a cleaner account, not a hand-typed id.
+- **Every `id pending` source is reachable from the WATCHLIST, not only from
+  a condition card (2026-09-18).** The Fix panel's "Save id" box above is
+  real but conditional: `collect_ig.py:386` folds per-handle
+  `unresolved_source` cards into the account-level `lookup_throttled` card,
+  whose actions are only retry/resolve — so the one input that ends the
+  outage disappears exactly when every account is throttled at once, which
+  is the state that produces 25 pending handles and 0 posts (2026-09-17).
+  A source can also sit unresolved with NO condition open at all: added
+  before any pass ran, or resolved to the wrong id. So the watchlist panel
+  (`IgIdPending`, `frontend/src/views/Watchlists.jsx`) is driven by
+  `platform_id == ""` alone and by no account state, and it is the door that
+  is always there. Three invariants it must keep:
+    1. **Match handle → label, write by label.** `set-id` keys on `label`,
+       and label and handle legitimately differ ("BhajanLal Ji" / the
+       handle). A panel that posted the pasted handle as the label would
+       silently create a second source instead of resolving the first.
+    2. **A non-numeric id is refused before it is sent.** Writing a handle
+       into `platform_id` leaves the row LOOKING resolved while the media
+       endpoint rejects it forever — strictly worse than pending, because
+       nothing flags it again (§2: `platform_id` is the machine id).
+    3. **A pasted handle that is not already a source is reported, never
+       created.** The operator's decision, 2026-09-18: a typo in a list of
+       25 must not become a real source that collects nothing.
+  Hashtag and `following` sources are excluded — they have no profile to
+  resolve, and listing them would be a permanent false alarm.
+  Tests: `frontend/src/lib/parseIgIds.test.mjs` (`node`, no runner).
 - **A refused lookup is the SESSION's condition, and the first refusal
   ends the asking (`lookup_throttled`, 2026-09-03 evening).** Eight sources
   on one account produced eight "handle needs its id" cards in thirteen
@@ -1862,9 +1888,12 @@ wording. Every change appends an entry in the same commit (2026-08-25).
 - Guard (advisory only), `doctor`, pinned scraper versions with startup
   asserts, additive self-applying migrations.
 - IG username→id resolution: three independent paths, the answer persisted to
-  `platform_id`, and a human escape hatch (`collect_ig.py set-id`) when a
-  restricted session can resolve nothing. Removing a fallback or the write-back
-  returns the collector to re-failing every name on every pass.
+  `platform_id`, and a human escape hatch when a restricted session can resolve
+  nothing — `collect_ig.py set-id` on the server, the Fix panel's "Save id" box
+  while a condition is open, and the watchlist's `IgIdPending` panel, which is
+  the only one of the three that is present unconditionally (§6). Removing a
+  fallback, the write-back, or the last of those three doors returns the
+  collector to re-failing every name on every pass.
 - Login walls / bans surface in the UI in plain words — never silent.
 
 **Dashboard**
