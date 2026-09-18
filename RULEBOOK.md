@@ -592,6 +592,28 @@ Test: `test_platform_urls`.
 - **Facebook/Instagram delivery is pull.** Watch-Tower pulls IG/FB via
   `/api/fb/posts` and `/api/instagram/posts`; X is pushed via webhook. Both are
   the same normalized shape.
+- **Instagram is also a STREAM on the X surfaces (2026-09-18).** A consumer
+  built around the X pull must not need a second paging model to take
+  Instagram. So `GET /api/tweets?platform=instagram&project=P` (or
+  `stream=ig:P:0`) serves `ig_results.db` exactly the way `/api/tweets`
+  serves X: the same `since_collected_ms` cursor (the table's `collected_at`
+  seconds, in milliseconds on the wire), oldest-first while cursoring, the
+  bounded count, the same `cursor` / `has_more` envelope, the shared row
+  shape of §2 (`store_ig.to_feed`) plus `created_ms` / `collected_ms` /
+  `author_id` / `streams`. And the structure endpoints list it: one
+  synthetic `ig:P:0` pseudo-stream per project with enabled sources on
+  `/api/streams` and `/api/streams/assignments`, one synthetic watchlist of
+  `kind: "instagram"` (the handles as `members[]`) on
+  `/api/watchlists?project=P`. Rules: it is OPT-IN — the default `/api/tweets`
+  answer never changes (WATCH_TOWER R4); the pseudo ids are the NEGATIVE
+  project id, an integer no real row carries, and no POST action accepts one;
+  the label is `ig:<project>:0` on purpose, because Watch-Tower reads the
+  number in a stream label as a project id — for Instagram that reading is
+  correct; without a project the answer is an empty page with a `note`,
+  never an `error` key (R10); nothing on this path ever needs `results.db`,
+  and a config without `root` gets empty answers rather than an exception.
+  `/api/ig/posts` stays as it is for the dashboard and for anyone already on
+  it. Test: `test_ig_as_stream`.
 - **The X mirror is a pull too, and it has 60 seconds (2026-09-06).**
   Watch-Tower's Collector page fills its projects from `GET
   /api/tweets?project=P&since_collected_ms=<cursor>&limit=500`, pages until a

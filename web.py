@@ -408,8 +408,40 @@ def _day_ms(value: str):
     return int(d.replace(tzinfo=datetime.timezone.utc).timestamp() * 1000)
 
 
+IG_STREAM_PREFIX = "ig:"
+
+
+def ig_stream_label(project_id) -> str:
+    """The pseudo-stream label Instagram wears on the X-shaped surfaces.
+
+    `ig:<project>:0` on purpose: Watch-Tower reads the number in `wl:N:0` as
+    a project id (it is a watchlist id — their bug, 2026-09-18), and for
+    Instagram the number IS the project id, so even their current parser
+    lands on the right card. One stream per project, never more: Instagram
+    sources are not chunked the way a handle watchlist is."""
+    return f"{IG_STREAM_PREFIX}{int(project_id)}:0"
+
+
+def _ig_stream_project(label) -> int:
+    """The project id inside an `ig:P:0` label, or 0 for anything else."""
+    s = str(label or "")
+    if not s.startswith(IG_STREAM_PREFIX):
+        return 0
+    try:
+        return int(s[len(IG_STREAM_PREFIX):].split(":", 1)[0])
+    except ValueError:
+        return 0
+
+
 def _query_tweets(p):
     """Filter the collected tweets. All of this is local; nothing touches X."""
+    # Instagram as a stream (2026-09-18): the same endpoint, the same cursor,
+    # the same row shape, a different table. Opt-in by `platform=instagram`
+    # or by naming the pseudo-stream, so nothing a consumer runs today
+    # changes (WATCH_TOWER.md R4, additive only).
+    if ((p.get("platform") or "").strip().lower() == "instagram"
+            or _ig_stream_project(p.get("stream"))):
+        return _query_ig_as_stream(p)
     where, params = ["t.source = 'result'"], []
     joins = ""
 
@@ -585,6 +617,207 @@ def _query_tweets(p):
                          "since_collected_ms": last["collected_ms"]}
         out["has_more"] = len(rows) == limit and total > limit
     return out
+
+
+def _query_ig_as_stream(p):
+    """
+    /api/tweets?platform=instagram — collected Instagram posts served the way
+    X streams are: project-scoped, walked on the gapless `since_collected_ms`
+    cursor, oldest-first while cursoring, one row shape (store_ig.to_feed —
+    the shared post shape of RULEBOOK §2) plus the numeric `created_ms` /
+    `collected_ms` the X rows carry and a `streams` list naming the
+    pseudo-stream. A consumer that mirrors X with a cursor loop mirrors
+    Instagram with the identical loop and one extra query parameter.
+
+    Why not /api/ig/posts: that endpoint pages newest-first on the media pk
+    and has no collection cursor, so a consumer built around X (Watch-Tower)
+    needed a second paging model and a 72-hour overlap window to stay
+    gapless. This is the same data on the model it already has.
+
+    Project-scoped like every Instagram read (store_ig's policy). Without a
+    project it answers an empty page with a `note`, never an `error` key
+    (WATCH_TOWER.md R10 — no more 200-with-error paths).
+    """
+    empty = {"total": 0, "rows": []}
+    pid = _project_or_none(p) or _ig_stream_project(p.get("stream"))
+    if not pid:
+        return {**empty, "note": "platform=instagram is project-scoped — "
+                                 "pass project=<id> (or stream=ig:<id>:0)"}
+    if _ig_stream_project(p.get("stream")) not in (0, pid):
+        # A stream label naming a different project than `project=` cannot
+        # both be honoured; say so instead of silently picking one.
+        return {**empty, "note": f"stream {p['stream']} is not in project {pid}"}
+    root = getattr(_CFG, "root", None)
+    rp = (root / "ig_results.db") if root else None
+    if rp is None or not rp.exists():
+        return empty
+    import store_ig
+
+    where, params = ["p.project_id = ?"], [pid]
+    if p.get("q"):
+        where.append("(p.caption LIKE ? OR p.username LIKE ?)")
+        params += [f"%{p['q']}%"] * 2
+    if p.get("author"):
+        where.append("p.username LIKE ?")
+        params.append(str(p["author"]).lstrip("@") + "%")
+    if p.get("min_likes"):
+        where.append("p.like_count >= ?")
+        params.append(int(p["min_likes"]))
+    if p.get("min_views"):
+        where.append("p.play_count >= ?")
+        params.append(int(p["min_views"]))
+    if p.get("from_date"):
+        ms = _day_ms(p["from_date"])
+        if ms is not None:
+            where.append("p.taken_at >= ?")
+            params.append(ms // 1000)
+    if p.get("to_date"):
+        ms = _day_ms(p["to_date"])
+        if ms is not None:
+            where.append("p.taken_at < ?")
+            params.append((ms + 86_400_000) // 1000)
+    if p.get("since"):
+        ms = store_mod.parse_window(p["since"])
+        if ms:
+            where.append("p.taken_at >= ?")
+            params.append(int(ms / 1000))
+    if p.get("has_media"):
+        where.append("(COALESCE(p.thumbnail_url, '') != '' OR COALESCE(p.video_url, '') != '')")
+
+    # The two cursors, meaning exactly what they mean on X: since_id walks
+    # post ids (media pks are time-monotonic, so it is even sound here),
+    # since_collected_ms walks OUR collection order and is the gapless one.
+    # collected_at is unix seconds in the table; the cursor is milliseconds
+    # on the wire, as on X, so a consumer keeps one field for both platforms.
+    # A cold load starts at 0, and "0" is a cursor, not an absence — the
+    # same as on X, where the wire value is the string "0" and truthy.
+    def given(k):
+        return p.get(k) is not None and str(p.get(k)).strip() != ""
+    cursoring = False
+    if given("since_id"):
+        where.append("p.pk > ?")
+        params.append(int(p["since_id"]))
+        cursoring = True
+    if given("since_collected_ms"):
+        where.append("p.collected_at * 1000 > ?")
+        params.append(int(p["since_collected_ms"]))
+        cursoring = True
+
+    order = "ASC" if (p.get("order") == "asc" or cursoring) else "DESC"
+    order_by = "p.collected_at, p.pk" if given("since_collected_ms") else "p.pk"
+    _SORTS = {"likes": "p.like_count DESC, p.pk DESC",
+              "views": "p.play_count DESC, p.pk DESC"}
+    if not cursoring and p.get("sort") in _SORTS:
+        order_by, order = _SORTS[p["sort"]], ""
+    limit = max(1, min(int(p.get("limit") or 50), 500))
+    offset = max(0, int(p.get("offset") or 0))
+    cond = " AND ".join(where)
+
+    with store_ig.Store(rp) as st:
+        if cursoring:
+            # Bounded, as on X: a mirror pages until a page comes back short.
+            total = st.db.execute(
+                f"SELECT COUNT(*) c FROM (SELECT 1 FROM posts p WHERE {cond} LIMIT ?)",
+                [*params, limit * 10 + 1]).fetchone()["c"]
+        else:
+            total = st.db.execute(
+                f"SELECT COUNT(*) c FROM posts p WHERE {cond}", params).fetchone()["c"]
+        # The avatar cache joined the same way store_ig._with_avatars does
+        # it, but with THIS order kept — that helper re-sorts newest-first,
+        # which would break a cursor walk.
+        rows = st.db.execute(
+            f"SELECT p.*, COALESCE(pp.avatar_url, p.author_avatar) AS _avatar "
+            f"FROM posts p LEFT JOIN profiles pp ON pp.user_pk = p.user_pk "
+            f"WHERE {cond} ORDER BY {order_by} {order} LIMIT ? OFFSET ?",
+            [*params, limit, offset]).fetchall()
+
+    label = ig_stream_label(pid)
+    out_rows = []
+    for r in rows:
+        d = dict(r)
+        d["author_avatar"] = d.pop("_avatar") or None
+        f = store_ig.to_feed(d)
+        f["created_ms"] = int(d.get("taken_at") or 0) * 1000
+        f["collected_ms"] = int(d.get("collected_at") or 0) * 1000
+        f["author_id"] = str(d.get("user_pk") or "")
+        f["streams"] = [label]
+        out_rows.append(f)
+    out = {"total": total, "rows": out_rows}
+    _stamp_labels(out["rows"], pid, "instagram")
+    if rows:
+        last = out_rows[-1]
+        out["cursor"] = {"since_id": last["tweet_id"],
+                         "since_collected_ms": last["collected_ms"]}
+        out["has_more"] = len(rows) == limit and total > limit
+    return out
+
+
+def _ig_pseudo_streams() -> list:
+    """
+    One entry per project that has enabled Instagram sources — what
+    Instagram looks like when listed beside the X streams. `tweets` is the
+    project's collected post count, `paused` the one collector switch, and
+    `sources` the handles (the members: Instagram has no separate members
+    call). Empty list when there is no ig_results.db yet. Read-only, cheap,
+    and never touching Instagram (WATCH_TOWER.md R8).
+    """
+    root = getattr(_CFG, "root", None)
+    rp = (root / "ig_results.db") if root else None
+    if rp is None or not rp.exists():
+        return []
+    import store_ig
+    out = []
+    try:
+        with store_ig.Store(rp) as st:
+            paused = (st.setting("ig_paused") == "1")
+            counts = {r["project_id"]: r["n"] for r in st.db.execute(
+                "SELECT project_id, COUNT(*) n FROM posts GROUP BY project_id")}
+            srcs = {}
+            for r in st.db.execute(
+                    "SELECT label, type, value, platform_id, project_id, account, "
+                    "assigned_account FROM sources WHERE enabled = 1 AND project_id > 0 "
+                    "ORDER BY project_id, label"):
+                srcs.setdefault(int(r["project_id"]), []).append({
+                    "handle": r["value"], "label": r["label"], "type": r["type"],
+                    "user_id": r["platform_id"] or None,
+                    "resolved": bool(r["platform_id"]),
+                    "collector": r["account"] or r["assigned_account"] or ""})
+    except Exception:
+        return []
+    for pid in sorted(srcs):
+        out.append({"project_id": pid, "label": ig_stream_label(pid),
+                    "paused": paused, "tweets": int(counts.get(pid, 0)),
+                    "sources": srcs[pid]})
+    return out
+
+
+def _ig_pseudo_watchlist(pid: int):
+    """
+    The Instagram sources of one project, shaped like a watchlist row so a
+    consumer reading /api/watchlists sees Instagram beside the X lists:
+    kind "instagram", one stream `ig:P:0`, the handles as members. None when
+    the project has no Instagram sources.
+
+    watchlist_id is the NEGATIVE project id: an integer (consumers key on
+    one), unique, impossible to confuse with a real watchlist, and a plain
+    signal that this row is synthetic — none of the watchlist POST actions
+    accept it.
+    """
+    for s in _ig_pseudo_streams():
+        if s["project_id"] == pid:
+            return {
+                "watchlist_id": -pid, "project_id": pid,
+                "name": "Instagram sources", "kind": "instagram",
+                "platform": "instagram", "list_id": None, "owner_handle": None,
+                "created_at": None, "filters": {}, "paused": s["paused"],
+                "members": [{"handle": m["handle"], "display_name": m["label"],
+                             "user_id": m["user_id"], "resolved": m["resolved"],
+                             "collector": m["collector"], "type": m["type"]}
+                            for m in s["sources"]],
+                "streams": [{"stream_id": -pid, "label": s["label"],
+                             "paused": s["paused"], "tweets": s["tweets"]}],
+            }
+    return None
 
 
 # --------------------------------------------------------------------------
@@ -1941,7 +2174,15 @@ def _watchlists_json(q):
         pid = 0
     if not pid:
         return {"error": "which project? pass ?project=<id>"}
-    return {"watchlists": _with_store(lambda st: st.watchlists(pid))}
+    wls = _with_store(lambda st: st.watchlists(pid))
+    # Instagram beside the X lists (2026-09-18): one synthetic row of kind
+    # "instagram" when the project has sources, so a consumer that builds
+    # its cards from this list sees every platform the project collects.
+    # Appended last and additive — nothing about the X rows changes.
+    ig = _ig_pseudo_watchlist(pid)
+    if ig:
+        wls = list(wls) + [ig]
+    return {"watchlists": wls}
 
 
 def _watchlist_post(body):
@@ -2431,7 +2672,17 @@ def _links_interval(body):
 # --------------------------------------------------------------------------
 
 def _stream_assignments_json():
-    return {"streams": _with_store(lambda st: st.streams_with_projects())}
+    streams = list(_with_store(lambda st: st.streams_with_projects()))
+    # The Instagram pseudo-streams, each assigned to exactly its project.
+    # stream_id is the negative project id — an integer no real stream can
+    # carry — and attach/detach refuse it (they take stream ids from
+    # results.db only).
+    for s in _ig_pseudo_streams():
+        streams.append({"stream_id": -s["project_id"], "label": s["label"],
+                        "paused": int(s["paused"]), "list_id": None,
+                        "tweets": s["tweets"], "projects": [s["project_id"]],
+                        "platform": "instagram"})
+    return {"streams": streams}
 
 
 def _stream_assign(body, attach: bool):
@@ -6248,19 +6499,28 @@ class Handler(BaseHTTPRequestHandler):
                 # /api/status carries account health and rate-limit internals.
                 # An integration wants to know what exists and how much of it
                 # there is, so this is that and nothing else.
-                if not _CFG.db_results.exists():
-                    return self._send(200, {"streams": []})
-                with _connect() as con:
-                    rows = con.execute(
-                        "SELECT s.label, s.query, s.list_id, s.paused, "
-                        "       COUNT(h.tweet_id) AS tweets "
-                        "FROM streams s LEFT JOIN tweet_hits h USING(stream_id) "
-                        "GROUP BY s.stream_id ORDER BY s.label").fetchall()
-                return self._send(200, {"streams": [
+                rows = []
+                if _CFG.db_results.exists():
+                    with _connect() as con:
+                        rows = con.execute(
+                            "SELECT s.label, s.query, s.list_id, s.paused, "
+                            "       COUNT(h.tweet_id) AS tweets "
+                            "FROM streams s LEFT JOIN tweet_hits h USING(stream_id) "
+                            "GROUP BY s.stream_id ORDER BY s.label").fetchall()
+                streams = [
                     {"label": r["label"],
                      "source": ("list:" + r["list_id"]) if r["list_id"] else r["query"],
                      "paused": bool(r["paused"]), "tweets": r["tweets"]}
-                    for r in rows]})
+                    for r in rows]
+                # Instagram, one pseudo-stream per project with sources, in
+                # the same four fields plus `platform` so a consumer can
+                # tell them apart without parsing the label.
+                streams += [
+                    {"label": s["label"], "source": f"instagram:project:{s['project_id']}",
+                     "paused": s["paused"], "tweets": s["tweets"],
+                     "platform": "instagram"}
+                    for s in _ig_pseudo_streams()]
+                return self._send(200, {"streams": streams})
             if u.path == "/api/guard":
                 import guard
                 return self._send(200, guard.assess(
@@ -6269,7 +6529,11 @@ class Handler(BaseHTTPRequestHandler):
                     queue=q.get("queue", "search"),
                 ).to_json())
             if u.path == "/api/tweets":
-                if not _CFG.db_results.exists():
+                # Instagram lives in ig_results.db; the X guard must not
+                # blank it just because no tweet has been stored yet.
+                if (not _CFG.db_results.exists()
+                        and (q.get("platform") or "").lower() != "instagram"
+                        and not _ig_stream_project(q.get("stream"))):
                     return self._send(200, {"total": 0, "rows": []})
                 return self._send(200, _query_tweets(q))
             if u.path == "/api/projects":

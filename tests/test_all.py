@@ -3720,6 +3720,154 @@ def test_ig_avatar(tmp):
            "and the first post with a picture lights up the older one by the same author")
 
 
+def test_ig_as_stream(tmp):
+    """
+    Instagram served the way X streams are (2026-09-18): /api/tweets with
+    platform=instagram walks ig_results.db on the same gapless
+    since_collected_ms cursor, oldest-first, in the shared row shape; and the
+    structure endpoints list one `ig:P:0` pseudo-stream per project with
+    sources, so a consumer that mirrors X with a cursor loop (Watch-Tower)
+    mirrors Instagram with the identical loop and one extra parameter.
+
+    Pins: opt-in only (the default X query is untouched); "0" is a cursor,
+    not an absence; the walk is gapless and repeats nothing; the stream
+    label alone scopes the project; a label naming another project is
+    refused with a note, never an `error` key (WATCH_TOWER.md R10); the
+    pseudo watchlist and stream rows carry negative ids and the handles as
+    members; nothing here touches results.db when it does not exist.
+    """
+    import store_ig, web
+    import pathlib as _pl
+
+    root = _pl.Path(str(tmp))
+    rp = root / "ig_results.db"
+    with store_ig.Store(str(rp)) as st:
+        st.add_source("Narendra Modi", "user", "narendramodi",
+                      platform_id="1550693326", project_id=7)
+        st.add_source("pending guy", "user", "pending_guy", project_id=7)
+        st.add_source("other", "user", "other", platform_id="5", project_id=9)
+        recs = [{"pk": 100 + i, "code": f"c{i}", "taken_at": 1000 + i,
+                 "username": "narendramodi", "user_pk": 1550693326,
+                 "caption": f"post {i}", "media_type": 1,
+                 "thumbnail_url": f"https://cdn/{i}.jpg", "like_count": i}
+                for i in range(7)]
+        st.upsert_posts(recs, "Narendra Modi", project_id=7)
+        # Collection order ≠ post order on purpose: 106 was posted last but
+        # collected FIRST — the case an id cursor steps over and a
+        # collection cursor must not.
+        st.db.execute("UPDATE posts SET collected_at = 2000 + (pk - 100)")
+        st.db.execute("UPDATE posts SET collected_at = 1999 WHERE pk = 106")
+        st.db.commit()
+        st.upsert_posts([{"pk": 900, "taken_at": 5, "username": "other",
+                          "user_pk": 5}], "other", project_id=9)
+
+    class Cfg:
+        pass
+    Cfg.root = root
+    Cfg.db_results = root / "results.db"      # never created: X is absent
+    saved = web._CFG
+    web._CFG = Cfg()
+    try:
+        print("== /api/tweets?platform=instagram ==")
+        r = web._query_tweets({"platform": "instagram"})
+        ok(r["rows"] == [] and "note" in r and "error" not in r,
+           "without a project: an empty page with a note, never an error key")
+        r = web._query_tweets({"platform": "instagram", "project": "7"})
+        ok(r["total"] == 7, f"project= scopes to that project's posts ({r['total']})")
+        ok([x["tweet_id"] for x in r["rows"]][:2] == ["106", "105"],
+           "browsing (no cursor) is newest-first by post id, like X")
+        row = r["rows"][0]
+        need = ("platform", "tweet_id", "text", "created_at", "collected_at",
+                "created_ms", "collected_ms", "author_username", "author_id",
+                "media", "like_count", "reply_count", "view_count", "source",
+                "streams", "label", "label_source", "label_ms")
+        ok(all(k in row for k in need), f"the shared row shape, plus the X cursor fields ({[k for k in need if k not in row]})")
+        ok(row["platform"] == "instagram" and row["streams"] == ["ig:7:0"],
+           "each row names its platform and its pseudo-stream")
+        ok(isinstance(row["tweet_id"], str) and row["collected_ms"] == 1999 * 1000,
+           "ids are strings; collected_ms is the table's seconds in milliseconds")
+        ok(row["media"] == [{"type": "photo", "url": "https://cdn/6.jpg",
+                             "thumb": "https://cdn/6.jpg"}],
+           "media is the [{type,url,thumb}] list every platform emits")
+
+        print("== the collection cursor: gapless, oldest-first, no repeats ==")
+        seen, cur, pages = [], "0", 0
+        while True:
+            page = web._query_tweets({"platform": "instagram", "project": 7,
+                                      "since_collected_ms": cur, "limit": 3})
+            seen += [x["tweet_id"] for x in page["rows"]]
+            pages += 1
+            if len(page["rows"]) < 3 or pages > 10:
+                break
+            cur = page["cursor"]["since_collected_ms"]
+        ok(seen == ["106", "100", "101", "102", "103", "104", "105"],
+           f"the walk follows collection order and delivers every row once ({seen})")
+        ok(pages == 3, f"three pages of three for seven rows ({pages})")
+        r0 = web._query_tweets({"platform": "instagram", "project": 7,
+                                "since_collected_ms": 0, "limit": 2})
+        ok(r0["rows"][0]["tweet_id"] == "106" and r0.get("has_more") is True,
+           "a numeric 0 cursor is a cold load, not 'no cursor'")
+        ok(r0["cursor"] == {"since_id": "100", "since_collected_ms": 2000 * 1000},
+           "the resume position is handed back in both currencies")
+        by_id = [x["tweet_id"] for x in web._query_tweets(
+            {"platform": "instagram", "project": 7, "since_id": "104"})["rows"]]
+        ok(by_id == ["105", "106"], f"since_id walks post ids ascending ({by_id})")
+
+        print("== the stream label ==")
+        ok(web._query_tweets({"stream": "ig:7:0"})["total"] == 7,
+           "stream=ig:P:0 alone selects the project — no platform= needed")
+        r = web._query_tweets({"stream": "ig:9:0", "project": 7})
+        ok(r["rows"] == [] and "note" in r and "error" not in r,
+           "a label naming a different project than project= is refused with a note")
+        ok(web._query_tweets({"platform": "instagram", "project": 9})["total"] == 1,
+           "the other project sees only its own row")
+        ok(web._ig_stream_project("wl:7:0") == 0 and web._ig_stream_project("ig:7:0") == 7
+           and web._ig_stream_project("ig:x:0") == 0,
+           "only ig:<int>:… labels are Instagram; wl: labels and garbage are not")
+        ok(web._query_tweets({"platform": "instagram", "project": 7, "q": "post 3"})["total"] == 1
+           and web._query_tweets({"platform": "instagram", "project": 7, "author": "narendra"})["total"] == 7
+           and web._query_tweets({"platform": "instagram", "project": 7, "min_likes": 5})["total"] == 2,
+           "q= / author= / min_likes= mean on Instagram what they mean on X")
+
+        print("== the pseudo-stream on the structure endpoints ==")
+        ps = web._ig_pseudo_streams()
+        ok([s["project_id"] for s in ps] == [7, 9],
+           f"one pseudo-stream per project with enabled sources ({[s['project_id'] for s in ps]})")
+        ok(ps[0]["label"] == "ig:7:0" and ps[0]["tweets"] == 7 and ps[0]["paused"] is False,
+           "labelled ig:P:0, counting that project's posts, carrying the collector's pause")
+        ok([m["handle"] for m in ps[0]["sources"]] == ["narendramodi", "pending_guy"]
+           and ps[0]["sources"][0]["resolved"] and not ps[0]["sources"][1]["resolved"],
+           "the handles ride along as members, each saying whether its id is resolved")
+        wl = web._ig_pseudo_watchlist(7)
+        ok(wl["watchlist_id"] == -7 and wl["kind"] == "instagram"
+           and wl["streams"] == [{"stream_id": -7, "label": "ig:7:0",
+                                  "paused": False, "tweets": 7}],
+           "the watchlist row: negative id, kind instagram, one stream")
+        ok([m["handle"] for m in wl["members"]] == ["narendramodi", "pending_guy"]
+           and wl["members"][0]["user_id"] == "1550693326"
+           and wl["members"][1]["user_id"] is None,
+           "members carry the handle and the numeric id (None while pending)")
+        ok(web._ig_pseudo_watchlist(42) is None,
+           "a project without Instagram sources gets no synthetic row")
+
+        print("== the X default is untouched ==")
+        # No results.db: the X path is never entered for an Instagram query,
+        # and the dispatch guard still blanks a plain X query.
+        ok(web._query_tweets({"platform": "instagram", "project": 7})["total"] == 7
+           and not Cfg.db_results.exists(),
+           "platform=instagram never needs results.db")
+        # And with a config that has no `root` at all (older test fixtures,
+        # a minimal deployment) the helpers say 'nothing' rather than raise.
+        class Bare:
+            db_results = root / "results.db"
+        web._CFG = Bare()
+        ok(web._ig_pseudo_streams() == [] and web._ig_pseudo_watchlist(7) is None
+           and web._query_tweets({"platform": "instagram", "project": 7})["rows"] == [],
+           "no root, no ig_results.db → empty answers, no exception")
+    finally:
+        web._CFG = saved
+
+
 def test_ig_rhythm(tmp):
     """
     Phone-time and the trickle (2026-09-04, later the same day).
@@ -6775,6 +6923,7 @@ def main():
         test_ig_device(fresh("ig"))
         section("instagram profile pictures (from the post's own user object, never a fetch)")
         test_ig_avatar(fresh("igav"))
+        test_ig_as_stream(fresh("igstream"))
         section("instagram rhythm (phone-time sessions, one visit at a time)")
         test_ig_rhythm(fresh("igrhythm"))
         section("instagram: a stop decision stands; shared stores are WAL")

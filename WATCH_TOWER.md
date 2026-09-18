@@ -105,8 +105,16 @@ Authorization: Bearer <key>
 → upsert by tweet_id, cursor = max(collected_ms) committed, page until < limit
 ```
 
-Instagram is the same key and project ids on `/api/ig/posts` with a different
-shape and paging model — `WATCH_TOWER_INSTAGRAM_HANDOVER.md`. The signed
+Instagram is the same key and project ids, and since 2026-09-18 the SAME
+loop: `GET /api/tweets?platform=instagram&project=P&since_collected_ms=<cursor>
+&limit=500` (or `stream=ig:P:0`) walks `ig_results.db` on the collection
+cursor with the X row shape (`platform: "instagram"`, `streams: ["ig:P:0"]`);
+`/api/streams`, `/api/streams/assignments` and `/api/watchlists?project=P`
+list the `ig:P:0` pseudo-stream / a `kind: "instagram"` watchlist so their
+Collector cards can show it beside the X lists. The older
+`/api/ig/posts` (newest-first on id, 72h-window loop —
+`WATCH_TOWER_INSTAGRAM_HANDOVER.md`) still works and is what the dashboard
+uses. The signed
 webhook push (`webhook.py`) is an alternative delivery path that exists and
 is documented (`WATCH_TOWER_HANDOVER.md`) but is **not** what the Collector
 page is built on; the pull is. Do not assume a webhook target is what keeps
@@ -285,11 +293,10 @@ point of view it did not happen.
 
 ## 7. Known gaps and the wishlist (ours to fix, in priority order)
 
-1. **Instagram has no collection-time cursor.** `/api/ig/posts` pages
-   newest-first on `id`; `since` is post time. Their loop must use an overlap
-   window (documented). Fix: `collected_at` in `store_ig.to_api` +
-   `since_collected_ms` with oldest-first ordering in `store_ig.query` /
-   `_ig_posts`. ~20 lines + a test; makes the IG loop identical to X.
+1. ~~**Instagram has no collection-time cursor.**~~ Done 2026-09-18, on
+   `/api/tweets?platform=instagram` rather than on `/api/ig/posts` (which is
+   unchanged): the IG loop is now identical to X. Tell them; the 72h-window
+   loop keeps working meanwhile.
 2. **Instagram metrics are frozen** (`INSERT OR IGNORE`). Fine for
    monitoring, wrong for engagement growth. Fix only if they ask; it changes
    the "never update" invariant their upsert relies on (R4 applies).

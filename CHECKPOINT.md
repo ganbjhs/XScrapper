@@ -19,6 +19,82 @@ must respect belongs in the rulebook, not here.
 
 ---
 
+## 2026-09-18 (II) — Instagram becomes a stream: one pull, one cursor, one shape
+
+**Changed**
+
+- `web.py` — `_query_tweets` dispatches to a new `_query_ig_as_stream` when
+  `platform=instagram` is given or `stream=` names an `ig:P:0` label. That
+  function serves `ig_results.db` with the X contract: project-scoped,
+  `since_collected_ms` (the table's `collected_at` seconds ×1000) and
+  `since_id` cursors, oldest-first while cursoring, the bounded count, the
+  same `cursor`/`has_more` envelope, `q`/`author`/`min_likes`/`min_views`/
+  `since`/dates/`has_media`/`sort` meaning what they mean on X. Rows are
+  `store_ig.to_feed` (the shared shape) plus `created_ms`, `collected_ms`,
+  `author_id`, `streams: ["ig:P:0"]`, and the project's labels stamped as
+  `instagram`. Avatars come through the `profiles` cache with the cursor
+  order kept (the store's own helper re-sorts newest-first, which would break
+  a walk). `"0"` and `0` are cursors, not absences.
+- `web.py` — `_ig_pseudo_streams()` / `_ig_pseudo_watchlist(pid)`: one
+  `ig:P:0` per project with enabled sources, carrying the project's post
+  count, the collector's pause and the handles (with numeric id / resolved /
+  collector). Appended, additively, to `/api/streams` (with
+  `platform: "instagram"` and `source: "instagram:project:P"`),
+  `/api/streams/assignments` (`stream_id: -P`, `projects: [P]`) and
+  `/api/watchlists?project=P` (`watchlist_id: -P`, `kind: "instagram"`,
+  members = handles). `ig_stream_label()` / `_ig_stream_project()` are the
+  one place the label format lives.
+- `web.py` — the `/api/tweets` dispatch no longer blanks an Instagram query
+  because `results.db` is absent.
+- `tests/test_all.py` — `test_ig_as_stream` (25 checks): opt-in only, the
+  gapless walk with collection order ≠ post order, the `0` cursor, both
+  cursor currencies handed back, label-alone scoping, cross-project label
+  refused with a note and no `error` key, filters, the pseudo rows, and a
+  config with no `root` answering empty instead of raising.
+- `RULEBOOK.md` §4 — the rule ("Instagram is also a STREAM on the X
+  surfaces"). `WATCH_TOWER.md` — the loop paragraph and wishlist item 1.
+
+**Why**
+
+Watch-Tower's Collector shows and binds X streams; Instagram, on a separate
+endpoint with a separate paging model, never got a place in it, so the
+25-source project 17 and the 118-source project 14 deliver nothing to any
+client. Their team judged a panel redesign (`WATCH_TOWER_COLLECTOR_PANEL_PROMPT.md`)
+too deep. The operator's question was the right one: if they can pull X,
+why can't they pull Instagram the same way? Nothing stopped it but our own
+endpoint split — `collected_at` was already in the table and `to_feed`
+already emitted the shared shape. Making Instagram look like a stream moves
+the work from their core to two hundred lines of ours, and their change
+shrinks to one extra query parameter on a loop they already run. The label
+is `ig:<project>:0` deliberately: their parser reads the number in a label
+as a project id (their bug — `wl:17:0` is watchlist 17, which is why their
+card for project 17 shows a project-14 list), and for Instagram that reading
+happens to be right.
+
+**Verified**
+
+- Full suite green: 1,472 checks (1,447 + 25), `python3 tests/test_all.py`.
+- A hand smoke against a temp store: 7 posts across 3 pages of 3, walked
+  from cursor `0` in collection order, no repeat, no gap; project 9 isolated;
+  default `/api/tweets` path not entered.
+- NOT verified against the live VPS — deployed by push to `main`. First thing
+  to look at after deploy: `GET /api/streams` shows `ig:13:0`, `ig:14:0`,
+  `ig:17:0`; `GET /api/tweets?platform=instagram&project=14&since_collected_ms=0&limit=5`
+  returns five oldest-collected rows with `streams: ["ig:14:0"]`.
+
+**Still open**
+
+- `/api/export` and `/api/live` (SSE) stay X-only; Instagram has no push.
+- `/api/fb/posts` still has no cursor and no per-page filter (the same
+  treatment would give Facebook a stream too — `fb:P:0` — when they ask).
+- The Watch-Tower note for this change is `WATCH_TOWER_INSTAGRAM_STREAM_PROMPT.md`
+  (new); the 2 Sept 72h-window loop in `WATCH_TOWER_INSTAGRAM_PROMPT.md`
+  keeps working and that file is left as sent.
+- Paced lookups / adaptive cadence: still unimplemented (design in the
+  project notes).
+
+---
+
 ## 2026-09-18 — A pending Instagram id can be fixed from the watchlist
 
 **Changed**
