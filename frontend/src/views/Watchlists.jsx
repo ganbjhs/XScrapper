@@ -2042,7 +2042,13 @@ export default function Watchlists({ onMenu }) {
   const [sel, setSel] = useState(null);        // "x:<id>" | "fb" | "ig"
   const [creating, setCreating] = useState(false);
 
-  const xLists = wls.data?.watchlists || [];
+  // /api/watchlists also carries one synthetic kind:"instagram" row per
+  // project (the ig:P:0 stream, for Watch Tower). The Instagram row below is
+  // built from /api/ig/status, so drop it here or it shows twice — once as a
+  // bogus "X List" with 118 handles.
+  const xLists = (wls.data?.watchlists || []).filter(
+    (w) => w.platform !== "instagram" && w.kind !== "instagram",
+  );
   const items = useMemo(() => {
     const out = xLists.map((w) => ({
       id: `x:${w.watchlist_id}`, platform: "x", name: w.name,
