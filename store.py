@@ -2011,6 +2011,40 @@ class Store:
         return {"watchlist_id": wid, "name": name, "kind": kind,
                 "owner_handle": owner}
 
+    async def rename_watchlist(self, watchlist_id: int, name) -> dict:
+        """
+        Give a watchlist a new display name.
+
+        Nothing recompiles and nothing moves: streams are labelled by id
+        (`wl:<id>:<n>`), Watch-Tower keys its cards on the id (R1), and the
+        collected posts hang off the stream, so a rename is exactly as cheap
+        as it looks. The one thing that DOES read the name is a sheet-backed
+        links list whose `sheet_tab` fell back to the name — that column is
+        stored separately and is left alone here, so the tab it reads stays
+        the same. Uniqueness is per project, like create_watchlist.
+        """
+        name = (name or "").strip()
+        if not name:
+            return {"error": "a watchlist needs a name"}
+        if len(name) > 120:
+            return {"error": "keep the name under 120 characters"}
+        w = self.db.execute("SELECT * FROM watchlists WHERE watchlist_id = ?",
+                            (int(watchlist_id),)).fetchone()
+        if not w:
+            return {"error": f"no watchlist {watchlist_id}"}
+        if name == w["name"]:
+            return {"watchlist_id": int(watchlist_id), "name": name}
+        clash = self.db.execute(
+            "SELECT 1 FROM watchlists WHERE project_id = ? AND name = ? "
+            "AND watchlist_id != ?",
+            (w["project_id"], name, int(watchlist_id))).fetchone()
+        if clash:
+            return {"error": f"this project already has a watchlist called {name!r}"}
+        self.db.execute("UPDATE watchlists SET name = ? WHERE watchlist_id = ?",
+                        (name, int(watchlist_id)))
+        return {"watchlist_id": int(watchlist_id), "name": name,
+                "previous": w["name"]}
+
     async def set_watchlist_owner(self, watchlist_id: int, handle) -> dict:
         """
         Record which X account owns this List — or clear it, with "".

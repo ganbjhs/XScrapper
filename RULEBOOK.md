@@ -202,6 +202,37 @@ change to the delivery contract. The write endpoint
 (`POST /api/watchlists/owner`) is cookie-only: a read integration does not get
 to restamp ownership.
 
+### A watchlist's name is a label; its id is the key — so rename freely, and count what you actually follow (2026-09-24)
+
+`POST /api/watchlists/rename` changes `watchlists.name` and nothing else. It is
+safe because nothing downstream reads the name: streams are labelled
+`wl:<id>:<n>`, posts hang off the stream, and Watch-Tower keys its cards on
+`watchlist_id` / `project_id` (R1). The store refuses a blank name and a name
+another list in the same project already uses; a sheet-backed links list keeps
+its stored `sheet_tab`, so the tab it reads does not move when the list is
+renamed. Cookie-only, like `/owner` — a read integration does not rename our
+lists.
+
+"How many accounts does this project follow?" has one honest answer per kind,
+and the dashboard adds them up rather than guessing:
+
+- a handle list counts its `members[]`;
+- an X List counts the **member cache** (`xlist_members`, filled only by
+  "Refresh members"), which `GET /api/watchlists` now carries as
+  `xmembers: {count, fetched_ms}` on `kind='xlist'` rows — additive, absent on
+  every other kind. `count: 0, fetched_ms: null` means NEVER FETCHED, and the
+  page says so by name ("3 lists not counted — fetch") instead of folding a
+  silent zero into the total. Rajasthan showed 171 for weeks because three of
+  its six Lists had never been pulled;
+- keyword and link lists follow no accounts and add nothing.
+
+That total is NOT Watch-Tower's "handles". Theirs is *distinct
+`author_username` in their mirror* (WATCH_TOWER_COLLECTOR_HANDOVER.md §6), so
+it counts past members, collab co-authors on Instagram (5% of Rajasthan's IG
+posts carry an author other than the source they came from) and retweeters —
+it is always ≥ ours and is the wrong number to reconcile against a member
+list. Say "accounts followed" for ours and "authors seen" for theirs.
+
 **The consumer's envelope is `rows` AND `items`, and neither may be renamed
 (2026-09-10).** `/api/links` serves the same list object under both keys.
 `rows` is ours and Watch-Tower reads it; `items` is the report tool's, because

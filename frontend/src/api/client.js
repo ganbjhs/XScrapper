@@ -169,6 +169,9 @@ export const api = {
   // Which X account owns an X List. "" clears it back to not-recorded.
   watchlistOwner: (watchlist_id, owner_handle) =>
     request("/api/watchlists/owner", { method: "POST", body: { watchlist_id, owner_handle } }),
+  // Display name only — streams, posts and Watch-Tower's cards all key on the id.
+  renameWatchlist: (watchlist_id, name) =>
+    request("/api/watchlists/rename", { method: "POST", body: { watchlist_id, name } }),
   removeWatchlist: (watchlist_id) =>
     request("/api/watchlists/remove", { method: "POST", body: { watchlist_id } }),
   watchlistFilters: (watchlist_id, filters) =>

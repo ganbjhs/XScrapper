@@ -19,6 +19,57 @@ must respect belongs in the rulebook, not here.
 
 ---
 
+## 2026-09-24 — Watchlists: rename, and a project-wide "accounts followed" count
+
+**Changed**
+
+- `store.py` — `rename_watchlist(watchlist_id, name)`: trims, refuses blank
+  and per-project duplicates, updates `watchlists.name` only. Streams, posts
+  and `sheet_tab` are untouched.
+- `web.py` — `POST /api/watchlists/rename` (cookie-only; not in
+  `API_KEY_WRITE_PATHS`). `GET /api/watchlists` attaches
+  `xmembers: {count, fetched_ms}` to `kind='xlist'` rows from the
+  `xlist_members` cache (`_attach_xlist_member_counts`); additive, other kinds
+  unchanged, the IG pseudo-row unchanged.
+- `frontend/src/views/Watchlists.jsx` — `RenameTitle` replaces the static
+  `<h3>` on the X and links panels (Rename → inline input, Enter/Escape).
+  Sidebar: an X List row reads "X List · 118 accounts" or "members not
+  fetched". The X group header adds "· N accounts" (handle-list members + X
+  List cache) and, when any List was never pulled, a "k lists not counted —
+  fetch" button that runs "Refresh members" for each of them in turn.
+- `frontend/dist` rebuilt (the VPS runs no Node).
+- `RULEBOOK.md` §2 — the rename/count rule, and the "accounts followed ≠
+  authors seen" distinction against Watch-Tower's card.
+
+**Why**
+
+Rajasthan (project 14): the operator counted 171 X handles, Watch-Tower showed
+184; 118 Instagram sources vs their 214 + 2 waiting. Traced live: 171 = the
+member cache of three of the project's six X Lists (118 + 40 + 13); प्रदेश
+प्रवक्ता, मोर्चाध्यक्ष and प्रदेश पदाधिकारी had never had "Refresh members"
+run (0, null) despite 1,700 collected posts. 184 ≈ 185 distinct authors in the
+21,601 X posts. IG 214 ≈ 234 distinct authors in 4,411 posts — 118 of those are
+collab co-authors (e.g. `drkailashvermabjp` → 31 posts by
+`drkailashverma_union`); every post came from an enabled source; the 2 waiting
+are the two unresolved ids. Neither side was wrong; they count different
+things, and the dashboard had no total at all.
+
+**Verified**
+
+`tests/test_all.py`: 1,481 checks green (was 1,472; +6 rename, +3 xmembers).
+`npm run build` clean. Not yet verified on the VPS.
+
+**Still open**
+
+- Named / multiple Instagram lists per project: `store_ig.sources` has no
+  grouping column, and Watch-Tower reads one `ig:P:0` per project. Needs a
+  `list_name` on sources + the pseudo-row split (or a `group` field on
+  members) — designed next, not in this commit.
+- The member cache is manual. A scheduled refresh (daily, cost 3 per list)
+  would keep the total honest without anyone clicking.
+
+---
+
 ## 2026-09-18 (II) — Instagram becomes a stream: one pull, one cursor, one shape
 
 **Changed**

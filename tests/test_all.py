@@ -2069,6 +2069,15 @@ def test_projects_watchlists(tmp):
         out["owner_set"] = await st.set_watchlist_owner(
             out["xl"]["watchlist_id"], "@Second_Bot")
         out["wls2"] = await st.watchlists(pid)
+        # Rename: display only, unique per project, never touches a stream.
+        out["ren_blank"] = await st.rename_watchlist(wid, "   ")
+        out["ren_clash"] = await st.rename_watchlist(wid, "Big permanent")
+        out["ren_missing"] = await st.rename_watchlist(999999, "Ghost")
+        out["ren_ok"] = await st.rename_watchlist(wid, "  Cabinet (renamed)  ")
+        out["ren_streams"] = [r["label"] for r in st.db.execute(
+            "SELECT label FROM streams WHERE label LIKE ? ORDER BY label",
+            (f"wl:{wid}:%",))]
+        out["wls_ren"] = await st.watchlists(pid)
         out["gone"] = await st.delete_watchlist(wid)
         out["wls3"] = await st.watchlists(pid)
         out["pid"], out["wid"] = pid, wid
@@ -2125,6 +2134,17 @@ def test_projects_watchlists(tmp):
     ok(xl_row["owner_handle"] == "second_bot",
        "the owner travels out on the watchlists API — what Watch-Tower reads")
 
+    ok("error" in r["ren_blank"], "renaming to a blank name is refused")
+    ok("error" in r["ren_clash"],
+       "renaming onto another list's name in the same project is refused")
+    ok("error" in r["ren_missing"], "renaming a watchlist that does not exist is refused")
+    ok(r["ren_ok"]["name"] == "Cabinet (renamed)" and r["ren_ok"]["previous"] == "Cabinet",
+       "rename trims, stores the new name and reports the old one")
+    ok(next(w["name"] for w in r["wls_ren"] if w["watchlist_id"] == r["wid"]) == "Cabinet (renamed)",
+       "the new name travels out on the watchlists API")
+    ok(r["ren_streams"] == [f"wl:{r['wid']}:0", f"wl:{r['wid']}:1", f"wl:{r['wid']}:2"],
+       "a rename leaves every compiled stream label untouched — the id is the key")
+
     ok(r["gone"]["removed"] and not any(w["watchlist_id"] == r["wid"] for w in r["wls3"]),
        "deleting a watchlist removes it from the dashboard")
     dead = con.execute(
@@ -2176,6 +2196,31 @@ def test_projects_watchlists(tmp):
     ok(proj_n == 2, f"project= narrows to what that project's streams collected ({proj_n})")
     ok(web._query_tweets({"project": "nonsense"})["total"] == 3,
        "an unparseable project id narrows nothing rather than erroring")
+
+    print()
+    print("== X List member counts ride on /api/watchlists ==")
+    # The xlist watchlist ("Big permanent", list 777) has no members row of
+    # its own — they live on x.com — so the page reads the member cache.
+    # _watchlists_json = store.watchlists + this attach step; the attach is
+    # what is under test, on the rows the store already produced above.
+    xl_id = r["xl"]["watchlist_id"]
+    wl0 = [dict(w) for w in r["wls2"]]
+    web._attach_xlist_member_counts(wl0)
+    xl0 = next(w for w in wl0 if w["watchlist_id"] == xl_id)
+    ok(xl0.get("xmembers") == {"count": 0, "fetched_ms": None},
+       "an X List whose members were never pulled says so: count 0, no fetch time")
+    ok(all("xmembers" not in w for w in wl0 if w["kind"] != "xlist"),
+       "handle lists carry no xmembers key — their members[] is the answer")
+    web._xlist_members_save("777", [
+        {"user_id": "1", "username": "alpha", "display_name": "Alpha"},
+        {"user_id": "2", "username": "beta", "display_name": "Beta"},
+        {"user_id": "", "username": "dropped"},          # no id -> not stored
+    ])
+    wl1 = [dict(w) for w in r["wls2"]]
+    web._attach_xlist_member_counts(wl1)
+    xl1 = next(w for w in wl1 if w["watchlist_id"] == xl_id)
+    ok(xl1["xmembers"]["count"] == 2 and xl1["xmembers"]["fetched_ms"],
+       f"after a refresh the cached count and fetch time travel out ({xl1['xmembers']})")
 
     print()
     print("== the live stream cursor ==")

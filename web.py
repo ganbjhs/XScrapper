@@ -2175,6 +2175,13 @@ def _watchlists_json(q):
     if not pid:
         return {"error": "which project? pass ?project=<id>"}
     wls = _with_store(lambda st: st.watchlists(pid))
+    # An X List's members live on x.com, so `members` is empty on those rows
+    # and the dashboard could not add the project up ("how many accounts do
+    # we follow?" had no answer). Attach what the member cache knows —
+    # count and when it was pulled — so the page can total it and can say
+    # which lists were never fetched. Additive: a consumer that ignores the
+    # key sees exactly what it saw before.
+    _attach_xlist_member_counts(wls)
     # Instagram beside the X lists (2026-09-18): one synthetic row of kind
     # "instagram" when the project has sources, so a consumer that builds
     # its cards from this list sees every platform the project collects.
@@ -2183,6 +2190,38 @@ def _watchlists_json(q):
     if ig:
         wls = list(wls) + [ig]
     return {"watchlists": wls}
+
+
+def _attach_xlist_member_counts(wls):
+    ids = [w["list_id"] for w in wls
+           if w.get("kind") == "xlist" and w.get("list_id")]
+    if not ids:
+        return
+    counts = {}
+    con = _xlist_con()
+    try:
+        marks = ",".join("?" * len(ids))
+        for r in con.execute(
+                f"SELECT list_id, COUNT(*) AS n, MAX(fetched_ms) AS fetched_ms "
+                f"FROM xlist_members WHERE list_id IN ({marks}) GROUP BY list_id",
+                [str(i) for i in ids]):
+            counts[str(r["list_id"])] = {"count": r["n"], "fetched_ms": r["fetched_ms"]}
+    except sqlite3.Error:
+        return
+    finally:
+        con.close()
+    for w in wls:
+        if w.get("kind") == "xlist":
+            w["xmembers"] = counts.get(str(w.get("list_id") or ""),
+                                       {"count": 0, "fetched_ms": None})
+
+
+def _watchlist_rename(body):
+    try:
+        wid = int(body.get("watchlist_id") or 0)
+    except (TypeError, ValueError):
+        return {"error": "watchlist_id must be a number"}
+    return _with_store(lambda st: st.rename_watchlist(wid, body.get("name")))
 
 
 def _watchlist_post(body):
@@ -6668,6 +6707,8 @@ class Handler(BaseHTTPRequestHandler):
                 return self._send(200, _watchlist_members(body))
             if u.path == "/api/watchlists/owner":
                 return self._send(200, _watchlist_owner(body))
+            if u.path == "/api/watchlists/rename":
+                return self._send(200, _watchlist_rename(body))
             if u.path == "/api/watchlists/filters":
                 return self._send(200, _watchlist_filters(body))
             if u.path == "/api/watchlists/interval":

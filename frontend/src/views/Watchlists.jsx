@@ -409,6 +409,57 @@ function FiltersPanel({ w, onChanged }) {
   );
 }
 
+// The watchlist's name, with a Rename button. Names are display only — every
+// stream, post and Watch-Tower card keys on the id — so renaming is safe at
+// any time; the store refuses a name another list in the same project uses.
+function RenameTitle({ w, onChanged }) {
+  const [editing, setEditing] = useState(false);
+  const [val, setVal] = useState(w.name || "");
+  const [busy, setBusy] = useState(false);
+  const [err, setErr] = useState("");
+
+  const save = async () => {
+    const name = val.trim();
+    if (!name || name === w.name) { setEditing(false); setErr(""); return; }
+    setBusy(true); setErr("");
+    try {
+      const r = await api.renameWatchlist(w.watchlist_id, name);
+      if (r && r.error) { setErr(r.error); return; }
+      setEditing(false);
+      onChanged();
+    } catch (e) { setErr(String(e.message || e)); }
+    finally { setBusy(false); }
+  };
+
+  if (!editing) {
+    return (
+      <>
+        <h3>{w.name}</h3>
+        <button className="btn btn-ghost btn-sm" title="Rename this watchlist"
+                onClick={() => { setVal(w.name || ""); setEditing(true); }}>
+          Rename
+        </button>
+      </>
+    );
+  }
+  return (
+    <span style={{ display: "flex", gap: 6, alignItems: "center", flexWrap: "wrap" }}>
+      <input value={val} autoFocus maxLength={120} style={{ minWidth: 220 }}
+             onChange={(e) => setVal(e.target.value)}
+             onKeyDown={(e) => {
+               if (e.key === "Enter") save();
+               if (e.key === "Escape") { setEditing(false); setErr(""); }
+             }} />
+      <button className="btn btn-brand btn-sm" disabled={busy} onClick={save}>
+        {busy ? "\u2026" : "Save"}
+      </button>
+      <button className="btn btn-ghost btn-sm" disabled={busy}
+              onClick={() => { setEditing(false); setErr(""); }}>Cancel</button>
+      {err && <span style={{ color: "var(--critical)", fontSize: 12.5 }}>{err}</span>}
+    </span>
+  );
+}
+
 // Who owns this X List. A List is editable only by the account that made it,
 // so with several accounts in the pool this is the difference between "add a
 // handle to the Cabinet list" and half an hour of signing in to find out which
@@ -706,7 +757,7 @@ function XDetail({ w, onChanged }) {
   return (
     <div className="panel">
       <div className="phead" style={{ alignItems: "center", flexWrap: "wrap", rowGap: 8 }}>
-        <h3>{w.name}</h3>
+        <RenameTitle w={w} onChanged={onChanged} />
         <span className="badge platform-x">
           {w.kind === "xlist" ? "X List" : w.kind === "keywords" ? "keywords" : "handles"}
         </span>
@@ -988,7 +1039,7 @@ function LinksDetail({ pid, w, onChanged }) {
   return (
     <div className="panel">
       <div className="phead" style={{ alignItems: "center", flexWrap: "wrap", rowGap: 8 }}>
-        <h3>{w.name}</h3>
+        <RenameTitle w={w} onChanged={onChanged} />
         <span className="badge platform-x">links</span>
         <span className="chip">{fmtN(summ.total ?? 0)} link{summ.total === 1 ? "" : "s"}</span>
         {summ.ok > 0 && <span className="chip good" title="last fetch returned the post">{fmtN(summ.ok)} ok</span>}
@@ -2053,7 +2104,8 @@ export default function Watchlists({ onMenu }) {
     const out = xLists.map((w) => ({
       id: `x:${w.watchlist_id}`, platform: "x", name: w.name,
       sub: w.kind === "xlist"
-        ? `X List${w.owner_handle ? ` \u00b7 @${w.owner_handle}` : ""}`
+        ? `X List \u00b7 ${w.xmembers?.count ? `${w.xmembers.count} accounts` : "members not fetched"}`
+          + `${w.owner_handle ? ` \u00b7 @${w.owner_handle}` : ""}`
         : w.kind === "links"
         ? `${w.links?.total ?? 0} links \u00b7 every ${Math.round((w.refresh_every_s || 86400) / 3600)}h`
           + (w.sheet ? (w.sheet_day ? ` \u00b7 day ${fmtDay(w.sheet_day)}` : ` \u00b7 sheet tab \u201c${w.sheet_tab || w.name}\u201d`) : "")
@@ -2083,6 +2135,37 @@ export default function Watchlists({ onMenu }) {
 
   const selected = items.find((i) => i.id === sel) || items[0] || null;
   const reloadAll = () => { wls.reload(); fb.reload(); ig.reload(); };
+
+  // How many X accounts this project follows, added up across its lists:
+  // handle lists count their members; X Lists count what the member cache
+  // holds (0 until "Refresh members" has run for that list — those are
+  // named, not silently skipped). Keyword and link lists follow no accounts.
+  // This is the number to put beside Watch-Tower's "handles" — theirs is
+  // distinct AUTHORS seen in the posts, which is always >= this.
+  const xTotals = useMemo(() => {
+    let accounts = 0;
+    const unfetched = [];
+    for (const w of xLists) {
+      if (w.kind === "xlist") {
+        if (w.xmembers?.count) accounts += w.xmembers.count;
+        else unfetched.push(w);
+      } else if (w.kind === "query") {
+        accounts += (w.members || []).length;
+      }
+    }
+    return { accounts, unfetched };
+  }, [xLists]);
+  const [refreshingAll, setRefreshingAll] = useState("");
+  const refreshUnfetched = async () => {
+    // One list at a time — each pull spends a little X budget and the
+    // server serialises fetches anyway.
+    for (const w of xTotals.unfetched) {
+      setRefreshingAll(w.name);
+      try { await api.refreshXlistMembers(w.list_id); } catch { /* shown per list */ }
+    }
+    setRefreshingAll("");
+    wls.reload();
+  };
   const [listFilter, setListFilter] = useState("");
 
   const groups = [["x", "X (Twitter)"], ["fb", "Facebook"], ["ig", "Instagram"]];
@@ -2127,6 +2210,24 @@ export default function Watchlists({ onMenu }) {
                       <div className="wl-group">
                         {label}
                         {p === "x" && xLists.length > 0 && <span className="cnt">· {xLists.length}</span>}
+                        {p === "x" && xTotals.accounts > 0 && (
+                          <span className="cnt"
+                                title={"Accounts followed across this project's handle lists and X Lists. "
+                                       + "Watch-Tower's \u201chandles\u201d is distinct authors seen in the posts "
+                                       + "(retweets, collabs and past members included), so theirs runs higher."}>
+                            · {fmtN(xTotals.accounts)} accounts
+                          </span>
+                        )}
+                        {p === "x" && xTotals.unfetched.length > 0 && (
+                          <button className="btn btn-ghost btn-sm" disabled={!!refreshingAll}
+                                  style={{ marginLeft: 6 }}
+                                  title={"Members of these X Lists have never been pulled, so they are missing from the total: "
+                                         + xTotals.unfetched.map((w) => w.name).join(", ")}
+                                  onClick={refreshUnfetched}>
+                            {refreshingAll ? `fetching ${refreshingAll}\u2026`
+                              : `${xTotals.unfetched.length} list${xTotals.unfetched.length === 1 ? "" : "s"} not counted \u2014 fetch`}
+                          </button>
+                        )}
                         {filterable && (
                           <input value={listFilter} placeholder={`filter ${xLists.length} watchlists…`}
                                  onChange={(e) => setListFilter(e.target.value)} />
