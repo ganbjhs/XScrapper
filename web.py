@@ -2160,7 +2160,9 @@ def _project_delete(body):
             f"{len(res['streams_purged'])} stream(s) purged, "
             f"{res['posts_deleted']} post(s) deleted, "
             f"{len(res['streams_shared'])} shared stream(s) kept, "
-            f"{res['watchlists']} watchlist(s), {res['collections']} collection(s)",
+            f"{res['watchlists']} watchlist(s), "
+            f"{len(res.get('watchlists_transferred') or [])} handed to other projects, "
+            f"{res['collections']} collection(s)",
             db=str(_CFG.root / "activity.db"))
     except Exception:
         pass
@@ -2461,7 +2463,66 @@ def _watchlist_remove(body):
         wid = int(body.get("watchlist_id") or 0)
     except (TypeError, ValueError):
         return {"error": "watchlist_id must be a number"}
-    return _with_store(lambda st: st.delete_watchlist(wid))
+    # `project` is optional and additive: without it this is the delete it
+    # always was. With it, a project that only ADDED a shared list is
+    # detached instead of deleting a list another project still collects.
+    pid = _int_or(body.get("project"), 0) or None
+    return _with_store(lambda st: st.delete_watchlist(wid, pid))
+
+
+# --------------------------------------------------------------------------
+# shared watchlists — one list, several projects (project_watchlists)
+#
+# Dashboard-only: none of these is in an API-key allowlist. A consumer reads
+# the result of sharing through /api/watchlists?project=P exactly as before —
+# a shared list is simply listed under every project that uses it, with the
+# same watchlist_id, plus the additive keys owner_project_id / projects[] /
+# shared. Nothing a consumer already reads changes shape.
+# --------------------------------------------------------------------------
+
+def _watchlist_library(q):
+    pid = _int_or(q.get("project"), 0)
+    return {"watchlists": _with_store(lambda st: st.watchlist_library(pid or None))}
+
+
+def _watchlist_attach(body):
+    pid = _int_or(body.get("project"), 0)
+    wid = _int_or(body.get("watchlist_id"), 0)
+    if not pid:
+        return {"error": "which project?"}
+    if not wid:
+        return {"error": "watchlist_id must be a number"}
+    res = _with_store(lambda st: st.attach_watchlist(pid, wid))
+    if "error" not in res and not res.get("already"):
+        try:
+            import activity_log
+            activity_log.log_event(
+                "x", f"[watchlists] project {pid} added shared watchlist {wid} "
+                f"{res.get('name')!r} (owned by project {res.get('owner_project_id')})",
+                db=str(_CFG.root / "activity.db"))
+        except Exception:
+            pass
+    return res
+
+
+def _watchlist_detach(body):
+    pid = _int_or(body.get("project"), 0)
+    wid = _int_or(body.get("watchlist_id"), 0)
+    if not pid:
+        return {"error": "which project?"}
+    if not wid:
+        return {"error": "watchlist_id must be a number"}
+    res = _with_store(lambda st: st.detach_watchlist(pid, wid))
+    if "error" not in res:
+        try:
+            import activity_log
+            activity_log.log_event(
+                "x", f"[watchlists] project {pid} removed shared watchlist {wid} "
+                f"{res.get('name')!r} (it keeps collecting for its other projects)",
+                db=str(_CFG.root / "activity.db"))
+        except Exception:
+            pass
+    return res
 
 
 # --------------------------------------------------------------------------
@@ -6579,6 +6640,8 @@ class Handler(BaseHTTPRequestHandler):
                 return self._send(200, _projects_json())
             if u.path == "/api/watchlists":
                 return self._send(200, _watchlists_json(q))
+            if u.path == "/api/watchlists/library":
+                return self._send(200, _watchlist_library(q))
             if u.path == "/api/project":
                 return self._send(*_project_json(q))
             if u.path == "/api/links":
@@ -6721,6 +6784,10 @@ class Handler(BaseHTTPRequestHandler):
                 return self._send(200, _watchlist_backfill(body))
             if u.path == "/api/watchlists/remove":
                 return self._send(200, _watchlist_remove(body))
+            if u.path == "/api/watchlists/attach":
+                return self._send(200, _watchlist_attach(body))
+            if u.path == "/api/watchlists/detach":
+                return self._send(200, _watchlist_detach(body))
             # Links watchlists (X_LINKS_PLAN.md). Dashboard-only: none of
             # these is in API_KEY_WRITE_PATHS, so a consumer's key cannot
             # add a link, re-time a list or make the server read a sheet.

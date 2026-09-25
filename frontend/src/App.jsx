@@ -97,6 +97,13 @@ function ManageProjects({ onClose }) {
             {plan.streams_shared.length > 0 ? plan.streams_shared.map((s) => (
               <li key={s.stream_id}><span className="mono">{s.label}</span> — only this project's tag is removed; still in {s.also_in.join(", ")}</li>
             )) : <li>no shared streams</li>}
+            {(plan.watchlists_transferred || []).length > 0 && (
+              <li>{plan.watchlists_transferred.length} shared watchlist(s) handed to the project that also uses them:
+                {" "}{plan.watchlists_transferred.map((t) => `${t.name} → ${t.to_project}`).join(", ")}</li>
+            )}
+            {(plan.watchlists_detached || 0) > 0 && (
+              <li>{plan.watchlists_detached} watchlist(s) added from other projects — unlinked, they stay where they were created</li>
+            )}
             {plan.streams_kept_config.length > 0 && (
               <li>Declared in config.toml, paused not deleted: <span className="mono">{plan.streams_kept_config.join(", ")}</span></li>
             )}

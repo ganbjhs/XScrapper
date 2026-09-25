@@ -202,6 +202,55 @@ change to the delivery contract. The write endpoint
 (`POST /api/watchlists/owner`) is cookie-only: a read integration does not get
 to restamp ownership.
 
+### A watchlist is shared by LINKING, never by copying — one list, one fetch, every project that added it (2026-09-25)
+
+A watchlist is created in one project — `watchlists.project_id`, which from
+here on means its OWNER — and any other project can add it. What "add"
+means is one row in `project_watchlists` and the list's `wl:<id>:%` streams
+in that project's `project_streams`; nothing else moves. The list, its
+members, its filters, its cadence and every post it ever collected stay
+exactly one row each, X is asked once however many projects read, and the
+adding project sees the list's whole history the moment it is linked,
+because posts hang off the stream and the stream is what got linked. Rules
+that follow from that:
+
+- **Never duplicate a list to share it.** A copy is a second fetch against
+  the same budget, a second set of streams, and two rows that drift the
+  first time someone edits one. The picker ("Add existing…",
+  `/api/watchlists/library`) exists so that copying is never the easy path.
+- **Editing is editing for everyone.** Members, filters and cadence belong
+  to the list, not to the project looking at it; the panel names who else
+  is looking (`shared`, `projects[]`) rather than pretending otherwise.
+- **"Delete" from a project that only ADDED the list is a detach.** Its
+  links go; the list keeps collecting for its owner. The owner cannot
+  delete while another project still uses it — refused by name, because
+  one project must not be able to silently stop another's collection.
+  Deleting the owner PROJECT hands each still-used list to its oldest other
+  user (name suffixed on a clash; a sheet binding travels with a links
+  list) instead of destroying it.
+- **Scope by USE, not by owner.** Every per-project read that used to say
+  `w.project_id = ?` (links snapshot, links handshake, alert creation, the
+  project's watchlist count) now asks `project_watchlists`. A project must
+  see what it added; the owner column alone would hide it.
+- **Compile attaches to every user.** `compile_watchlist` links each stream
+  it makes into `project_streams` for every project in `project_watchlists`,
+  so a chunk that appears after the share reaches everyone, not the owner.
+- **The consumer API changes shape not at all.** A shared list is simply
+  listed under every project that uses it, with the SAME `watchlist_id` and
+  `project_id` still the owner's; the new keys (`owner_project_id`,
+  `owner_project`, `projects[]`, `shared`) are additive, and the new
+  endpoints are dashboard-only. Watch-Tower is told (handover §5) to key
+  cards on `(project_id, watchlist_id)` — nothing about this is observable
+  to them until the first list is actually shared, and they are told
+  before that happens.
+- **The migration is one backfill, idempotent, and touches no big table.**
+  `INSERT OR IGNORE` one link per existing list on `open()`; rollback is
+  dropping the table, because the owner column never went away.
+
+Instagram and Facebook sources are NOT shared this way: their posts carry
+`project_id` directly, with no stream join to link. That is a separate
+design (phase 2), not a smaller version of this one.
+
 ### A watchlist's name is a label; its id is the key — so rename freely, and count what you actually follow (2026-09-24)
 
 `POST /api/watchlists/rename` changes `watchlists.name` and nothing else. It is

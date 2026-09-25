@@ -587,6 +587,28 @@ CREATE TABLE IF NOT EXISTS project_streams (
   PRIMARY KEY (project_id, stream_id)
 ) WITHOUT ROWID;
 
+-- Which projects USE a watchlist (2026-09-25). A watchlist is created inside
+-- one project — `watchlists.project_id`, which from here on means its OWNER —
+-- but any project can add an existing one, and then the same list, the same
+-- compiled streams and the same collected posts serve both. One list is one
+-- fetch: nothing is copied, and X is asked once however many projects read.
+--
+-- The join a project's feed uses does not change: attaching a list to a
+-- project also puts its `wl:<id>:%` streams into project_streams for that
+-- project, so "this project's tweets" stays one join and the project sees
+-- the list's whole history the moment it is added. This table is the
+-- record of intent ("project P added list W") that lets the dashboard show
+-- who shares what, lets a detach remove exactly those stream links, and
+-- lets a project delete hand a still-used list to its next user instead of
+-- destroying it. Backfilled once with one row per existing watchlist.
+CREATE TABLE IF NOT EXISTS project_watchlists (
+  project_id   INTEGER NOT NULL,
+  watchlist_id INTEGER NOT NULL,
+  added_at     TEXT NOT NULL,
+  PRIMARY KEY (project_id, watchlist_id)
+) WITHOUT ROWID;
+CREATE INDEX IF NOT EXISTS ix_project_watchlists_wl ON project_watchlists(watchlist_id);
+
 -- Post LINKS as a watchlist (kind='links'; see X_LINKS_PLAN.md).
 --
 -- A links watchlist holds specific post URLs, not handles. Its one compiled
@@ -1416,6 +1438,20 @@ class Store:
                 "  (SELECT 1 FROM project_streams ps WHERE ps.stream_id = s.stream_id)",
                 (oldest["project_id"],))
 
+        # Shared watchlists (2026-09-25): every watchlist is "used by" its
+        # owner. One row per existing list, INSERT OR IGNORE, so a database
+        # that already has the table is left exactly as the operator arranged
+        # it. And every linked project holds the list's compiled streams —
+        # true already for the owner (compile_watchlist attached them), made
+        # true here for any link this same statement is creating.
+        self.db.execute(
+            "INSERT OR IGNORE INTO project_watchlists(project_id, watchlist_id, added_at) "
+            "SELECT project_id, watchlist_id, created_at FROM watchlists")
+        self.db.execute(
+            "INSERT OR IGNORE INTO project_streams(project_id, stream_id) "
+            "SELECT pw.project_id, s.stream_id FROM project_watchlists pw "
+            "JOIN streams s ON s.label LIKE 'wl:' || pw.watchlist_id || ':%'")
+
         self._externalize_raw()
         self._migrate_collection_pins()
 
@@ -1658,7 +1694,7 @@ class Store:
     async def projects(self, include_archived: bool = False) -> list:
         rows = self.db.execute(
             "SELECT p.*, "
-            "  (SELECT COUNT(*) FROM watchlists w WHERE w.project_id = p.project_id) AS watchlists, "
+            "  (SELECT COUNT(*) FROM project_watchlists pw WHERE pw.project_id = p.project_id) AS watchlists, "
             "  (SELECT COUNT(*) FROM project_streams ps WHERE ps.project_id = p.project_id) AS streams "
             "FROM projects p "
             + ("" if include_archived else "WHERE p.archived = 0 ")
@@ -1721,6 +1757,31 @@ class Store:
     # confirmation — X's index reaches back ~a week, so purged posts older
     # than that are gone for good.
     # ----------------------------------------------------------------------
+
+    def _watchlists_to_transfer(self, project_id: int) -> list:
+        """
+        Lists this project OWNS that another project still uses. A project
+        delete hands each to its oldest other user rather than destroying
+        it — the other project added the list on purpose, and its collection
+        must not stop because the project that first typed the handles went.
+        """
+        out = []
+        for w in self.db.execute(
+                "SELECT w.watchlist_id, w.name, w.kind FROM watchlists w "
+                "WHERE w.project_id = ? AND EXISTS ("
+                "  SELECT 1 FROM project_watchlists pw "
+                "  WHERE pw.watchlist_id = w.watchlist_id AND pw.project_id != ?) "
+                "ORDER BY w.watchlist_id", (int(project_id), int(project_id))):
+            heir = self.db.execute(
+                "SELECT p.project_id, p.name FROM project_watchlists pw "
+                "JOIN projects p ON p.project_id = pw.project_id "
+                "WHERE pw.watchlist_id = ? AND pw.project_id != ? "
+                "ORDER BY pw.added_at, pw.project_id LIMIT 1",
+                (w["watchlist_id"], int(project_id))).fetchone()
+            out.append({"watchlist_id": w["watchlist_id"], "name": w["name"],
+                        "kind": w["kind"], "to_project_id": heir["project_id"],
+                        "to_project": heir["name"]})
+        return out
 
     def _orphan_streams_after(self, project_id: int) -> list:
         """Streams that would have NO project once `project_id` lets go."""
@@ -1785,7 +1846,18 @@ class Store:
             "streams_kept_config": [s["label"] for s in kept_cfg],
             "posts_deleted": posts_deleted,
             "posts_kept_shared": posts_kept,
-            "watchlists": count("SELECT COUNT(*) c FROM watchlists WHERE project_id = ?", pid),
+            # Owned AND used by nobody else: the ones that actually go.
+            "watchlists": count(
+                "SELECT COUNT(*) c FROM watchlists w WHERE w.project_id = ? "
+                "AND NOT EXISTS (SELECT 1 FROM project_watchlists pw "
+                "  WHERE pw.watchlist_id = w.watchlist_id AND pw.project_id != ?)",
+                pid, pid),
+            "watchlists_transferred": self._watchlists_to_transfer(pid),
+            # Lists this project only ADDED: the link goes, the list stays.
+            "watchlists_detached": count(
+                "SELECT COUNT(*) c FROM project_watchlists pw "
+                "JOIN watchlists w ON w.watchlist_id = pw.watchlist_id "
+                "WHERE pw.project_id = ? AND w.project_id != ?", pid, pid),
             "collections": count("SELECT COUNT(*) c FROM collections WHERE project_id = ?", pid),
             "labels": count("SELECT COUNT(*) c FROM post_labels WHERE project_id = ?", pid),
             "delivery_targets": count(
@@ -1805,6 +1877,34 @@ class Store:
 
         self.db.execute("BEGIN IMMEDIATE")
         try:
+            # Shared lists first: hand each to its next user BEFORE the
+            # owner-scoped deletes below, so they never see it. The name is
+            # unique per owner, so a collision in the new home gets a suffix
+            # rather than an IntegrityError that rolls the whole delete back.
+            for t in plan["watchlists_transferred"]:
+                name = t["name"]
+                if self.db.execute(
+                        "SELECT 1 FROM watchlists WHERE project_id = ? AND name = ?",
+                        (t["to_project_id"], name)).fetchone():
+                    name = f"{name} (from {plan['name']})"
+                self.db.execute(
+                    "UPDATE watchlists SET project_id = ?, name = ? WHERE watchlist_id = ?",
+                    (t["to_project_id"], name, t["watchlist_id"]))
+                # A sheet-fed links list takes its sheet binding along, or the
+                # sync loop would find the sheet bound to a project that no
+                # longer exists. If the heir already has that same sheet
+                # bound, the binding stays behind and is deleted below; the
+                # list keeps its links, pasted-style, and stops syncing.
+                if t["kind"] == "links":
+                    try:
+                        self.db.execute(
+                            "UPDATE link_sheets SET project_id = ? WHERE link_sheet_id = "
+                            "(SELECT link_sheet_id FROM watchlists WHERE watchlist_id = ?)",
+                            (t["to_project_id"], t["watchlist_id"]))
+                    except sqlite3.IntegrityError:
+                        pass
+            # Links this project only added: just the links.
+            self.db.execute("DELETE FROM project_watchlists WHERE project_id = ?", (pid,))
             # Project-owned rows: nothing else references them.
             self.db.execute(
                 "DELETE FROM watchlist_members WHERE watchlist_id IN "
@@ -1885,10 +1985,33 @@ class Store:
             out.append(d)
         return out
 
+    def _watchlist_projects(self, watchlist_id: int) -> list:
+        """Every project that uses a watchlist, owner first, then by id."""
+        return [dict(r) for r in self.db.execute(
+            "SELECT p.project_id, p.name, p.archived, "
+            "       (p.project_id = w.project_id) AS owner "
+            "FROM project_watchlists pw "
+            "JOIN projects p ON p.project_id = pw.project_id "
+            "JOIN watchlists w ON w.watchlist_id = pw.watchlist_id "
+            "WHERE pw.watchlist_id = ? ORDER BY owner DESC, p.project_id",
+            (int(watchlist_id),))]
+
     async def watchlists(self, project_id: int) -> list:
+        """
+        The watchlists a project USES — the ones it created and the ones it
+        added from other projects — in one list, in the shape the dashboard
+        and Watch Tower have always read. `project_id` on a row is still the
+        OWNER (where the list was created), so a shared list carries the same
+        `project_id` and the same `watchlist_id` under every project that
+        reads it; the additive keys say the rest: `owner_project_id`,
+        `owner_project`, `projects[]` (everyone using it) and `shared`
+        (used by more than one).
+        """
         out = []
         for w in self.db.execute(
-                "SELECT * FROM watchlists WHERE project_id = ? ORDER BY watchlist_id",
+                "SELECT w.* FROM watchlists w "
+                "JOIN project_watchlists pw ON pw.watchlist_id = w.watchlist_id "
+                "WHERE pw.project_id = ? ORDER BY w.watchlist_id",
                 (int(project_id),)).fetchall():
             members = [dict(m) for m in self.db.execute(
                 "SELECT handle, display_name, user_id, added_at "
@@ -1906,6 +2029,13 @@ class Store:
             d = dict(w)
             d["members"] = members
             d["streams"] = streams
+            projs = self._watchlist_projects(w["watchlist_id"])
+            d["owner_project_id"] = w["project_id"]
+            d["owner_project"] = next(
+                (p["name"] for p in projs if p["owner"]), None)
+            d["projects"] = [{"project_id": p["project_id"], "name": p["name"],
+                              "owner": bool(p["owner"])} for p in projs]
+            d["shared"] = len(projs) > 1
             # The current check-interval override (seconds), or None = default.
             d["interval_s"] = streams[0]["min_interval_s"] if streams else None
             # Pinned means min == max: the cadence in the dropdown is the
@@ -2006,10 +2136,126 @@ class Store:
         except sqlite3.IntegrityError:
             return {"error": f"this project already has a watchlist called {name!r}"}
         wid = cur.lastrowid
+        self.db.execute(
+            "INSERT OR IGNORE INTO project_watchlists(project_id, watchlist_id, added_at) "
+            "VALUES(?,?,?)", (int(project_id), wid, _iso_ms(int(time.time() * 1000))))
         if kind in ("xlist", "links"):
             await self.compile_watchlist(wid)
         return {"watchlist_id": wid, "name": name, "kind": kind,
                 "owner_handle": owner}
+
+    # ----------------------------------------------------------------------
+    # sharing a watchlist between projects (project_watchlists)
+    # ----------------------------------------------------------------------
+
+    async def _attach_streams_to_users(self, watchlist_id: int, stream_id: int) -> None:
+        """One compiled stream -> project_streams for EVERY project using the list."""
+        for r in self.db.execute(
+                "SELECT project_id FROM project_watchlists WHERE watchlist_id = ?",
+                (int(watchlist_id),)).fetchall():
+            await self.attach_stream(r["project_id"], stream_id)
+
+    async def watchlist_library(self, exclude_project: int | None = None) -> list:
+        """
+        Every watchlist across projects, for the "add an existing list"
+        picker: what it is, who owns it, who else uses it, how big it is.
+        `exclude_project` drops nothing — it marks `attached` instead, so the
+        picker can grey out what this project already has rather than hide
+        it and leave the operator wondering where a list went.
+        """
+        rows = self.db.execute(
+            "SELECT w.watchlist_id, w.project_id, w.name, w.kind, w.list_id, "
+            "       w.owner_handle, w.created_at, w.sheet_tab, w.sheet_day, "
+            "       p.name AS owner_project, p.archived AS owner_archived, "
+            "       (SELECT COUNT(*) FROM watchlist_members m "
+            "         WHERE m.watchlist_id = w.watchlist_id) AS members, "
+            "       (SELECT COUNT(*) FROM watchlist_links l "
+            "         WHERE l.watchlist_id = w.watchlist_id "
+            "           AND l.status != 'removed') AS links, "
+            "       (SELECT COUNT(h.tweet_id) FROM streams s "
+            "          JOIN tweet_hits h USING(stream_id) "
+            "          WHERE s.label LIKE 'wl:' || w.watchlist_id || ':%') AS tweets, "
+            "       (SELECT MIN(COALESCE(s.paused, 0)) FROM streams s "
+            "          WHERE s.label LIKE 'wl:' || w.watchlist_id || ':%') AS all_paused_min "
+            "FROM watchlists w JOIN projects p ON p.project_id = w.project_id "
+            "ORDER BY p.archived, p.name, w.name").fetchall()
+        out = []
+        for r in rows:
+            d = dict(r)
+            projs = self._watchlist_projects(r["watchlist_id"])
+            d["projects"] = [{"project_id": p["project_id"], "name": p["name"],
+                              "owner": bool(p["owner"])} for p in projs]
+            d["shared"] = len(projs) > 1
+            d["attached"] = (exclude_project is not None and any(
+                p["project_id"] == int(exclude_project) for p in projs))
+            d["live"] = d.pop("all_paused_min") == 0
+            out.append(d)
+        return out
+
+    async def attach_watchlist(self, project_id: int, watchlist_id: int) -> dict:
+        """
+        Add an existing watchlist to a project. The list is not copied and
+        nothing is re-fetched: the project gets a row in project_watchlists
+        and the list's compiled streams in project_streams, and from that
+        moment every post the list ever collected is in this project's feed.
+        Idempotent — adding a list a project already has is a no-op.
+        """
+        pid, wid = int(project_id), int(watchlist_id)
+        if not self.db.execute("SELECT 1 FROM projects WHERE project_id = ?",
+                               (pid,)).fetchone():
+            return {"error": f"no project {project_id}"}
+        w = self.db.execute("SELECT * FROM watchlists WHERE watchlist_id = ?",
+                            (wid,)).fetchone()
+        if not w:
+            return {"error": f"no watchlist {watchlist_id}"}
+        already = bool(self.db.execute(
+            "SELECT 1 FROM project_watchlists WHERE project_id = ? AND watchlist_id = ?",
+            (pid, wid)).fetchone())
+        self.db.execute(
+            "INSERT OR IGNORE INTO project_watchlists(project_id, watchlist_id, added_at) "
+            "VALUES(?,?,?)", (pid, wid, _iso_ms(int(time.time() * 1000))))
+        self.db.execute(
+            "INSERT OR IGNORE INTO project_streams(project_id, stream_id) "
+            "SELECT ?, stream_id FROM streams WHERE label LIKE ?",
+            (pid, f"wl:{wid}:%"))
+        return {"attached": True, "already": already, "project_id": pid,
+                "watchlist_id": wid, "name": w["name"], "kind": w["kind"],
+                "owner_project_id": w["project_id"],
+                "projects": self._watchlist_projects(wid)}
+
+    async def detach_watchlist(self, project_id: int, watchlist_id: int) -> dict:
+        """
+        Take a watchlist out of a project. The list, its streams and its
+        posts are untouched — only this project's links go, so its feed
+        stops showing them. The OWNER cannot detach: its name is unique
+        within that project and its sheet (for links) is bound there; the
+        owner deletes instead, and delete_watchlist refuses while anyone
+        else still uses the list.
+        """
+        pid, wid = int(project_id), int(watchlist_id)
+        w = self.db.execute("SELECT * FROM watchlists WHERE watchlist_id = ?",
+                            (wid,)).fetchone()
+        if not w:
+            return {"error": f"no watchlist {watchlist_id}"}
+        if int(w["project_id"]) == pid:
+            others = [p["name"] for p in self._watchlist_projects(wid) if not p["owner"]]
+            if others:
+                return {"error": f"{w['name']!r} was created in this project and is "
+                                 f"still used by {', '.join(others)} — remove it "
+                                 "there first, or delete it to stop collection"}
+            return {"error": f"{w['name']!r} was created in this project — "
+                             "delete it instead of removing it"}
+        n = self.db.execute(
+            "DELETE FROM project_watchlists WHERE project_id = ? AND watchlist_id = ?",
+            (pid, wid)).rowcount
+        if not n:
+            return {"error": f"{w['name']!r} is not in this project"}
+        self.db.execute(
+            "DELETE FROM project_streams WHERE project_id = ? AND stream_id IN "
+            "(SELECT stream_id FROM streams WHERE label LIKE ?)",
+            (pid, f"wl:{wid}:%"))
+        return {"detached": True, "project_id": pid, "watchlist_id": wid,
+                "name": w["name"], "projects": self._watchlist_projects(wid)}
 
     async def rename_watchlist(self, watchlist_id: int, name) -> dict:
         """
@@ -2141,7 +2387,8 @@ class Store:
         forget_stream is for if the operator truly wants it gone.
 
         Every compiled stream carries watched=1 (the watcher polls it without a
-        config.toml entry) and is attached to the watchlist's project.
+        config.toml entry) and is attached to EVERY project that uses the
+        watchlist (project_watchlists) — the owner and any that added it.
         """
         w = self.db.execute("SELECT * FROM watchlists WHERE watchlist_id = ?",
                             (int(watchlist_id),)).fetchone()
@@ -2162,7 +2409,7 @@ class Store:
             self.db.execute(
                 "UPDATE streams SET watched = 1, paused = 0, filters = ? "
                 "WHERE stream_id = ?", (flt_json, sid))
-            await self.attach_stream(w["project_id"], sid)
+            await self._attach_streams_to_users(w["watchlist_id"], sid)
             labels.append(label)
         elif w["kind"] == "links":
             # One stream so the posts belong to the project through the same
@@ -2174,7 +2421,7 @@ class Store:
             label = f"wl:{w['watchlist_id']}:0"
             sid = await self.ensure_stream(label, "", "Latest", True)
             self.db.execute("UPDATE streams SET watched = 0 WHERE stream_id = ?", (sid,))
-            await self.attach_stream(w["project_id"], sid)
+            await self._attach_streams_to_users(w["watchlist_id"], sid)
             labels.append(label)
         elif w["kind"] == "keywords":
             # Terms OR-combine; chunking is by QUERY LENGTH, not count — a
@@ -2210,7 +2457,7 @@ class Store:
                 self.db.execute(
                     "UPDATE streams SET watched = 1, paused = 0, filters = ? "
                     "WHERE stream_id = ?", (flt_json, sid))
-                await self.attach_stream(w["project_id"], sid)
+                await self._attach_streams_to_users(w["watchlist_id"], sid)
                 labels.append(label)
         else:
             handles = [r["handle"] for r in self.db.execute(
@@ -2224,7 +2471,7 @@ class Store:
                 self.db.execute(
                     "UPDATE streams SET watched = 1, paused = 0, filters = ? "
                     "WHERE stream_id = ?", (flt_json, sid))
-                await self.attach_stream(w["project_id"], sid)
+                await self._attach_streams_to_users(w["watchlist_id"], sid)
                 labels.append(label)
 
         # Chunks beyond the current count (members shrank, or kind changed):
@@ -2311,18 +2558,37 @@ class Store:
             (val, f"wl:{int(watchlist_id)}:%"))
         return {"watchlist_id": int(watchlist_id), "max_pages_per_poll": val}
 
-    async def delete_watchlist(self, watchlist_id: int) -> dict:
+    async def delete_watchlist(self, watchlist_id: int,
+                               project_id: int | None = None) -> dict:
         """
         Remove the watchlist and STOP its collection; keep collected tweets.
 
         Compiled streams are paused + un-watched rather than deleted — same
         reasoning as compile_watchlist's retirement path. Destroying the data
         stays an explicit per-stream forget_stream(delete_tweets=True).
+
+        With a shared list the verb depends on who is asking. From a project
+        that merely ADDED it, "delete" means detach: the list goes on
+        collecting for its owner. From the owner, while another project
+        still uses it, the request is refused by name — one project must not
+        be able to silently stop another's collection. `project_id` None is
+        the pre-sharing call (tests, tools): a plain delete of an unshared
+        list, refused the same way when the list is shared.
         """
         w = self.db.execute("SELECT * FROM watchlists WHERE watchlist_id = ?",
                             (int(watchlist_id),)).fetchone()
         if not w:
             return {"error": f"no watchlist {watchlist_id}"}
+        if project_id is not None and int(project_id) != int(w["project_id"]):
+            return await self.detach_watchlist(int(project_id), int(watchlist_id))
+        others = [p["name"] for p in self._watchlist_projects(int(watchlist_id))
+                  if not p["owner"]]
+        if others:
+            return {"error": f"{w['name']!r} is also used by {', '.join(others)} — "
+                             "remove it from those projects first, or leave it "
+                             "and it keeps collecting for them"}
+        self.db.execute("DELETE FROM project_watchlists WHERE watchlist_id = ?",
+                        (int(watchlist_id),))
         self.db.execute(
             "UPDATE streams SET paused = 1, watched = 0 WHERE label LIKE ?",
             (f"wl:{w['watchlist_id']}:%",))
@@ -2774,7 +3040,9 @@ class Store:
         #
         # The predicate is deliberately the SAME expression links_due uses; two
         # spellings of "paused" are two things that can disagree.
-        where = ["w.project_id = ?", "w.kind = 'links'",
+        # Scoped by USE (project_watchlists), not by owner: a links list one
+        # project added from another is served to both.
+        where = ["EXISTS (SELECT 1 FROM project_watchlists pw WHERE pw.watchlist_id = w.watchlist_id AND pw.project_id = ?)", "w.kind = 'links'",
                  "COALESCE(s.paused, 0) = 0"]
         params: list = [int(project_id)]
         if watchlist_id:
@@ -2905,7 +3173,7 @@ class Store:
                 "SELECT l.status s, COUNT(*) c FROM watchlist_links l "
                 "JOIN watchlists w ON w.watchlist_id = l.watchlist_id "
                 "LEFT JOIN streams s2 ON s2.label = 'wl:' || w.watchlist_id || ':0' "
-                "WHERE w.project_id = ? AND w.kind = 'links' "
+                "WHERE EXISTS (SELECT 1 FROM project_watchlists pw WHERE pw.watchlist_id = w.watchlist_id AND pw.project_id = ?) AND w.kind = 'links' "
                 # Counted the same way links_snapshot serves, so
                 # counters.total and /api/links `total` are the same number.
                 "  AND COALESCE(s2.paused, 0) = 0 GROUP BY l.status",
@@ -2914,8 +3182,8 @@ class Store:
         total = sum(counts.values())
 
         tabs = self.db.execute(
-            "SELECT COUNT(*) c, SUM(sheet_day IS NOT NULL) d FROM watchlists "
-            "WHERE project_id = ? AND kind = 'links'", (pid,)).fetchone()
+            "SELECT COUNT(*) c, SUM(sheet_day IS NOT NULL) d FROM watchlists w "
+            "WHERE EXISTS (SELECT 1 FROM project_watchlists pw WHERE pw.watchlist_id = w.watchlist_id AND pw.project_id = ?) AND kind = 'links'", (pid,)).fetchone()
         # What we are NOT serving, and why. A consumer seeing 1,614 links where
         # the sheet holds 2,288 must be able to find out where the rest went
         # without asking a human.
@@ -2924,7 +3192,7 @@ class Store:
             "FROM watchlists w "
             "LEFT JOIN streams s ON s.label = 'wl:' || w.watchlist_id || ':0' "
             "LEFT JOIN watchlist_links l ON l.watchlist_id = w.watchlist_id "
-            "WHERE w.project_id = ? AND w.kind = 'links' "
+            "WHERE EXISTS (SELECT 1 FROM project_watchlists pw WHERE pw.watchlist_id = w.watchlist_id AND pw.project_id = ?) AND w.kind = 'links' "
             "  AND COALESCE(s.paused, 0) = 1", (pid,)).fetchone()
         sheet = self.db.execute(
             "SELECT sheet_id, title, last_sync_ms, last_error, paused, tabs_mode "
@@ -2933,7 +3201,7 @@ class Store:
         fresh = self.db.execute(
             "SELECT MAX(l.last_refresh_ms) m FROM watchlist_links l "
             "JOIN watchlists w ON w.watchlist_id = l.watchlist_id "
-            "WHERE w.project_id = ? AND w.kind = 'links'", (pid,)).fetchone()
+            "WHERE EXISTS (SELECT 1 FROM project_watchlists pw WHERE pw.watchlist_id = w.watchlist_id AND pw.project_id = ?) AND w.kind = 'links'", (pid,)).fetchone()
 
         out = {
             "project": {"id": pid, "name": project.get("name"), "platform": "x",
@@ -2970,7 +3238,7 @@ class Store:
                 self.db.execute(
                     "SELECT 1 FROM watchlist_links l "
                     "JOIN watchlists w ON w.watchlist_id = l.watchlist_id "
-                    "WHERE w.project_id = ? AND w.kind = 'links' "
+                    "WHERE EXISTS (SELECT 1 FROM project_watchlists pw WHERE pw.watchlist_id = w.watchlist_id AND pw.project_id = ?) AND w.kind = 'links' "
                     "  AND l.last_attempt_ms IS NOT NULL "
                     "  AND l.last_attempt_ms > ? LIMIT 1",
                     (pid, int(time.time() * 1000) - 5 * 60_000)).fetchone())
@@ -3585,7 +3853,7 @@ class Store:
                                (int(project_id),)).fetchone():
             return {"error": f"no project {project_id}"}
         if watchlist_id and not self.db.execute(
-                "SELECT 1 FROM watchlists WHERE watchlist_id = ? AND project_id = ?",
+                "SELECT 1 FROM project_watchlists WHERE watchlist_id = ? AND project_id = ?",
                 (int(watchlist_id), int(project_id))).fetchone():
             return {"error": f"no watchlist {watchlist_id} in this project"}
         try:

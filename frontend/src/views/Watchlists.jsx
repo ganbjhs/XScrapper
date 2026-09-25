@@ -711,7 +711,183 @@ function DepthRow({ w, onChanged }) {
   );
 }
 
-function XDetail({ w, onChanged }) {
+// ---------------------------------------------------------------------------
+// Shared watchlists — one list, several projects.
+//
+// A watchlist is created inside one project (its OWNER) and any other project
+// can add it. Nothing is copied: the same list, the same streams, one fetch;
+// every project that added it sees every post it ever collected. Editing it
+// anywhere edits it everywhere — the panel says who else is looking.
+// ---------------------------------------------------------------------------
+
+const KIND_LABEL = { xlist: "X List", keywords: "keywords", links: "links", query: "handles" };
+
+// "Created in A · also used by B, C" under the panel header — only when there
+// is something to say (the list is shared, or belongs to another project).
+function SharedLine({ w, pid }) {
+  const others = (w.projects || []).filter((p) => p.project_id !== pid);
+  const mine = w.owner_project_id === pid;
+  if (mine && others.length === 0) return null;
+  return (
+    <div style={{ color: "var(--ink-3)", fontSize: 12.5, display: "flex", gap: 6, alignItems: "center", flexWrap: "wrap" }}>
+      <span className="chip" title="This list is used by more than one project. Members, filters and cadence are shared — a change here changes it everywhere.">
+        shared
+      </span>
+      {mine
+        ? <span>also used by <b>{others.map((p) => p.name).join(", ")}</b></span>
+        : <span>created in <b>{w.owner_project || `project #${w.owner_project_id}`}</b>
+            {others.length > 1 && <> · also used by <b>{others.filter((p) => !p.owner).map((p) => p.name).join(", ")}</b></>}
+          </span>}
+    </div>
+  );
+}
+
+// Delete vs remove. From the owner: delete (refused by the server while
+// another project still uses it — the message names them). From a project
+// that only added it: detach, and the list goes on collecting for the rest.
+function WatchlistDeleteModal({ w, pid, onClose, onChanged, sub }) {
+  const [err, setErr] = useState("");
+  const [busy, setBusy] = useState(false);
+  const mine = !w.owner_project_id || w.owner_project_id === pid;
+  const others = (w.projects || []).filter((p) => p.project_id !== pid).map((p) => p.name);
+  const go = async () => {
+    setBusy(true); setErr("");
+    try {
+      const r = mine ? await api.removeWatchlist(w.watchlist_id, pid)
+                     : await api.detachWatchlist(pid, w.watchlist_id);
+      if (r?.error) { setErr(r.error); return; }
+      onClose(); onChanged();
+    } catch (e) { setErr(String(e.message || e)); }
+    finally { setBusy(false); }
+  };
+  if (!mine) {
+    return (
+      <Modal title={`Remove “${w.name}” from this project?`} onClose={onClose}
+             sub={`It was created in ${w.owner_project || "another project"} and keeps collecting there. Only this project stops seeing its posts — nothing is deleted.`}>
+        {err && <div className="err">{err}</div>}
+        <div className="row">
+          <button className="btn btn-ghost" onClick={onClose}>Keep it</button>
+          <button className="btn btn-danger" disabled={busy} onClick={go}>Remove from project</button>
+        </div>
+      </Modal>
+    );
+  }
+  return (
+    <Modal title={`Delete “${w.name}”?`} onClose={onClose} sub={sub}>
+      {others.length > 0 && (
+        <div className="err" style={{ marginTop: 10 }}>
+          Also used by <b>{others.join(", ")}</b>. Remove it from those projects first —
+          or leave it, and it keeps collecting for them.
+        </div>
+      )}
+      {err && <div className="err">{err}</div>}
+      <div className="row">
+        <button className="btn btn-ghost" onClick={onClose}>Keep it</button>
+        <button className="btn btn-danger" disabled={busy || others.length > 0} onClick={go}>Delete</button>
+      </div>
+    </Modal>
+  );
+}
+
+// The picker: every X watchlist in every other project, grouped by the
+// project that created it. "Add" links it here — no copy, no re-fetch, and
+// its whole history shows in this project's feed at once.
+function AddExistingModal({ pid, onDone, onClose }) {
+  const lib = useApi(() => api.watchlistLibrary(pid), [pid]);
+  const [q, setQ] = useState("");
+  const [busy, setBusy] = useState(null);     // watchlist_id being added
+  const [err, setErr] = useState("");
+  const [added, setAdded] = useState(() => new Set());
+
+  const rows = (lib.data?.watchlists || []).filter((w) => w.project_id !== pid);
+  const needle = q.trim().toLowerCase();
+  const shown = needle
+    ? rows.filter((w) => `${w.name} ${w.owner_project} ${KIND_LABEL[w.kind] || w.kind}`.toLowerCase().includes(needle))
+    : rows;
+  const groups = [];
+  for (const w of shown) {
+    let g = groups.find((x) => x.project_id === w.project_id);
+    if (!g) { g = { project_id: w.project_id, name: w.owner_project, archived: !!w.owner_archived, rows: [] }; groups.push(g); }
+    g.rows.push(w);
+  }
+
+  const add = async (w) => {
+    setBusy(w.watchlist_id); setErr("");
+    try {
+      const r = await api.attachWatchlist(pid, w.watchlist_id);
+      if (r?.error) { setErr(r.error); return; }
+      setAdded((s) => new Set([...s, w.watchlist_id]));
+      onDone();
+    } catch (e) { setErr(String(e.message || e)); }
+    finally { setBusy(null); }
+  };
+
+  const size = (w) => w.kind === "xlist" ? "X List"
+    : w.kind === "links" ? `${fmtN(w.links)} link${w.links === 1 ? "" : "s"}`
+    : `${fmtN(w.members)} ${w.kind === "keywords" ? "keyword" : "handle"}${w.members === 1 ? "" : "s"}`;
+
+  return (
+    <Modal title="Add an existing watchlist"
+           sub="Lists created in other projects. Adding one shares it — the same list, collected once, and every post it has ever collected shows here too."
+           onClose={onClose}>
+      {lib.loading && !lib.data && <Loading />}
+      {lib.error && <ErrorState error={lib.error} retry={lib.reload} />}
+      {lib.data && rows.length === 0 && (
+        <Empty title="No watchlists in other projects yet">
+          Create one in any project and it can be added here.
+        </Empty>
+      )}
+      {rows.length > 8 && (
+        <div className="field" style={{ marginTop: 12 }}>
+          <input value={q} placeholder={`filter ${rows.length} watchlists…`} autoFocus
+                 onChange={(e) => setQ(e.target.value)} />
+        </div>
+      )}
+      <div className="proj-manage" style={{ maxHeight: "55vh", overflow: "auto" }}>
+        {groups.map((g) => (
+          <React.Fragment key={g.project_id}>
+            <div className="wl-group" style={{ padding: "8px 2px 2px" }}>
+              {g.name}{g.archived ? " · archived" : ""}
+              <span className="cnt">· {g.rows.length}</span>
+            </div>
+            {g.rows.map((w) => {
+              const have = w.attached || added.has(w.watchlist_id);
+              return (
+                <div key={w.watchlist_id} className={`proj-row${have ? " archived" : ""}`}>
+                  <span className={`dot${w.live ? "" : " off"}`} title={w.live ? "collecting" : "paused"} />
+                  <div className="name">
+                    <b>{w.name}</b>
+                    <small>
+                      {KIND_LABEL[w.kind] || w.kind} · {size(w)} · {fmtN(w.tweets)} collected
+                      {w.shared && <> · also in {w.projects.filter((p) => !p.owner).map((p) => p.name).join(", ")}</>}
+                    </small>
+                  </div>
+                  <div className="acts">
+                    {have
+                      ? <span className="chip good">in this project</span>
+                      : <button className="btn btn-brand btn-sm" disabled={busy != null}
+                                onClick={() => add(w)}>{busy === w.watchlist_id ? "adding…" : "Add"}</button>}
+                  </div>
+                </div>
+              );
+            })}
+          </React.Fragment>
+        ))}
+        {needle && shown.length === 0 && (
+          <div style={{ color: "var(--ink-3)", fontSize: 12.5, padding: "8px 12px" }}>
+            no watchlist matches “{q}”
+          </div>
+        )}
+      </div>
+      {err && <div className="err">{err}</div>}
+      <div className="row">
+        <button className="btn btn-ghost" onClick={onClose}>Close</button>
+      </div>
+    </Modal>
+  );
+}
+
+function XDetail({ w, pid, onChanged }) {
   const [adding, setAdding] = useState("");
   const [search, setSearch] = useState("");
   const [err, setErr] = useState("");
@@ -785,7 +961,7 @@ function XDetail({ w, onChanged }) {
             {busyPause ? "…" : paused ? "Resume" : "Pause"}
           </button>
           <button className="btn btn-danger btn-sm" onClick={() => setConfirming(true)}>
-            Delete
+            {w.owner_project_id && w.owner_project_id !== pid ? "Remove" : "Delete"}
           </button>
         </span>
       </div>
@@ -794,6 +970,7 @@ function XDetail({ w, onChanged }) {
           ? `Collected through X List ${w.list_id} — members are managed on x.com.`
           : `${w.members.length} ${w.kind === "keywords" ? "keyword rule" : "handle"}${w.members.length === 1 ? "" : "s"} → ${live.length} live stream${live.length === 1 ? "" : "s"}`}
       </div>
+      <SharedLine w={w} pid={pid} />
       {w.kind === "xlist" && <OwnerLine w={w} onChanged={onChanged} />}
 
       <DepthRow w={w} onChanged={onChanged} />
@@ -872,19 +1049,8 @@ function XDetail({ w, onChanged }) {
       )}
 
       {confirming && (
-        <Modal title={`Delete “${w.name}”?`} onClose={() => setConfirming(false)}
-               sub="Collection stops. Everything already collected stays in the database.">
-          <div className="row">
-            <button className="btn btn-ghost" onClick={() => setConfirming(false)}>Keep it</button>
-            <button className="btn btn-danger"
-                    onClick={async () => {
-                      await api.removeWatchlist(w.watchlist_id);
-                      setConfirming(false); onChanged();
-                    }}>
-              Delete
-            </button>
-          </div>
-        </Modal>
+        <WatchlistDeleteModal w={w} pid={pid} onClose={() => setConfirming(false)} onChanged={onChanged}
+                              sub="Collection stops. Everything already collected stays in the database." />
       )}
     </div>
   );
@@ -1077,9 +1243,12 @@ function LinksDetail({ pid, w, onChanged }) {
                   onClick={() => act(() => api.streamSettings({ label: `wl:${w.watchlist_id}:0`, paused: !paused }))}>
             {paused ? "Resume" : "Pause"}
           </button>
-          <button className="btn btn-danger btn-sm" onClick={() => setConfirming(true)}>Delete</button>
+          <button className="btn btn-danger btn-sm" onClick={() => setConfirming(true)}>
+            {w.owner_project_id && w.owner_project_id !== pid ? "Remove" : "Delete"}
+          </button>
         </span>
       </div>
+      <SharedLine w={w} pid={pid} />
 
       <div style={{ color: "var(--ink-3)", fontSize: 12.5, lineHeight: 1.5 }}>
         {sheet ? (
@@ -1196,19 +1365,8 @@ function LinksDetail({ pid, w, onChanged }) {
       </details>
 
       {confirming && (
-        <Modal title={`Delete “${w.name}”?`} onClose={() => setConfirming(false)}
-               sub="Refreshing stops for these links. The posts already collected stay in the database.">
-          <div className="row">
-            <button className="btn btn-ghost" onClick={() => setConfirming(false)}>Keep it</button>
-            <button className="btn btn-danger"
-                    onClick={async () => {
-                      await api.removeWatchlist(w.watchlist_id);
-                      setConfirming(false); onChanged();
-                    }}>
-              Delete
-            </button>
-          </div>
-        </Modal>
+        <WatchlistDeleteModal w={w} pid={pid} onClose={() => setConfirming(false)} onChanged={onChanged}
+                              sub="Refreshing stops for these links. The posts already collected stay in the database." />
       )}
     </div>
   );
@@ -2092,6 +2250,7 @@ export default function Watchlists({ onMenu }) {
   const [tab, setTab] = useState("lists");
   const [sel, setSel] = useState(null);        // "x:<id>" | "fb" | "ig"
   const [creating, setCreating] = useState(false);
+  const [addingExisting, setAddingExisting] = useState(false);
 
   // /api/watchlists also carries one synthetic kind:"instagram" row per
   // project (the ig:P:0 stream, for Watch Tower). The Instagram row below is
@@ -2103,13 +2262,15 @@ export default function Watchlists({ onMenu }) {
   const items = useMemo(() => {
     const out = xLists.map((w) => ({
       id: `x:${w.watchlist_id}`, platform: "x", name: w.name,
-      sub: w.kind === "xlist"
+      sub: (w.kind === "xlist"
         ? `X List \u00b7 ${w.xmembers?.count ? `${w.xmembers.count} accounts` : "members not fetched"}`
           + `${w.owner_handle ? ` \u00b7 @${w.owner_handle}` : ""}`
         : w.kind === "links"
         ? `${w.links?.total ?? 0} links \u00b7 every ${Math.round((w.refresh_every_s || 86400) / 3600)}h`
           + (w.sheet ? (w.sheet_day ? ` \u00b7 day ${fmtDay(w.sheet_day)}` : ` \u00b7 sheet tab \u201c${w.sheet_tab || w.name}\u201d`) : "")
-        : `${w.members.length} ${w.kind === "keywords" ? "keywords" : "handles"}`,
+        : `${w.members.length} ${w.kind === "keywords" ? "keywords" : "handles"}`)
+        + (w.owner_project_id && w.owner_project_id !== pid ? ` \u00b7 from ${w.owner_project || "another project"}`
+           : w.shared ? " \u00b7 shared" : ""),
       live: w.streams.some((s) => !s.paused), w,
     }));
     if (out.length === 0) {
@@ -2131,7 +2292,7 @@ export default function Watchlists({ onMenu }) {
       live: (ig.data?.accounts || []).some((a) => a.active),
     });
     return out;
-  }, [xLists, fb.data, ig.data]);
+  }, [xLists, fb.data, ig.data, pid]);
 
   const selected = items.find((i) => i.id === sel) || items[0] || null;
   const reloadAll = () => { wls.reload(); fb.reload(); ig.reload(); };
@@ -2177,6 +2338,10 @@ export default function Watchlists({ onMenu }) {
     <>
       <PageHead title="Watchlists" onMenu={onMenu}
                 sub={project ? `${project.name} — who this project follows, on every platform` : ""}>
+        <button className="btn btn-ghost" onClick={() => setAddingExisting(true)}
+                title="Share a watchlist another project already has — one list, collected once, shown in both.">
+          Add existing…
+        </button>
         <button className="btn btn-brand" onClick={() => setCreating(true)}>+ New watchlist</button>
       </PageHead>
 
@@ -2289,7 +2454,7 @@ export default function Watchlists({ onMenu }) {
                   <LinksDetail pid={pid} w={selected.w} onChanged={reloadAll} />
                 )}
                 {selected?.platform === "x" && selected.w && selected.w.kind !== "links" && (
-                  <XDetail w={selected.w} onChanged={reloadAll} />
+                  <XDetail w={selected.w} pid={pid} onChanged={reloadAll} />
                 )}
                 {selected?.id === "fb" && (
                   <FbDetail pid={pid} data={fb.data} reload={fb.reload}
@@ -2318,6 +2483,9 @@ export default function Watchlists({ onMenu }) {
 
       {creating && pid && (
         <AddModal pid={pid} onDone={reloadAll} onClose={() => setCreating(false)} />
+      )}
+      {addingExisting && pid && (
+        <AddExistingModal pid={pid} onDone={reloadAll} onClose={() => setAddingExisting(false)} />
       )}
     </>
   );

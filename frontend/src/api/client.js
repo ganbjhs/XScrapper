@@ -172,8 +172,18 @@ export const api = {
   // Display name only — streams, posts and Watch-Tower's cards all key on the id.
   renameWatchlist: (watchlist_id, name) =>
     request("/api/watchlists/rename", { method: "POST", body: { watchlist_id, name } }),
-  removeWatchlist: (watchlist_id) =>
-    request("/api/watchlists/remove", { method: "POST", body: { watchlist_id } }),
+  // `project` is optional: with it, a project that only ADDED a shared list
+  // is detached instead of deleting a list another project still collects.
+  removeWatchlist: (watchlist_id, project) =>
+    request("/api/watchlists/remove", { method: "POST", body: { watchlist_id, project } }),
+  // Shared watchlists — one list used by several projects. The library is
+  // every list across projects (with `attached` marked for this one);
+  // attach/detach link or unlink without copying or re-fetching anything.
+  watchlistLibrary: (project) => request(`/api/watchlists/library${qs({ project })}`),
+  attachWatchlist: (project, watchlist_id) =>
+    request("/api/watchlists/attach", { method: "POST", body: { project, watchlist_id } }),
+  detachWatchlist: (project, watchlist_id) =>
+    request("/api/watchlists/detach", { method: "POST", body: { project, watchlist_id } }),
   watchlistFilters: (watchlist_id, filters) =>
     request("/api/watchlists/filters", { method: "POST", body: { watchlist_id, filters } }),
   watchlistInterval: (watchlist_id, seconds) =>

@@ -2240,6 +2240,144 @@ def test_projects_watchlists(tmp):
 
 # ==========================================================================
 # collections: curation boards over collected tweets
+
+def test_shared_watchlists(tmp):
+    """
+    One list, several projects. A project adds a list another project
+    created; the list is not copied, its streams are attached to both, both
+    feeds see the same posts, and "delete" from the adding side is a detach.
+    """
+    import sqlite3
+
+    import store as store_mod
+
+    db = pathlib.Path(tmp) / "results.db"
+
+    async def run():
+        st = store_mod.Store(db, False)
+        await st.open()
+        out = {}
+        a = (await st.create_project("A"))["project_id"]
+        b = (await st.create_project("B"))["project_id"]
+        c = (await st.create_project("C"))["project_id"]
+        wl = await st.create_watchlist(a, "Cabinet")
+        wid = wl["watchlist_id"]
+        await st.set_watchlist_members(wid, add=["alpha", "beta"])
+        sid = st.db.execute("SELECT stream_id FROM streams WHERE label = ?",
+                            (f"wl:{wid}:0",)).fetchone()["stream_id"]
+        # A tweet the list collected before anyone shared it.
+        st.db.execute(
+            "INSERT INTO tweets(tweet_id, source, created_ms, collected_at, collected_ms, "
+            "last_seen_at, lag_ms) VALUES(1001, 'result', 1, 'x', 1, 'x', 0)")
+        st.db.execute(
+            "INSERT INTO tweet_hits(stream_id, tweet_id, first_seen_ms) VALUES(?, 1001, 1)",
+            (sid,))
+
+        out["lib_before"] = await st.watchlist_library(b)
+        out["b_before"] = await st.watchlists(b)
+        out["attach"] = await st.attach_watchlist(b, wid)
+        out["attach_again"] = await st.attach_watchlist(b, wid)
+        out["attach_missing"] = await st.attach_watchlist(b, 999999)
+        out["a_after"] = await st.watchlists(a)
+        out["b_after"] = await st.watchlists(b)
+        out["lib_after"] = await st.watchlist_library(b)
+        out["projects"] = await st.projects()
+        out["b_streams"] = st.db.execute(
+            "SELECT COUNT(*) c FROM project_streams WHERE project_id = ? AND stream_id = ?",
+            (b, sid)).fetchone()["c"]
+        # Growing the list after sharing: the new chunk reaches BOTH projects.
+        await st.set_watchlist_members(wid, add=[f"h{i:03d}" for i in range(25)])
+        out["chunks_b"] = st.db.execute(
+            "SELECT COUNT(*) c FROM project_streams ps JOIN streams s USING(stream_id) "
+            "WHERE ps.project_id = ? AND s.label LIKE ?", (b, f"wl:{wid}:%")).fetchone()["c"]
+        out["chunks_a"] = st.db.execute(
+            "SELECT COUNT(*) c FROM project_streams ps JOIN streams s USING(stream_id) "
+            "WHERE ps.project_id = ? AND s.label LIKE ?", (a, f"wl:{wid}:%")).fetchone()["c"]
+        # The owner may not delete while B uses it; B's "delete" is a detach.
+        out["owner_delete_refused"] = await st.delete_watchlist(wid, a)
+        out["owner_detach_refused"] = await st.detach_watchlist(a, wid)
+        out["c_detach_refused"] = await st.detach_watchlist(c, wid)
+        out["alert_b"] = await st.create_alert(b, wid)
+        out["b_delete"] = await st.delete_watchlist(wid, b)
+        out["b_gone"] = await st.watchlists(b)
+        out["b_streams_after"] = st.db.execute(
+            "SELECT COUNT(*) c FROM project_streams WHERE project_id = ?", (b,)).fetchone()["c"]
+        out["a_still"] = await st.watchlists(a)
+        out["stream_live"] = st.db.execute(
+            "SELECT paused, watched FROM streams WHERE stream_id = ?", (sid,)).fetchone()
+        # Project delete hands a shared list to its other user.
+        await st.attach_watchlist(c, wid)
+        await st.create_watchlist(c, "Cabinet")        # a name clash in the heir
+        out["plan"] = await st.project_delete_plan(a)
+        out["deleted"] = await st.delete_project(a)
+        out["c_after"] = await st.watchlists(c)
+        out["wl_row"] = dict(st.db.execute(
+            "SELECT project_id, name FROM watchlists WHERE watchlist_id = ?", (wid,)).fetchone())
+        out["wl_links"] = [r["project_id"] for r in st.db.execute(
+            "SELECT project_id FROM project_watchlists WHERE watchlist_id = ?", (wid,))]
+        out["tweet_kept"] = st.db.execute(
+            "SELECT COUNT(*) c FROM tweets WHERE tweet_id = 1001").fetchone()["c"]
+        out["a"], out["b"], out["c"], out["wid"] = a, b, c, wid
+        await st.close()
+        # Re-open: the backfill is idempotent and adds nothing.
+        st = store_mod.Store(db, False)
+        await st.open()
+        out["links_reopen"] = st.db.execute(
+            "SELECT COUNT(*) c FROM project_watchlists").fetchone()["c"]
+        await st.close()
+        return out
+
+    r = asyncio.run(run())
+    a, b, c, wid = r["a"], r["b"], r["c"], r["wid"]
+    lib = {w["watchlist_id"]: w for w in r["lib_before"]}
+    ok(wid in lib and lib[wid]["owner_project"] == "A" and not lib[wid]["attached"]
+       and lib[wid]["members"] == 2 and lib[wid]["tweets"] == 1,
+       "the library lists A's list with owner, size and collected count")
+    ok(r["b_before"] == [], "B starts with no watchlists")
+    ok(r["attach"].get("attached") and not r["attach"]["already"],
+       "B adds A's list")
+    ok(r["attach_again"].get("already") is True, "adding it twice is a no-op")
+    ok("error" in r["attach_missing"], "a missing watchlist is refused")
+    ok(r["b_streams"] == 1, "B holds the list's compiled stream in project_streams")
+    ba = r["b_after"]
+    ok(len(ba) == 1 and ba[0]["watchlist_id"] == wid and ba[0]["project_id"] == a,
+       "B's /api/watchlists row is the SAME watchlist_id, project_id still the owner")
+    ok(ba[0]["shared"] and ba[0]["owner_project_id"] == a and ba[0]["owner_project"] == "A"
+       and [p["project_id"] for p in ba[0]["projects"]] == [a, b],
+       "additive keys: shared, owner_project_id, owner_project, projects[] (owner first)")
+    ok(r["a_after"][0]["shared"] and r["a_after"][0]["watchlist_id"] == wid,
+       "A sees the same row, now marked shared")
+    ok(ba[0]["streams"][0]["tweets"] == 1,
+       "B sees the list's history — the tweet collected before the share")
+    ok({p["name"]: p["watchlists"] for p in r["projects"]}["B"] == 1,
+       "/api/projects counts the lists a project USES")
+    ok(r["chunks_a"] == 2 and r["chunks_b"] == 2,
+       "a new chunk compiled after the share is attached to every user")
+    ok("error" in r["owner_delete_refused"] and "B" in r["owner_delete_refused"]["error"],
+       "the owner cannot delete while B uses the list — refused by name")
+    ok("error" in r["owner_detach_refused"], "the owner cannot detach its own list")
+    ok("error" in r["c_detach_refused"], "a project that never added it cannot detach")
+    ok("error" not in r["alert_b"], "B can put an alert on a list it added")
+    ok(r["b_delete"].get("detached") is True, "B's delete is a detach")
+    ok(r["b_gone"] == [] and r["b_streams_after"] == 0,
+       "B no longer lists it and holds none of its streams")
+    ok(len(r["a_still"]) == 1 and not r["a_still"][0]["shared"],
+       "A still has it, no longer shared")
+    ok(r["stream_live"]["paused"] == 0 and r["stream_live"]["watched"] == 1,
+       "the stream kept collecting throughout — a detach pauses nothing")
+    plan = r["plan"]
+    ok(plan["watchlists"] == 0 and len(plan["watchlists_transferred"]) == 1
+       and plan["watchlists_transferred"][0]["to_project"] == "C",
+       "deleting A plans to hand its shared list to C, not delete it")
+    ok(r["deleted"].get("deleted") is True, "A is deleted")
+    ok(r["wl_row"]["project_id"] == c and r["wl_row"]["name"] == "Cabinet (from A)",
+       f"the list now belongs to C, renamed around C's own 'Cabinet' ({r['wl_row']})")
+    ok(r["wl_links"] == [c], "only C is linked to it afterwards")
+    ok(any(w["watchlist_id"] == wid for w in r["c_after"]), "C's watchlists show it")
+    ok(r["tweet_kept"] == 1, "its collected tweet survived the project delete")
+    ok(r["links_reopen"] == 2, "re-opening the database adds no link rows")
+
+
 # ==========================================================================
 
 def test_collections(tmp):
@@ -7001,6 +7139,7 @@ def main():
 
         section("projects & watchlists (dashboard state -> compiled streams)")
         test_projects_watchlists(fresh("projects"))
+        test_shared_watchlists(fresh("shared_wl"))
 
         section("collections (curation boards)")
         test_collections(fresh("collections"))

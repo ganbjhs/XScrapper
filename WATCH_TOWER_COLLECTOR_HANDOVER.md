@@ -1,4 +1,4 @@
-# Watch-Tower ← Collector: what is here and how to fetch it (2026-09-18)
+# Watch-Tower ← Collector: what is here and how to fetch it (2026-09-18, shared watchlists added 2026-09-25)
 
 *The one document to hand the Watch-Tower agent. It is written for their
 coding agent, is self-contained, and supersedes the endpoint sections of the
@@ -248,6 +248,74 @@ is the API surface, there is no other discovery document. Do not probe.
   both; bound for one, receives one. Treat ig:P:0 exactly as one more
   stream of P in whatever you do today for an X list: bind, unbind,
   mirror, backfill from your own copy.
+
+  SHARED WATCHLISTS (2026-09-25). One X watchlist can now be used by
+  several of our projects: it is created in one project (its owner) and
+  any other project can add it. Nothing is copied — one list, one set of
+  wl:<id>:<n> streams, fetched ONCE, and its posts show in every project
+  that added it. What that means for you:
+
+    * /api/watchlists?project=P keeps its shape. A shared list is simply
+      listed under EVERY project that uses it, with the SAME watchlist_id
+      and the same streams[]. `project_id` on the row stays the OWNER's id
+      (where it was created), so under P it may not equal P.
+    * Key your cards on (project_id_you_asked_for, watchlist_id) — never
+      on watchlist_id alone, or the same list bound in two of your
+      projects collides. This is the one thing to check in your code.
+    * Additive keys on the row, ignore if you like:
+        owner_project_id  int   the project that created it (= project_id)
+        owner_project     str   its name
+        projects          [{project_id, name, owner}]  everyone using it
+        shared            bool  used by more than one project
+    * /api/projects → `watchlists` counts the lists a project USES,
+      including added ones. /api/streams/assignments → `projects[]` on a
+      shared list's streams names every project, which it always could.
+    * A post collected through a shared list is one row in /api/tweets;
+      `streams` on it names the wl:<id>:<n> stream as before, and the
+      post appears under ?project=P for each project using the list. If
+      you mirror two of our projects that share a list, you will receive
+      the same tweet_id once per project — dedupe on tweet_id per your
+      project, exactly as a tweet matched by two lists already required.
+    * Nothing changes for Instagram or Facebook: sources there are still
+      per-project.
+  Until the first list is actually shared, none of this is observable;
+  we will tell you before that happens.
+
+  REQUEST — SEVERAL OF OUR LISTS PER WATCH-TOWER PROJECT (2026-09-25).
+  Today a Watch-Tower project shows ONE of our watchlists for a bound
+  project. We would like it to show ALL of them, with the choice on your
+  side. Please build this — and, agent: before you start, get Ankit sir's
+  go-ahead on the shape below, since it changes what his projects show.
+
+    What we want:
+      * When a Watch-Tower project is bound to our project P, list EVERY
+        row of GET /api/watchlists?project=P — every X list P created or
+        added, plus the Instagram row — not just one.
+      * Ankit sir picks which of them the Watch-Tower project follows:
+        add / remove from your side, any time, any number. Nothing to ask
+        us for; nothing changes on our side when he does.
+      * Store the choice as (our project_id, our watchlist_id) pairs.
+        Never store handles or stream labels as the binding: we add and
+        remove handles inside a list, and a list re-chunks its wl:<id>:<n>
+        streams on its own — read streams[] fresh from the row each run.
+      * Pull per selected list exactly as today: for each label in that
+        row's streams[], GET /api/tweets?project=P&stream=<label>&
+        since_collected_ms=… . A list selected in two of your projects is
+        one list on our side; pull it once per your project and dedupe on
+        tweet_id within each.
+      * Re-read /api/watchlists?project=P on every refresh so a list we add
+        to P shows up as selectable without anyone re-binding; a list we
+        delete disappears from the picker and its selection can be shown
+        as "no longer in the collector" rather than erroring.
+      * Cards: one per selected list, keyed on (project_id, watchlist_id),
+        with `upstream posts` = sum of streams[].tweets for that list.
+
+    What limits it: the picker can only ever offer lists that exist on
+    OUR side under that project — created there, or shared into it from
+    another project with the new "Add existing…" control in our
+    dashboard. If a list Ankit sir wants is missing from the picker, it
+    has to be added to project P in the collector first; that is a
+    request to us, not something to work around by parsing labels.
 
 ======================================================================
 6. NUMBERS ON YOUR CARDS
