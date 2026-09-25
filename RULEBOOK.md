@@ -1721,6 +1721,14 @@ before changing the engine; nearly every "obvious" idea has been tried.)
   `ALTER TABLE` on `open()` so an existing DB upgrades in place; never require a
   wipe. (See `store_fb._MIGRATIONS` and the X store's `watched`/interval
   columns as the pattern.)
+- **A per-row count over `tweet_hits` takes a BOUND `wl:<id>:%` pattern, never
+  a computed one.** `s.label LIKE ?` with the pattern bound lets SQLite pick
+  the streams first and range-scan `tweet_hits` per stream; `s.label LIKE
+  'wl:' || w.watchlist_id || ':%'` inside a correlated subquery made it walk
+  the whole hits table once per watchlist — 5 s on 750k hits, and the
+  "Add existing…" picker sat on Loading… in production (2026-09-25). Count
+  in a loop the way `watchlists()` does; the suite cannot see this, only a
+  real-sized table can.
 - **`python3 tests/test_all.py` stays green, offline, and grows a test for the
   new behavior.** The suite is the contract; it needs no accounts and spends no
   budget. Run it as a script, not under pytest.

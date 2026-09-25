@@ -2171,24 +2171,36 @@ class Store:
             "         WHERE m.watchlist_id = w.watchlist_id) AS members, "
             "       (SELECT COUNT(*) FROM watchlist_links l "
             "         WHERE l.watchlist_id = w.watchlist_id "
-            "           AND l.status != 'removed') AS links, "
-            "       (SELECT COUNT(h.tweet_id) FROM streams s "
-            "          JOIN tweet_hits h USING(stream_id) "
-            "          WHERE s.label LIKE 'wl:' || w.watchlist_id || ':%') AS tweets, "
-            "       (SELECT MIN(COALESCE(s.paused, 0)) FROM streams s "
-            "          WHERE s.label LIKE 'wl:' || w.watchlist_id || ':%') AS all_paused_min "
+            "           AND l.status != 'removed') AS links "
             "FROM watchlists w JOIN projects p ON p.project_id = w.project_id "
             "ORDER BY p.archived, p.name, w.name").fetchall()
         out = []
         for r in rows:
             d = dict(r)
+            # Collected count and liveness per list, the way watchlists()
+            # does it: a BOUND 'wl:<id>:%' pattern and one GROUP BY, which
+            # the planner turns into an index range per stream. Written as
+            # a correlated subquery with a computed LIKE pattern, the same
+            # count made SQLite walk tweet_hits once per list — 5 s on
+            # 750k hits, minutes on production — and the picker sat on
+            # "Loading…" (2026-09-25).
+            live = False
+            tweets = 0
+            for srow in self.db.execute(
+                    "SELECT s.paused, COUNT(h.tweet_id) AS n "
+                    "FROM streams s LEFT JOIN tweet_hits h USING(stream_id) "
+                    "WHERE s.label LIKE ? GROUP BY s.stream_id",
+                    (f"wl:{r['watchlist_id']}:%",)):
+                tweets += srow["n"] or 0
+                live = live or not srow["paused"]
+            d["tweets"] = tweets
+            d["live"] = live
             projs = self._watchlist_projects(r["watchlist_id"])
             d["projects"] = [{"project_id": p["project_id"], "name": p["name"],
                               "owner": bool(p["owner"])} for p in projs]
             d["shared"] = len(projs) > 1
             d["attached"] = (exclude_project is not None and any(
                 p["project_id"] == int(exclude_project) for p in projs))
-            d["live"] = d.pop("all_paused_min") == 0
             out.append(d)
         return out
 
