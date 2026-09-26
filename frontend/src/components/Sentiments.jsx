@@ -1,21 +1,8 @@
 // The sentiment strip — every category and how many posts carry it, sitting at
-// the top of the page rather than buried one click into a board.
-//
-// It also owns the two buttons that act on the whole project: Classify, which
-// now covers every unlabelled post rather than a slice, and Export, which is
-// the only export the Collections page offers. Both belong beside the counts
-// they change; a button that fills these tiles and lives on another screen is a
-// button nobody presses.
-//
-// Classifying is a background job now, so this polls /api/labels/status while a
-// run is going and shows a bar that moves. The old shape held the request open
-// and then apologised for work that was, in fact, still running.
 import React, { useEffect, useRef, useState } from "react";
 import { api, fmtN } from "../api/client.js";
 
 // Poll while a run is in flight, stop the moment it is not. Deliberately not
-// `useApi({ every })`: a dashboard that polls a labelling endpoint forever
-// costs a query a second on a page nobody is looking at.
 export function useLabelRun(labels, onFinished) {
   const run = labels.data?.run || null;
   const running = !!run?.running;
@@ -57,8 +44,6 @@ function runSummary(run) {
 }
 
 // A hook, not a component: it owns state (is a start in flight? what did the
-// last one say?) but its caller decides where the button and the message go —
-// the Live Feed puts them in its header, the strip below puts them in a panel.
 export function useClassifyButton({ pid, labels, big = false }) {
   const [starting, setStarting] = useState(false);
   const [msg, setMsg] = useState("");

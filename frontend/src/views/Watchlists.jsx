@@ -1,21 +1,9 @@
 // Watchlists — ONE structure for every platform.
-//
-// Layout contract (the fix for "everything thrown on the main interface"):
-//   * Two tabs: "Watchlists" (the daily surface) and "Network & settings"
-//     (configuration, login health, streams wiring — the rarely-used things).
-//   * The Watchlists tab is MASTER-DETAIL: a compact list of every watchlist
-//     across X / Facebook / Instagram on the left, ONE detail panel on the
-//     right. A list with 200 handles scrolls inside its own box, never the
-//     page.
-//   * "+ New watchlist" is a single flow for every platform: pick the
-//     platform first, the form adapts (X: handles / keywords / X List;
-//     Facebook: pages / favorites; Instagram: user / hashtag / following).
-//     A future platform adds one entry to PLATFORM_KINDS and one detail
-//     component — the shell does not change.
-import React, { useMemo, useState } from "react";
-import { api, fmtAgo, fmtN, fmtPosted, useApi } from "../api/client.js";
+import React, { useEffect, useMemo, useState } from "react";
+import { Link } from "react-router-dom";
+import { api, byName, fmtAgo, fmtN, fmtPosted, sortBy, useApi } from "../api/client.js";
 import { PageHead, useProject } from "../App.jsx";
-import { Empty, ErrorState, Loading, Modal } from "../components/ui.jsx";
+import { Empty, ErrorState, Hint, Loading, Modal, PillSelect, Sec, Segmented, icons, toast, useMediaQuery } from "../components/ui.jsx";
 import { cleanHandle, cleanId, parseIgIds } from "../lib/parseIgIds.js";
 
 // Must match FB_SPEEDS in web.py — the named cadences a page can be checked at.
@@ -29,11 +17,6 @@ const INTERVAL_OPTS = [
 ];
 
 // Split keyword input into rules on commas and newlines — but NOT on a comma
-// inside quotes. `"Modi, Shah" OR "Fadnavis, Shinde"` used to shatter into
-// three fragments, two rejected for unbalanced quotes and the middle one
-// ('Shah" OR "Fadnavis') silently ACCEPTED and collected against. A field that
-// takes a whole X query has to respect the one piece of X syntax that can
-// legitimately contain a comma.
 const splitKeywordRules = (raw) => {
   const out = [];
   let buf = "", quoted = false;
@@ -70,9 +53,35 @@ const PLATFORM_KINDS = {
   ],
 };
 
-// ---------------------------------------------------------------------------
 // The unified Add modal — platform first, then the platform's own form.
-// ---------------------------------------------------------------------------
+
+const KIND_SHORT = {
+  query: "Handles", keywords: "Keywords", xlist: "X List", links: "Post links",
+  pages: "Pages", favorites: "Favorites feed", user: "Users", hashtag: "Hashtags", following: "Home feed",
+};
+const KIND_DESC = {
+  query: "A set of accounts, built here — no X List needed.",
+  keywords: "A search: every post matching the rules, from anyone.",
+  xlist: "An existing X List — the fastest polling.",
+  links: "Specific posts, pasted or from a Google Sheet, re-fetched daily for fresh numbers.",
+  pages: "Each Facebook page is checked on its own cadence.",
+  favorites: "One richer pass over the collector account's Favourites feed.",
+  user: "A profile's posts — numeric id preferred.",
+  hashtag: "Posts under a hashtag.",
+  following: "The account's whole home feed — everything it follows. One source is created.",
+};
+
+function Field({ label, hint, optional, children }) {
+  return (
+    <div className="field">
+      <div className="flabel">
+        <label>{label}{optional ? <span style={{ fontWeight: 500, textTransform: "none", letterSpacing: 0 }}> · optional</span> : null}</label>
+        {hint && <Hint text={hint} />}
+      </div>
+      {children}
+    </div>
+  );
+}
 
 function AddModal({ pid, onDone, onClose }) {
   const [platform, setPlatform] = useState("x");
@@ -94,8 +103,6 @@ function AddModal({ pid, onDone, onClose }) {
     try {
       if (platform === "x" && kind === "links") {
         // A sheet names its own watchlists (one per tab) and is read on this
-        // click, so the report below says what it found before the modal
-        // closes. A pasted list is an ordinary create.
         const body = { project: pid, kind: "links", name, links: handles };
         if (sheet.trim()) body.sheet = sheet.trim();
         const made = await api.createWatchlist(body);
@@ -170,156 +177,90 @@ function AddModal({ pid, onDone, onClose }) {
 
   return (
     <Modal title="New watchlist" onClose={onClose}
-           sub="One flow for every platform — pick where it collects from, the form adapts.">
+           sub="Pick a platform and a type — the fields below adapt.">
       <div className="field">
         <label>Platform</label>
-        <select value={platform} onChange={(e) => pick(e.target.value)}>
-          <option value="x">X (Twitter)</option>
-          <option value="fb">Facebook</option>
-          <option value="ig">Instagram</option>
-        </select>
+        <Segmented value={platform} onChange={pick}
+                   options={[["x", "𝕏  X (Twitter)"], ["fb", "Facebook"], ["ig", "Instagram"]]} />
       </div>
       <div className="field">
         <label>Type</label>
-        <select value={kind} onChange={(e) => setKind(e.target.value)}>
-          {PLATFORM_KINDS[platform].map(([v, t]) => (
-            <option key={v} value={v}>{t}</option>
-          ))}
-        </select>
+        <Segmented value={kind} onChange={setKind}
+                   options={PLATFORM_KINDS[platform].map(([v, t]) => [v, KIND_SHORT[v] || t, t])} />
+        <div className="fhint">{KIND_DESC[kind]}</div>
       </div>
 
       {platform === "x" && kind === "links" && (
         <>
-          <div className="field">
-            <label>Google Sheet URL — every tab becomes a watchlist named after it (optional)</label>
+          <Field label="Google Sheet URL" optional
+                 hint="Share the sheet with the collector's service account as Viewer (the same account Sheet delivery uses). Every cell of every tab is scanned for x.com post links and every tab becomes a watchlist named after it. Re-read every 10 minutes.">
             <input value={sheet} autoFocus onChange={(e) => setSheet(e.target.value)}
                    placeholder="https://docs.google.com/spreadsheets/d/…/edit" />
-            <div style={{ color: "var(--ink-3)", fontSize: 12, marginTop: 6, lineHeight: 1.5 }}>
-              Share the sheet with the collector's service account as <b>Viewer</b>{" "}
-              (the same account Sheet delivery uses). Every cell of every tab is
-              scanned for x.com post links; other columns are ignored. Re-read
-              every 10 minutes — paste a row and it starts within a couple of minutes.
-            </div>
-          </div>
+          </Field>
           {!sheet.trim() && (
             <>
-              <div className="field">
-                <label>Name</label>
-                <input value={name} onChange={(e) => setName(e.target.value)}
-                       placeholder="e.g. Launch week posts" />
-              </div>
-              <div className="field">
-                <label>Post links — one per line</label>
+              <Field label="Name">
+                <input value={name} onChange={(e) => setName(e.target.value)} placeholder="e.g. Launch week posts" />
+              </Field>
+              <Field label="Post links" hint="One x.com post link per line. Each post is re-fetched on the list's cadence (12h/24h/48h) and its likes, reposts, replies, quotes, views and bookmarks are overwritten with the latest numbers. Use a project that is not bound to Watch-Tower.">
                 <textarea rows="5" value={handles} onChange={(e) => setHandles(e.target.value)}
                           placeholder={"https://x.com/nasa/status/1789…\nhttps://x.com/isro/status/1790…"} />
-              </div>
+              </Field>
             </>
           )}
-          <div style={{ color: "var(--ink-3)", fontSize: 12, marginTop: 4, lineHeight: 1.5 }}>
-            Each post is re-fetched once a day (12h/24h/48h per list) and its likes,
-            reposts, replies, quotes, <b>views</b> and bookmarks are overwritten with
-            the latest numbers. No history is kept here — the tool reading{" "}
-            <code>/api/links</code> keeps its own. Use a project that is <b>not</b> bound
-            to Watch-Tower: they mirror whole projects.
-          </div>
         </>
       )}
 
       {platform === "x" && kind !== "links" && (
         <>
-          <div className="field">
-            <label>Name</label>
-            <input value={name} autoFocus onChange={(e) => setName(e.target.value)}
-                   placeholder="e.g. Cabinet" />
-          </div>
+          <Field label="Name">
+            <input value={name} autoFocus onChange={(e) => setName(e.target.value)} placeholder="e.g. Cabinet" />
+          </Field>
           {kind === "xlist" ? (
             <>
-              <div className="field">
-                <label>X List URL or id</label>
+              <Field label="X List URL or id">
                 <input value={listId} onChange={(e) => setListId(e.target.value)}
                        placeholder="https://x.com/i/lists/1234567890123456789" />
-              </div>
-              <div className="field">
-                <label>Owned by — the X account this list was made on (optional)</label>
-                <input value={owner} onChange={(e) => setOwner(e.target.value)}
-                       placeholder="@our_scraper_2" />
-                <div style={{ color: "var(--ink-3)", fontSize: 12, marginTop: 6 }}>
-                  A list lives on x.com and only its owner can add or remove
-                  members. Writing the handle down here is how anyone later
-                  knows which account to sign in as — leave it blank if you
-                  do not know.
-                </div>
-              </div>
+              </Field>
+              <Field label="Owner" optional
+                     hint="The X account this list was made on. A list lives on x.com and only its owner can add or remove members — recording it here is how anyone later knows which account to sign in as.">
+                <input value={owner} onChange={(e) => setOwner(e.target.value)} placeholder="@our_scraper_2" />
+              </Field>
             </>
           ) : kind === "keywords" ? (
-            <div className="field">
-              <label>Keywords — one rule per line, or separated by commas</label>
+            <Field label="Keyword rules"
+                   hint={'One rule per line or separated by commas. Comma / new line = OR (match any). Uppercase AND between two words = both required, any order (Varanasi AND Modi). Two words with no operator also mean both, so Devendra Fadnavis also matches "Fadnavis … Devendra"; quote for the exact phrase: "Devendra Fadnavis". Also -exclude, #hashtag, @mention.'}>
               <textarea rows="5" value={handles} onChange={(e) => setHandles(e.target.value)}
                         placeholder={'Devendra Fadnavis, \u0926\u0947\u0935\u0947\u0902\u0926\u094d\u0930 \u092b\u0921\u0923\u0935\u0940\u0938\nCM AND maharashtra\n"input tax credit", #Chhattisgarh'} />
-              <div style={{ color: "var(--ink-3)", fontSize: 12, marginTop: 6 }}>
-                Syntax: <b>comma</b> (or a new line) = <b>OR</b> (match any).
-                Uppercase <b>AND</b> between two words = <b>both required</b>,
-                any order — e.g. <code>Varanasi AND Modi</code>.
-                Two words with no operator mean both as well, so
-                <code>Devendra Fadnavis</code> also matches “Fadnavis … Devendra”;
-                for the exact phrase, quote it: <code>"Devendra Fadnavis"</code>.
-                Also <code>-exclude</code>, <code>#hashtag</code>,
-                <code>@mention</code>.
-              </div>
-            </div>
+              <div className="fhint">comma = any · <code>AND</code> = both · <code>"quotes"</code> = exact phrase · <code>-word</code> = exclude</div>
+            </Field>
           ) : (
-            <div className="field">
-              <label>Handles — one per line, @ optional</label>
+            <Field label="Handles" hint="One per line, @ optional. A profile URL works too.">
               <textarea rows="5" value={handles} onChange={(e) => setHandles(e.target.value)}
                         placeholder={"@DrKirodilalBJP\nJoraramKumawat\nhttps://x.com/KirodiOffice"} />
-            </div>
+            </Field>
           )}
         </>
       )}
 
       {platform === "fb" && (
-        <>
-          {kind === "favorites" && (
-            <div style={{ color: "var(--ink-3)", fontSize: 12.5, margin: "10px 0 0", lineHeight: 1.5 }}>
-              Switches collection to the account's <b>Favorites feed</b> — one
-              richer pass instead of page-by-page checks. Add the pages below
-              too so posts are attributed to them (and add them to Favorites
-              in the collector's Facebook account: Feeds → Favourites → Manage).
-            </div>
-          )}
-          <div className="field">
-            <label>Page handles — from the page URL, one per line</label>
-            <textarea rows="4" value={handles} onChange={(e) => setHandles(e.target.value)}
-                      placeholder={"narendramodi\nAmitShahOfficial"} />
-          </div>
-        </>
+        <Field label="Page handles"
+               hint={"From the page URL, one per line." + (kind === "favorites"
+                 ? " Favorites mode switches collection to the account's Favourites feed — one richer pass instead of page-by-page checks. Add the pages here so posts are attributed to them, and add them to Favourites in the collector's Facebook account (Feeds → Favourites → Manage)."
+                 : "")}>
+          <textarea rows="4" value={handles} onChange={(e) => setHandles(e.target.value)}
+                    placeholder={"narendramodi\nAmitShahOfficial"} />
+        </Field>
       )}
 
-      {platform === "ig" && (
-        <>
-          {kind === "following" ? (
-            <div style={{ color: "var(--ink-3)", fontSize: 12.5, margin: "10px 0 0", lineHeight: 1.5 }}>
-              Collects the account's whole <b>home feed</b> (everything it follows).
-              One source is created.
-            </div>
-          ) : (
-            <div className="field">
-              <label>{kind === "user"
-                ? "Usernames or numeric ids — one per line"
-                : "Hashtags (without #) — one per line"}</label>
-              <textarea rows="5" value={handles} autoFocus
-                        onChange={(e) => setHandles(e.target.value)}
-                        placeholder={kind === "user" ? "natgeo\nnasa\n787132" : "wildlife\nnature"} />
-              {kind === "user" && (
-                <div style={{ color: "var(--ink-3)", fontSize: 12, marginTop: 6 }}>
-                  Paste one or many. A username works; a numeric id is more robust when the
-                  session is restricted (find it in the profile source as “profile_id”). The
-                  label is the username/id itself.
-                </div>
-              )}
-            </div>
-          )}
-        </>
+      {platform === "ig" && kind !== "following" && (
+        <Field label={kind === "user" ? "Usernames or numeric ids" : "Hashtags"}
+               hint={kind === "user"
+                 ? "One per line. A username works; a numeric id is more robust when the session is restricted (find it in the profile source as “profile_id”). The label is the username/id itself."
+                 : "Without the #, one per line."}>
+          <textarea rows="5" value={handles} autoFocus onChange={(e) => setHandles(e.target.value)}
+                    placeholder={kind === "user" ? "natgeo\nnasa\n787132" : "wildlife\nnature"} />
+        </Field>
       )}
 
       {err && <div className="err">{err}</div>}
@@ -333,9 +274,7 @@ function AddModal({ pid, onDone, onClose }) {
   );
 }
 
-// ---------------------------------------------------------------------------
 // X detail panel
-// ---------------------------------------------------------------------------
 
 const FILTER_BOXES = [
   ["skip_retweets", "No retweets"],
@@ -350,16 +289,14 @@ function FiltersPanel({ w, onChanged }) {
   const [open, setOpen] = useState(false);
   const [f, setF] = useState(w.filters || {});
   const [busy, setBusy] = useState(false);
-  const [msg, setMsg] = useState("");
+  useEffect(() => { setF(w.filters || {}); }, [w.watchlist_id]);
 
-  const active = Object.keys(w.filters || {}).length;
+  const active = Object.keys(w.filters || {}).filter((k) => w.filters[k]).length;
+  const dirty = JSON.stringify(f) !== JSON.stringify(w.filters || {});
   const save = async () => {
-    setBusy(true); setMsg("");
-    try {
-      await api.watchlistFilters(w.watchlist_id, f);
-      setMsg("✓ Saved — collection uses the new filters from its next check");
-      onChanged();
-    } catch (e) { setMsg(`✗ ${String(e.message || e)}`); }
+    setBusy(true);
+    try { await api.watchlistFilters(w.watchlist_id, f); onChanged(); }
+    catch { /* toast */ }
     finally { setBusy(false); }
   };
   const box = (key, label) => (
@@ -371,152 +308,100 @@ function FiltersPanel({ w, onChanged }) {
   );
 
   return (
-    <div style={{ marginTop: 12, borderTop: "1px solid var(--ring)", paddingTop: 10 }}>
-      <button className="btn btn-ghost btn-sm" onClick={() => setOpen(!open)}>
-        Collection filters{active ? ` (${active} active)` : ""} {open ? "▴" : "▾"}
-      </button>
-      {open && (
-        <div style={{ marginTop: 10 }}>
+    <Sec label="Collection filters"
+         hint={w.kind === "xlist"
+           ? "Applied at collection time: the List timeline is read as usual and filtered posts are dropped before they are stored, so they never reach the feed, exports or Telegram. Posts already collected stay."
+           : "Applied at collection time: filtered posts are never fetched at all. Posts already collected stay."}
+         right={<>
+           {active > 0 && <span className="chip">{active} active</span>}
+           <button className="btn btn-ghost btn-sm" onClick={() => setOpen(!open)} aria-expanded={open}>
+             {open ? "Hide" : active ? "Edit" : "Add filters"}
+           </button>
+         </>}>
+      <div className={`reveal${open ? " open" : ""}`}>
+        <div>
           <div className="filters" style={{ marginBottom: 8 }}>
             {FILTER_BOXES.map(([k, l]) => box(k, l))}
           </div>
-          <div className="filters" style={{ marginBottom: 8 }}>
-            <input placeholder="language (hi, en…)" value={f.lang || ""}
-                   style={{ width: 150 }}
+          <div className="filters" style={{ marginBottom: 0 }}>
+            <input placeholder="language (hi, en…)" value={f.lang || ""} style={{ width: 150 }}
+                   title="Only posts X tags with this language code"
                    onChange={(e) => setF((s) => ({ ...s, lang: e.target.value }))} />
-            <input placeholder="min likes" inputMode="numeric" value={f.min_likes || ""}
-                   style={{ width: 110 }}
+            <input placeholder="min likes" inputMode="numeric" value={f.min_likes || ""} style={{ width: 110 }}
                    onChange={(e) => setF((s) => ({ ...s, min_likes: e.target.value }))} />
-            <input placeholder="min retweets" inputMode="numeric" value={f.min_retweets || ""}
-                   style={{ width: 120 }}
+            <input placeholder="min retweets" inputMode="numeric" value={f.min_retweets || ""} style={{ width: 120 }}
                    onChange={(e) => setF((s) => ({ ...s, min_retweets: e.target.value }))} />
-            <button className="btn btn-brand btn-sm" disabled={busy} onClick={save}>
-              Save filters
+            <button className="btn btn-brand btn-sm" disabled={busy || !dirty} onClick={save}>
+              {busy ? "Saving…" : "Save filters"}
             </button>
           </div>
-          {msg && (
-            <div className={msg.startsWith("✓") ? "st-good" : "st-crit"}
-                 style={{ fontSize: 12.5, fontWeight: 600 }}>{msg}</div>
-          )}
-          <div style={{ color: "var(--ink-3)", fontSize: 12 }}>
-            {w.kind === "xlist"
-              ? "Applies at collection time — the List timeline is read as usual and filtered posts are dropped before they are stored, so they never reach the feed, exports or Telegram. Already-collected posts stay."
-              : "Applies at collection time — filtered posts are never fetched at all. Already-collected posts stay."}
-          </div>
         </div>
-      )}
-    </div>
+      </div>
+    </Sec>
   );
 }
 
-// The watchlist's name, with a Rename button. Names are display only — every
-// stream, post and Watch-Tower card keys on the id — so renaming is safe at
-// any time; the store refuses a name another list in the same project uses.
-function RenameTitle({ w, onChanged }) {
-  const [editing, setEditing] = useState(false);
+// Rename happens in a modal so the panel header never changes shape.
+function RenameModal({ w, onChanged, onClose }) {
   const [val, setVal] = useState(w.name || "");
   const [busy, setBusy] = useState(false);
   const [err, setErr] = useState("");
-
   const save = async () => {
     const name = val.trim();
-    if (!name || name === w.name) { setEditing(false); setErr(""); return; }
+    if (!name || name === w.name) { onClose(); return; }
     setBusy(true); setErr("");
     try {
       const r = await api.renameWatchlist(w.watchlist_id, name);
       if (r && r.error) { setErr(r.error); return; }
-      setEditing(false);
-      onChanged();
+      onChanged(); onClose();
     } catch (e) { setErr(String(e.message || e)); }
     finally { setBusy(false); }
   };
-
-  if (!editing) {
-    return (
-      <>
-        <h3>{w.name}</h3>
-        <button className="btn btn-ghost btn-sm" title="Rename this watchlist"
-                onClick={() => { setVal(w.name || ""); setEditing(true); }}>
-          Rename
-        </button>
-      </>
-    );
-  }
   return (
-    <span style={{ display: "flex", gap: 6, alignItems: "center", flexWrap: "wrap" }}>
-      <input value={val} autoFocus maxLength={120} style={{ minWidth: 220 }}
-             onChange={(e) => setVal(e.target.value)}
-             onKeyDown={(e) => {
-               if (e.key === "Enter") save();
-               if (e.key === "Escape") { setEditing(false); setErr(""); }
-             }} />
-      <button className="btn btn-brand btn-sm" disabled={busy} onClick={save}>
-        {busy ? "\u2026" : "Save"}
-      </button>
-      <button className="btn btn-ghost btn-sm" disabled={busy}
-              onClick={() => { setEditing(false); setErr(""); }}>Cancel</button>
-      {err && <span style={{ color: "var(--critical)", fontSize: 12.5 }}>{err}</span>}
-    </span>
+    <Modal title="Rename watchlist" sub="Display name only — collection is unaffected." onClose={onClose}>
+      <div className="field">
+        <label htmlFor="wlname">Name</label>
+        <input id="wlname" value={val} autoFocus maxLength={120}
+               onChange={(e) => setVal(e.target.value)}
+               onKeyDown={(e) => e.key === "Enter" && save()} />
+      </div>
+      {err && <div className="err">{err}</div>}
+      <div className="row">
+        <button className="btn btn-ghost" onClick={onClose}>Cancel</button>
+        <button className="btn btn-brand" disabled={busy || !val.trim()} onClick={save}>Save</button>
+      </div>
+    </Modal>
   );
 }
 
-// Who owns this X List. A List is editable only by the account that made it,
-// so with several accounts in the pool this is the difference between "add a
-// handle to the Cabinet list" and half an hour of signing in to find out which
-// account can. Free text, and blank is a legitimate answer — a list added
-// before anyone was asked has an owner nobody wrote down, and guessing one
-// would print a guess as a fact.
-function OwnerLine({ w, onChanged }) {
-  const [editing, setEditing] = useState(false);
+// Who owns this X List — only that account can edit its members on x.com.
+function OwnerModal({ w, onChanged, onClose }) {
   const [val, setVal] = useState(w.owner_handle || "");
   const [busy, setBusy] = useState(false);
   const [err, setErr] = useState("");
-
   const save = async () => {
     setBusy(true); setErr("");
     try {
       const r = await api.watchlistOwner(w.watchlist_id, val.trim());
       if (r && r.error) { setErr(r.error); return; }
-      setEditing(false);
-      onChanged();
+      onChanged(); onClose();
     } catch (e) { setErr(String(e.message || e)); }
     finally { setBusy(false); }
   };
-
-  if (!editing) {
-    return (
-      <div style={{ color: "var(--ink-3)", fontSize: 12.5, marginTop: 4 }}>
-        {w.owner_handle ? (
-          <>
-            Owned by{" "}
-            <a href={`https://x.com/${w.owner_handle}`} target="_blank" rel="noreferrer"
-               style={{ color: "var(--ink-2)", fontWeight: 600 }}>@{w.owner_handle}</a>
-            {" "}— only that account can edit its members.
-          </>
-        ) : (
-          <>Owner not recorded — nobody knows which account can edit this list.</>
-        )}
-        <button className="btn btn-ghost btn-sm" style={{ marginLeft: 8 }}
-                onClick={() => { setVal(w.owner_handle || ""); setEditing(true); }}>
-          {w.owner_handle ? "Change" : "Set owner"}
-        </button>
-      </div>
-    );
-  }
-
   return (
-    <div className="filters" style={{ margin: "6px 0 0" }}>
-      <input value={val} autoFocus placeholder="@handle, or blank to clear"
-             style={{ flex: 1, minWidth: 180 }}
-             onChange={(e) => setVal(e.target.value)}
-             onKeyDown={(e) => e.key === "Enter" && save()} />
-      <button className="btn btn-brand btn-sm" disabled={busy} onClick={save}>
-        {busy ? "…" : "Save"}
-      </button>
-      <button className="btn btn-ghost btn-sm" disabled={busy}
-              onClick={() => { setEditing(false); setErr(""); }}>Cancel</button>
-      {err && <span style={{ color: "var(--critical)", fontSize: 12.5 }}>{err}</span>}
-    </div>
+    <Modal title="List owner" sub="The X account that can edit this List's members on x.com." onClose={onClose}>
+      <div className="field">
+        <label htmlFor="wlowner">Handle</label>
+        <input id="wlowner" value={val} autoFocus placeholder="@handle — blank to clear"
+               onChange={(e) => setVal(e.target.value)}
+               onKeyDown={(e) => e.key === "Enter" && save()} />
+      </div>
+      {err && <div className="err">{err}</div>}
+      <div className="row">
+        <button className="btn btn-ghost" onClick={onClose}>Cancel</button>
+        <button className="btn btn-brand" disabled={busy} onClick={save}>Save</button>
+      </div>
+    </Modal>
   );
 }
 
@@ -524,39 +409,35 @@ function OwnerLine({ w, onChanged }) {
 function XListMembers({ listId }) {
   const { data, reload } = useApi(() => api.xlistMembers(listId), [listId]);
   const [busy, setBusy] = useState(false);
-  const [msg, setMsg] = useState("");
-  const members = data?.members || [];
+  const [q, setQ] = useState("");
+  const all = data?.members || [];
+  const members = sortBy(all, "username").filter((m) =>
+    !q || `${m.display_name || ""} ${m.username}`.toLowerCase().includes(q.toLowerCase()));
 
   const refresh = async () => {
-    setBusy(true); setMsg("");
-    try {
-      const r = await api.refreshXlistMembers(listId);
-      if (r && r.error) setMsg(r.error);
-      reload();
-    } catch (e) { setMsg(String(e.message || e)); }
+    setBusy(true);
+    try { await api.refreshXlistMembers(listId); reload(); }
+    catch { /* toast */ }
     finally { setBusy(false); }
   };
 
   return (
-    <div style={{ marginTop: 12, borderTop: "1px solid var(--ring)", paddingTop: 10 }}>
-      <div className="toolbar">
-        <span style={{ color: "var(--ink-3)", fontSize: 12.5 }}>
-          {members.length ? `${members.length} accounts in this list` : "Members not fetched yet"}
-          {data?.fetched_ms ? ` · updated ${fmtAgo(data.fetched_ms)}` : ""}
-        </span>
-        <span className="grow" />
-        <button className="btn btn-ghost btn-sm" disabled={busy} onClick={refresh}>
-          {busy ? "Fetching…" : "Refresh members"}
-        </button>
-      </div>
-      <div className="members-box" style={{ maxHeight: 340, padding: "0 12px" }}>
+    <Sec label="Members"
+         hint="The List is collected as one fast stream. Refreshing pulls the individual accounts inside it from X (spends a little X budget; cached afterwards)."
+         right={<>
+           {all.length > 0 && <span className="chip">{fmtN(all.length)} accounts{data?.fetched_ms ? ` · ${fmtAgo(data.fetched_ms)}` : ""}</span>}
+           {all.length > 8 && <input className="mini" value={q} placeholder="search…" onChange={(e) => setQ(e.target.value)} />}
+           <button className="btn btn-ghost btn-sm" disabled={busy} onClick={refresh}>
+             {busy ? "Fetching…" : all.length ? "Refresh" : "Fetch members"}
+           </button>
+         </>}>
+      <div className="members-box tall">
         {members.map((m) => (
           <div className="wl-row" key={m.user_id}>
             <div className="who" style={{ display: "flex", alignItems: "center", gap: 10 }}>
               {m.avatar
-                ? <img src={m.avatar} alt="" width="34" height="34"
-                       style={{ borderRadius: "50%", flex: "none" }} />
-                : <span className="pfp" style={{ background: "var(--brand)", width: 34, height: 34 }}>
+                ? <img src={m.avatar} alt="" width="30" height="30" style={{ borderRadius: "50%", flex: "none" }} />
+                : <span className="pfp" style={{ background: "var(--brand)", width: 30, height: 30, fontSize: 12 }}>
                     {(m.display_name || m.username || "?").slice(0, 1).toUpperCase()}
                   </span>}
               <div style={{ minWidth: 0 }}>
@@ -568,183 +449,81 @@ function XListMembers({ listId }) {
                rel="noreferrer" style={{ color: "var(--ink-3)", fontSize: 12 }}>open ↗</a>
           </div>
         ))}
-        {members.length === 0 && (
-          <div style={{ color: "var(--ink-3)", fontSize: 13, padding: "12px 0" }}>
-            This list is collected as one fast stream. Click “Refresh members” to pull the
-            individual accounts inside it (spends a little X budget; cached afterwards).
-          </div>
-        )}
+        {all.length === 0 && <div className="muted">Members not fetched yet.</div>}
+        {all.length > 0 && members.length === 0 && <div className="muted">no match for “{q}”</div>}
       </div>
-      {msg && <div style={{ color: "var(--critical)", fontSize: 12.5, marginTop: 6 }}>{msg}</div>}
-    </div>
+    </Sec>
   );
 }
 
+const DEPTH_OPTS = [["", "default"], ["1", "1 page (~20)"], ["3", "3 pages (~60)"], ["5", "5 pages (~100)"], ["10", "10 pages (~200)"], ["25", "25 pages (~500)"]];
+const DIG_OPTS = [["", "off"], ["300", "every 5 min"], ["600", "every 10 min"], ["900", "every 15 min"]];
+const EVERY_OPTS = [["", "auto"], ["300", "5 min"], ["600", "10 min"], ["900", "15 min"], ["1800", "30 min"], ["3600", "1 hour"]];
+
 // Depth and history — the two controls that answer "why has this stopped?".
-//
-// Watchlist collection is watermark-first: every poll walks the timeline from
-// the top and stops the moment it reaches a post it already has. That is what
-// makes it cheap and fast on a live account, and it is also why a watchlist can
-// sit at a frozen number for days while apparently running perfectly. Two
-// different things can be going on, they have two different fixes, and until
-// now the interface offered neither:
-//
-//   * Posts arrive faster than one poll reaches. The poll runs out of pages
-//     before it gets down to known ground, and the window in between is missed.
-//     Fix: more pages per check.
-//   * There is nothing NEW to find, and everything worth having is older than
-//     the watermark — an archival query (`until:2025-02-20`), or an account
-//     that has stopped posting. No cadence and no page count helps here; the
-//     poller is doing its job and its job is the wrong shape. Fix: walk
-//     backwards on a standing schedule, which is what "dig older" switches on.
-//
-// "Fetch now" sits here too, because the third thing an operator does when a
-// count looks stuck is check whether it is the SCHEDULE that is broken. Making
-// them leave for the Live Feed to answer that turned a one-second question
-// into a navigation.
-//
-// Both are shown together because from the outside the symptom is identical,
-// and an operator who can see both controls can tell which one they have.
 function DepthRow({ w, onChanged }) {
   const [busy, setBusy] = useState(false);
-  const [err, setErr] = useState("");
   const bf = w.backfill || {};
-
   const run = async (fn) => {
-    setBusy(true); setErr("");
-    try {
-      const r = await fn();
-      if (r && r.error) setErr(r.error); else onChanged();
-    } catch (e) { setErr(String(e.message || e)); }
+    setBusy(true);
+    try { const r = await fn(); if (!(r && r.error)) onChanged(); }
+    catch { /* toast */ }
     finally { setBusy(false); }
   };
 
   return (
-    <div className="filters" style={{ margin: "10px 0 0", alignItems: "center",
-                                      flexWrap: "wrap", rowGap: 8 }}>
-      <label className="fpill" style={{ padding: "5px 6px 5px 11px" }}
-             title={"How far down the timeline ONE check is allowed to go, in "
-                    + "pages of about 20 posts.\n\nRaise this if a busy "
-                    + "watchlist is missing posts between checks. It will NOT "
-                    + "help a watchlist that has stopped growing — a check "
-                    + "still stops at the newest post it already has, however "
-                    + "many pages it is allowed. Use 'fetch older' for that."}>
-        <span>depth</span>
-        <select value={w.pages ? String(w.pages) : ""} disabled={busy}
-                onChange={(e) => run(() =>
-                  api.watchlistDepth(w.watchlist_id, e.target.value))}>
-          <option value="">default</option>
-          <option value="1">1 page (~20)</option>
-          <option value="3">3 pages (~60)</option>
-          <option value="5">5 pages (~100)</option>
-          <option value="10">10 pages (~200)</option>
-          <option value="25">25 pages (~500)</option>
-        </select>
-      </label>
-
-      {/* The forward twin. Fetching current posts used to mean leaving this
-          page and refreshing the Live Feed, which is why "it only fetched
-          once" read as a bug in the schedule rather than as a missing button.
-          One page per stream, same guard as everywhere else. */}
+    <div className="ctrl-row">
+      <PillSelect label="depth" value={w.pages ? String(w.pages) : ""} options={DEPTH_OPTS} disabled={busy}
+                  title={"How far down the timeline ONE check may go, in pages of ~20 posts. Raise it if a busy watchlist misses posts between checks. It does not help a watchlist that has stopped growing — use 'dig older' for that."}
+                  onChange={(v) => run(() => api.watchlistDepth(w.watchlist_id, v))} />
+      <PillSelect label="dig older" value={bf.auto ? String(Math.round(bf.every_s || 300)) : ""} options={DIG_OPTS}
+                  disabled={busy || !w.streams.length}
+                  title={"Keep walking BACKWARDS through this query on a schedule, collecting older posts until X has no more. For archival queries or accounts that stopped posting. Takes the smaller share of the rate limit, resumes across restarts, and switches itself off when the archive is empty."}
+                  onChange={(v) => run(() => v ? api.watchlistBackfillAuto(w.watchlist_id, true, v)
+                                              : api.watchlistBackfillAuto(w.watchlist_id, false))} />
       <button className="btn btn-ghost btn-sm" disabled={busy || !w.streams.length}
-              title={"Check for NEW posts right now, without waiting for the "
-                     + "next scheduled check. One page per stream."}
+              title="Check for NEW posts right now instead of waiting for the next scheduled check. One page per stream."
               onClick={() => run(async () => {
                 const r = await api.watchlistFetchNow(w.watchlist_id);
-                if (r && r.needs_ack
-                    && confirm("The rate-limit guard has warnings. Fetch anyway?"))
+                if (r && r.needs_ack && confirm("The rate-limit guard has warnings. Fetch anyway?"))
                   return api.watchlistFetchNow(w.watchlist_id, true);
                 return r;
               })}>
         {busy ? "…" : "Fetch now"}
       </button>
-
-      {/* The standing backwards sweep.
-          A page grant was the wrong shape: it made the operator the scheduler,
-          returning every few minutes to top it up so a background job stayed
-          alive. This is a cadence instead — the exact mirror of the check
-          interval above it, running the other way — and it retires itself when
-          X runs out, so there is nothing to remember and nothing to stop. */}
-      <label className="fpill" style={{ padding: "5px 6px 5px 11px" }}
-             title={"Keep walking BACKWARDS through this watchlist's query on a "
-                    + "schedule, collecting posts older than what it already "
-                    + "has, until there is no more history to find.\n\n"
-                    + "This is the control for an archival query "
-                    + "(until:2025-02-20) or an account that has stopped "
-                    + "posting — cases where checking more often finds nothing "
-                    + "because there is nothing new to find. It resumes where "
-                    + "it left off across restarts, takes the smaller share of "
-                    + "the rate limit so live collection always wins, and "
-                    + "stops by itself when the archive is empty."}>
-        <span>dig older</span>
-        <select value={bf.auto ? String(Math.round(bf.every_s || 300)) : ""}
-                disabled={busy || !w.streams.length}
-                onChange={(e) => run(() => e.target.value
-                  ? api.watchlistBackfillAuto(w.watchlist_id, true, e.target.value)
-                  : api.watchlistBackfillAuto(w.watchlist_id, false))}>
-          <option value="">off</option>
-          <option value="300">every 5 min</option>
-          <option value="600">every 10 min</option>
-          <option value="900">every 15 min</option>
-        </select>
-      </label>
-
       {bf.auto && !bf.exhausted && (
-        <span className="chip" title="the backwards sweep is running in the background">
-          digging older — {fmtN(bf.got || 0)} collected so far
+        <span className="chip good" title="The backwards sweep is running in the background">
+          <span className="dot pulse" /> digging · {fmtN(bf.got || 0)} so far
         </span>
       )}
-
-      {/* Exhausted is worth saying out loud. Without it, a sweep that finished
-          because X genuinely has no more results is indistinguishable from one
-          that quietly failed, and the natural response — switch it on again —
-          spends requests to be told the same thing twice. */}
       {bf.exhausted && bf.walked > 0 && (
         <span className="chip" title="X returned no further results for this query">
-          history complete — {fmtN(bf.got || 0)} older post
-          {bf.got === 1 ? "" : "s"} collected
+          history complete · {fmtN(bf.got || 0)} older
         </span>
       )}
-
-      {err && <span style={{ color: "var(--critical)", fontSize: 12.5 }}>{err}</span>}
     </div>
   );
 }
 
-// ---------------------------------------------------------------------------
 // Shared watchlists — one list, several projects.
-//
-// A watchlist is created inside one project (its OWNER) and any other project
-// can add it. Nothing is copied: the same list, the same streams, one fetch;
-// every project that added it sees every post it ever collected. Editing it
-// anywhere edits it everywhere — the panel says who else is looking.
-// ---------------------------------------------------------------------------
 
 const KIND_LABEL = { xlist: "X List", keywords: "keywords", links: "links", query: "handles" };
 
-// "Created in A · also used by B, C" under the panel header — only when there
-// is something to say (the list is shared, or belongs to another project).
+// "shared · created in A · also used by B" — only when there is something to say.
 function SharedLine({ w, pid }) {
   const others = (w.projects || []).filter((p) => p.project_id !== pid);
   const mine = w.owner_project_id === pid;
   if (mine && others.length === 0) return null;
+  const names = sortBy(others).map((p) => p.name).join(", ");
   return (
-    <div style={{ color: "var(--ink-3)", fontSize: 12.5, display: "flex", gap: 6, alignItems: "center", flexWrap: "wrap" }}>
-      <span className="chip" title="This list is used by more than one project. Members, filters and cadence are shared — a change here changes it everywhere.">
-        shared
-      </span>
-      {mine
-        ? <span>also used by <b>{others.map((p) => p.name).join(", ")}</b></span>
-        : <span>created in <b>{w.owner_project || `project #${w.owner_project_id}`}</b>
-            {others.length > 1 && <> · also used by <b>{others.filter((p) => !p.owner).map((p) => p.name).join(", ")}</b></>}
-          </span>}
-    </div>
+    <span className="chip" title={"Used by more than one project. Members, filters and cadence are shared — a change here changes it everywhere."
+      + (mine ? ` Also used by ${names}.` : ` Created in ${w.owner_project || `project #${w.owner_project_id}`}.`)}>
+      shared · {mine ? `also in ${names}` : `from ${w.owner_project || `#${w.owner_project_id}`}`}
+    </span>
   );
 }
 
 // Delete vs remove. From the owner: delete (refused by the server while
-// another project still uses it — the message names them). From a project
-// that only added it: detach, and the list goes on collecting for the rest.
 function WatchlistDeleteModal({ w, pid, onClose, onChanged, sub }) {
   const [err, setErr] = useState("");
   const [busy, setBusy] = useState(false);
@@ -790,8 +569,6 @@ function WatchlistDeleteModal({ w, pid, onClose, onChanged, sub }) {
 }
 
 // The picker: every X watchlist in every other project, grouped by the
-// project that created it. "Add" links it here — no copy, no re-fetch, and
-// its whole history shows in this project's feed at once.
 function AddExistingModal({ pid, onDone, onClose }) {
   const lib = useApi(() => api.watchlistLibrary(pid), [pid]);
   const [q, setQ] = useState("");
@@ -799,7 +576,7 @@ function AddExistingModal({ pid, onDone, onClose }) {
   const [err, setErr] = useState("");
   const [added, setAdded] = useState(() => new Set());
 
-  const rows = (lib.data?.watchlists || []).filter((w) => w.project_id !== pid);
+  const rows = sortBy((lib.data?.watchlists || []).filter((w) => w.project_id !== pid));
   const needle = q.trim().toLowerCase();
   const shown = needle
     ? rows.filter((w) => `${w.name} ${w.owner_project} ${KIND_LABEL[w.kind] || w.kind}`.toLowerCase().includes(needle))
@@ -810,6 +587,7 @@ function AddExistingModal({ pid, onDone, onClose }) {
     if (!g) { g = { project_id: w.project_id, name: w.owner_project, archived: !!w.owner_archived, rows: [] }; groups.push(g); }
     g.rows.push(w);
   }
+  groups.sort(byName());
 
   const add = async (w) => {
     setBusy(w.watchlist_id); setErr("");
@@ -887,146 +665,136 @@ function AddExistingModal({ pid, onDone, onClose }) {
   );
 }
 
-function XDetail({ w, pid, onChanged }) {
+function XDetail({ w, pid, onChanged, onBack }) {
   const [adding, setAdding] = useState("");
   const [search, setSearch] = useState("");
-  const [err, setErr] = useState("");
   const [busy, setBusy] = useState(false);
   const [confirming, setConfirming] = useState(false);
+  const [renaming, setRenaming] = useState(false);
+  const [owning, setOwning] = useState(false);
   const [editing, setEditing] = useState(null);   // {old, val}
+  useEffect(() => { setSearch(""); setAdding(""); }, [w.watchlist_id]);
 
   const change = async (add, remove) => {
-    setBusy(true); setErr("");
-    try {
-      await api.watchlistMembers(w.watchlist_id, add, remove);
-      setAdding(""); onChanged();
-    } catch (e) { setErr(String(e.message || e)); }
+    setBusy(true);
+    try { await api.watchlistMembers(w.watchlist_id, add, remove); setAdding(""); onChanged(); }
+    catch { /* toast */ }
     finally { setBusy(false); }
   };
 
   const live = w.streams.filter((s) => !s.paused);
   const collected = w.streams.reduce((a, s) => a + (s.tweets || 0), 0);
-  const setInterval = async (seconds) => {
-    await api.watchlistInterval(w.watchlist_id, seconds);
-    onChanged();
-  };
   const curInterval = w.interval_s ? String(w.interval_s) : "";
+  const sorted = sortBy(w.members, "handle");
   const members = search
-    ? w.members.filter((m) => m.handle.toLowerCase().includes(search.toLowerCase()))
-    : w.members;
+    ? sorted.filter((m) => m.handle.toLowerCase().includes(search.toLowerCase()))
+    : sorted;
 
-  // Pause/resume the whole watchlist by pausing its compiled stream(s). Paused
-  // streams are skipped by the collector; nothing collected is lost.
   const [busyPause, setBusyPause] = useState(false);
   const paused = w.streams.length > 0 && w.streams.every((s) => s.paused);
   const togglePause = async () => {
-    setBusyPause(true); setErr("");
+    setBusyPause(true);
     try {
-      for (const s of w.streams) {
-        await api.streamSettings({ label: s.label, paused: !paused });
-      }
+      for (const s of w.streams) await api.streamSettings({ label: s.label, paused: !paused }, { quiet: true });
+      toast.ok(paused ? "Collection resumed" : "Collection paused");
       onChanged();
-    } catch (e) { setErr(String(e.message || e)); }
+    } catch (e) { toast.err(String(e.message || e)); }
     finally { setBusyPause(false); }
   };
+  const foreign = w.owner_project_id && w.owner_project_id !== pid;
+  const unit = w.kind === "keywords" ? "keyword rule" : "handle";
 
   return (
-    <div className="panel">
-      <div className="phead" style={{ alignItems: "center", flexWrap: "wrap", rowGap: 8 }}>
-        <RenameTitle w={w} onChanged={onChanged} />
-        <span className="badge platform-x">
-          {w.kind === "xlist" ? "X List" : w.kind === "keywords" ? "keywords" : "handles"}
-        </span>
-        <span className="chip">{fmtN(collected)} collected</span>
-        {paused && <span className="chip warn">paused</span>}
-        <span className="right" style={{ display: "flex", gap: 8, alignItems: "center" }}>
-          <label className="fpill" style={{ padding: "5px 6px 5px 11px" }}
-                 title={"How often the collector re-checks this watchlist.\n\n"
-                        + "A chosen interval is EXACT — it pins both ends of the "
-                        + "scheduler, so 5 min means 5 min. 'auto' hands the "
-                        + "cadence back to the adaptive controller, which speeds "
-                        + "up on busy streams and slows down on quiet ones."}>
-            <span>every</span>
-            <select value={curInterval} onChange={(e) => setInterval(e.target.value)}>
-              <option value="">auto</option>
-              <option value="300">5 min</option>
-              <option value="600">10 min</option>
-              <option value="900">15 min</option>
-              <option value="1800">30 min</option>
-              <option value="3600">1 hour</option>
-            </select>
-          </label>
-          <button className="btn btn-ghost btn-sm" disabled={busyPause || w.streams.length === 0}
-                  onClick={togglePause}>
+    <div className="panel detail" key={w.watchlist_id}>
+      <div className="dhead">
+        <div className="dtitle">
+          {onBack && <button className="icon-btn back" onClick={onBack} aria-label="All watchlists">{icons.back}</button>}
+          <h3 title={w.name}>{w.name}</h3>
+          <button className="icon-btn xs" title="Rename" aria-label="Rename" onClick={() => setRenaming(true)}>{icons.edit}</button>
+          <span className="badge platform-x">{KIND_LABEL[w.kind] || w.kind}</span>
+          {paused && <span className="chip warn">paused</span>}
+        </div>
+        <div className="dactions">
+          <PillSelect label="every" value={curInterval} options={EVERY_OPTS}
+                      title={"How often the collector re-checks this watchlist. A chosen interval is exact; 'auto' lets the adaptive controller speed up on busy streams and slow down on quiet ones."}
+                      onChange={async (v) => { await api.watchlistInterval(w.watchlist_id, v); onChanged(); }} />
+          <button className="btn btn-ghost btn-sm" disabled={busyPause || w.streams.length === 0} onClick={togglePause}
+                  title={paused ? "Start checking this watchlist again" : "Stop checking; nothing already collected is lost"}>
             {busyPause ? "…" : paused ? "Resume" : "Pause"}
           </button>
-          <button className="btn btn-danger btn-sm" onClick={() => setConfirming(true)}>
-            {w.owner_project_id && w.owner_project_id !== pid ? "Remove" : "Delete"}
+          <button className="btn btn-danger btn-sm" onClick={() => setConfirming(true)}
+                  title={foreign ? "Unlink from this project — the list stays in the project that created it" : "Delete this watchlist"}>
+            {foreign ? "Remove" : "Delete"}
           </button>
-        </span>
+        </div>
       </div>
-      <div style={{ color: "var(--ink-3)", fontSize: 12.5 }}>
-        {w.kind === "xlist"
-          ? `Collected through X List ${w.list_id} — members are managed on x.com.`
-          : `${w.members.length} ${w.kind === "keywords" ? "keyword rule" : "handle"}${w.members.length === 1 ? "" : "s"} → ${live.length} live stream${live.length === 1 ? "" : "s"}`}
-      </div>
-      <SharedLine w={w} pid={pid} />
-      {w.kind === "xlist" && <OwnerLine w={w} onChanged={onChanged} />}
 
-      <DepthRow w={w} onChanged={onChanged} />
+      <div className="dmeta">
+        {w.kind === "xlist"
+          ? <span className="chip" title="Members are managed on x.com">List {w.list_id}</span>
+          : <span className="chip">{fmtN(w.members.length)} {unit}{w.members.length === 1 ? "" : "s"}</span>}
+        <span className={`chip ${live.length ? "good" : ""}`} title="Compiled streams the collector is polling for this watchlist">
+          {live.length} live stream{live.length === 1 ? "" : "s"}
+        </span>
+        <span className="chip" title="Posts collected through this watchlist so far">{fmtN(collected)} collected</span>
+        <SharedLine w={w} pid={pid} />
+        {w.kind === "xlist" && (
+          <button className="chip as-btn" onClick={() => setOwning(true)}
+                  title={w.owner_handle ? "Only this account can edit the List's members on x.com. Click to change." : "Record which X account owns this List. Click to set."}>
+            {w.owner_handle ? `owner @${w.owner_handle}` : "owner not set"} <span className="chev">›</span>
+          </button>
+        )}
+      </div>
+
+      <Sec label="Schedule"
+           hint="'every' is the check cadence. 'depth' is how far one check reads. 'dig older' walks backwards through history on its own schedule. 'Fetch now' runs one check immediately.">
+        <DepthRow w={w} onChanged={onChanged} />
+      </Sec>
 
       {w.kind !== "xlist" && (
-        <>
-          {w.members.length > 12 && (
-            <div className="filters" style={{ margin: "10px 0 0" }}>
-              <input value={search} placeholder={`search ${w.members.length} members…`}
-                     style={{ flex: 1, minWidth: 160 }}
-                     onChange={(e) => setSearch(e.target.value)} />
-            </div>
-          )}
+        <Sec label={w.kind === "keywords" ? "Keyword rules" : "Handles"}
+             hint={w.kind === "keywords"
+               ? "Each rule is one search. Inside a rule, a comma means OR (match any); AND means every term must appear. Click a rule to edit it."
+               : "Accounts whose posts this watchlist collects. Click a handle to edit it, ✕ to remove."}
+             right={w.members.length > 8 && (
+               <input className="mini" value={search} placeholder={`search ${w.members.length}…`}
+                      onChange={(e) => setSearch(e.target.value)} />
+             )}>
           <div className="members-box">
             {members.map((mb) => (
               <span className="tag" key={mb.handle}>
-                <button style={{ font: "inherit", color: "inherit", padding: 0 }}
-                        title="click to edit" disabled={busy}
+                <button className="tag-txt" title="Click to edit" disabled={busy}
                         onClick={() => setEditing({ old: mb.handle, val: mb.handle })}>
                   {w.kind === "keywords" ? mb.handle : `@${mb.handle}`}
                 </button>
-                <button aria-label={`remove ${mb.handle}`} disabled={busy}
+                <button aria-label={`remove ${mb.handle}`} title="Remove" disabled={busy}
                         onClick={() => change([], [mb.handle])}>✕</button>
               </span>
             ))}
-            {w.members.length === 0 && (
-              <span style={{ color: "var(--ink-3)", fontSize: 13 }}>
-                {w.kind === "keywords" ? "No keywords yet — add some below."
-                                       : "No handles yet — add some below."}
-              </span>
-            )}
-            {w.members.length > 0 && members.length === 0 && (
-              <span style={{ color: "var(--ink-3)", fontSize: 13 }}>no match for “{search}”</span>
-            )}
+            {w.members.length === 0 && <div className="muted">Nothing yet — add {w.kind === "keywords" ? "a rule" : "a handle"} below.</div>}
+            {w.members.length > 0 && members.length === 0 && <div className="muted">no match for “{search}”</div>}
           </div>
-          <div className="filters" style={{ marginBottom: 0 }}>
+          <div className="add-row">
             <input value={adding}
-                   placeholder={w.kind === "keywords"
-                     ? "comma = OR (match any) · Varanasi AND Modi = both required"
-                     : "@handle, profile URL, or several separated by spaces"}
-                   style={{ flex: 1, minWidth: 200 }}
+                   placeholder={w.kind === "keywords" ? "add a rule, e.g. Varanasi AND Modi" : "add @handle or profile URL"}
+                   title={w.kind === "keywords"
+                     ? "comma = OR (match any) · 'Varanasi AND Modi' = both required · one rule per line"
+                     : "@handle, a profile URL, or several separated by spaces"}
                    onChange={(e) => setAdding(e.target.value)}
-                   onKeyDown={(e) => e.key === "Enter" && adding.trim() &&
-                     change(splitAdd(w.kind, adding), [])} />
+                   onKeyDown={(e) => e.key === "Enter" && adding.trim() && change(splitAdd(w.kind, adding), [])} />
             <button className="btn btn-brand btn-sm" disabled={busy || !adding.trim()}
                     onClick={() => change(splitAdd(w.kind, adding), [])}>
               Add
             </button>
           </div>
-        </>
+        </Sec>
       )}
       {w.kind === "xlist" && <XListMembers listId={w.list_id} />}
-      {err && <div style={{ color: "var(--critical)", fontSize: 13, marginTop: 8 }}>{err}</div>}
 
       <FiltersPanel w={w} onChanged={onChanged} />
 
+      {renaming && <RenameModal w={w} onChanged={onChanged} onClose={() => setRenaming(false)} />}
+      {owning && <OwnerModal w={w} onChanged={onChanged} onClose={() => setOwning(false)} />}
       {editing && (
         <Modal title={w.kind === "keywords" ? "Edit keyword rule" : "Edit handle"}
                sub="The collection query rebuilds automatically on save."
@@ -1047,7 +815,6 @@ function XDetail({ w, pid, onChanged }) {
           </div>
         </Modal>
       )}
-
       {confirming && (
         <WatchlistDeleteModal w={w} pid={pid} onClose={() => setConfirming(false)} onChanged={onChanged}
                               sub="Collection stops. Everything already collected stays in the database." />
@@ -1056,14 +823,7 @@ function XDetail({ w, pid, onChanged }) {
   );
 }
 
-// ---------------------------------------------------------------------------
 // Links detail panel — post URLs re-fetched on a cadence (X_LINKS_PLAN.md §7).
-//
-// The links PANEL: one row per link, the way the handles box shows handles —
-// author, the post, its current counters, its state, when it was last read.
-// Group-by-author gives the "see it like handles" view without changing what
-// is collected: the list is the posts, not the people.
-// ---------------------------------------------------------------------------
 
 const LINK_REFRESH = [["43200", "12 hours"], ["86400", "24 hours"], ["172800", "48 hours"]];
 const fmtDay = (iso) => {
@@ -1150,6 +910,7 @@ function LinksDetail({ pid, w, onChanged }) {
   const [err, setErr] = useState("");
   const [busy, setBusy] = useState(false);
   const [confirming, setConfirming] = useState(false);
+  const [renaming, setRenaming] = useState(false);
 
   const rows = useApi(
     () => api.links({ project: pid, watchlist: w.watchlist_id, sort, status, limit: 500 }),
@@ -1202,29 +963,22 @@ function LinksDetail({ pid, w, onChanged }) {
     </tr>
   );
 
+  const foreign = w.owner_project_id && w.owner_project_id !== pid;
+  const refreshOpts = LINK_REFRESH.some(([v]) => v === String(w.refresh_every_s)) || !w.refresh_every_s
+    ? LINK_REFRESH : [...LINK_REFRESH, [String(w.refresh_every_s), `${Math.round(w.refresh_every_s / 3600)} hours`]];
   return (
-    <div className="panel">
-      <div className="phead" style={{ alignItems: "center", flexWrap: "wrap", rowGap: 8 }}>
-        <RenameTitle w={w} onChanged={onChanged} />
-        <span className="badge platform-x">links</span>
-        <span className="chip">{fmtN(summ.total ?? 0)} link{summ.total === 1 ? "" : "s"}</span>
-        {summ.ok > 0 && <span className="chip good" title="last fetch returned the post">{fmtN(summ.ok)} ok</span>}
-        {summ.pending > 0 && <span className="chip" title="not fetched yet, or retrying">{fmtN(summ.pending)} pending</span>}
-        {summ.unavailable > 0 && <span className="chip warn" title="deleted, protected or suspended — last numbers kept">{fmtN(summ.unavailable)} unavailable</span>}
-        {paused && <span className="chip warn">paused</span>}
-        <span className="right" style={{ display: "flex", gap: 8, alignItems: "center", flexWrap: "wrap" }}>
-          <label className="fpill" style={{ padding: "5px 6px 5px 11px" }}
-                 title={"How often every post on this list is re-fetched.\n\nOne TweetDetail "
-                        + "request per post per cycle, trickled through the day on its own "
-                        + "rate budget — it never slows the handle watchlists."}>
-            <span>every</span>
-            <select value={String(w.refresh_every_s || 86400)} disabled={busy}
-                    onChange={(e) => act(() => api.linksInterval(w.watchlist_id, Number(e.target.value)))}>
-              {LINK_REFRESH.map(([v, t]) => <option key={v} value={v}>{t}</option>)}
-              {!LINK_REFRESH.some(([v]) => v === String(w.refresh_every_s)) && w.refresh_every_s
-                && <option value={String(w.refresh_every_s)}>{Math.round(w.refresh_every_s / 3600)} hours</option>}
-            </select>
-          </label>
+    <div className="panel detail" key={w.watchlist_id}>
+      <div className="dhead">
+        <div className="dtitle">
+          <h3 title={w.name}>{w.name}</h3>
+          <button className="icon-btn xs" title="Rename" aria-label="Rename" onClick={() => setRenaming(true)}>{icons.edit}</button>
+          <span className="badge platform-x">links</span>
+          {paused && <span className="chip warn">paused</span>}
+        </div>
+        <div className="dactions">
+          <PillSelect label="every" value={String(w.refresh_every_s || 86400)} options={refreshOpts} disabled={busy}
+                      title={"How often every post on this list is re-fetched. One request per post per cycle, trickled through the day on its own rate budget — it never slows the handle watchlists."}
+                      onChange={(v) => act(() => api.linksInterval(w.watchlist_id, Number(v)))} />
           <button className="btn btn-ghost btn-sm" disabled={busy || !summ.total}
                   title="Queue every post on this list for a fetch on the next pass (within a minute)"
                   onClick={() => act(() => api.linksRefreshNow(w.watchlist_id),
@@ -1240,15 +994,24 @@ function LinksDetail({ pid, w, onChanged }) {
             </button>
           )}
           <button className="btn btn-ghost btn-sm" disabled={busy}
+                  title={paused ? "Start re-fetching these posts again" : "Stop re-fetching; posts already collected stay"}
                   onClick={() => act(() => api.streamSettings({ label: `wl:${w.watchlist_id}:0`, paused: !paused }))}>
             {paused ? "Resume" : "Pause"}
           </button>
-          <button className="btn btn-danger btn-sm" onClick={() => setConfirming(true)}>
-            {w.owner_project_id && w.owner_project_id !== pid ? "Remove" : "Delete"}
+          <button className="btn btn-danger btn-sm" onClick={() => setConfirming(true)}
+                  title={foreign ? "Unlink from this project — the list stays in the project that created it" : "Delete this watchlist"}>
+            {foreign ? "Remove" : "Delete"}
           </button>
-        </span>
+        </div>
       </div>
-      <SharedLine w={w} pid={pid} />
+      <div className="dmeta">
+        <span className="chip">{fmtN(summ.total ?? 0)} link{summ.total === 1 ? "" : "s"}</span>
+        {summ.ok > 0 && <span className="chip good" title="last fetch returned the post">{fmtN(summ.ok)} ok</span>}
+        {summ.pending > 0 && <span className="chip" title="not fetched yet, or retrying">{fmtN(summ.pending)} pending</span>}
+        {summ.unavailable > 0 && <span className="chip warn" title="deleted, protected or suspended — last numbers kept">{fmtN(summ.unavailable)} unavailable</span>}
+        <SharedLine w={w} pid={pid} />
+      </div>
+      {renaming && <RenameModal w={w} onChanged={onChanged} onClose={() => setRenaming(false)} />}
 
       <div style={{ color: "var(--ink-3)", fontSize: 12.5, lineHeight: 1.5 }}>
         {sheet ? (
@@ -1372,18 +1135,15 @@ function LinksDetail({ pid, w, onChanged }) {
   );
 }
 
-// ---------------------------------------------------------------------------
 // Facebook detail panel — pages + fetch. Configuration lives in the
-// Network & settings tab, NOT here.
-// ---------------------------------------------------------------------------
 
-function FbDetail({ pid, data, reload, gotoSettings }) {
+function FbDetail({ pid, data, reload, gotoSettings, onBack }) {
   const [adding, setAdding] = useState("");
   const [busy, setBusy] = useState(false);
   const [msg, setMsg] = useState("");
   const [fetching, setFetching] = useState(false);
   const [result, setResult] = useState(null);
-  const sources = data?.sources || [];
+  const sources = sortBy(data?.sources || [], "label");
   const paused = !!data?.paused;
   const health = data?.health || {};
   const nm = useApi(() => api.identities("fb"), []);
@@ -1421,43 +1181,35 @@ function FbDetail({ pid, data, reload, gotoSettings }) {
   };
 
   return (
-    <div className="panel">
-      <div className="phead" style={{ alignItems: "center", flexWrap: "wrap", rowGap: 8 }}>
-        <h3><span className="badge platform-fb" style={{ marginRight: 8 }}>f</span>Facebook pages</h3>
-        <span className="chip">{fmtN(data?.totals?.posts ?? 0)} collected</span>
-        <span className={`chip ${paused ? "warn" : "good"}`}>{paused ? "paused" : "collecting"}</span>
-        {data?.config?.mode === "favorites" && <span className="chip">favorites mode</span>}
-        {(health.blocked || !data?.enabled) && (
-          <button className="chip crit" style={{ cursor: "pointer" }} onClick={gotoSettings}
-                  title="Open Network & settings to fix the login">
-            {health.blocked ? "login needs a human →" : "login not set up →"}
+    <div className="panel detail">
+      <div className="dhead">
+        <div className="dtitle">
+          {onBack && <button className="icon-btn back" onClick={onBack} aria-label="All watchlists">{icons.back}</button>}
+          <span className="badge platform-fb">f</span>
+          <h3>Facebook pages</h3>
+          <span className={`chip ${paused ? "warn" : "good"}`}>{paused ? "paused" : "collecting"}</span>
+          {(health.blocked || !data?.enabled) && (
+            <button className="chip crit as-btn" onClick={gotoSettings} title="Open Network & settings to fix the login">
+              {health.blocked ? "login needs a human" : "login not set up"} <span className="chev">›</span>
+            </button>
+          )}
+        </div>
+        <div className="dactions">
+          <button className="btn btn-brand btn-sm" disabled={fetching || paused || sources.length === 0} onClick={run(api.fbFetch)}
+                  title="Visit every page now instead of waiting for its cadence">
+            {fetching ? "Fetching…" : "Fetch now"}
           </button>
-        )}
-        <span className="right">{sources.length} page{sources.length === 1 ? "" : "s"}</span>
+          <button className="btn btn-ghost btn-sm" disabled={fetching || paused} onClick={run(api.fbFavorites, true)}
+                  title="Read the collector account's Favourites feed once — richer data, one pass. Needs no pages here.">
+            {fetching ? "…" : "Favorites feed"}
+          </button>
+          <button className="btn btn-ghost btn-sm" onClick={gotoSettings}>Settings →</button>
+        </div>
       </div>
-
-      <div className="toolbar">
-        <button className="btn btn-brand btn-sm"
-                disabled={fetching || paused || sources.length === 0}
-                onClick={run(api.fbFetch)}>
-          {fetching ? "Fetching…" : "Fetch now"}
-        </button>
-        {/* NOT gated on sources.length. Favorites mode reads the collector
-            account's OWN Favorites feed on Facebook and attributes each post to
-            whichever page wrote it — the pages live in that account, not in this
-            watchlist. Requiring a page row here disabled the one button that
-            works without page rows, which is how a project in favorites mode
-            with 0 pages ended up unable to fetch at all. */}
-        <button className="btn btn-ghost btn-sm"
-                disabled={fetching || paused}
-                onClick={run(api.fbFavorites, true)}
-                title="Read the account's Favorites feed once — richer data, one pass. Needs no pages here.">
-          {fetching ? "…" : "Fetch Favorites feed"}
-        </button>
-        <span className="grow" />
-        <button className="btn btn-ghost btn-sm" onClick={gotoSettings}>
-          Settings →
-        </button>
+      <div className="dmeta">
+        <span className="chip">{sources.length} page{sources.length === 1 ? "" : "s"}</span>
+        <span className="chip">{fmtN(data?.totals?.posts ?? 0)} collected</span>
+        {data?.config?.mode === "favorites" && <span className="chip" title="Posts come from the collector account's Favourites feed">favorites mode</span>}
       </div>
 
       {fetching && (
@@ -1495,17 +1247,10 @@ function FbDetail({ pid, data, reload, gotoSettings }) {
               </small>
             </div>
             <div className="right" style={{ display: "flex", gap: 6, alignItems: "center" }}>
-              <label className="fpill" title="how often this page is checked"
-                     style={{ padding: "4px 5px 4px 10px" }}>
-                <span>every</span>
-                <select value={s.speed || ""}
-                        onChange={async (e) => { await api.fbSetInterval(s.label, e.target.value); reload(); }}>
-                  <option value="">6h</option>
-                  {Object.entries(FB_SPEEDS).map(([v, t]) => (
-                    <option key={v} value={v}>{t}</option>
-                  ))}
-                </select>
-              </label>
+              <PillSelect label="every" value={s.speed || ""} className="sm"
+                          options={[["", "default"], ...Object.entries(FB_SPEEDS)]}
+                          title="How often this page is checked. 'default' follows the page cadence in Network & settings."
+                          onChange={async (v) => { await api.fbSetInterval(s.label, v); reload(); }} />
               <button className="btn btn-ghost btn-sm"
                       onClick={async () => { await api.fbSetEnabled(s.label, !s.enabled); reload(); }}>
                 {s.enabled ? "Pause" : "Resume"}
@@ -1542,19 +1287,7 @@ function FbDetail({ pid, data, reload, gotoSettings }) {
   );
 }
 
-// ---------------------------------------------------------------------------
 // "Waiting for a profile id" — the manual way past a throttled name lookup.
-//
-// A user source Instagram has never resolved to a numeric platform_id cannot
-// be collected AT ALL: the media endpoint takes the numeric pk, and the handle
-// is only the thing a human reads (store_ig, "WHY label / value / platform_id
-// ARE THREE COLUMNS"). Normally `resolve-ids` fills it. When every collecting
-// account is refused on the lookup endpoint at once — 2026-09-17, 25 sources,
-// 0 posts — the ONLY way forward is an operator pasting ids in by hand, and
-// until now that meant shell access to `collect_ig.py set-id`.
-//
-// So: collapsed to ONE line when there is nothing to do, and hidden entirely
-// when every source is resolved. It never grows the panel it lives in.
 export function IgIdPending({ pid, sources, reload }) {
   const [open, setOpen] = useState(false);
   const [pasteOpen, setPasteOpen] = useState(false);
@@ -1571,8 +1304,6 @@ export function IgIdPending({ pid, sources, reload }) {
     [sources]);
 
   // Handle -> label, over EVERY source (not just the pending ones): an
-  // operator re-pasting their whole list should be able to correct an id that
-  // was resolved wrong, not be told the row is unknown.
   const byHandle = useMemo(() => {
     const m = new Map();
     for (const s of sources) {
@@ -1749,17 +1480,15 @@ export function IgIdPending({ pid, sources, reload }) {
   );
 }
 
-// ---------------------------------------------------------------------------
 // Instagram detail panel
-// ---------------------------------------------------------------------------
 
-function IgDetail({ pid, data, reload, gotoSettings }) {
+function IgDetail({ pid, data, reload, gotoSettings, onBack }) {
   const [msg, setMsg] = useState("");
   const [fetching, setFetching] = useState(false);
   const [result, setResult] = useState(null);
   const [adding, setAdding] = useState("");
   const [busyAdd, setBusyAdd] = useState(false);
-  const sources = data?.sources || [];
+  const sources = sortBy(data?.sources || [], "label");
   const paused = !!data?.paused;
   const anyCheckpoint = (data?.accounts || []).some((a) => a.checkpoint_at);
   const anyActive = (data?.accounts || []).some((a) => a.active);
@@ -1805,30 +1534,32 @@ function IgDetail({ pid, data, reload, gotoSettings }) {
   };
 
   return (
-    <div className="panel">
-      <div className="phead" style={{ alignItems: "center", flexWrap: "wrap", rowGap: 8 }}>
-        <h3><span className="badge platform-ig" style={{ marginRight: 8 }}>IG</span>Instagram sources</h3>
-        <span className="chip">{fmtN(data?.totals?.posts ?? 0)} collected</span>
-        <span className={`chip ${paused ? "warn" : anyActive ? "good" : "warn"}`}>
-          {paused ? "paused" : anyActive ? "collecting" : "no active session"}
-        </span>
-        {(anyCheckpoint || !anyActive) && (
-          <button className="chip crit" style={{ cursor: "pointer" }} onClick={gotoSettings}
-                  title="Open Network & settings to fix the session">
-            {anyCheckpoint ? "checkpoint — needs a human →" : "not signed in →"}
+    <div className="panel detail">
+      <div className="dhead">
+        <div className="dtitle">
+          {onBack && <button className="icon-btn back" onClick={onBack} aria-label="All watchlists">{icons.back}</button>}
+          <span className="badge platform-ig">IG</span>
+          <h3>Instagram sources</h3>
+          <span className={`chip ${paused ? "warn" : anyActive ? "good" : "warn"}`}>
+            {paused ? "paused" : anyActive ? "collecting" : "no active session"}
+          </span>
+          {(anyCheckpoint || !anyActive) && (
+            <button className="chip crit as-btn" onClick={gotoSettings} title="Open Network & settings to fix the session">
+              {anyCheckpoint ? "checkpoint — needs a human" : "not signed in"} <span className="chev">›</span>
+            </button>
+          )}
+        </div>
+        <div className="dactions">
+          <button className="btn btn-brand btn-sm" disabled={fetching || paused || sources.length === 0} onClick={fetchNow}
+                  title="Check every source now instead of waiting for the next cycle">
+            {fetching ? "Fetching…" : "Fetch now"}
           </button>
-        )}
-        <span className="right">{sources.length} source{sources.length === 1 ? "" : "s"}</span>
+          <button className="btn btn-ghost btn-sm" onClick={gotoSettings}>Settings →</button>
+        </div>
       </div>
-
-      <div className="toolbar">
-        <button className="btn btn-brand btn-sm"
-                disabled={fetching || paused || sources.length === 0}
-                onClick={fetchNow}>
-          {fetching ? "Fetching…" : "Fetch now"}
-        </button>
-        <span className="grow" />
-        <button className="btn btn-ghost btn-sm" onClick={gotoSettings}>Settings →</button>
+      <div className="dmeta">
+        <span className="chip">{sources.length} source{sources.length === 1 ? "" : "s"}</span>
+        <span className="chip">{fmtN(data?.totals?.posts ?? 0)} collected</span>
       </div>
 
       {fetching && (
@@ -1907,158 +1638,148 @@ function IgDetail({ pid, data, reload, gotoSettings }) {
   );
 }
 
-// ---------------------------------------------------------------------------
-// Network & settings tab — configuration, login health, streams wiring.
-// ---------------------------------------------------------------------------
+// Network & settings tab — one card per network: is it running, is the login
+// healthy, how often it checks, and the few switches that change that.
+
+function StatusChips({ paused, login }) {
+  return (
+    <>
+      <span className={`chip ${paused ? "warn" : "good"}`}>{paused ? "paused" : "collecting"}</span>
+      {login && <span className={`chip ${login.cls}`}>{login.text}</span>}
+    </>
+  );
+}
+
+function NetHead({ platform, name, children, right }) {
+  return (
+    <div className="dhead">
+      <div className="dtitle">
+        <span className={`badge platform-${platform}`}>{{ x: "𝕏", fb: "f", ig: "IG" }[platform]}</span>
+        <h3>{name}</h3>
+        {children}
+      </div>
+      <div className="dactions">{right}</div>
+    </div>
+  );
+}
+
+// X — the watcher process, the lists that feed it, and how much it holds.
+function XNetwork({ pid, xLists, status, guard }) {
+  const s = status.data || {};
+  const up = Boolean(s.watcher_pid);
+  const paused = Boolean(s.collection_paused);
+  const streams = xLists.flatMap((w) => w.streams || []);
+  const live = streams.filter((x) => !x.paused).length;
+  const collected = streams.reduce((a, x) => a + (x.tweets || 0), 0);
+  const accounts = xLists.reduce((a, w) => a + (w.kind === "xlist" ? (w.xmembers?.count || 0) : w.kind === "query" ? (w.members || []).length : 0), 0);
+  const g = guard.data || {};
+  return (
+    <div className="panel detail">
+      <NetHead platform="x" name="X (Twitter)"
+               right={<Link className="btn btn-ghost btn-sm" to="/accounts" title="Sign in, backups and failover live on Accounts & Sessions">Accounts →</Link>}>
+        {!status.data ? null
+          : !up ? <span className="chip crit" title="The watcher process is not running — start it with: python3 main.py watch --all">collector off</span>
+          : <StatusChips paused={paused} />}
+      </NetHead>
+      <div className="kv-grid">
+        <div className="kv"><span>Watchlists in this project<Hint text="Handle lists, keyword searches, X Lists and link sheets — all compiled into streams the collector polls." /></span><b>{fmtN(xLists.length)}</b></div>
+        <div className="kv"><span>Live streams<Hint text="One stream per query the collector is actively checking. Paused watchlists do not count." /></span><b>{fmtN(live)} <small>of {fmtN(streams.length)}</small></b></div>
+        <div className="kv"><span>Accounts followed<Hint text="Members across handle lists plus fetched X List members." /></span><b>{fmtN(accounts)}</b></div>
+        <div className="kv"><span>Collected<Hint text="Posts stored through this project's X watchlists." /></span><b>{fmtN(collected)}</b></div>
+        {guard.data && (
+          <div className="kv"><span>Rate-limit guard<Hint text="The guard slows or blocks fetches when X's rate limits are close. Details on the Guard page." /></span>
+            <b className={g.blocked ? "st-crit" : g.warnings?.length ? "st-warn" : "st-good"}>
+              {g.blocked ? "blocked" : g.warnings?.length ? `${g.warnings.length} warning${g.warnings.length === 1 ? "" : "s"}` : "clear"}
+            </b></div>
+        )}
+      </div>
+      <div className="hint">Cadence, depth and filters are set per watchlist on the Watchlists tab. Sign-in and backup accounts are on Accounts &amp; Sessions.</div>
+    </div>
+  );
+}
 
 function FbHealthBanner({ health, onAction, busy }) {
   if (!health?.blocked) return null;
   return (
-    <div style={{ border: "1px solid var(--critical)", borderRadius: 10,
-                  padding: "10px 12px", margin: "8px 0",
-                  background: "color-mix(in srgb, var(--critical) 8%, transparent)" }}>
-      <b className="st-crit">
-        Login needs a human — automatic retries are stopped
-        ({health.reason === "checkpoint" ? "verification checkpoint" : "login failed"})
-      </b>
-      <div style={{ fontSize: 12.5, marginTop: 4 }}>{health.detail}</div>
-      <div style={{ fontSize: 12, color: "var(--ink-3)", marginTop: 4 }}>
-        since {health.ts ? fmtAgo(health.ts * 1000) : "—"}
-        {health.email ? ` · account ${health.email}` : ""}
-      </div>
+    <div className="banner-crit" style={{ margin: "10px 0 4px" }}>
+      <b>Login needs a human</b> — automatic retries are stopped
+      ({health.reason === "checkpoint" ? "verification checkpoint" : "login failed"}).
+      <div style={{ marginTop: 4 }}>{health.detail}</div>
+      <div className="hint">since {health.ts ? fmtAgo(health.ts * 1000) : "—"}{health.email ? ` · ${health.email}` : ""}</div>
       <div className="filters" style={{ marginTop: 8, marginBottom: 0 }}>
-        <button className="btn btn-brand btn-sm" disabled={busy}
-                onClick={() => onAction("clear")}>
-          I fixed it — clear &amp; retry
-        </button>
-        <button className="btn btn-ghost btn-sm" disabled={busy}
-                onClick={() => onAction("reset_session")}
-                title="Also deletes fb_state.json so the next run logs in completely fresh">
-          Reset session (fresh login next run)
-        </button>
+        <button className="btn btn-brand btn-sm" disabled={busy} onClick={() => onAction("clear")}>I fixed it — retry</button>
+        <button className="btn btn-ghost btn-sm" disabled={busy} onClick={() => onAction("reset_session")}
+                title="Also deletes fb_state.json so the next run logs in completely fresh">Reset session</button>
       </div>
     </div>
   );
 }
 
+const FB_MODES = [["pages", "Pages"], ["favorites", "Favorites feed"]];
+
 function FbSettings({ data, reload }) {
   const [form, setForm] = useState(null);
   const [busy, setBusy] = useState(false);
-  const [note, setNote] = useState("");
   const cfg = data?.config || {};
   const ses = data?.session || {};
   const paused = !!data?.paused;
-
   const f = form || {
     mode: cfg.mode || "pages",
     default_interval_s: String(cfg.default_interval_s || 21600),
     fav_interval_s: String(cfg.fav_interval_s || 3600),
   };
+  const dirty = form && JSON.stringify(form) !== JSON.stringify({
+    mode: cfg.mode || "pages", default_interval_s: String(cfg.default_interval_s || 21600), fav_interval_s: String(cfg.fav_interval_s || 3600),
+  });
 
-  const healthAction = async (action) => {
-    setBusy(true);
-    try { await api.fbHealthAction(action); reload(); }
-    catch (e) { setNote(`✗ ${String(e.message || e)}`); }
-    finally { setBusy(false); }
-  };
-  const togglePause = async () => {
-    setBusy(true);
-    try { await api.fbControl(paused ? "resume" : "pause"); reload(); }
-    catch (e) { setNote(`✗ ${String(e.message || e)}`); }
-    finally { setBusy(false); }
-  };
-  const save = async () => {
-    setBusy(true); setNote("");
-    try {
-      await api.fbSettings(f);
-      setNote("✓ Saved — the collector uses this from its next cycle (no restart)");
-      reload();
-    } catch (e) { setNote(`✗ ${String(e.message || e)}`); }
-    finally { setBusy(false); }
-  };
+  const go = async (fn) => { setBusy(true); try { await fn(); reload(); } catch { /* toast */ } finally { setBusy(false); } };
+  const login = !data?.enabled ? { cls: "crit", text: "login not set up" }
+    : data?.health?.blocked ? { cls: "crit", text: "login blocked" } : { cls: "good", text: "login ok" };
 
   return (
-    <div className="panel">
-      <div className="phead" style={{ alignItems: "center", flexWrap: "wrap", rowGap: 8 }}>
-        <h3><span className="badge platform-fb" style={{ marginRight: 8 }}>f</span>Facebook network</h3>
-        <span className={`chip ${paused ? "warn" : "good"}`}>{paused ? "paused" : "collecting"}</span>
-        <span className={`chip ${!data?.enabled ? "crit" : data?.health?.blocked ? "crit" : "good"}`}>
-          {!data?.enabled ? "login not set up" : data?.health?.blocked ? "login blocked" : "login ok"}
-        </span>
-        <span className="right">
-          <button className={`btn btn-sm ${paused ? "btn-brand" : "btn-ghost"}`}
-                  disabled={busy} onClick={togglePause}
-                  title="Master switch — the background service honors it within a minute">
-            {paused ? "Resume collection" : "Pause collection"}
-          </button>
-        </span>
-      </div>
+    <div className="panel detail">
+      <NetHead platform="fb" name="Facebook"
+               right={<button className={`btn btn-sm ${paused ? "btn-brand" : "btn-ghost"}`} disabled={busy}
+                              title="Master switch — the background service honours it within a minute"
+                              onClick={() => go(() => api.fbControl(paused ? "resume" : "pause"))}>
+                        {paused ? "Resume collection" : "Pause collection"}
+                      </button>}>
+        {data && <StatusChips paused={paused} login={login} />}
+      </NetHead>
 
-      {!data?.enabled && (
-        <div className="banner-crit" style={{ margin: "8px 0" }}>
-          <b>Not set up.</b> Add <code>FB_EMAIL / FB_PASSWORD</code> (or
-          <code> FB_C_USER / FB_XS</code>) to .env on the server, then restart the dashboard.
+      {data && !data.enabled && (
+        <div className="banner-crit" style={{ margin: "10px 0 4px" }}>
+          <b>Not set up.</b> Add <code>FB_EMAIL / FB_PASSWORD</code> (or <code>FB_C_USER / FB_XS</code>) to <code>.env</code> on the server, then restart the dashboard.
         </div>
       )}
-      <FbHealthBanner health={data?.health} onAction={healthAction} busy={busy} />
+      <FbHealthBanner health={data?.health} onAction={(a) => go(() => api.fbHealthAction(a))} busy={busy} />
 
-      <div className="kv"><span>Login account</span>
-        <b>{ses.identity || "not set"} {ses.method ? `(${ses.method})` : ""}</b></div>
-      <div className="kv"><span>Saved session (fb_state.json)</span>
-        <b className={ses.state_saved ? "st-good" : "st-warn"}>
-          {ses.state_saved ? "present" : "none — will log in fresh"}</b></div>
-      <div className="kv"><span>Bandwidth</span>
-        <b>server IP{cfg.use_proxy ? " + proxy" : ""}, cap {cfg.monthly_cap_gb} GB/month</b></div>
-
-      <div className="filters" style={{ marginTop: 12, marginBottom: 6 }}>
-        <label className="fpill">
-          <span>Collection mode</span>
-          <select value={f.mode}
-                  onChange={(e) => setForm({ ...f, mode: e.target.value })}>
-            <option value="pages">Pages (visit each page on its cadence)</option>
-            <option value="favorites">Favorites feed (one richer pass)</option>
-          </select>
-        </label>
-        <label className="fpill">
-          <span>Default page cadence</span>
-          <select value={f.default_interval_s}
-                  onChange={(e) => setForm({ ...f, default_interval_s: e.target.value })}>
-            {INTERVAL_OPTS.filter(([v]) => Number(v) >= 3600).map(([v, t]) => (
-              <option key={v} value={v}>{t}</option>
-            ))}
-          </select>
-        </label>
-        <label className="fpill">
-          <span>Favorites cadence</span>
-          <select value={f.fav_interval_s}
-                  onChange={(e) => setForm({ ...f, fav_interval_s: e.target.value })}>
-            {INTERVAL_OPTS.map(([v, t]) => (
-              <option key={v} value={v}>{t}</option>
-            ))}
-          </select>
-        </label>
-        <button className="btn btn-brand btn-sm" disabled={busy} onClick={save}>
-          Save configuration
-        </button>
+      <div className="kv-grid">
+        <div className="kv"><span>Login account</span><b>{ses.identity || "not set"}{ses.method ? <small> · {ses.method}</small> : null}</b></div>
+        <div className="kv"><span>Saved session<Hint text="fb_state.json on the server. With it, the collector reuses the login; without it, the next run logs in fresh." /></span>
+          <b className={ses.state_saved ? "st-good" : "st-warn"}>{ses.state_saved ? "present" : "none — fresh login next run"}</b></div>
+        <div className="kv"><span>Pages<Hint text="Pages this project follows — managed on the Watchlists tab under Facebook." /></span><b>{fmtN((data?.sources || []).length)}</b></div>
+        <div className="kv"><span>Collected</span><b>{fmtN(data?.totals?.posts ?? 0)}</b></div>
+        <div className="kv"><span>Bandwidth<Hint text="Facebook runs on the server's own connection with a monthly cap." /></span>
+          <b>server IP{cfg.use_proxy ? " + proxy" : ""}{cfg.monthly_cap_gb ? <small> · cap {cfg.monthly_cap_gb} GB/mo</small> : null}</b></div>
       </div>
-      {note && (
-        <div className={note.startsWith("✓") ? "st-good" : "st-crit"}
-             style={{ fontSize: 12.5, fontWeight: 600 }}>{note}</div>
-      )}
-      <details className="help">
-        <summary>How Facebook collection works</summary>
-        <p>
-          Facebook runs on the server's own bandwidth with a monthly cap — it
-          checks each page a few times a day, newest posts only. Credentials
-          stay in .env on the server; everything operational is on this panel.
-        </p>
-        <p>
-          <b>Favorites feed (richer):</b> add your pages to the collector
-          account's Favorites (Facebook → Feeds → Favourites → Manage, up to
-          30), then favorites mode reads them all as one real feed — more
-          posts and reaction counts in a single pass.
-        </p>
-      </details>
+
+      <Sec label="Collection"
+           hint="Pages mode visits each page on its own cadence, newest posts only. Favorites mode reads the collector account's Favourites feed (Facebook → Feeds → Favourites → Manage, up to 30 pages) as one richer pass with reaction counts."
+           right={<button className="btn btn-brand btn-sm" disabled={busy || !dirty} onClick={() => go(() => api.fbSettings(f))}>Save</button>}>
+        <div className="ctrl-row">
+          <PillSelect label="mode" value={f.mode} options={FB_MODES} onChange={(v) => setForm({ ...f, mode: v })}
+                      title="Pages: visit each page on its cadence. Favorites: one pass over the Favourites feed." />
+          <PillSelect label="page cadence" value={f.default_interval_s}
+                      options={INTERVAL_OPTS.filter(([v]) => Number(v) >= 3600)}
+                      onChange={(v) => setForm({ ...f, default_interval_s: v })}
+                      title="How often each page is checked unless the page sets its own speed." />
+          <PillSelect label="favorites cadence" value={f.fav_interval_s} options={INTERVAL_OPTS}
+                      onChange={(v) => setForm({ ...f, fav_interval_s: v })}
+                      title="How often the Favourites feed is read (favorites mode only)." />
+        </div>
+        <div className="hint">Saved settings apply from the collector's next cycle — no restart.</div>
+      </Sec>
     </div>
   );
 }
@@ -2070,109 +1791,60 @@ const IG_INTERVALS = [
 
 function IgSettings({ data, reload }) {
   const [busy, setBusy] = useState(false);
-  const [note, setNote] = useState("");
-  const accounts = data?.accounts || [];
+  const accounts = sortBy(data?.accounts || [], "username");
   const paused = !!data?.paused;
   const checkpointed = accounts.filter((a) => a.checkpoint_at);
+  const active = accounts.filter((a) => a.active);
   const interval = String(data?.config?.interval_s || 120);
-
-  const togglePause = async () => {
-    setBusy(true); setNote("");
-    try { await api.igControl(paused ? "resume" : "pause"); reload(); }
-    catch (e) { setNote(`✗ ${String(e.message || e)}`); }
-    finally { setBusy(false); }
-  };
-  const setInterval = async (v) => {
-    setBusy(true); setNote("");
-    try {
-      await api.igSettings({ interval_s: v });
-      setNote("✓ Saved — applies from the service's next cycle (no restart)");
-      reload();
-    } catch (e) { setNote(`✗ ${String(e.message || e)}`); }
-    finally { setBusy(false); }
-  };
+  const go = async (fn) => { setBusy(true); try { await fn(); reload(); } catch { /* toast */ } finally { setBusy(false); } };
+  const login = checkpointed.length ? { cls: "crit", text: "checkpoint — needs a human" }
+    : active.length ? { cls: "good", text: `${active.length} session${active.length === 1 ? "" : "s"} active` } : { cls: "warn", text: "no active session" };
 
   return (
-    <div className="panel">
-      <div className="phead" style={{ alignItems: "center", flexWrap: "wrap", rowGap: 8 }}>
-        <h3><span className="badge platform-ig" style={{ marginRight: 8 }}>IG</span>Instagram network</h3>
-        <span className={`chip ${paused ? "warn" : "good"}`}>{paused ? "paused" : "collecting"}</span>
-        <span className={`chip ${checkpointed.length ? "crit"
-          : accounts.some((a) => a.active) ? "good" : "warn"}`}>
-          {checkpointed.length ? "checkpoint — needs a human"
-            : accounts.some((a) => a.active) ? "session active" : "no active session"}
-        </span>
-        <span className="right">
-          <button className={`btn btn-sm ${paused ? "btn-brand" : "btn-ghost"}`}
-                  disabled={busy} onClick={togglePause}
-                  title="Master switch — the background service honors it within a minute">
-            {paused ? "Resume collection" : "Pause collection"}
-          </button>
-        </span>
-      </div>
+    <div className="panel detail">
+      <NetHead platform="ig" name="Instagram"
+               right={<>
+                 <PillSelect label="check every" value={interval} options={IG_INTERVALS} disabled={busy}
+                             title="How often every Instagram source is checked. Applies from the service's next cycle — no restart."
+                             onChange={(v) => go(() => api.igSettings({ interval_s: v }))} />
+                 <button className={`btn btn-sm ${paused ? "btn-brand" : "btn-ghost"}`} disabled={busy}
+                         title="Master switch — the background service honours it within a minute"
+                         onClick={() => go(() => api.igControl(paused ? "resume" : "pause"))}>
+                   {paused ? "Resume collection" : "Pause collection"}
+                 </button>
+               </>}>
+        {data && <StatusChips paused={paused} login={login} />}
+      </NetHead>
 
       {checkpointed.map((a) => (
-        <div key={a.username}
-             style={{ border: "1px solid var(--critical)", borderRadius: 10,
-                      padding: "10px 12px", margin: "8px 0",
-                      background: "color-mix(in srgb, var(--critical) 8%, transparent)" }}>
-          <b className="st-crit">@{a.username} is checkpoint-locked — automatic
-            relogins are stopped (since {a.checkpoint_at})</b>
-          <div style={{ fontSize: 12.5, marginTop: 4, lineHeight: 1.5 }}>
-            No code can clear this; retrying makes the lock stickier. On
-            Accounts &amp; Sessions, press Sign in → “Open this account's
-            browser” (its own phone, its own proxy), complete the “confirm it's
-            you” check there, and the session is adopted for you. Or clear it
-            on a trusted phone and paste that browser's cookies into the same
-            panel. Either one clears this banner by itself.
+        <div className="banner-crit" key={a.username} style={{ margin: "10px 0 4px" }}>
+          <b>@{a.username} is checkpoint-locked</b> — automatic relogins are stopped (since {a.checkpoint_at}).
+          <div style={{ marginTop: 4 }}>
+            On <Link to="/accounts">Accounts &amp; Sessions</Link>, press <b>Sign in → Open this account's browser</b> and complete the
+            “confirm it's you” check there; or paste that browser's cookies into the same panel. Either clears this by itself.
           </div>
         </div>
       ))}
 
-      {accounts.map((a) => (
-        <div className="kv" key={a.username}>
-          <span>@{a.username}</span>
-          <b className={a.active ? "st-good" : "st-crit"}>
-            {a.active ? `collecting · owns ${a.owns ?? 0}` : "benched"}{a.proxy ? " · proxied" : ""}
-            {a.identity ? (
-              <span style={{ color: a.identity.legacy ? "var(--warn-text)" : "var(--ink-3)", fontWeight: 400 }}>
-                {` · ${a.identity.name || a.identity.model}${a.identity.legacy ? " (legacy phone — sign in again)" : ""}`}
-              </span>
-            ) : null}
-            {a.error ? ` · ${a.error}` : ""}
-          </b>
-        </div>
-      ))}
-      {accounts.filter((a) => a.active).length > 1 && (
-        <div style={{ color: "var(--ink-3)", fontSize: 12.5, marginTop: 4 }}>
-          {accounts.filter((a) => a.active).length} accounts collect in parallel; each source above
-          says which one reads it. Pin one by hand from the CLI
-          (<code>collect_ig.py add-source --account</code>); otherwise the collector balances them
-          and keeps them where they are.
-        </div>
-      )}
-      {accounts.length === 0 && (
-        <div style={{ color: "var(--ink-3)", fontSize: 13, marginTop: 6 }}>
-          No Instagram account onboarded yet — accounts are managed on the
-          Accounts &amp; Sessions page.
-        </div>
-      )}
-
-      <div className="filters" style={{ marginTop: 12, marginBottom: 0 }}>
-        <label className="fpill">
-          <span>Check every</span>
-          <select value={interval} disabled={busy}
-                  onChange={(e) => setInterval(e.target.value)}>
-            {IG_INTERVALS.map(([v, t]) => (
-              <option key={v} value={v}>{t}</option>
-            ))}
-          </select>
-        </label>
-        {note && (
-          <span className={note.startsWith("✓") ? "st-good" : "st-crit"}
-                style={{ fontSize: 12.5, fontWeight: 600 }}>{note}</span>
-        )}
+      <div className="kv-grid">
+        <div className="kv"><span>Sources<Hint text="Instagram accounts this project follows — managed on the Watchlists tab under Instagram." /></span><b>{fmtN((data?.sources || []).length)}</b></div>
+        <div className="kv"><span>Collected</span><b>{fmtN(data?.totals?.posts ?? 0)}</b></div>
+        <div className="kv"><span>Accounts in rotation<Hint text="Server-side Instagram logins. Active ones collect in parallel and the collector balances sources between them." /></span>
+          <b>{active.length} <small>of {accounts.length}</small></b></div>
       </div>
+
+      <Sec label="Accounts" hint="Each active account owns a share of the sources. 'benched' means it is signed in but not collecting. Manage sign-ins on Accounts & Sessions.">
+        {accounts.length === 0 && <div className="muted">No Instagram account onboarded yet — add one on <Link to="/accounts">Accounts &amp; Sessions</Link>.</div>}
+        {accounts.map((a) => (
+          <div className="kv" key={a.username}>
+            <span>@{a.username}{a.identity ? <small className={a.identity.legacy ? "st-warn" : ""} title={a.identity.legacy ? "Legacy phone identity — sign in again to mint a fresh one" : "Phone identity this account presents"}> · {a.identity.name || a.identity.model}{a.identity.legacy ? " (legacy)" : ""}</small> : null}</span>
+            <b className={a.active ? "st-good" : "st-warn"}>
+              {a.active ? `collecting · ${a.owns ?? 0} source${a.owns === 1 ? "" : "s"}` : "benched"}{a.proxy ? " · proxied" : ""}
+              {a.error ? <span className="st-crit"> · {a.error}</span> : null}
+            </b>
+          </div>
+        ))}
+      </Sec>
     </div>
   );
 }
@@ -2234,9 +1906,7 @@ function StreamsManager({ pid }) {
   );
 }
 
-// ---------------------------------------------------------------------------
 // The view: tabs + master-detail
-// ---------------------------------------------------------------------------
 
 export default function Watchlists({ onMenu }) {
   const { project } = useProject();
@@ -2247,35 +1917,34 @@ export default function Watchlists({ onMenu }) {
   );
   const fb = useApi(() => api.fbStatus(pid), [pid], { every: 30_000 });
   const ig = useApi(() => api.igStatus(pid), [pid], { every: 60_000 });
+  const status = useApi(() => api.status(), [], { every: 30_000 });
+  const guard = useApi(() => api.guard(), [], { every: 120_000 });
   const [tab, setTab] = useState("lists");
-  const [sel, setSel] = useState(null);        // "x:<id>" | "fb" | "ig"
+  const [sel, setSel] = useState(null);        // "x:<id>" | "fb" | "ig" | null
   const [creating, setCreating] = useState(false);
   const [addingExisting, setAddingExisting] = useState(false);
+  const mobile = useMediaQuery("(max-width: 1000px)");
 
-  // /api/watchlists also carries one synthetic kind:"instagram" row per
-  // project (the ig:P:0 stream, for Watch Tower). The Instagram row below is
-  // built from /api/ig/status, so drop it here or it shows twice — once as a
-  // bogus "X List" with 118 handles.
-  const xLists = (wls.data?.watchlists || []).filter(
+  // /api/watchlists also carries one synthetic kind:"instagram" row per project (the ig:P:0 stream,
+  // for Watch Tower).
+  const xLists = useMemo(() => sortBy((wls.data?.watchlists || []).filter(
     (w) => w.platform !== "instagram" && w.kind !== "instagram",
-  );
+  )), [wls.data]);
   const items = useMemo(() => {
     const out = xLists.map((w) => ({
       id: `x:${w.watchlist_id}`, platform: "x", name: w.name,
       sub: (w.kind === "xlist"
-        ? `X List \u00b7 ${w.xmembers?.count ? `${w.xmembers.count} accounts` : "members not fetched"}`
-          + `${w.owner_handle ? ` \u00b7 @${w.owner_handle}` : ""}`
+        ? `X List · ${w.xmembers?.count ? `${w.xmembers.count} accounts` : "members not fetched"}`
+          + `${w.owner_handle ? ` · @${w.owner_handle}` : ""}`
         : w.kind === "links"
-        ? `${w.links?.total ?? 0} links \u00b7 every ${Math.round((w.refresh_every_s || 86400) / 3600)}h`
-          + (w.sheet ? (w.sheet_day ? ` \u00b7 day ${fmtDay(w.sheet_day)}` : ` \u00b7 sheet tab \u201c${w.sheet_tab || w.name}\u201d`) : "")
+        ? `${w.links?.total ?? 0} links · every ${Math.round((w.refresh_every_s || 86400) / 3600)}h`
+          + (w.sheet ? (w.sheet_day ? ` · day ${fmtDay(w.sheet_day)}` : ` · sheet tab “${w.sheet_tab || w.name}”`) : "")
         : `${w.members.length} ${w.kind === "keywords" ? "keywords" : "handles"}`)
-        + (w.owner_project_id && w.owner_project_id !== pid ? ` \u00b7 from ${w.owner_project || "another project"}`
-           : w.shared ? " \u00b7 shared" : ""),
+        + (w.owner_project_id && w.owner_project_id !== pid ? ` · from ${w.owner_project || "another project"}`
+           : w.shared ? " · shared" : ""),
       live: w.streams.some((s) => !s.paused), w,
     }));
     if (out.length === 0) {
-      // X is a row even with nothing in it, like the Facebook and Instagram
-      // rows below — an empty platform is a place to start from, not a gap.
       out.push({
         id: "x", platform: "x", name: "X (Twitter) watchlists",
         sub: "none yet — handles, keywords, an X List, or post links", live: false,
@@ -2294,15 +1963,16 @@ export default function Watchlists({ onMenu }) {
     return out;
   }, [xLists, fb.data, ig.data, pid]);
 
-  const selected = items.find((i) => i.id === sel) || items[0] || null;
+  // Desktop always shows a detail (the first list by default); a phone shows
+  // the list until one is tapped, then the detail with a back button.
+  const picked = items.find((i) => i.id === sel) || null;
+  const selected = picked || (mobile ? null : items[0] || null);
+  const showList = !mobile || !selected;
+  const showDetail = !mobile || !!selected;
+  const back = mobile ? () => setSel(null) : undefined;
   const reloadAll = () => { wls.reload(); fb.reload(); ig.reload(); };
 
   // How many X accounts this project follows, added up across its lists:
-  // handle lists count their members; X Lists count what the member cache
-  // holds (0 until "Refresh members" has run for that list — those are
-  // named, not silently skipped). Keyword and link lists follow no accounts.
-  // This is the number to put beside Watch-Tower's "handles" — theirs is
-  // distinct AUTHORS seen in the posts, which is always >= this.
   const xTotals = useMemo(() => {
     let accounts = 0;
     const unfetched = [];
@@ -2318,8 +1988,6 @@ export default function Watchlists({ onMenu }) {
   }, [xLists]);
   const [refreshingAll, setRefreshingAll] = useState("");
   const refreshUnfetched = async () => {
-    // One list at a time — each pull spends a little X budget and the
-    // server serialises fetches anyway.
     for (const w of xTotals.unfetched) {
       setRefreshingAll(w.name);
       try { await api.refreshXlistMembers(w.list_id); } catch { /* shown per list */ }
@@ -2330,9 +1998,7 @@ export default function Watchlists({ onMenu }) {
   const [listFilter, setListFilter] = useState("");
 
   const groups = [["x", "X (Twitter)"], ["fb", "Facebook"], ["ig", "Instagram"]];
-  // A group past this many rows scrolls in its own box; past FILTER_AT it
-  // also gets a filter box, because thirty day-tabs are not scanned by eye.
-  const SCROLL_AT = 5, FILTER_AT = 8;
+  const SCROLL_AT = 6, FILTER_AT = 8;
 
   return (
     <>
@@ -2359,8 +2025,8 @@ export default function Watchlists({ onMenu }) {
           {wls.loading && !wls.data && <Loading />}
           {wls.error && <ErrorState error={wls.error} retry={wls.reload} />}
           {wls.data && (
-            <div className="wl-layout">
-              <div className="wl-list">
+            <div className={`wl-layout${mobile && showDetail ? " detail-only" : ""}`}>
+              {showList && <div className="wl-list">
                 {groups.map(([p, label]) => {
                   const all = items.filter((i) => i.platform === p);
                   if (all.length === 0) return null;
@@ -2378,19 +2044,18 @@ export default function Watchlists({ onMenu }) {
                         {p === "x" && xTotals.accounts > 0 && (
                           <span className="cnt"
                                 title={"Accounts followed across this project's handle lists and X Lists. "
-                                       + "Watch-Tower's \u201chandles\u201d is distinct authors seen in the posts "
+                                       + "Watch-Tower's “handles” is distinct authors seen in the posts "
                                        + "(retweets, collabs and past members included), so theirs runs higher."}>
                             · {fmtN(xTotals.accounts)} accounts
                           </span>
                         )}
                         {p === "x" && xTotals.unfetched.length > 0 && (
                           <button className="btn btn-ghost btn-sm" disabled={!!refreshingAll}
-                                  style={{ marginLeft: 6 }}
                                   title={"Members of these X Lists have never been pulled, so they are missing from the total: "
                                          + xTotals.unfetched.map((w) => w.name).join(", ")}
                                   onClick={refreshUnfetched}>
-                            {refreshingAll ? `fetching ${refreshingAll}\u2026`
-                              : `${xTotals.unfetched.length} list${xTotals.unfetched.length === 1 ? "" : "s"} not counted \u2014 fetch`}
+                            {refreshingAll ? `fetching ${refreshingAll}…`
+                              : `${xTotals.unfetched.length} list${xTotals.unfetched.length === 1 ? "" : "s"} not counted — fetch`}
                           </button>
                         )}
                         {filterable && (
@@ -2410,26 +2075,23 @@ export default function Watchlists({ onMenu }) {
                               <b>{i.name}</b>
                               <small>{i.sub}</small>
                             </span>
-                            <span className={`dot${i.live ? "" : " off"}`} />
+                            <span className={`dot${i.live ? "" : " off"}`} title={i.live ? "collecting" : "not collecting"} />
+                            {mobile && <span className="chev">›</span>}
                           </button>
                         ))}
                         {q && rows.length === 0 && (
-                          <div style={{ color: "var(--ink-3)", fontSize: 12.5, padding: "8px 12px" }}>
-                            no watchlist matches “{listFilter}”
-                          </div>
+                          <div className="muted" style={{ padding: "8px 12px" }}>no watchlist matches “{listFilter}”</div>
                         )}
                       </div>
                     </React.Fragment>
                   );
                 })}
                 {items.length === 0 && (
-                  <div style={{ color: "var(--ink-3)", fontSize: 13, padding: 14 }}>
-                    Nothing yet — “+ New watchlist”.
-                  </div>
+                  <div className="muted" style={{ padding: 14 }}>Nothing yet — “+ New watchlist”.</div>
                 )}
-              </div>
+              </div>}
 
-              <div style={{ minWidth: 0 }}>
+              {showDetail && <div className="wl-detail" key={selected?.id || "none"}>
                 {!selected && (
                   <Empty title="No watchlists in this project yet">
                     A watchlist is a set of accounts to collect. “+ New watchlist”
@@ -2437,11 +2099,11 @@ export default function Watchlists({ onMenu }) {
                   </Empty>
                 )}
                 {selected?.id === "x" && (
-                  <div className="panel">
+                  <div className="panel detail">
+                    {back && <button className="btn btn-ghost btn-sm" onClick={back}>‹ All watchlists</button>}
                     <Empty title="No X watchlists in this project yet">
                       An X watchlist is a set of handles, a keyword search, an existing
-                      X List, or a list of post links from a Google Sheet. Posts start
-                      flowing into the Live Feed as soon as one exists.
+                      X List, or a list of post links from a Google Sheet.
                       <div style={{ marginTop: 14 }}>
                         <button className="btn btn-brand" onClick={() => setCreating(true)}>
                           + New watchlist
@@ -2451,34 +2113,32 @@ export default function Watchlists({ onMenu }) {
                   </div>
                 )}
                 {selected?.platform === "x" && selected.w?.kind === "links" && (
-                  <LinksDetail pid={pid} w={selected.w} onChanged={reloadAll} />
+                  <>{back && <button className="btn btn-ghost btn-sm back-btn" onClick={back}>‹ All watchlists</button>}
+                  <LinksDetail pid={pid} w={selected.w} onChanged={reloadAll} /></>
                 )}
                 {selected?.platform === "x" && selected.w && selected.w.kind !== "links" && (
-                  <XDetail w={selected.w} pid={pid} onChanged={reloadAll} />
+                  <XDetail w={selected.w} pid={pid} onChanged={reloadAll} onBack={back} />
                 )}
                 {selected?.id === "fb" && (
-                  <FbDetail pid={pid} data={fb.data} reload={fb.reload}
+                  <FbDetail pid={pid} data={fb.data} reload={fb.reload} onBack={back}
                             gotoSettings={() => setTab("settings")} />
                 )}
                 {selected?.id === "ig" && (
-                  <IgDetail pid={pid} data={ig.data} reload={ig.reload}
+                  <IgDetail pid={pid} data={ig.data} reload={ig.reload} onBack={back}
                             gotoSettings={() => setTab("settings")} />
                 )}
-              </div>
+              </div>}
             </div>
           )}
         </>
       )}
 
       {tab === "settings" && (
-        <>
+        <div className="net-grid">
+          <XNetwork pid={pid} xLists={xLists} status={status} guard={guard} />
           <FbSettings data={fb.data} reload={fb.reload} />
           <IgSettings data={ig.data} reload={ig.reload} />
-          {/* The raw "Streams in this project" panel was removed — streams are
-              plumbing (watchlists compile into them), not something to wire by
-              hand. The StreamsManager component and the /api/streams/* endpoints
-              are left intact; the panel just isn't rendered. */}
-        </>
+        </div>
       )}
 
       {creating && pid && (

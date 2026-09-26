@@ -1,25 +1,4 @@
 // Parse a pasted handle -> Instagram profile_id list.
-//
-// WHY THIS EXISTS: a source the collector has never resolved to a numeric id
-// cannot be read at all (store_ig: platform_id is the thing Instagram's media
-// endpoint accepts; the handle is only the thing a human reads). When the name
-// lookup endpoint is throttled — which, per the 2026-09-17 finding, it is for
-// every collecting account at once — the ONLY way forward is a human pasting
-// ids in by hand. So this parser's job is to accept whatever shape that human
-// already has, not to teach them a format:
-//
-//   {"natgeo": "787132", "nasa": 528817151}          JSON object
-//   [{"handle": "natgeo", "profile_id": "787132"}]   JSON array of records
-//   [["natgeo", "787132"]]                           JSON array of pairs
-//   natgeo 787132                                    whitespace
-//   natgeo,787132   natgeo:787132   natgeo | 787132  csv / colon / pipe
-//   @natgeo - 787132                                 dash, leading @
-//   https://www.instagram.com/natgeo/  787132        pasted profile URL
-//   787132 natgeo                                    reversed
-//
-// It never throws and never guesses an id: a line it cannot read with
-// certainty comes back in `bad` so the panel can show it to the operator
-// rather than silently dropping it.
 
 const HANDLE_KEYS = ["handle", "username", "user_name", "user", "name",
                      "label", "account", "profile"];
@@ -39,9 +18,6 @@ export const cleanHandle = (raw) => {
 };
 
 // An id is numeric or it is not an id. A "handle" in the id column is the
-// commonest paste mistake and it must NOT be written to platform_id — the
-// collector would then fetch by a string Instagram rejects, and the row would
-// look resolved while collecting nothing.
 export const cleanId = (raw) => {
   const s = String(raw ?? "").trim().replace(/^["']|["']$/g, "");
   return /^\d+$/.test(s) ? s : "";
@@ -117,8 +93,6 @@ export function parseIgIds(text) {
 
     const first = toks[0], last = toks[toks.length - 1];
     // Whichever end is numeric is the id — this is what makes both
-    // "natgeo 787132" and "787132 natgeo" work without asking the operator
-    // which column order their export used.
     if (cleanId(last)) push(first, last, line);
     else if (cleanId(first)) push(last, first, line);
     else bad.push(line);

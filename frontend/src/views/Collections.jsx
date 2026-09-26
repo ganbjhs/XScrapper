@@ -1,17 +1,6 @@
 // Curation boards: what an editor pinned, ready to hand off — plus the boards
-// the labeller fills on its own, one per category. Boards reference collected
-// posts; deleting a board never touches the archive.
-//
-// The sentiment counts sit at the top, above everything: "how much of each?"
-// is the question this page is opened with, and it used to take five clicks
-// into five boards to answer. The one Classify button and the one Export
-// button live up there with them.
-//
-// Two tabs below that: "Boards" for daily work, "Labelling" for the vocabulary.
-// There are no spend controls any more — a run covers every unlabelled post in
-// the project and stops for nothing but a provider failure.
 import React, { useEffect, useRef, useState } from "react";
-import { api, fmtAgo, fmtN, useApi } from "../api/client.js";
+import { api, fmtAgo, fmtN, useApi, sortBy } from "../api/client.js";
 import { PageHead, useProject } from "../App.jsx";
 import PostCard from "../components/PostCard.jsx";
 import SentimentStrip from "../components/Sentiments.jsx";
@@ -39,8 +28,6 @@ function Board({ c, pid, cats, onBack, onChanged }) {
   };
 
   // No per-board download: the whole project exports as one workbook from the
-  // strip at the top. Five files that each hold a fifth of the answer is a
-  // filing problem, not a hand-off.
   const gone = (data?.pinned || 0) - (data?.count || 0);
 
   return (
@@ -79,9 +66,7 @@ function Board({ c, pid, cats, onBack, onChanged }) {
   );
 }
 
-// ---------------------------------------------------------------------------
 // the labelling tab: the vocabulary the model is given, and the spend controls
-// ---------------------------------------------------------------------------
 
 function CategoryRow({ pid, cat, onSaved }) {
   const [c, setC] = useState(cat);
@@ -155,8 +140,6 @@ function CategoryRow({ pid, cat, onSaved }) {
 }
 
 // `st` is the page's own labelling-status handle, passed down rather than
-// fetched again: the strip at the top polls it while a run is going, and two
-// pollers on one endpoint is one poller too many.
 function Labelling({ pid, st }) {
   const cs = useApi(() => (pid ? api.labelCategories(pid) : Promise.resolve(null)), [pid]);
   const [adding, setAdding] = useState(false);
@@ -300,8 +283,6 @@ export default function Collections({ onMenu }) {
   };
 
   // A finished run has just moved posts onto boards, so the board list is a
-  // screen behind until it is asked again. Watching the flag rather than
-  // polling the boards: they only change when a run ends or somebody pins.
   const wasRunning = useRef(false);
   const running = !!labels.data?.run?.running;
   useEffect(() => {
@@ -332,7 +313,7 @@ export default function Collections({ onMenu }) {
     );
   }
 
-  const boards = data?.collections || [];
+  const boards = sortBy(data?.collections || []);
   const autos = boards.filter((c) => c.auto);
   const mine = boards.filter((c) => !c.auto);
 

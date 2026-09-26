@@ -1,6 +1,4 @@
 // The pipe's outbound half, scoped to the current project: this project's
-// own targets (created right here), plus the global ones from config.toml.
-// "Behind: 0" is the whole point of the product.
 import React, { useEffect, useState } from "react";
 import { api, fmtAgo, fmtN, useApi } from "../api/client.js";
 import { PageHead, useProject } from "../App.jsx";
@@ -41,8 +39,6 @@ function AddTargetModal({ pid, serviceAccount, onDone, onClose }) {
   const [sheetUrl, setSheetUrl] = useState("");
   const [sheetTab, setSheetTab] = useState("Sheet1");
   // Apps Script by default: it needs no Google Cloud project and no key on
-  // the server, which is the difference between "set this up now" and "set
-  // this up one day".
   const [sheetMode, setSheetMode] = useState("script");
   // The sheet token's .env variable is its own state, NOT shared with the
   // webhook secret above — one form, two unrelated credentials.
@@ -53,12 +49,6 @@ function AddTargetModal({ pid, serviceAccount, onDone, onClose }) {
   const [err, setErr] = useState("");
 
   // Ask the server what token this variable should carry.
-  //
-  // It answers with the value ALREADY in .env when there is one, and mints a
-  // new one only when there is not (or when `rotate` is passed). That matters:
-  // an earlier version generated a token per call, so reopening this form
-  // quietly replaced the token of a deployment that was already working, and
-  // made a correct .env look wrong.
   const loadScript = async (opts = {}) => {
     try {
       const r = await api.sheetScript({
@@ -513,8 +503,6 @@ export default function Delivery({ onMenu }) {
   const { project } = useProject();
   const pid = project?.project_id;
   // Never fetch before the project is known: /api/delivery WITHOUT ?project
-  // returns every project's targets, so the first paint after a reload would
-  // flash another project's data until the projects list arrives.
   const { data, error, loading, reload } = useApi(
     () => (pid ? api.delivery(pid) : Promise.resolve(null)), [pid], { every: 10_000 });
   const [adding, setAdding] = useState(false);

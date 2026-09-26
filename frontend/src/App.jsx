@@ -1,9 +1,9 @@
-// The shell: left navbar (project switcher on top, project-scoped views,
-// global section below), routing, and the shared project context.
+// The shell: navbar (project switcher, project-scoped views, global section),
+// routing, theme / sidebar state, keyboard shortcuts, shared project context.
 import React, { createContext, useContext, useEffect, useMemo, useState } from "react";
-import { NavLink, Navigate, Route, Routes } from "react-router-dom";
-import { api, useApi } from "./api/client.js";
-import { Modal, icons } from "./components/ui.jsx";
+import { NavLink, Navigate, Route, Routes, useNavigate } from "react-router-dom";
+import { api, sortBy, useApi } from "./api/client.js";
+import { Modal, ShortcutsModal, ToastHost, icons, toast } from "./components/ui.jsx";
 import LiveFeed from "./views/LiveFeed.jsx";
 import Watchlists from "./views/Watchlists.jsx";
 import Search from "./views/Search.jsx";
@@ -19,13 +19,12 @@ import StressTest from "./views/StressTest.jsx";
 const ProjectCtx = createContext(null);
 export const useProject = () => useContext(ProjectCtx);
 
-// Rename / archive / delete, for every project including archived ones.
-// Delete is two steps: the server's dry-run plan is shown first (what goes,
-// what is shared and therefore kept), then the operator types the name.
+// Rename / archive / delete. Delete shows the server's dry-run plan first,
+// then asks for the project name.
 function ManageProjects({ onClose }) {
   const { reload, setProjectId, project } = useProject();
   const { data, reload: reloadAll } = useApi(() => api.projects(), []);
-  const all = data?.projects || [];
+  const all = sortBy(data?.projects || []);
   const [editing, setEditing] = useState(null);      // project_id being renamed
   const [draft, setDraft] = useState("");
   const [deleting, setDeleting] = useState(null);    // { project, plan }
@@ -190,9 +189,10 @@ function ProjectSwitcher() {
 
   return (
     <div className="proj-switch">
-      <button onClick={() => setOpen((o) => !o)} aria-expanded={open}>
-        {project ? project.name : "No project"}
-        <span className="caret">▼</span>
+      <button onClick={() => setOpen((o) => !o)} aria-expanded={open} title={project?.name}>
+        <span className="pmark">{(project?.name || "?").slice(0, 1).toUpperCase()}</span>
+        <span className="pname">{project ? project.name : "No project"}</span>
+        <svg className="caret" viewBox="0 0 24 24" aria-hidden="true"><path d="M6 9l6 6 6-6" /></svg>
       </button>
       {open && (
         <div className="proj-menu" onMouseLeave={() => setOpen(false)}>
@@ -236,60 +236,161 @@ function ProjectSwitcher() {
   );
 }
 
-function Nav({ open, close }) {
+const THEMES = ["system", "light", "dark"];
+const THEME_ICON = { system: "auto", light: "sun", dark: "moon" };
+const THEME_LABEL = { system: "Theme: follows system", light: "Theme: light", dark: "Theme: dark" };
+
+const NAV = [
+  { to: "/feed", icon: "feed", label: "Live Feed", key: "f" },
+  { to: "/watchlists", icon: "watchlists", label: "Watchlists", key: "w" },
+  { to: "/search", icon: "search", label: "Search", key: "s" },
+  { to: "/collections", icon: "collections", label: "Collections", key: "c" },
+  { to: "/alerts", icon: "alerts", label: "Alerts", key: "a" },
+  { to: "/delivery", icon: "delivery", label: "Delivery", key: "d" },
+  { to: "/activity", icon: "activity", label: "Activity Log", key: "l" },
+];
+const NAV_GLOBAL = [
+  { to: "/accounts", icon: "accounts", label: "Accounts & Sessions", key: "u" },
+  { to: "/guard", icon: "guard", label: "Guard", key: "g" },
+  { to: "/settings", icon: "settings", label: "Settings", key: "t" },
+  { to: "/stress", icon: "stress", label: "Stress Test" },
+];
+
+function Nav({ open, close, rail, toggleRail, theme, cycleTheme, showShortcuts }) {
   const { data: delivery } = useApi(() => api.delivery(), [], { every: 30_000 });
   const behind = (delivery?.targets || []).reduce((a, t) => a + (t.behind || 0), 0);
-  const item = (to, icon, label, pill = null) => (
-    <NavLink to={to} className={({ isActive }) => `nav-item${isActive ? " active" : ""}`}
+  const item = ({ to, icon, label, key }) => (
+    <NavLink key={to} to={to} title={rail ? label : undefined}
+             className={({ isActive }) => `nav-item${isActive ? " active" : ""}`}
              onClick={close}>
       {icons[icon]}
-      {label}
-      {pill}
+      <span className="lbl">{label}</span>
+      {key && <span className="kbd-hint">g {key}</span>}
+      {to === "/delivery" && behind > 0 && <span className="pill warn" data-n={behind}><span>{behind} behind</span></span>}
     </NavLink>
   );
   return (
     <nav className={`side${open ? " open" : ""}`}>
       <div className="brand">
         <div className="logo">◎</div>
-        <div>
+        <div className="txt">
           <b>Collector</b>
           <small>DATA → WATCH-TOWER</small>
         </div>
+        <button className="nav-collapse" onClick={toggleRail}
+                aria-label={rail ? "Expand sidebar" : "Collapse sidebar"} title={`${rail ? "Expand" : "Collapse"} sidebar  [`}>
+          {icons.collapse}
+        </button>
       </div>
 
-      <div className="nav-label">PROJECT</div>
+      <div className="nav-label">Project</div>
       <ProjectSwitcher />
-      <div style={{ height: 10 }} />
-      {item("/feed", "feed", "Live Feed")}
-      {item("/watchlists", "watchlists", "Watchlists")}
-      {item("/search", "search", "Search")}
-      {item("/collections", "collections", "Collections")}
-      {item("/alerts", "alerts", "Alerts")}
-      {item("/delivery", "delivery", "Delivery",
-        behind > 0 ? <span className="pill warn">{behind} behind</span> : null)}
-      {item("/activity", "activity", "Activity Log")}
+      <div style={{ height: 8 }} />
+      {NAV.map(item)}
 
-      <div className="nav-label">GLOBAL</div>
-      {item("/accounts", "accounts", "Accounts & Sessions")}
-      {item("/guard", "guard", "Guard")}
-      {item("/settings", "settings", "Settings")}
-      {item("/stress", "stress", "Stress Test")}
+      <div className="nav-label">Global</div>
+      <div className="nav-divider" />
+      {NAV_GLOBAL.map(item)}
 
       <div className="nav-foot">
         <div className="avatar">C</div>
-        <div>
+        <div className="who">
           <b>Collector</b>
           <small><a href="/logout" style={{ textDecoration: "none" }}>sign out →</a></small>
         </div>
+      </div>
+      <div className="nav-tools">
+        <button className="icon-btn" onClick={cycleTheme} title={`${THEME_LABEL[theme]}  \\`} aria-label="Switch theme">
+          {icons[THEME_ICON[theme]]}
+        </button>
+        <button className="icon-btn" onClick={showShortcuts} title="Keyboard shortcuts  ?" aria-label="Keyboard shortcuts">
+          {icons.keyboard}
+        </button>
+        <a className="icon-btn logout" href="/logout" title="Sign out" aria-label="Sign out">{icons.logout}</a>
       </div>
     </nav>
   );
 }
 
+// Phone-width bottom bar: the four everyday pages plus the full menu.
+function MobileNav({ openMenu }) {
+  const { data: delivery } = useApi(() => api.delivery(), [], { every: 30_000 });
+  const behind = (delivery?.targets || []).reduce((a, t) => a + (t.behind || 0), 0);
+  const item = ({ to, icon, label }) => (
+    <NavLink key={to} to={to} className={({ isActive }) => (isActive ? "active" : "")}>
+      {icons[icon]}{label}
+    </NavLink>
+  );
+  return (
+    <nav className="mnav" aria-label="Quick navigation">
+      {NAV.slice(0, 4).map(item)}
+      <button onClick={openMenu} aria-label="Open full menu">
+        {icons.more}Menu
+        {behind > 0 && <span className="pill">{behind}</span>}
+      </button>
+    </nav>
+  );
+}
+
+const ls = {
+  get: (k) => { try { return localStorage.getItem(k); } catch { return null; } },
+  set: (k, v) => { try { localStorage.setItem(k, v); } catch {} },
+};
+
+function useTheme() {
+  const [theme, setTheme] = useState(() => (THEMES.includes(ls.get("collector.theme")) ? ls.get("collector.theme") : "system"));
+  useEffect(() => {
+    const el = document.documentElement;
+    if (theme === "system") delete el.dataset.theme; else el.dataset.theme = theme;
+    ls.set("collector.theme", theme);
+  }, [theme]);
+  const ref = React.useRef(theme);
+  ref.current = theme;
+  const cycle = React.useCallback(() => {
+    const next = THEMES[(THEMES.indexOf(ref.current) + 1) % THEMES.length];
+    setTheme(next);
+    toast(THEME_LABEL[next], { ms: 1600 });
+  }, []);
+  return [theme, cycle];
+}
+
+// g + key navigation, "/" focuses the first filter box, "[" toggles the rail,
+// "\\" cycles the theme, "?" opens help. Ignored while typing in a field.
+function useShortcuts({ toggleRail, cycleTheme, showShortcuts }) {
+  const navigate = useNavigate();
+  useEffect(() => {
+    let pendingG = 0;
+    const typing = (e) => {
+      const t = e.target;
+      return t && (t.isContentEditable || /^(INPUT|TEXTAREA|SELECT)$/.test(t.tagName));
+    };
+    const h = (e) => {
+      if (e.metaKey || e.ctrlKey || e.altKey || typing(e)) return;
+      const now = Date.now();
+      if (pendingG && now - pendingG < 1200) {
+        pendingG = 0;
+        const hit = [...NAV, ...NAV_GLOBAL].find((n) => n.key === e.key);
+        if (hit) { e.preventDefault(); navigate(hit.to); }
+        return;
+      }
+      pendingG = 0;
+      if (e.key === "g") { pendingG = now; return; }
+      if (e.key === "/") {
+        const box = document.querySelector('main input[type="search"], main .filters input, main .field input, main input');
+        if (box) { e.preventDefault(); box.focus(); box.select?.(); }
+      } else if (e.key === "[") { e.preventDefault(); toggleRail(); }
+      else if (e.key === "\\") { e.preventDefault(); cycleTheme(); }
+      else if (e.key === "?") { e.preventDefault(); showShortcuts(); }
+    };
+    addEventListener("keydown", h);
+    return () => removeEventListener("keydown", h);
+  }, [navigate, toggleRail, cycleTheme, showShortcuts]);
+}
+
 export default function App() {
   const { data, error, loading, reload } = useApi(() => api.projects(), []);
   const projects = useMemo(
-    () => (data?.projects || []).filter((p) => !p.archived),
+    () => sortBy((data?.projects || []).filter((p) => !p.archived)),
     [data],
   );
   const [projectId, setProjectId] = useState(() => {
@@ -308,13 +409,24 @@ export default function App() {
   }, [project, projectId]);
 
   const [navOpen, setNavOpen] = useState(false);
+  const [rail, setRail] = useState(() => ls.get("collector.nav") === "rail");
+  useEffect(() => { ls.set("collector.nav", rail ? "rail" : "full"); }, [rail]);
+  const toggleRail = React.useCallback(() => setRail((r) => !r), []);
+  const [theme, cycleTheme] = useTheme();
+  const [help, setHelp] = useState(false);
+  const showShortcuts = React.useCallback(() => setHelp(true), []);
+  useShortcuts({ toggleRail, cycleTheme, showShortcuts });
 
   const ctx = { projects, project, setProjectId, reload, projectsError: error, projectsLoading: loading };
   return (
     <ProjectCtx.Provider value={ctx}>
-      <div className="shell">
-        <Nav open={navOpen} close={() => setNavOpen(false)} />
+      <div className={`shell${rail ? " rail" : ""}`}>
+        <Nav open={navOpen} close={() => setNavOpen(false)} rail={rail} toggleRail={toggleRail}
+             theme={theme} cycleTheme={cycleTheme} showShortcuts={showShortcuts} />
         {navOpen && <div className="nav-scrim" onClick={() => setNavOpen(false)} />}
+        <MobileNav openMenu={() => setNavOpen(true)} />
+        <ToastHost />
+        {help && <ShortcutsModal onClose={() => setHelp(false)} />}
         <main className="content">
           <Routes>
             <Route path="/" element={<Navigate to="/feed" replace />} />

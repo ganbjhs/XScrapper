@@ -1,14 +1,4 @@
 // Account Control Panel — manage the scraper accounts of all three platforms
-// from one place: add / edit / remove, see status, promote a backup, force
-// failover, refresh backup codes, preview the current TOTP, and (next step)
-// sign in on the server IP.
-//
-// TWO things show per platform, on purpose:
-//   1. The managed POOL (store_accounts) — full controls.
-//   2. LIVE sessions already running that aren't in the pool yet — read from
-//      the existing X / Instagram status endpoints so nothing you already run
-//      ever disappears from this page. Each has an "Add to pool" button to
-//      bring it under management.
 import React, { useEffect, useState } from "react";
 import { Link, useSearchParams } from "react-router-dom";
 import { api, fmtAgo, useApi } from "../api/client.js";
@@ -27,9 +17,7 @@ const STATUS = {
   dead: { dot: " bad", text: "Dead", cls: "st-crit", chip: "crit" },
 };
 
-// ---------------------------------------------------------------------------
 // Add / edit / backup-code modals
-// ---------------------------------------------------------------------------
 
 function AddModal({ initial, onDone, onClose }) {
   const [f, setF] = useState({
@@ -127,10 +115,6 @@ function EditModal({ a, onDone, onClose }) {
       if (f.password) body.password = f.password;          // blank = keep
       if (f.totp_secret) body.totp_secret = f.totp_secret; // blank = keep
       // The proxy URL is WRITE-ONLY: it is encrypted at rest and never sent back
-      // to this page, so a blank box has to mean KEEP, exactly like password and
-      // TOTP. Clearing it must be said out loud — otherwise a label rename would
-      // silently drop the account back onto the server IP, which is the
-      // sign-in/collect fingerprint mismatch ACCOUNTS.md 7 exists to prevent.
       if (dropProxy) body.proxy_url = "";
       else if (f.proxy_url.trim()) body.proxy_url = f.proxy_url.trim();
       await api.poolUpdate(body);
@@ -225,24 +209,7 @@ function CodesModal({ a, onDone, onClose }) {
   );
 }
 
-// ---------------------------------------------------------------------------
 // Sign in — one path for all three platforms, and it is not a browser
-// ---------------------------------------------------------------------------
-//
-// Two mechanisms, ranked by how much suspicion they create (signin.py has the
-// full reasoning):
-//
-//   IMPORT     paste the cookies from a browser you are already signed into.
-//              No login event ever reaches the platform from this server — no
-//              form to fingerprint, no captcha to lose. Works on all three.
-//   BACKGROUND Instagram only, via instagrapi's app API. Not a browser, which
-//              is why it works where the streamed window never did. Costs one
-//              real login, but it is the only path that can re-login by itself
-//              when a session dies.
-//
-// The server runs it in a thread and streams its commentary back, because
-// "Instagram wants a code sent to your email" and "that cookie expired" are
-// different problems and a lone red X cannot tell them apart.
 
 const NEEDS_HINT = {
   proxy: "The residential proxy is missing or its exit is unusable. Fix it on this card (Edit → proxy URL — another session number if the exit is dead), then sign in again.",
@@ -251,16 +218,7 @@ const NEEDS_HINT = {
   browser: "Open this account's own browser below (its phone, its proxy), clear what Instagram asks, and the session is adopted for you.",
 };
 
-// ---------------------------------------------------------------------------
 // The streamed browser window — the account's OWN Chromium on the server
-// ---------------------------------------------------------------------------
-//
-// Instagram sometimes wants to see a browser it recognises (a native
-// checkpoint, a Bloks flow, a captcha). The server opens one per account:
-// shaped like the account's phone (ig_identity), through the account's own
-// proxy, on a persistent profile — and streams it here. The operator clicks
-// and types; when the page is signed in, the session is adopted by the app
-// client on the same phone (signin.ig_browser_adopt) and the window closes.
 function BrowserLoginModal({ a, onDone, onClose }) {
   const [win, setWin] = useState(null);       // {width,height,phone,...}
   const [state, setState] = useState("");
@@ -542,21 +500,7 @@ function SignInModal({ a, onDone, onClose }) {
 }
 
 
-// ---------------------------------------------------------------------------
 // Session state — ALWAYS rendered, on every card
-// ---------------------------------------------------------------------------
-//
-// This row used to be conditional on `live` (`{live && ...}`), and that single
-// `&&` is why an Instagram card could show no state at all: an account that is
-// in the pool but has never been signed in on the server has no row in
-// ig_accounts.db, so `liveFor` returned null, so the card silently rendered
-// nothing between "proxy / IP" and "last success —". Two very different
-// situations — "signed in and collecting" and "we have never seen this account
-// sign in" — looked identical: blank.
-//
-// A missing session IS a state, and the most important one, because it is the
-// only one an operator has to act on. So the row is unconditional and says
-// which of the two it is.
 function SessionRow({ a, live }) {
   // No live record at all: the account exists in the pool and nowhere else.
   if (!live) {
@@ -609,9 +553,7 @@ function SessionRow({ a, live }) {
 }
 
 
-// ---------------------------------------------------------------------------
 // A managed (pool) account card — full controls
-// ---------------------------------------------------------------------------
 
 function AccountCard({ a, live, onChanged }) {
   const [msg, setMsg] = useState("");
@@ -642,9 +584,6 @@ function AccountCard({ a, live, onChanged }) {
     catch (e) { setMsg(String(e.message || e)); }
   };
   // Instagram: N accounts collect in parallel. "Bench" takes this one off
-  // the roster (its unpinned sources move to the others on the next pass);
-  // "Collect" puts it back. "New phone" mints a fresh identity — the session
-  // dies with the old phone, so it benches the account until a sign-in.
   const isIg = a.platform === "ig";
   const bench = () => act(() => api.igAccount(live.username, false), "benched — its sources move on the next pass");
   const collect = () => act(() => api.igAccount(live.username, true), "collecting again from the next pass");
@@ -717,9 +656,7 @@ function AccountCard({ a, live, onChanged }) {
   );
 }
 
-// ---------------------------------------------------------------------------
 // A live session that isn't in the pool yet — read-only + "Add to pool"
-// ---------------------------------------------------------------------------
 
 function OrphanCard({ r, platform, onAdopt }) {
   const name = r.username || r.label || "(unknown)";
@@ -751,9 +688,7 @@ function OrphanCard({ r, platform, onAdopt }) {
   );
 }
 
-// ---------------------------------------------------------------------------
 // One platform section: pool accounts, then live-not-in-pool sessions
-// ---------------------------------------------------------------------------
 
 function PlatformSection({ platform, title, summary, accounts, orphans, liveFor, onAdopt, onChanged }) {
   const failover = async () => {
@@ -832,15 +767,7 @@ function PlatformSection({ platform, title, summary, accounts, orphans, liveFor,
   );
 }
 
-// ---------------------------------------------------------------------------
 // The Fix panel — what the decider (decider.py) needs a human for.
-// ---------------------------------------------------------------------------
-//
-// A Telegram ping links here with ?fix=<condition id>. The panel shows every
-// open condition, the one linked first and expanded, with the steps the
-// policy wrote for it and ONLY the actions the policy allows. Nothing here
-// invents advice: `steps` and `actions` come from the rule table, so the
-// dashboard and the phone always say the same thing.
 
 const KIND_TXT = {
   checkpoint: "Checkpoint — Instagram wants a human",
@@ -978,19 +905,6 @@ function FixCard({ c, focus, accounts, onAdopt, onChanged, onSignin }) {
 }
 
 // "Needs attention" means A HUMAN IS NEEDED — nothing else (2026-09-12).
-//
-// It used to mean "the decider has any open condition at all", and its own
-// subtitle admitted it: "N need you · M self-healing". So a rate limit that
-// clears itself in fifteen minutes, or a proxy exit that the pool will replace
-// on the next request, raised a heading that reads as an alarm. The operator's
-// complaint was exactly this: popups saying attention is needed when nothing
-// critical is happening.
-//
-// Now: conditions that need a human get the heading and the cards. Conditions
-// that heal themselves get ONE muted line, collapsed, because they are worth
-// being able to see and not worth being told. A condition the pager pinged
-// about is always a needs-human one by construction (Rule.needs_human), so the
-// ?fix= link still lands on an open card.
 function FixPanel({ conds, focusId, accounts, onAdopt, onChanged, telegram }) {
   const [signin, setSignin] = useState(null);
   const [showSelf, setShowSelf] = useState(false);
@@ -1046,25 +960,19 @@ function FixPanel({ conds, focusId, accounts, onAdopt, onChanged, telegram }) {
   );
 }
 
-// ---------------------------------------------------------------------------
 // The view
-// ---------------------------------------------------------------------------
 
 export default function Accounts({ onMenu }) {
   const pool = useApi(() => api.pool(), [], { every: 30_000 });
   const liveX = useApi(() => api.status(), [], { every: 30_000 });
   // Same 30 s refresh as the others. Loaded once, the Instagram session rows
-  // went stale the moment an account signed in on this very page: the pool
-  // half of the card said "last success 1m ago" while the session half said
-  // "never signed in on this server" (seen live 2026-09-05, all three cards).
   const liveIg = useApi(() => api.igStatus(), [], { every: 30_000 });
   const liveFb = useApi(() => api.fbStatus(), [], { every: 30_000 });
   const conds = useApi(() => api.deciderConditions(), [], { every: 30_000 });
   const [adding, setAdding] = useState(null);   // null | {} | {platform,label,login}
 
-  // ?fix=<condition id> is what a Telegram ping links to; ?snooze=6 on the
-  // same link quiets it first. The snooze is applied once and the parameter
-  // dropped, so a reload does not snooze again.
+  // ?fix=<condition id> is what a Telegram ping links to; ?snooze=6 on the same link quiets it
+  // first.
   const [params, setParams] = useSearchParams();
   const focusId = params.get("fix") || "";
   useEffect(() => {
@@ -1115,11 +1023,6 @@ export default function Accounts({ onMenu }) {
       : p === "fb" ? fbLive() : [];
 
   // Match a managed account to its live session.
-  //
-  // Case- and @-insensitive, and it passes the WHOLE live record through rather
-  // than plucking two fields: the error, the checkpoint tombstone and last_used
-  // are exactly the details that explain a card with no green dot, and dropping
-  // them here is what left the panel unable to say why an account was quiet.
   const norm = (v) => String(v || "").trim().toLowerCase().replace(/^@/, "");
   const liveFor = (a) => {
     const label = norm(a.label), login = norm(a.login);

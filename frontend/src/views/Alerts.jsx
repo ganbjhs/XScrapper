@@ -1,7 +1,7 @@
 // Velocity alerts: "ping Telegram when this is moving faster than usual."
 // Rules are counts over collected posts — no AI, no sentiment.
 import React, { useState } from "react";
-import { api, fmtAgo, useApi } from "../api/client.js";
+import { api, fmtAgo, useApi, sortBy } from "../api/client.js";
 import { PageHead, useProject } from "../App.jsx";
 import { Empty, ErrorState, Loading, Modal } from "../components/ui.jsx";
 
@@ -110,7 +110,7 @@ export default function Alerts({ onMenu }) {
         </Empty>
       )}
 
-      {(data?.alerts || []).map((a) => (
+      {sortBy(data?.alerts || [], "watchlist_name").map((a) => (
         <div className="panel" key={a.alert_id}>
           <div className="phead">
             <h3>

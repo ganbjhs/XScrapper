@@ -1,13 +1,29 @@
-// One thin fetch layer. Every endpoint is same-origin (the Python server or
-// the Vite dev proxy), cookie-authed; a 401 means the session expired and the
-// only useful response is the login page.
+// One thin fetch layer: same-origin, cookie-authed; a 401 means the session
+// expired. Mutating calls raise a toast on success and failure.
+import { toast } from "../components/ui.jsx";
+
+const doneWord = (path) => {
+  if (/remove|delete|detach|purge/.test(path)) return "Removed";
+  if (/test/.test(path)) return "Test finished";
+  if (/create|attach|add|import|new/.test(path)) return "Added";
+  if (/fetch|reseed|backfill|control|run|start|stop/.test(path)) return "Done";
+  return "Saved";
+};
 
 async function request(path, opts = {}) {
-  const rep = await fetch(path, {
-    headers: opts.body ? { "Content-Type": "application/json" } : undefined,
-    ...opts,
-    body: opts.body ? JSON.stringify(opts.body) : undefined,
-  });
+  const { quiet = false, ...init } = opts;
+  const mutating = init.method && init.method !== "GET";
+  let rep;
+  try {
+    rep = await fetch(path, {
+      headers: init.body ? { "Content-Type": "application/json" } : undefined,
+      ...init,
+      body: init.body ? JSON.stringify(init.body) : undefined,
+    });
+  } catch (e) {
+    if (mutating && !quiet) toast.err("Network error — the server did not answer.");
+    throw e;
+  }
   if (rep.status === 401) {
     window.location.href = "/login";
     throw new Error("signed out");
@@ -16,12 +32,16 @@ async function request(path, opts = {}) {
   try {
     data = await rep.json();
   } catch {
+    if (mutating && !quiet) toast.err(`HTTP ${rep.status}: not JSON`);
     throw new Error(`HTTP ${rep.status}: not JSON`);
   }
-  if (!rep.ok) throw new Error(data.error || `HTTP ${rep.status}`);
-  // The API reports validation problems as {error} with HTTP 200; surface
-  // them the same way as transport errors so callers handle one shape.
-  if (data && typeof data === "object" && data.error) throw new Error(data.error);
+  // Validation problems come back as {error} with HTTP 200 — same shape as transport errors.
+  const err = !rep.ok ? (data.error || `HTTP ${rep.status}`) : (data && typeof data === "object" && data.error);
+  if (err) {
+    if (mutating && !quiet) toast.err(String(err));
+    throw new Error(err);
+  }
+  if (mutating && !quiet) toast.ok(doneWord(path));
   return data;
 }
 
@@ -65,8 +85,6 @@ export const api = {
   tweets: (p) => request(`/api/tweets${qs(p)}`),
   igPosts: (p) => request(`/api/ig/posts${qs(p)}`),
   // Instagram is project-scoped like Facebook: pass the selected project or the
-  // server returns no sources (server-side accounts still come back — a login
-  // belongs to the machine, not to a project).
   igStatus: (project) => request(`/api/ig/status${qs({ project })}`),
   igDiag: () => request("/api/ig/diag"),
   igAccount: (username, active) =>
@@ -85,8 +103,6 @@ export const api = {
   refreshXlistMembers: (list_id) =>
     request("/api/watchlist/xmembers/refresh", { method: "POST", body: { list_id, ack: true } }),
   // Stress test — find how many requests an account can pull before it's hot.
-  // stressAccounts lists platforms+accounts; the UI works for any future
-  // platform the server registers, no client change needed.
   stressAccounts: () => request("/api/stress/accounts"),
   stressRun: (body) => request("/api/stress/run", { method: "POST", body }),
   fbPosts: (p) => request(`/api/fb/posts${qs(p)}`),
@@ -134,9 +150,6 @@ export const api = {
     request("/api/pool/login", { method: "POST", body: { account_id } }),
   poolTotp: (account_id) => request(`/api/pool/totp${qs({ account_id })}`),
   // Session import / background sign-in. `user_agent` is the operator's OWN
-  // browser string, sent with a paste on purpose: the cookies were copied from
-  // that browser, and a session that then collects under a different
-  // user-agent is a fingerprint that has never been associated with it.
   poolSignin: (body) =>
     request("/api/pool/signin", { method: "POST",
                                   body: { ...body, user_agent: navigator.userAgent } }),
@@ -177,8 +190,6 @@ export const api = {
   removeWatchlist: (watchlist_id, project) =>
     request("/api/watchlists/remove", { method: "POST", body: { watchlist_id, project } }),
   // Shared watchlists — one list used by several projects. The library is
-  // every list across projects (with `attached` marked for this one);
-  // attach/detach link or unlink without copying or re-fetching anything.
   watchlistLibrary: (project) => request(`/api/watchlists/library${qs({ project })}`),
   attachWatchlist: (project, watchlist_id) =>
     request("/api/watchlists/attach", { method: "POST", body: { project, watchlist_id } }),
@@ -193,9 +204,6 @@ export const api = {
   watchlistBackfill: (watchlist_id, pages) =>
     request("/api/watchlists/backfill", { method: "POST", body: { watchlist_id, pages } }),
   // The standing backwards sweep: on/off plus its cadence. Separate call from
-  // the one-shot grant above because they are different promises — a quantity
-  // versus a rhythm — and collapsing them into one argument made the caller
-  // guess which it had asked for.
   watchlistBackfillAuto: (watchlist_id, auto, every_s) =>
     request("/api/watchlists/backfill",
             { method: "POST", body: { watchlist_id, auto, every_s } }),
@@ -220,7 +228,7 @@ export const api = {
   linksInterval: (watchlist_id, refresh) =>
     request("/api/watchlists/links/interval", { method: "POST", body: { watchlist_id, refresh } }),
 
-  streamSettings: (body) => request("/api/stream/settings", { method: "POST", body }),
+  streamSettings: (body, opts) => request("/api/stream/settings", { method: "POST", body, ...opts }),
 
   collections: (project) => request(`/api/collections${qs({ project })}`),
   createCollection: (project, name) =>
@@ -232,8 +240,6 @@ export const api = {
   collectionItems: (id) => request(`/api/collections/items${qs({ id })}`),
 
   // Content labelling. `add`/`remove` on collectionPin still accept bare X
-  // tweet ids; a board can hold three platforms now, so they also accept
-  // { platform, post_id }.
   labelStatus: (project) => request(`/api/labels/status${qs({ project })}`),
   labelCategories: (project) => request(`/api/labels/categories${qs({ project })}`),
   saveLabelCategory: (project, cat) =>
@@ -259,7 +265,7 @@ import { useCallback, useEffect, useRef, useState } from "react";
 export function useApi(fn, deps = [], { every = 0 } = {}) {
   const [state, set] = useState({ data: null, error: null, loading: true });
   const alive = useRef(true);
-  useEffect(() => () => { alive.current = false; }, []);
+  useEffect(() => { alive.current = true; return () => { alive.current = false; }; }, []);
 
   const load = useCallback(async (soft = false) => {
     if (!soft) set((s) => ({ ...s, loading: true, error: null }));
@@ -281,6 +287,11 @@ export function useApi(fn, deps = [], { every = 0 } = {}) {
 
   return { ...state, reload: load };
 }
+
+// One ordering for every list the UI shows: A→Z, numbers in natural order, case-insensitive.
+export const byName = (key = "name") => (a, b) =>
+  String(a?.[key] ?? "").localeCompare(String(b?.[key] ?? ""), undefined, { numeric: true, sensitivity: "base" });
+export const sortBy = (arr, key = "name") => [...(arr || [])].sort(byName(key));
 
 export const fmtN = (n) => (n == null ? "—" : Number(n).toLocaleString("en-IN"));
 
@@ -305,21 +316,7 @@ export const fmtAgo = (iso) => {
 // Beyond this, "how long ago" stops being the useful answer.
 const AGO_LIMIT_DAYS = 30;
 
-/**
- * When a post was PUBLISHED, for a human reading a feed.
- *
- * Relative up to a month ("3h ago", "12d ago"), then the actual date. The
- * cutover exists because the two questions are different: for something from
- * this week "how fresh is it" is what you want, but "97d ago" answers nothing
- * — nobody counts backwards from today to find July, and a feed showing a
- * month of history turns into a column of three-digit day counts you have to
- * do arithmetic on.
- *
- * Deliberately NOT folded into fmtAgo. That one measures OUR freshness —
- * when we last collected, last delivered, last polled — where a big number is
- * itself the alarm and a date would hide it. This measures someone else's
- * timeline.
- */
+// When a post was PUBLISHED, for a human reading a feed.
 export const fmtPosted = (iso) => {
   const t = typeof iso === "number" ? iso : Date.parse(iso);
   if (!t) return "—";

@@ -1,7 +1,7 @@
 // The "+ Collection" picker: pin one post into a board, or make the board
 // right there. Small on purpose — pinning must cost one click, not a form.
 import React, { useState } from "react";
-import { api, useApi } from "../api/client.js";
+import { api, useApi, sortBy } from "../api/client.js";
 import { Modal } from "./ui.jsx";
 
 export default function CollectionPicker({ t, pid, onClose }) {
@@ -45,7 +45,7 @@ export default function CollectionPicker({ t, pid, onClose }) {
       ) : (
         <>
           <div style={{ margin: "12px 0 4px" }}>
-            {(data?.collections || []).map((c) => (
+            {sortBy(data?.collections || []).map((c) => (
               <button key={c.collection_id} className="btn btn-ghost btn-sm"
                       style={{ margin: "0 6px 8px 0" }}
                       onClick={() => pin(c.collection_id, c.name)}>

@@ -1,6 +1,5 @@
-// Small shared pieces: states, modal, icons. Everything renders honest
-// loading / empty / error rather than a blank area.
-import React, { useEffect } from "react";
+// Shared pieces: states, modal, toasts, icons.
+import React, { useEffect, useLayoutEffect, useRef, useState } from "react";
 import { createPortal } from "react-dom";
 
 export function Loading({ label = "Loading…" }) {
@@ -35,25 +34,9 @@ export function Empty({ title, children }) {
   );
 }
 
-// An overlay is rendered THROUGH A PORTAL to <body>, never in place.
-//
-// z-index only ranks siblings inside the same stacking context, and the modal
-// is usually mounted deep inside whatever component opened it. `nav.side` is
-// `position: sticky`, and a sticky element ALWAYS creates a stacking context
-// even with `z-index: auto` — so the "New project" modal, which lives inside
-// the project switcher in the navbar, had its `z-index: 50` scoped to the
-// inside of the navbar. `main.content` comes after the navbar in the DOM, so
-// every positioned descendant of the feed painted over it: the post media
-// thumbnails (`.thumb` is `position: relative`) sat on top of the dialog and
-// its scrim, un-dimmed, covering the name field (2026-08-25).
-//
-// Raising the z-index would not have fixed it — no value inside a trapped
-// context can beat a sibling of the context itself. The portal is the fix:
-// mounted on <body>, the overlay has no ancestor to be trapped by, and it
-// keeps working wherever a future caller happens to mount it. React events
-// still bubble through the portal to the React parent, so callers are
-// unchanged.
-export function Modal({ title, sub, onClose, children }) {
+// Rendered through a portal to <body>: the sticky navbar creates its own
+// stacking context, so an overlay mounted inside it could never cover main.
+export function Modal({ title, sub, onClose, children, wide = false }) {
   useEffect(() => {
     const h = (e) => e.key === "Escape" && onClose();
     addEventListener("keydown", h);
@@ -61,18 +44,145 @@ export function Modal({ title, sub, onClose, children }) {
   }, [onClose]);
   return createPortal(
     <div className="modal-back" onMouseDown={(e) => e.target === e.currentTarget && onClose()}>
-      <div className="modal" role="dialog" aria-modal="true" aria-label={title}>
+      <div className="modal" role="dialog" aria-modal="true" aria-label={title}
+           style={wide ? { width: "min(94vw, 620px)" } : undefined}>
         <h3>{title}</h3>
         {sub && <div className="sub">{sub}</div>}
-        {children}
+        <AutoHeight>{children}</AutoHeight>
       </div>
     </div>,
     document.body,
   );
 }
 
+// Animates its own height whenever the content inside changes size, so a form
+// that swaps fields glides instead of snapping.
+export function AutoHeight({ children, className = "" }) {
+  const inner = useRef(null);
+  const [h, setH] = useState(null);
+  useLayoutEffect(() => {
+    const el = inner.current;
+    if (!el || typeof ResizeObserver === "undefined") return;
+    const ro = new ResizeObserver(() => setH(el.offsetHeight));
+    ro.observe(el);
+    setH(el.offsetHeight);
+    return () => ro.disconnect();
+  }, []);
+  return (
+    <div className={`autoh ${className}`} style={h == null ? undefined : { height: h }}>
+      <div ref={inner}>{children}</div>
+    </div>
+  );
+}
+
+// Segmented control: one visible choice per option, no dropdown.
+export function Segmented({ value, options, onChange, className = "" }) {
+  return (
+    <div className={`seg ${className}`} role="radiogroup">
+      {options.map(([v, label, tip]) => (
+        <button key={v} type="button" role="radio" aria-checked={String(v) === String(value)}
+                className={String(v) === String(value) ? "on" : ""} title={tip}
+                onClick={() => onChange(v)}>
+          {label}
+        </button>
+      ))}
+    </div>
+  );
+}
+
+/* ---------------- toasts ---------------- */
+const listeners = new Set();
+let seq = 0;
+
+// toast("Saved") · toast.ok("Added") · toast.err("Failed: …") · toast.warn("…")
+export function toast(message, { kind = "info", title = "", ms = 3800 } = {}) {
+  const t = { id: ++seq, message: String(message), kind, title, ms };
+  listeners.forEach((l) => l(t));
+  return t.id;
+}
+toast.ok = (m, o) => toast(m, { ...o, kind: "ok" });
+toast.err = (m, o) => toast(m, { ...o, kind: "err", ms: 6000 });
+toast.warn = (m, o) => toast(m, { ...o, kind: "warn", ms: 5000 });
+
+const GLYPH = { info: "i", ok: "✓", err: "!", warn: "!" };
+
+export function ToastHost() {
+  const [items, setItems] = useState([]);
+  useEffect(() => {
+    const add = (t) => {
+      setItems((xs) => [...xs.slice(-4), t]);
+      setTimeout(() => dismiss(t.id), t.ms);
+    };
+    listeners.add(add);
+    return () => listeners.delete(add);
+  }, []);
+  const dismiss = (id) => {
+    setItems((xs) => xs.map((x) => (x.id === id ? { ...x, out: true } : x)));
+    setTimeout(() => setItems((xs) => xs.filter((x) => x.id !== id)), 200);
+  };
+  if (!items.length) return null;
+  return createPortal(
+    <div className="toasts" aria-live="polite">
+      {items.map((t) => (
+        <div key={t.id} className={`toast ${t.kind}${t.out ? " out" : ""}`} role="status">
+          <span className="ticon" aria-hidden="true">{GLYPH[t.kind]}</span>
+          <div className="tmsg">
+            {t.title && <b>{t.title}</b>}
+            {t.message}
+          </div>
+          <button className="tx" onClick={() => dismiss(t.id)} aria-label="Dismiss">×</button>
+        </div>
+      ))}
+    </div>,
+    document.body,
+  );
+}
+
+/* ---------------- keyboard shortcuts help ---------------- */
+export const SHORTCUTS = [
+  { h: "Navigate (press g, then a key)" },
+  { k: ["g", "f"], d: "Live Feed" },
+  { k: ["g", "w"], d: "Watchlists" },
+  { k: ["g", "s"], d: "Search" },
+  { k: ["g", "c"], d: "Collections" },
+  { k: ["g", "a"], d: "Alerts" },
+  { k: ["g", "d"], d: "Delivery" },
+  { k: ["g", "l"], d: "Activity Log" },
+  { k: ["g", "u"], d: "Accounts & Sessions" },
+  { k: ["g", "g"], d: "Guard" },
+  { k: ["g", "t"], d: "Settings" },
+  { h: "General" },
+  { k: ["/"], d: "Focus the first search / filter box" },
+  { k: ["["], d: "Collapse or expand the sidebar" },
+  { k: ["\\"], d: "Cycle theme (system → light → dark)" },
+  { k: ["?"], d: "Show this help" },
+  { k: ["Esc"], d: "Close dialogs" },
+];
+
+export function ShortcutsModal({ onClose }) {
+  return (
+    <Modal title="Keyboard shortcuts" sub="Shortcuts are ignored while you type in a field." onClose={onClose}>
+      <div className="kbd-list">
+        {SHORTCUTS.map((s, i) =>
+          s.h ? (
+            <div key={i} className="kh">{s.h}</div>
+          ) : (
+            <React.Fragment key={i}>
+              <span>{s.d}</span>
+              <span className="keys">{s.k.map((k) => <kbd key={k}>{k}</kbd>)}</span>
+            </React.Fragment>
+          ),
+        )}
+      </div>
+      <div className="row">
+        <button className="btn btn-ghost" onClick={onClose}>Close</button>
+      </div>
+    </Modal>
+  );
+}
+
 const I = (d, extra = null) => (
-  <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" aria-hidden="true">
+  <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
     <path d={d} />
     {extra}
   </svg>
@@ -92,4 +202,84 @@ export const icons = {
   stress: I("M13 2L4 14h7l-1 8 9-12h-7z"),
   settings: I("M12 15.5a3.5 3.5 0 100-7 3.5 3.5 0 000 7M19.4 15a1.7 1.7 0 00.3 1.9l.1.1a2 2 0 11-2.8 2.8l-.1-.1a1.7 1.7 0 00-1.9-.3 1.7 1.7 0 00-1 1.5V21a2 2 0 11-4 0v-.1a1.7 1.7 0 00-1.1-1.6 1.7 1.7 0 00-1.9.4l-.1.1a2 2 0 11-2.8-2.8l.1-.1a1.7 1.7 0 00.3-1.9 1.7 1.7 0 00-1.5-1H3a2 2 0 110-4h.1a1.7 1.7 0 001.6-1.1 1.7 1.7 0 00-.4-1.9l-.1-.1a2 2 0 112.8-2.8l.1.1a1.7 1.7 0 001.9.3H11a1.7 1.7 0 001-1.5V3a2 2 0 114 0v.1a1.7 1.7 0 001 1.5 1.7 1.7 0 001.9-.3l.1-.1a2 2 0 112.8 2.8l-.1.1a1.7 1.7 0 00-.3 1.9V11a1.7 1.7 0 001.5 1H21a2 2 0 110 4h-.1a1.7 1.7 0 00-1.5 1z"),
   menu: I("M4 6h16M4 12h16M4 18h16"),
+  chevron: I("M6 9l6 6 6-6"),
+  collapse: I("M15 6l-6 6 6 6"),
+  sun: I("M12 3v2M12 19v2M4.2 4.2l1.4 1.4M18.4 18.4l1.4 1.4M3 12h2M19 12h2M4.2 19.8l1.4-1.4M18.4 5.6l1.4-1.4", <circle cx="12" cy="12" r="4" />),
+  moon: I("M21 12.8A9 9 0 1111.2 3a7 7 0 009.8 9.8z"),
+  auto: I("M12 3a9 9 0 100 18 9 9 0 000-18zm0 0v18", <path d="M12 3a9 9 0 010 18z" fill="currentColor" stroke="none" />),
+  keyboard: I("M6 10h.01M10 10h.01M14 10h.01M18 10h.01M8 14h8", <rect x="2" y="6" width="20" height="12" rx="2" />),
+  logout: I("M15 17l5-5-5-5M20 12H9M13 21H5a2 2 0 01-2-2V5a2 2 0 012-2h8"),
+  edit: I("M12 20h9M16.5 3.5a2.1 2.1 0 013 3L7 19l-4 1 1-4z"),
+  back: I("M15 18l-6-6 6-6"),
+  info: I("M12 16v-4M12 8h.01", <circle cx="12" cy="12" r="9" />),
+  more: I("M4 6h16M4 12h16M4 18h16"),
+  x: I("M18 6L6 18M6 6l12 12"),
 };
+
+// Small ⓘ that explains on hover or focus — the paragraph lives in a tooltip
+// rendered through a portal, so no scrolling box can clip it.
+export function Hint({ text }) {
+  const ref = useRef(null);
+  const [pos, setPos] = useState(null);
+  const show = () => {
+    const r = ref.current?.getBoundingClientRect();
+    if (!r) return;
+    const below = r.bottom + 8 + 120 < innerHeight;
+    setPos({ x: Math.min(Math.max(164, r.left + r.width / 2), innerWidth - 164), y: below ? r.bottom + 8 : r.top - 8, below });
+  };
+  const hide = () => setPos(null);
+  return (
+    <>
+      <span ref={ref} className="hint-i" tabIndex={0} role="img" aria-label={text}
+            onMouseEnter={show} onMouseLeave={hide} onFocus={show} onBlur={hide}>
+        {icons.info}
+      </span>
+      {pos && createPortal(
+        <div className={`tipbox ${pos.below ? "below" : "above"}`} role="tooltip"
+             style={{ left: pos.x, top: pos.y }}>{text}</div>,
+        document.body,
+      )}
+    </>
+  );
+}
+
+// A labelled block inside a detail panel: label + optional hint on the left,
+// optional controls on the right, content below. Keeps every panel the same shape.
+export function Sec({ label, hint, right, children, className = "" }) {
+  return (
+    <section className={`sec ${className}`}>
+      <div className="sec-h">
+        <span className="sec-l">{label}{hint && <Hint text={hint} />}</span>
+        {right && <span className="sec-r">{right}</span>}
+      </div>
+      {children}
+    </section>
+  );
+}
+
+// A dropdown that looks like a solid pill: label + current value + caret,
+// with the native <select> stretched invisibly over it (see .fpill-block).
+export function PillSelect({ label, value, options, onChange, disabled, title, className = "" }) {
+  const cur = options.find(([v]) => String(v) === String(value ?? ""));
+  return (
+    <label className={`fpill fpill-block ${className}`} title={title}>
+      <span>{label}</span>
+      <span className="fpill-val">{cur ? cur[1] : String(value ?? "")}</span>
+      <svg className="fpill-caret" viewBox="0 0 24 24" aria-hidden="true"><path d="M6 9l6 6 6-6" /></svg>
+      <select value={value ?? ""} disabled={disabled} onChange={(e) => onChange(e.target.value)} aria-label={label}>
+        {options.map(([v, t]) => <option key={v} value={v}>{t}</option>)}
+      </select>
+    </label>
+  );
+}
+
+export function useMediaQuery(q) {
+  const [m, setM] = useState(() => typeof matchMedia !== "undefined" && matchMedia(q).matches);
+  useEffect(() => {
+    const mq = matchMedia(q);
+    const h = () => setM(mq.matches);
+    mq.addEventListener("change", h);
+    return () => mq.removeEventListener("change", h);
+  }, [q]);
+  return m;
+}

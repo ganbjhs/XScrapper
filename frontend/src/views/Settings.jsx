@@ -1,29 +1,10 @@
 // Settings — where the ADMIN knobs live, so that the working surfaces
-// (Accounts, Watchlists, Live Feed) can be about the work.
-//
-// WHY THIS VIEW EXISTS (2026-09-12). The pager lived on /app/accounts as a
-// full-width amber banner, permanently, because "amber unless a dedicated
-// admin bot is configured" is its resting state. So the first thing on the
-// page that exists to answer "are my accounts healthy?" was a warning about
-// something that is not an account and was not broken. Configuration that is
-// set once every few months does not belong above the thing you read daily.
-//
-// What belongs here: anything global, set rarely, and owned by the operator
-// rather than by a project. What does NOT: per-project wiring (that is
-// Watchlists -> Network & settings) and anything that reports on the work
-// itself (Guard, Activity Log).
 import React, { useState } from "react";
 import { api, useApi } from "../api/client.js";
 import { PageHead } from "../App.jsx";
 import { ErrorState, Loading } from "../components/ui.jsx";
 
-// ---------------------------------------------------------------------------
 // The pager — which bot pages the admin, to which chat
-// ---------------------------------------------------------------------------
-//
-// Moved verbatim from Accounts.jsx, with one change: it is a PANEL, not a
-// banner. A banner says "something is wrong right now"; this says "here is
-// how paging is configured", which is a different sentence.
 function Pager({ pager, onChanged }) {
   const [open, setOpen] = useState(false);
   const [token, setToken] = useState("");
@@ -104,9 +85,7 @@ function Pager({ pager, onChanged }) {
   );
 }
 
-// ---------------------------------------------------------------------------
 // Secret storage
-// ---------------------------------------------------------------------------
 function Secrets({ pool }) {
   if (!pool) return null;
   const ok = !!pool.cipher_ready;
@@ -133,13 +112,7 @@ function Secrets({ pool }) {
   );
 }
 
-// ---------------------------------------------------------------------------
 // System — what the server is actually running
-// ---------------------------------------------------------------------------
-//
-// /api/ig/diag has existed since 2026-09-04 and had no UI at all: the only way
-// to read it was curl. It is exactly what you want when the dashboard looks
-// fine and collection is not happening.
 function System({ diag, reload }) {
   if (!diag) return null;
   const svc = diag.services || {};

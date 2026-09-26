@@ -1,6 +1,4 @@
 // The main screen: incoming posts for this project, stat strip, and the
-// pipe-health column (delivery, chart, watchlists). Polls every 10s and
-// batches new arrivals behind a "N new posts" pill so the list never jumps.
 import React, { useEffect, useMemo, useState } from "react";
 import { api, fmtAgo, fmtLag, fmtN, useApi } from "../api/client.js";
 import { PageHead, useProject } from "../App.jsx";
@@ -40,24 +38,7 @@ const DUR_LABEL = { "1h": "Last 1 hour", "6h": "Last 6 hours", "12h": "Last 12 h
                     "24h": "Last 24 hours", "48h": "Last 48 hours",
                     "7d": "Last 7 days", "30d": "Last 30 days", all: "All time" };
 
-// ---------------------------------------------------------------------------
 // Filter memory.
-//
-// The Live Feed is a route, so leaving it for Watchlists (or anywhere else)
-// UNMOUNTS this component and every useState in it goes back to its default.
-// Somebody who set Source=X, Last 7 days and stepped away to check a watchlist
-// came back to the default screen and had to set it all again. So the filter
-// set is kept in localStorage — the same place App.jsx already keeps the
-// selected project.
-//
-// Keyed BY PROJECT, because Category is project-specific vocabulary: a label
-// saved under one project does not exist in the next one, and restoring it
-// there would show an empty feed with no obvious reason why.
-//
-// Everything read back is validated against the options that actually exist.
-// A stored value from an older build (a duration that was renamed, a platform
-// that was removed) falls back to the default instead of wedging the feed on a
-// filter the UI can no longer clear.
 const FLT_KEY = "collector.feed.filters";
 const DEFAULT_FLT = { source: "all", sort: "latest", dur: "24h", label: "all" };
 const FLT_SOURCES = new Set(["all", "x", "instagram", "facebook"]);
@@ -74,8 +55,6 @@ function readFilters(pid) {
       sort: FLT_SORTS.has(saved.sort) ? saved.sort : DEFAULT_FLT.sort,
       dur: has(DUR_LABEL, saved.dur) ? saved.dur : DEFAULT_FLT.dur,
       // Categories are created and deleted by the operator, so there is no
-      // fixed list to check against here; the Category pill falls back to
-      // "All" on its own when the stored key is no longer offered.
       label: typeof saved.label === "string" && saved.label
         ? saved.label : DEFAULT_FLT.label,
     };
@@ -97,10 +76,6 @@ function writeFilters(pid, flt) {
 }
 
 // The whole pill is the control: the transparent <select> is stretched over
-// the entire block, so a click anywhere on it — the "Source:" label, the
-// current value, the padding — opens the menu. The visible text is drawn by
-// us; the real select stays in the tab order and keeps native keyboard
-// behaviour and the native dropdown on every platform.
 function Pill({ label, value, onChange, options }) {
   const current = options.find(([v]) => v === value);
   return (
@@ -124,10 +99,6 @@ export default function LiveFeed({ onMenu }) {
   const { project, projectsError } = useProject();
   const pid = project?.project_id;
   // The filter set travels with the project it belongs to, so switching
-  // projects swaps filters instead of carrying one project's Category into
-  // another. Adjusted DURING RENDER rather than in an effect: this way the
-  // very first render after a project switch already holds that project's
-  // filters, and the fetch hooks below never fire once with the wrong ones.
   const [fstate, setFState] = useState(() => ({ pid: pid ?? null,
                                                 flt: readFilters(pid) }));
   if (pid && fstate.pid !== pid) setFState({ pid, flt: readFilters(pid) });
@@ -144,8 +115,6 @@ export default function LiveFeed({ onMenu }) {
   const delivery = useApi(() => api.delivery(pid), [pid], { every: 15_000 });
   const wls = useApi(() => (pid ? api.watchlists(pid) : Promise.resolve({ watchlists: [] })), [pid]);
   // Labelling state: how many posts are waiting, the project's vocabulary, and
-  // whether the server even has a key. Polled slowly — none of it moves unless
-  // somebody presses Classify.
   const labels = useApi(
     () => (pid ? api.labelStatus(pid) : Promise.resolve(null)), [pid],
     { every: 60_000 });
@@ -209,8 +178,6 @@ export default function LiveFeed({ onMenu }) {
     setFetching(true);
     setFetchMsg("");
     // Facebook runs a headless browser and takes ~a minute, so kick it off in
-    // the BACKGROUND — don't make the fast X refresh wait on it. When it lands,
-    // reload the feed and note how many Facebook posts arrived.
     api.fbFetch(pid)
       .then((fr) => {
         if (fr && fr.new > 0) {
@@ -247,10 +214,6 @@ export default function LiveFeed({ onMenu }) {
     }
   };
   // Classify = send EVERY unlabelled post in this project to Grok, once, on
-  // purpose. It spends money, so it is a button and never a timer. The run
-  // happens in the background now — the same hook the Collections strip uses
-  // owns the button, the progress and the message, so the two screens cannot
-  // disagree about what is going on.
   const classify = useClassifyButton({ pid, labels });
   const run = useLabelRun(labels, () => {
     // A run just ended: the feed is holding posts whose labels have changed
@@ -287,9 +250,6 @@ export default function LiveFeed({ onMenu }) {
   }, [pid]);
 
   // Batch new arrivals: the visible list only advances when the pill is
-  // clicked, so reading is never interrupted by a reflow. When nothing is on
-  // screen yet (first load, project switch, empty feed) there is nothing to
-  // interrupt — reveal immediately.
   const [shownIds, setShownIds] = useState(null);
   const feedRows = feed.data?.rows;
   const latest = useMemo(() => {
@@ -304,19 +264,12 @@ export default function LiveFeed({ onMenu }) {
   }, [pushed, feedRows]);
   const keyOf = (t) => `${t.platform}:${t.tweet_id}`;
   // The filter bar applies to everything on screen — fetched backlog and
-  // stream-pushed posts alike (the server pre-filters the backlog; this
-  // repeats the rule locally so live arrivals obey it too).
   const filtered = useMemo(() => {
     const cutoff = flt.dur !== "all" ? Date.now() - DUR_MS[flt.dur] : 0;
     // Some sources (Facebook) don't expose an exact post time, so created_at is
-    // null. Fall back to collected time for the window test, and if even that
-    // won't parse, keep the post rather than silently hiding it — a just-
-    // collected post must never vanish from a recent-window view.
     const inWindow = (t) => {
       if (!cutoff) return true;
       // Show if the post OR its collection falls in the window. Facebook posts
-      // can carry an older original time but were just collected — those must
-      // not vanish from a recent view. If neither timestamp parses, keep it.
       const c = Date.parse(t.created_at || "");
       const g = Date.parse(t.collected_at || "");
       if (!Number.isNaN(c) && c >= cutoff) return true;
@@ -329,8 +282,6 @@ export default function LiveFeed({ onMenu }) {
           || (flt.label === "none" ? !t.label : t.label === flt.label))
       && inWindow(t));
     // Latest/Oldest order by the post's OWN time, not collection time — a 2024
-    // post collected five minutes ago must not outrank a 2025 post. Facebook
-    // sometimes has no exact post time, so fall back to collected time there.
     const postTime = (t) => {
       const c = Date.parse(t.created_at || "");
       if (!Number.isNaN(c)) return c;
@@ -373,19 +324,6 @@ export default function LiveFeed({ onMenu }) {
     status.reload(true);
   };
   // Every term from this project's KEYWORD watchlists, so the feed can
-  // underline where each keyword-search hit actually matched.
-  //
-  // A rule is X search syntax, not a word, so it has to be TOKENISED rather
-  // than split on one operator. Splitting on AND alone (what this used to do)
-  // left "a OR b" as the single literal term `a OR b`, which no post can
-  // contain — so every OR rule, and every rule carrying an operator or an
-  // internal quote, highlighted nothing at all while a bare word worked. That
-  // looked like "highlighting works on some posts but not others".
-  //
-  // Quotes bind first so a phrase stays one term; AND/OR/NOT are joins, not
-  // content; a -negation is what must NOT be there, so highlighting it would
-  // point at the opposite of a match; and from:/lang:/filter: style operators
-  // are syntax. #tags and @mentions ARE content and stay.
   const keywordTerms = useMemo(() => {
     const set = new Set();
     for (const w of wls.data?.watchlists || []) {

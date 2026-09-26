@@ -1,10 +1,4 @@
 // The activity view, two lenses on "what is the collector doing":
-//   * Polls — the structured X poll history (what it fetched, what it cost).
-//   * Account log — the RAW line-by-line log the FB/IG collectors and engines
-//     write while acting as the burner accounts: session reuse, login
-//     attempts, logged-out walls, fetches, avatar captures, errors. This is
-//     the eye-on-the-accounts view: if a login is failing, it says so here in
-//     the engine's own words.
 import React, { useState } from "react";
 import { api, fmtAgo, fmtLag, useApi } from "../api/client.js";
 import { PageHead } from "../App.jsx";
@@ -25,8 +19,6 @@ const PLATFORMS = [
   ["instagram", "Instagram"],
   ["x", "X"],
   // Classify runs log here too: what they sent, what they cost, why they
-  // stopped. A run whose log lives only in the response of the click that
-  // started it is a run nobody can look up afterwards.
   ["classify", "Labelling"],
 ];
 

@@ -1,6 +1,4 @@
 // One collected post — X, Instagram or Facebook — with the Collector's own
-// chrome: platform badge, lag badge, content label, watchlist attribution,
-// media thumbnails.
 import React from "react";
 import { fmtAgo, fmtLag, fmtN, fmtPosted } from "../api/client.js";
 
@@ -11,23 +9,7 @@ const pfpColor = (s) => {
   return PFP_COLORS[h % PFP_COLORS.length];
 };
 
-// ---------------------------------------------------------------------------
 // Facebook media: why it is a frame, and how we know before we ask
-//
-// Facebook SIGNS every fbcdn image URL and writes the expiry into the URL
-// itself — `oe=<hex epoch>`, about a week out. Past that moment the identical
-// URL answers "URL signature expired", which is why saved Facebook posts here
-// showed empty media boxes: the link in the database had died. No <img>, no
-// proxy and no cache-buster can revive it — only Facebook can mint a new one.
-//
-// We store no bytes, so the durable thing we hold is the PERMALINK. Facebook's
-// own post embed renders that permalink live and mints fresh image URLs on
-// every view, so an expired post is shown by framing the post itself.
-//
-// Reading `oe` (rather than waiting for onError) is what keeps this quiet: the
-// expiry is IN the link, so we know a thumbnail is dead before we request it
-// and the operator never sees a broken image flash. onError stays as the
-// backstop for links that die for some other reason.
 const fbExpiryMs = (u) => {
   const m = /[?&]oe=([0-9A-Fa-f]+)/.exec(String(u || ""));
   if (!m) return null;
@@ -41,8 +23,6 @@ const fbLinkDead = (u) => {
   return exp == null ? false : exp < Date.now();
 };
 // The stored permalink carries Facebook's click-tracking payload
-// (__cft__[0]=..., __tn__=...). The embed plugin wants the bare post URL; the
-// story/video ids are the only query keys that identify the post.
 const fbEmbedHref = (u) => {
   try {
     const url = new URL(u);
@@ -64,8 +44,6 @@ const fbEmbedSrc = (u) =>
   `&show_text=false&width=${FB_EMBED_W}`;
 
 // One framed post. Deliberately lazy: a feed page holds many cards and each
-// frame is a real Facebook page load, so a frame is only mounted once its slot
-// is near the viewport. Cards the operator never scrolls to cost nothing.
 function FbEmbed({ url, tall }) {
   const slot = React.useRef(null);
   const [show, setShow] = React.useState(false);
@@ -119,14 +97,9 @@ function Media({ media, onDead }) {
 }
 
 // Highlight any matched keyword terms inside a plain-text run. Split on the
-// terms (one capturing group, so matches land on odd indices) and wrap those
-// in <mark> — underlined + tinted via .kw in styles.css, so a keyword-search
-// hit is verifiable at a glance.
 function highlightTerms(text, terms, keyBase) {
   if (!terms || terms.length === 0) return text;
   // Longest first: regex alternation takes the first branch that matches at a
-  // position, so with ["Devendra", "Devendra Fadnavis"] the phrase could never
-  // win — half of it would highlight and the rest would look unmatched.
   const esc = [...new Set(terms)]
     .sort((a, b) => String(b).length - String(a).length)
     .map((t) => String(t).trim().replace(/[.*+?^${}()|[\]\\]/g, "\\$&"))
@@ -169,8 +142,6 @@ function Pfp({ t, name }) {
 }
 
 // The content label, as a chip. `cats` is the project's vocabulary so the chip
-// can show the human name; without it the key is shown, which is ugly but true
-// — better than an empty chip while the vocabulary is still loading.
 function LabelChip({ t, cats }) {
   if (!t.label) return null;
   const cat = (cats || []).find((c) => c.key === t.label);

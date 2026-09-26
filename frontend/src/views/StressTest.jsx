@@ -1,10 +1,4 @@
 // Stress Test — deliberately push ONE account with back-to-back requests to
-// see how many posts it pulls before it goes "hot" (rate-limited / challenged),
-// with a per-request latency (hotness) graph.
-//
-// Extensible by design: the platform list and per-platform accounts come from
-// the server (/api/stress/accounts). Add a platform in stress.py and it shows
-// up here automatically — no change to this file.
 import React, { useEffect, useMemo, useState } from "react";
 import { api, useApi, fmtN, fmtLag } from "../api/client.js";
 import { PageHead } from "../App.jsx";
@@ -14,8 +8,6 @@ const LABEL = { x: "X / Twitter", ig: "Instagram", fb: "Facebook" };
 const platName = (p) => LABEL[p] || p.toUpperCase();
 
 // A small dependency-free line chart of per-request latency. Hot requests are
-// drawn red; the point where the account went hot gets a marker. This is the
-// "hotness rises as we keep fetching" picture the user asked for.
 function HotnessChart({ steps }) {
   const W = 640, H = 220, PL = 44, PR = 12, PT = 16, PB = 28;
   const iw = W - PL - PR, ih = H - PT - PB;
