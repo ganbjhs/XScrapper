@@ -298,7 +298,8 @@ export function WtBadge({ consumers, project, compact = false }) {
   const row = wtStatus(consumers, project?.project_id);
   const ref = useRef(null);
   const [pos, setPos] = useState(null);
-  if (!row) return null;
+  // Listed-only projects (Watch-Tower shows them but is not bound) get no badge.
+  if (!row || !row.mirrored) return null;
   const plats = WT_PLATFORMS.filter(([k]) => row.platforms?.[k]);
   const live = row.live;
   const show = () => {
@@ -317,14 +318,14 @@ export function WtBadge({ consumers, project, compact = false }) {
       </span>
       {pos && createPortal(
         <div className="tipbox below wt-tip" style={{ left: pos.x, top: pos.y }}>
-          <b>{project.name}</b> — {live ? "live with Watch-Tower" : `Watch-Tower idle · last pull ${ago(row.last_ms)}`}
+          <b>{project.name}</b> — {live ? "bound · Watch-Tower is mirroring it now" : `bound · last mirror pull ${ago(row.last_ms)}`}
           <div className="wt-rows">
             {plats.map(([k, glyph, name]) => (
               <span key={k} className={row.platforms[k].live ? "on" : ""}>
                 <i className="dot" /> {name} · {ago(row.platforms[k].last_ms)}
               </span>
             ))}
-            {row.platforms?.telemetry && <span><i className="dot" /> telemetry · {ago(row.platforms.telemetry.last_ms)}</span>}
+
           </div>
         </div>,
         document.body,

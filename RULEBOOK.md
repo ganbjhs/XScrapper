@@ -842,7 +842,10 @@ session got opened on a live account (§6, "never signed in twice").
   allowlist server-side, not by the caller being polite. Keys are compared in
   constant time.
 - **Every API-key GET that names a project is stamped in `consumers.py`
-  (project, platform, last seen) — observational only.** It changes no
+  (project, platform, last seen) — observational only.** A project counts as
+  **mirrored** only through a CURSORED post pull (`since_collected_ms` /
+  `since_id` / `cursor`); Watch-Tower lists every project on its Collector
+  page whether bound or not, so plain listing reads must never light one up. It changes no
   response and adds nothing to any key allowlist; `/api/consumers` is
   dashboard-only. It exists so the operator can see which project Watch-Tower
   is actually pulling ("live" = a pull within 15 min) and which is idle or a

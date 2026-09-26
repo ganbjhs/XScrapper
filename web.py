@@ -6585,10 +6585,11 @@ class Handler(BaseHTTPRequestHandler):
                 return self._serve_fb_media(u.path)
             if not self._require_auth():
                 return
-            # Observational only: which project/platform a machine key is
-            # pulling, so the dashboard can say who is live with Watch-Tower.
+            # Observational only: which project a machine key MIRRORS (a
+            # cursored post pull) vs merely lists, so the dashboard can say
+            # who is bound to Watch-Tower.
             if self._via_api_key and q.get("project"):
-                consumers.record(q.get("project"), consumers.platform_of(u.path, q),
+                consumers.record(q.get("project"), consumers.mirror_platform(u.path, q),
                                  "…" + _presented_key(self.headers)[-4:])
             # The React app (frontend/dist, served under /app) IS the dashboard
             # now. The old server-rendered pages at / and /accounts are retired;
