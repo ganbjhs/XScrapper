@@ -61,6 +61,7 @@ export const api = {
   activity: (p) => request(`/api/activity${qs(p)}`),
   activityLogs: (p) => request(`/api/activity/logs${qs(p)}`),
   delivery: (project) => request(`/api/delivery${qs({ project })}`),
+  consumers: () => request("/api/consumers"),
   streamAssignments: () => request("/api/streams/assignments"),
   attachStream: (project, stream_id) =>
     request("/api/streams/attach", { method: "POST", body: { project, stream_id } }),

@@ -214,6 +214,7 @@ export const icons = {
   info: I("M12 16v-4M12 8h.01", <circle cx="12" cy="12" r="9" />),
   more: I("M4 6h16M4 12h16M4 18h16"),
   x: I("M18 6L6 18M6 6l12 12"),
+  tower: I("M9 21l1.5-9h3L15 21M8 3h8M9 3l1 5h4l1-5M8 12h8"),
 };
 
 // Small ⓘ that explains on hover or focus — the paragraph lives in a tooltip
@@ -270,6 +271,65 @@ export function PillSelect({ label, value, options, onChange, disabled, title, c
         {options.map(([v, t]) => <option key={v} value={v}>{t}</option>)}
       </select>
     </label>
+  );
+}
+
+/* ---------------- Watch-Tower consumer badge ----------------
+   A tower icon with one letter per platform: lit while Watch-Tower pulled that
+   platform within the live window, grey when it has gone quiet. Hover lists
+   the project and each platform's last pull. */
+const WT_PLATFORMS = [["x", "𝕏", "X"], ["instagram", "IG", "Instagram"], ["facebook", "f", "Facebook"], ["links", "↗", "Post links"]];
+
+function ago(ms) {
+  const s = Math.max(0, (Date.now() - ms) / 1000);
+  if (s < 60) return "just now";
+  if (s < 3600) return `${Math.floor(s / 60)}m ago`;
+  if (s < 86400) return `${Math.floor(s / 3600)}h ago`;
+  return `${Math.floor(s / 86400)}d ago`;
+}
+
+export function wtStatus(consumers, projectId) {
+  const row = consumers?.projects?.[String(projectId)];
+  if (!row) return null;
+  return row;
+}
+
+export function WtBadge({ consumers, project, compact = false }) {
+  const row = wtStatus(consumers, project?.project_id);
+  const ref = useRef(null);
+  const [pos, setPos] = useState(null);
+  if (!row) return null;
+  const plats = WT_PLATFORMS.filter(([k]) => row.platforms?.[k]);
+  const live = row.live;
+  const show = () => {
+    const r = ref.current?.getBoundingClientRect();
+    if (r) setPos({ x: Math.min(Math.max(150, r.left + r.width / 2), innerWidth - 150), y: r.bottom + 8 });
+  };
+  return (
+    <>
+      <span ref={ref} className={`wt ${live ? "live" : "idle"}${compact ? " compact" : ""}`}
+            onMouseEnter={show} onMouseLeave={() => setPos(null)} onFocus={show} onBlur={() => setPos(null)}
+            tabIndex={0} aria-label={`Watch-Tower ${live ? "live" : "idle"}`}>
+        {icons.tower}
+        {!compact && plats.map(([k, glyph]) => (
+          <b key={k} className={row.platforms[k].live ? "on" : ""}>{glyph}</b>
+        ))}
+      </span>
+      {pos && createPortal(
+        <div className="tipbox below wt-tip" style={{ left: pos.x, top: pos.y }}>
+          <b>{project.name}</b> — {live ? "live with Watch-Tower" : `Watch-Tower idle · last pull ${ago(row.last_ms)}`}
+          <div className="wt-rows">
+            {plats.map(([k, glyph, name]) => (
+              <span key={k} className={row.platforms[k].live ? "on" : ""}>
+                <i className="dot" /> {name} · {ago(row.platforms[k].last_ms)}
+              </span>
+            ))}
+            {row.platforms?.telemetry && <span><i className="dot" /> telemetry · {ago(row.platforms.telemetry.last_ms)}</span>}
+          </div>
+        </div>,
+        document.body,
+      )}
+    </>
   );
 }
 

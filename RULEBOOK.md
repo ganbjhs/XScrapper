@@ -841,6 +841,13 @@ session got opened on a live account (§6, "never signed in twice").
   account, open a sign-in browser, or change what a human sees. Enforced by an
   allowlist server-side, not by the caller being polite. Keys are compared in
   constant time.
+- **Every API-key GET that names a project is stamped in `consumers.py`
+  (project, platform, last seen) — observational only.** It changes no
+  response and adds nothing to any key allowlist; `/api/consumers` is
+  dashboard-only. It exists so the operator can see which project Watch-Tower
+  is actually pulling ("live" = a pull within 15 min) and which is idle or a
+  test, instead of guessing from binding docs. State is `consumers.json`,
+  git-ignored, flushed at most every 15 s. (Added 2026-09-26.)
 - **The API-key allowlist is keyed on (METHOD, path), never path alone.** Most
   endpoints mean opposite things under the two verbs — `GET /api/projects`
   lists, `POST /api/projects` creates; likewise watchlists, collections and

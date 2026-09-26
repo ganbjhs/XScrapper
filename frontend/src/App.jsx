@@ -3,7 +3,7 @@
 import React, { createContext, useContext, useEffect, useMemo, useState } from "react";
 import { NavLink, Navigate, Route, Routes, useNavigate } from "react-router-dom";
 import { api, sortBy, useApi } from "./api/client.js";
-import { Modal, ShortcutsModal, ToastHost, icons, toast } from "./components/ui.jsx";
+import { Modal, ShortcutsModal, ToastHost, WtBadge, icons, toast } from "./components/ui.jsx";
 import LiveFeed from "./views/LiveFeed.jsx";
 import Watchlists from "./views/Watchlists.jsx";
 import Search from "./views/Search.jsx";
@@ -22,7 +22,7 @@ export const useProject = () => useContext(ProjectCtx);
 // Rename / archive / delete. Delete shows the server's dry-run plan first,
 // then asks for the project name.
 function ManageProjects({ onClose }) {
-  const { reload, setProjectId, project } = useProject();
+  const { reload, setProjectId, project, consumers } = useProject();
   const { data, reload: reloadAll } = useApi(() => api.projects(), []);
   const all = sortBy(data?.projects || []);
   const [editing, setEditing] = useState(null);      // project_id being renamed
@@ -141,6 +141,7 @@ function ManageProjects({ onClose }) {
                 <small>#{p.project_id} · {p.watchlists} watchlist(s) · {p.streams} stream(s){p.archived ? " · archived" : ""}</small>
               </div>
             )}
+            <WtBadge consumers={consumers} project={p} />
             <div className="acts">
               <button className="btn btn-ghost btn-sm" disabled={busy}
                       onClick={() => { setEditing(p.project_id); setDraft(p.name); }}>Rename</button>
@@ -163,7 +164,7 @@ function ManageProjects({ onClose }) {
 }
 
 function ProjectSwitcher() {
-  const { projects, project, setProjectId, reload } = useProject();
+  const { projects, project, setProjectId, reload, consumers } = useProject();
   const [open, setOpen] = useState(false);
   const [creating, setCreating] = useState(false);
   const [managing, setManaging] = useState(false);
@@ -192,6 +193,7 @@ function ProjectSwitcher() {
       <button onClick={() => setOpen((o) => !o)} aria-expanded={open} title={project?.name}>
         <span className="pmark">{(project?.name || "?").slice(0, 1).toUpperCase()}</span>
         <span className="pname">{project ? project.name : "No project"}</span>
+        {project && <WtBadge consumers={consumers} project={project} compact />}
         <svg className="caret" viewBox="0 0 24 24" aria-hidden="true"><path d="M6 9l6 6 6-6" /></svg>
       </button>
       {open && (
@@ -200,8 +202,8 @@ function ProjectSwitcher() {
             <button key={p.project_id}
                     className={p.project_id === project?.project_id ? "sel" : ""}
                     onClick={() => { setProjectId(p.project_id); setOpen(false); }}>
-              {p.name}
-              {p.archived ? " (archived)" : ""}
+              <span className="pname">{p.name}{p.archived ? " (archived)" : ""}</span>
+              <WtBadge consumers={consumers} project={p} />
             </button>
           ))}
           <button className="new" onClick={() => { setOpen(false); setCreating(true); }}>
@@ -417,7 +419,11 @@ export default function App() {
   const showShortcuts = React.useCallback(() => setHelp(true), []);
   useShortcuts({ toggleRail, cycleTheme, showShortcuts });
 
-  const ctx = { projects, project, setProjectId, reload, projectsError: error, projectsLoading: loading };
+  // Who is pulling which project through the API (Watch-Tower). Polled so a
+  // project going live or quiet shows within a minute.
+  const { data: consumers } = useApi(() => api.consumers().catch(() => null), [], { every: 60_000 });
+
+  const ctx = { projects, project, setProjectId, reload, projectsError: error, projectsLoading: loading, consumers };
   return (
     <ProjectCtx.Provider value={ctx}>
       <div className={`shell${rail ? " rail" : ""}`}>

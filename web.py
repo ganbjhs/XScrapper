@@ -40,6 +40,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import unquote
 
+import consumers
 import fb_media
 import store as store_mod
 
@@ -6584,6 +6585,11 @@ class Handler(BaseHTTPRequestHandler):
                 return self._serve_fb_media(u.path)
             if not self._require_auth():
                 return
+            # Observational only: which project/platform a machine key is
+            # pulling, so the dashboard can say who is live with Watch-Tower.
+            if self._via_api_key and q.get("project"):
+                consumers.record(q.get("project"), consumers.platform_of(u.path, q),
+                                 "…" + _presented_key(self.headers)[-4:])
             # The React app (frontend/dist, served under /app) IS the dashboard
             # now. The old server-rendered pages at / and /accounts are retired;
             # redirects keep every bookmark and muscle-memory URL working.
@@ -6595,6 +6601,9 @@ class Handler(BaseHTTPRequestHandler):
                 return self._serve_app(u.path)
             if u.path == "/api/status":
                 return self._send(200, _status())
+            if u.path == "/api/consumers":
+                # Dashboard-only (not in any key allowlist): who reads which project.
+                return self._send(200, consumers.snapshot())
             if u.path == "/api/streams":
                 # /api/status carries account health and rate-limit internals.
                 # An integration wants to know what exists and how much of it
@@ -6956,6 +6965,7 @@ def serve(cfg, host="127.0.0.1", port=8765, log=print, behind_proxy=False):
     global _CFG
     _CFG = cfg
     _CFG._behind_proxy = behind_proxy
+    consumers.init(cfg.root)
 
     loopback = host in ("127.0.0.1", "localhost", "::1")
 

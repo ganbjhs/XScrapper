@@ -740,6 +740,34 @@ input.mini:focus { outline: none; border-color: var(--brand); box-shadow: 0 0 0 
 /* ---------------- mobile bottom nav ---------------- */
 .mnav { display: none; }
 
+/* ---------------- Watch-Tower badge ---------------- */
+.wt {
+  display: inline-flex; align-items: center; gap: 3px; flex: none; cursor: default; outline: none;
+  padding: 2px 6px 2px 4px; border-radius: 999px; border: 1px solid var(--ring); background: var(--surface);
+  color: var(--ink-4); font-size: 9.5px; line-height: 1; transition: border-color 0.14s, color 0.14s;
+}
+.wt svg { width: 13px; height: 13px; stroke: currentColor; fill: none; stroke-width: 2; stroke-linecap: round; stroke-linejoin: round; }
+.wt.live { color: var(--good-text); border-color: color-mix(in srgb, var(--good) 40%, transparent); background: color-mix(in srgb, var(--good) 8%, var(--surface)); }
+.wt.live svg { animation: pulse 2s infinite; }
+.wt b { font-weight: 700; color: var(--ink-4); padding: 0 1px; }
+.wt b.on { color: var(--good-text); }
+.wt.compact { padding: 2px 4px; }
+.wt:hover, .wt:focus-visible { border-color: var(--brand); }
+a.nav-item.active .wt, .proj-menu button.sel .wt { background: transparent; }
+.tipbox.wt-tip { pointer-events: none; }
+.wt-rows { display: grid; gap: 3px; margin-top: 6px; color: color-mix(in srgb, var(--page) 70%, transparent); }
+.wt-rows span { display: inline-flex; align-items: center; gap: 6px; }
+.wt-rows span.on { color: var(--page); }
+.wt-rows .dot { width: 6px; height: 6px; box-shadow: none; background: var(--ink-4); }
+.wt-rows span.on .dot { background: var(--good); }
+.proj-menu button .pname { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.proj-menu button .wt { margin-left: auto; }
+.proj-menu button.sel .wt { margin-left: auto; }
+.proj-menu button.sel::after { margin-left: 6px; }
+.proj-switch > button .wt { margin-right: 2px; }
+.proj-row .wt { flex: none; }
+.rail .proj-switch > button .wt { display: none; }
+
 /* ---------------- toasts ---------------- */
 .toasts { position: fixed; right: 16px; bottom: 16px; z-index: 80; display: flex; flex-direction: column; gap: 8px; pointer-events: none; max-width: min(92vw, 380px); }
 .toast {
