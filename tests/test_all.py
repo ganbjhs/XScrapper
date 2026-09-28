@@ -7194,6 +7194,10 @@ def main():
         import test_script_read
         test_script_read.run(fresh("script_read"), ok)
 
+        section("the scraper watchdog (watchdog.py)")
+        import test_watchdog
+        test_watchdog.run(fresh("watchdog"), ok)
+
         section("naming post links on every platform (Phase 2, step 1)")
         import test_platform_urls
         test_platform_urls.run(None, ok)

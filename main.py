@@ -573,6 +573,16 @@ def build_parser():
     gd.add_argument("--json", action="store_true", help="Machine-readable output.")
     gd.set_defaults(func=cmd_guard)
 
+    # --- watchdog ---
+    wd = sub.add_parser("watchdog",
+                        help="Page Telegram when a collector stops collecting (see watchdog.py).")
+    wd.add_argument("--loop", action="store_true",
+                    help="Keep checking, once a minute — what the systemd unit runs.")
+    wd.add_argument("--test", action="store_true",
+                    help="Send one test message through the watchdog bot and exit.")
+    wd.add_argument("--json", action="store_true", help="Machine-readable one-shot report.")
+    wd.set_defaults(func=cmd_watchdog)
+
     # --- serve ---
     sv = sub.add_parser("serve", help="Local web dashboard for the collected data.")
     sv.add_argument("--port", type=int, default=8765, help="Port (default 8765).")
@@ -602,6 +612,33 @@ async def cmd_guard(args) -> int:
                                      queue=args.queue).to_json(), indent=2))
         return EXIT_OK
     return guard.report(cfg, args.action, args.cost, log=_log, queue=args.queue)
+
+
+async def cmd_watchdog(args) -> int:
+    import watchdog
+
+    cfg = load_config(args.config)
+    root = cfg.root
+    if args.test:
+        bs = watchdog.bot_status(root)
+        if not bs["ready"]:
+            _log("No watchdog bot yet. Settings -> Watchdog in the dashboard, or put "
+                 "WATCHDOG_TELEGRAM_BOT_TOKEN and WATCHDOG_TELEGRAM_CHAT_ID in .env.")
+            return EXIT_CONFIG
+        ok, err = watchdog.send(root, "🟢 Scraper watchdog is connected. You will hear "
+                                      "from this bot only when a collector has stopped "
+                                      "collecting — and again when it is back.")
+        _log("sent — check Telegram" if ok else f"Telegram refused: {err}")
+        return EXIT_OK if ok else EXIT_CONFIG
+    if args.loop:
+        return watchdog.run(root, log=_log)
+    rep = watchdog.tick(root, log=_log, dry=True)
+    if args.json:
+        _log(json.dumps(rep, indent=2, default=str))
+    else:
+        for ln in watchdog.report_lines(rep):
+            _log(ln)
+    return EXIT_OK
 
 
 async def cmd_serve(args) -> int:

@@ -79,7 +79,9 @@ in the dashboard, and it collects from the server's own IP. See
 `BLUEPRINT.md` §6 — one script on a Linux VPS sets up the always-on collector,
 the dashboard behind nginx + HTTPS, and auto-restart. Instagram and Facebook
 each run as their own always-on service (`xscraper-ig`, `xscraper-fb`)
-alongside the X watcher (`xscraper-watch`).
+alongside the X watcher (`xscraper-watch`). A fourth service, `xscraper-watchdog`,
+pages Telegram when any collector goes an hour without a good poll — and again
+when it is back (`watchdog.py`; Settings → Watchdog for the bot and thresholds).
 
 ## Tests
 

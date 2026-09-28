@@ -133,6 +133,11 @@ export const api = {
   // The pager: the admin bot that pages one person about what needs a human.
   pagerSave: (body) => request("/api/pager/telegram", { method: "POST", body }),
   pagerTest: () => request("/api/pager/test", { method: "POST", body: {} }),
+  // The watchdog: pages when a collector stops collecting (watchdog.py).
+  watchdog: () => request("/api/watchdog"),
+  watchdogSettings: (body) => request("/api/watchdog/settings", { method: "POST", body }),
+  watchdogBotSave: (body) => request("/api/watchdog/telegram", { method: "POST", body }),
+  watchdogTest: () => request("/api/watchdog/test", { method: "POST", body: {} }),
   // --- Account Control Panel: the managed account pool (store_accounts) ---
   pool: () => request("/api/pool"),
   poolAdd: (body) => request("/api/pool/add", { method: "POST", body }),

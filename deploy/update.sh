@@ -66,8 +66,10 @@ if changed '^deploy/xscraper-.*\.service$'; then
   else
     echo "   !!  could not read the current port from the installed web unit; leaving it alone"
   fi
-  cp deploy/xscraper-watch.service deploy/xscraper-fb.service deploy/xscraper-ig.service /etc/systemd/system/
+  cp deploy/xscraper-watch.service deploy/xscraper-fb.service deploy/xscraper-ig.service \
+     deploy/xscraper-watchdog.service /etc/systemd/system/
   systemctl daemon-reload
+  systemctl enable -q xscraper-watchdog 2>/dev/null || true
   ok "daemon-reload"
 fi
 
@@ -88,6 +90,9 @@ for unit in xscraper-watch xscraper-fb xscraper-ig; do
     ok "$unit is stopped - left stopped"
   fi
 done
+# The watchdog is never "left stopped": a box without it is a box nobody is
+# told about. First deploy after it was added starts it here.
+systemctl restart xscraper-watchdog && ok "xscraper-watchdog restarted"
 
 say "verify"
 sleep 3

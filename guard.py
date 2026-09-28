@@ -357,6 +357,65 @@ def _poll_stats(cfg) -> dict:
     return out
 
 
+def _watchdog_findings(cfg) -> list:
+    out = []
+    try:
+        import watchdog
+        rep = watchdog.tick(cfg.root, log=lambda *_: None, dry=True)
+        svc = watchdog.service_status(cfg.root, rep["now_ms"])
+    except Exception as e:
+        return [Finding(WARN, "watchdog.unchecked", "Could not run the collection check",
+                        f"{type(e).__name__}: {e}", "Run `python3 main.py watchdog`.")]
+    now = rep["now_ms"]
+    for plat, r in rep["platforms"].items():
+        if not r["stale"]:
+            continue
+        name = watchdog.NAMES[plat]
+        ago = (f"{watchdog.fmt_dur(now - r['last_ok_ms'])} ago" if r["last_ok_ms"]
+               else "never")
+        detail = f"Last good poll: {ago} (threshold {rep['config']['stale_min'][plat]} min)."
+        if r.get("detail"):
+            detail += " " + r["detail"]
+        if r.get("last_seen_ms") and r.get("last_ok_ms") and r["last_seen_ms"] > r["last_ok_ms"]:
+            detail += " It is still trying — every attempt fails."
+        out.append(Finding(
+            WARN, f"collect.stale.{plat}", f"{name} has not collected anything for {ago.replace(' ago', '')}",
+            detail,
+            f"`sudo systemctl restart {watchdog.UNITS[plat]}`, then "
+            f"`journalctl -u {watchdog.UNITS[plat]} -n 50`. If it is a database lock, "
+            f"see RULEBOOK §3 (every shared SQLite file in WAL).",
+        ))
+    if svc["silent"]:
+        out.append(Finding(
+            WARN, "watchdog.silent",
+            f"The watchdog itself has not checked for {watchdog.fmt_dur(now - svc['last_tick_ms'])}",
+            "Nobody is paged if a collector stops while the watchdog is down.",
+            "`sudo systemctl restart xscraper-watchdog`.",
+        ))
+    elif not svc["ever_ran"]:
+        out.append(Finding(
+            INFO, "watchdog.never",
+            "The watchdog has never run here",
+            "It pages Telegram when a collector goes an hour without a good poll.",
+            "`sudo systemctl enable --now xscraper-watchdog` (deploy/update.sh does this), "
+            "then Settings → Watchdog for the bot.",
+        ))
+    elif not rep["bot"]["ready"]:
+        out.append(Finding(
+            WARN, "watchdog.nobot",
+            "The watchdog is running but has nobody to page",
+            "No Telegram bot token / chat id is set for it (or for the pager it falls back to).",
+            "Settings → Watchdog: paste a bot token from @BotFather, press Start on the bot, Send test.",
+        ))
+    elif not rep["config"]["enabled"]:
+        out.append(Finding(
+            INFO, "watchdog.off", "Watchdog paging is switched off",
+            "Collectors are checked, but nobody is told when one stops.",
+            "Settings → Watchdog → switch paging on.",
+        ))
+    return out
+
+
 # --------------------------------------------------------------------------
 # the rules
 # --------------------------------------------------------------------------
@@ -564,6 +623,12 @@ def assess(cfg, action: str = "", cost: int = 0, host: str = "",
     if st["errors"]:
         add(Finding(WARN, "collect.errors", f"{st['errors']} polls errored in the last hour",
                     "Check the watcher output.", "Run `python3 main.py doctor`."))
+
+    # --- is anything actually being collected? (watchdog.py, same probes)
+    # The 2026-09-28 lockout: every account "signed in", the unit "active",
+    # and four hours of pages=0 stop=error. "Alive" is not "collecting".
+    for f in _watchdog_findings(cfg):
+        add(f)
     if st["gaps"]:
         add(Finding(
             INFO, "collect.gaps", f"{st['gaps']} open gaps recorded",

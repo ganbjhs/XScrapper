@@ -674,6 +674,32 @@ Test: `test_platform_urls`.
   dashboard endpoint that scales with the corpus is cached or it is a bug —
   the dashboard is allowed to be stale, never to stall the collector.
 
+- **"Alive" is not "collecting" — a collector silent for an hour pages
+  someone, from a process that is not the collector** (2026-09-28). The
+  four-hour lockout above was found by a person looking, because every alert
+  the project had was about an ACCOUNT needing a human (decider.py) or DATA
+  moving fast (alerts.py); nothing asked whether anything was being
+  collected at all, and `systemctl is-active` cannot answer that (the unit
+  was `active` throughout). `watchdog.py`, run by `xscraper-watchdog`, asks
+  once a minute per platform "when did the collector last complete a GOOD
+  unit of work" — X: the newest poll whose `stop_reason` is not `error` /
+  `no_account_or_abort`; Instagram/Facebook: the newest `sources.last_run`
+  among enabled sources — and pages the watchdog bot (`WATCHDOG_TELEGRAM_*`
+  in .env, falling back to the admin bot) when that is older than the
+  threshold (`watchdog_stale_min_<platform>` in results.db `settings`,
+  default 60 min; Settings → Watchdog edits it, no restart). One message per
+  outage, a reminder every `watchdog_remind_min` (default 360) while it
+  stays down, one when it is back. A paused collector, or one with nothing
+  enabled, is silent on purpose and is never paged for. Rules: the watchdog
+  is ITS OWN process (the process that hangs must not be the one expected to
+  notice — the web process was starved at 1.5 GB that morning); it opens
+  every database `mode=ro` and writes only `profiles/watchdog.json`, its own
+  heartbeat, which Settings and the guard read so a dead watchdog is itself
+  visible (`watchdog.silent` after 5 min); it imports nothing beyond the
+  standard library, so the thing that pages cannot fail to import; and the
+  guard shows the same probes as `collect.stale.<platform>` so the dashboard
+  and the pager never disagree about what "down" means.
+
 ## 4. Delivery rules
 
 - **The delivery cursor keys on `collected_ms`, NEVER on `created_ms`.** This is

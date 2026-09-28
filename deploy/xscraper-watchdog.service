@@ -1,0 +1,39 @@
+[Unit]
+Description=Scraper watchdog (pages Telegram when a collector stops collecting)
+After=network-online.target
+Wants=network-online.target
+
+# See deploy/xscraper-fb.service for why StartLimit* live in [Unit].
+StartLimitIntervalSec=600
+StartLimitBurst=5
+
+[Service]
+Type=simple
+User=xscraper
+Group=xscraper
+WorkingDirectory=/opt/xscraper/app
+Environment=DO_NOT_TRACK=1
+Environment=PYTHONUNBUFFERED=1
+
+# Deliberately its OWN process, not a thread in xscraper-web or the watcher:
+# the process that hangs must not be the one expected to notice the hang
+# (2026-09-28: the web process was starved at 1.5 GB while the watcher sat
+# locked out for four hours). It only ever reads the databases (mode=ro) and
+# writes profiles/watchdog.json — its own heartbeat, which the dashboard and
+# the guard use to tell you if the watchdog itself has gone quiet.
+ExecStart=/opt/xscraper/app/.venv/bin/python3 main.py watchdog --loop
+
+Restart=always
+RestartSec=30
+
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/opt/xscraper/app
+ProtectKernelTunables=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+
+[Install]
+WantedBy=multi-user.target

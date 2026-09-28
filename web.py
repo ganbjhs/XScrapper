@@ -4226,6 +4226,129 @@ def _test_pager(body):
     return {"ok": True, **_pager_status()}
 
 
+# ---------------------------------------------------------------------------
+# The watchdog (watchdog.py): "a collector has stopped collecting", to
+# Telegram. Its own bot, its own systemd unit; the dashboard only shows what
+# it sees and edits its knobs. Dashboard-only: none of these paths are in
+# API_KEY_PATHS.
+# ---------------------------------------------------------------------------
+
+def _watchdog_status():
+    """What the watchdog sees right now (a live probe, cheap: three MAX()
+    queries), what it is set to, and whether it is itself alive."""
+    import watchdog
+    root = _CFG.root
+    rep = watchdog.tick(root, log=lambda *_: None, dry=True)
+    svc = watchdog.service_status(root, rep["now_ms"])
+    # The dry tick decides against a throwaway state; the real incident
+    # bookkeeping (alerted / down since) is the service's, so read it back.
+    for plat, row in rep["platforms"].items():
+        real = svc["platforms"].get(plat) or {}
+        row["alerted_ms"] = real.get("alerted_ms")
+        row["down_since_ms"] = real.get("down_since_ms")
+    return {"now_ms": rep["now_ms"], "config": rep["config"], "bot": rep["bot"],
+            "platforms": rep["platforms"],
+            "service": {k: svc[k] for k in ("ever_ran", "last_tick_ms", "silent", "pid")},
+            "defaults": {"stale_min": watchdog.DEFAULT_STALE_MIN,
+                         "remind_min": watchdog.DEFAULT_REMIND_MIN,
+                         "min_stale_min": watchdog.MIN_STALE_MIN}}
+
+
+def _save_watchdog_settings(body):
+    """Thresholds and the on/off switch -> results.db settings, which the
+    watchdog re-reads every tick (no restart)."""
+    import watchdog
+    pairs = []
+    if "enabled" in body:
+        pairs.append((watchdog.KEY_ENABLED, "1" if body["enabled"] else "0"))
+    if "remind_min" in body:
+        v = body["remind_min"]
+        if v in (None, ""):
+            pairs.append((watchdog.KEY_REMIND, ""))
+        else:
+            try:
+                n = int(v)
+            except (TypeError, ValueError):
+                return {"error": "remind is a number of minutes"}
+            if n < 30:
+                return {"error": "remind at least every 30 minutes, or it is spam"}
+            pairs.append((watchdog.KEY_REMIND, str(n)))
+    for plat, v in (body.get("stale_min") or {}).items():
+        if plat not in watchdog.PLATFORMS:
+            return {"error": f"unknown platform {plat!r}"}
+        if v in (None, ""):
+            pairs.append((watchdog.KEY_STALE % plat, ""))
+            continue
+        try:
+            n = int(v)
+        except (TypeError, ValueError):
+            return {"error": f"{watchdog.NAMES[plat]} threshold is a number of minutes"}
+        if n < watchdog.MIN_STALE_MIN:
+            return {"error": f"threshold is at least {watchdog.MIN_STALE_MIN} minutes"}
+        pairs.append((watchdog.KEY_STALE % plat, str(n)))
+    if not pairs:
+        return {"error": "nothing to save"}
+    con = sqlite3.connect(_CFG.db_results, timeout=5)
+    try:
+        with con:
+            # Same shape as store.py's; a box that has never polled has no
+            # results.db yet, and the watchdog's knobs should still save.
+            con.execute("CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT)")
+            con.executemany(
+                "INSERT INTO settings(key, value) VALUES(?,?) "
+                "ON CONFLICT(key) DO UPDATE SET value = excluded.value", pairs)
+    finally:
+        con.close()
+    return {"ok": True, **_watchdog_status()}
+
+
+def _save_watchdog_bot(body):
+    """The watchdog bot: token + chat id -> .env (the service re-reads .env
+    each tick). A missing chat id is looked up from the bot's own updates,
+    exactly like the pager."""
+    import decider
+    import watchdog
+    token = (body.get("token") or "").strip()
+    chat = (body.get("chat_id") or "").strip()
+    if token and not re.fullmatch(_TG_TOKEN_RE, token):
+        return {"error": "That does not look like a bot token. BotFather gives "
+                         "you something like 123456789:AAH... — paste the whole line."}
+    if chat and not re.fullmatch(r"-?\d{1,20}", chat):
+        return {"error": "the chat id is a number (your own user id, or a group's)"}
+    _env_set((("WATCHDOG_TELEGRAM_BOT_TOKEN", token),
+              ("WATCHDOG_TELEGRAM_CHAT_ID", chat)))
+    found = ""
+    root = _CFG.root
+    if watchdog.own_bot(root) and not os.getenv("WATCHDOG_TELEGRAM_CHAT_ID", "").strip():
+        cid, who = decider.discover_chat(watchdog.bot_token(root))
+        if cid:
+            _env_set((("WATCHDOG_TELEGRAM_CHAT_ID", cid),))
+            found = f"chat id {cid} ({who}) read from the bot's updates"
+        else:
+            found = f"no chat id yet — {who}"
+    return {"ok": True, "found": found, "bot": watchdog.bot_status(root)}
+
+
+def _test_watchdog(body):
+    """One test message through the watchdog bot, exactly as a real one."""
+    import decider
+    import watchdog
+    root = _CFG.root
+    if not watchdog.bot_token(root):
+        return {"error": "No watchdog bot token saved yet."}
+    if not watchdog.bot_chat(root):
+        cid, who = decider.discover_chat(watchdog.bot_token(root))
+        if not cid:
+            return {"error": f"No chat id — {who}"}
+        _env_set((("WATCHDOG_TELEGRAM_CHAT_ID", cid),))
+    ok, err = watchdog.send(
+        root, "🟢 Scraper watchdog is connected. You will hear from this bot only "
+              "when a collector has stopped collecting — and again when it is back.")
+    if not ok:
+        return {"error": f"Telegram refused: {err}", "bot": watchdog.bot_status(root)}
+    return {"ok": True, "bot": watchdog.bot_status(root)}
+
+
 # How many real tweets "Send a test" puts in the channel. Three is enough to
 # see the format, the pacing and the links without filling the group.
 TG_TEST_COUNT = 3
@@ -5570,7 +5693,8 @@ def _ig_diag():
         out["instagrapi"] = "?"
     # the services
     svc = {}
-    for unit in ("xscraper-web", "xscraper-ig", "xscraper-watch", "xscraper-fb"):
+    for unit in ("xscraper-web", "xscraper-ig", "xscraper-watch", "xscraper-fb",
+                 "xscraper-watchdog"):
         try:
             r = subprocess.run(["systemctl", "is-active", unit], capture_output=True,
                                text=True, timeout=5)
@@ -6807,6 +6931,8 @@ class Handler(BaseHTTPRequestHandler):
                 return self._send(200, _signin_status())
             if u.path == "/api/decider/conditions":
                 return self._send(200, _decider_conditions(q))
+            if u.path == "/api/watchdog":
+                return self._send(200, _watchdog_status())
             if u.path == "/api/pool/signin/help":
                 return self._send(200, _signin_help())
             if u.path == "/api/pool" or u.path.startswith("/api/pool/"):
@@ -7017,6 +7143,12 @@ class Handler(BaseHTTPRequestHandler):
                 return self._send(200, _save_pager(body))
             if u.path == "/api/pager/test":
                 return self._send(200, _test_pager(body))
+            if u.path == "/api/watchdog/settings":
+                return self._send(200, _save_watchdog_settings(body))
+            if u.path == "/api/watchdog/telegram":
+                return self._send(200, _save_watchdog_bot(body))
+            if u.path == "/api/watchdog/test":
+                return self._send(200, _test_watchdog(body))
             if u.path == "/api/decider":
                 return self._send(200, _decider_post(body))
             if u.path == "/api/pool" or u.path.startswith("/api/pool/"):

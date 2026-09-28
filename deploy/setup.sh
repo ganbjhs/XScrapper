@@ -237,9 +237,13 @@ cp deploy/xscraper-watch.service /etc/systemd/system/
 # .env, IG via ig_login.py / ig_import.py), and the dashboard's Fetch-now can
 # run a pass on demand meanwhile.
 cp deploy/xscraper-fb.service deploy/xscraper-ig.service /etc/systemd/system/
+# The watchdog: always on, independent of every collector. It pages Telegram
+# when a collector has not completed a good poll for an hour (watchdog.py).
+cp deploy/xscraper-watchdog.service /etc/systemd/system/
 systemctl daemon-reload
-systemctl enable -q xscraper-web xscraper-watch xscraper-fb xscraper-ig
+systemctl enable -q xscraper-web xscraper-watch xscraper-fb xscraper-ig xscraper-watchdog
 systemctl restart xscraper-web
+systemctl restart xscraper-watchdog
 sleep 2
 if systemctl is-active --quiet xscraper-web; then
   ok "xscraper-web running on 127.0.0.1:$PORT"
@@ -422,6 +426,9 @@ $( [ -n "${NEW_PW:-}" ] && echo "    DASH_PASSWORD=$NEW_PW" || echo "    DASH_PA
 
   2. Once one account shows "Working":
        systemctl start xscraper-watch
+
+  3. Settings -> Watchdog: paste a bot token from @BotFather and press Start
+     on the bot, so you are paged when a collector stops collecting.
 
   Re-run this script after any git pull. It is safe to run repeatedly.
 
