@@ -652,6 +652,28 @@ Test: `test_platform_urls`.
   web server reading while a collector writes is no longer a "database is
   locked" pass_error (14:42 the same day). Test: `test_ig_stop_stands`.
 
+- **`accounts.db` too — and no dashboard read may be allowed to grow without
+  bound** (2026-09-28). The one file the rule above left out was twscrape's
+  own `accounts.db`, opened by the library with a bare `aiosqlite.connect()`
+  (no `journal_mode`), so it sat in rollback-journal mode where every READER
+  blocks every WRITER. The watcher writes it on every single request (the
+  pool's `UPDATE accounts SET locks`); the dashboard reads it on every
+  `/api/status`. 07:45–11:58 UTC the watcher logged `OperationalError:
+  database is locked` on every poll for four hours while `systemctl` said
+  `active (running)` and the account cards said "signed in · collecting".
+  `pages=0` on every failure is how to tell: the lock was in the pool, not in
+  `results.db`. The reads had become minutes long because `/api/status` did
+  a `COUNT(*)` over every tweet plus per-stream scans, `results.db` had
+  outgrown RAM (5.8 GB on a 4 GB box), and every open tab re-polled it every
+  30 s — so unfinished calls piled up and held the file open continuously.
+  Two rules: `auth.open_api` puts `accounts.db` in WAL before twscrape
+  touches it (persistent in the file, so a one-time cost), and `_status` is
+  computed once per 15 s under a lock (any POST invalidates it) with only the
+  two cheap live bits — watcher pid, paused flag — read fresh per call. The
+  general form: a shared SQLite file is in WAL or it is a bug, and a
+  dashboard endpoint that scales with the corpus is cached or it is a bug —
+  the dashboard is allowed to be stale, never to stall the collector.
+
 ## 4. Delivery rules
 
 - **The delivery cursor keys on `collected_ms`, NEVER on `created_ms`.** This is

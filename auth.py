@@ -907,9 +907,42 @@ def open_api(db_path) -> API:
     concentrating both wear and ban exposure on one account. LRU spreads it.
     SQLite sorts NULLs first, so never-used accounts are picked up first.
     """
+    _ensure_wal(db_path)
     api = API(str(db_path))
     api.pool._order_by = "last_used ASC"
     return api
+
+
+def _ensure_wal(db_path) -> None:
+    """
+    Put accounts.db in WAL mode, once, before twscrape opens it.
+
+    twscrape opens this file with plain aiosqlite.connect(): no journal_mode,
+    so a fresh database sits in rollback-journal ("delete") mode, where every
+    READER holds a SHARED lock that blocks every WRITER. The watcher writes
+    this file on every single request (the pool's UPDATE ... SET locks), and
+    the dashboard reads it on every /api/status. On 2026-09-28 the dashboard
+    got slow enough (a 5.8 GB results.db on a 4 GB box) that its status reads
+    piled up and held accounts.db open continuously, and the watcher logged
+    "OperationalError: database is locked" on every poll for four hours while
+    looking perfectly alive. WAL is the fix: readers never block writers.
+
+    journal_mode is persistent in the file, so this is a no-op after the first
+    run; it runs here so a fresh install gets it too. Best effort — a busy or
+    missing file is twscrape's problem to report, not ours to mask.
+    """
+    import sqlite3
+    try:
+        if not Path(db_path).exists():
+            return
+        con = sqlite3.connect(str(db_path), timeout=5)
+        try:
+            if con.execute("PRAGMA journal_mode").fetchone()[0].lower() != "wal":
+                con.execute("PRAGMA journal_mode = WAL")
+        finally:
+            con.close()
+    except sqlite3.Error:
+        pass
 
 
 # --------------------------------------------------------------------------

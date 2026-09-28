@@ -1041,8 +1041,48 @@ def _fill_avatars_by_name(posts, platform, handle_of):
             p["author_avatar"] = avby[nm.lower()]
 
 
+# /api/status is polled by every open dashboard tab every ~30 s, and it is
+# the most expensive read on the server: a COUNT(*) over every tweet plus
+# per-stream hit counts, last-poll rows and lag samples, and a fresh twscrape
+# pool open for the account rows. Once results.db outgrew RAM (5.8 GB on a
+# 4 GB box, 2026-09-28) one call took minutes, the tabs kept re-polling, and
+# the pile of unfinished calls held accounts.db open long enough to lock the
+# watcher out for four hours. One computation at a time, reused for
+# STATUS_TTL_S; the two cheap live bits (watcher pid, paused flag) are read
+# fresh on every call so Start/Stop and the "collection off" banner stay
+# honest to the second.
+STATUS_TTL_S = 15
+_STATUS_LOCK = threading.Lock()
+_STATUS_CACHE: dict = {"at": 0.0, "out": None}
+
+
 def _status():
     """Accounts, streams, budget, totals — everything the sidebar shows."""
+    import auth
+
+    now = time.monotonic()
+    with _STATUS_LOCK:
+        cached = _STATUS_CACHE["out"]
+        if cached is None or now - _STATUS_CACHE["at"] > STATUS_TTL_S:
+            cached = _status_uncached()
+            _STATUS_CACHE.update(at=time.monotonic(), out=cached)
+    out = dict(cached)
+
+    try:
+        out["watcher_pid"] = auth.read_watcher_pid(_CFG.root)
+    except Exception:
+        out["watcher_pid"] = None
+    try:
+        with _connect() as con:
+            row = con.execute(
+                "SELECT value FROM meta WHERE key = 'collection_paused'").fetchone()
+            out["collection_paused"] = bool(row and row["value"] == "1")
+    except Exception:
+        out["collection_paused"] = False
+    return out
+
+
+def _status_uncached():
     import auth
 
     out = {"accounts": [], "streams": [], "totals": {}, "db": str(_CFG.db_results)}
@@ -6753,6 +6793,10 @@ class Handler(BaseHTTPRequestHandler):
                 return
             n = int(self.headers.get("Content-Length") or 0)
             body = json.loads(self.rfile.read(n) or "{}")
+            # Any POST may change what the sidebar shows (stream speed, a
+            # promoted account, a paused watchlist): drop the cached status so
+            # the next poll recomputes rather than serving a 15 s old picture.
+            _STATUS_CACHE["out"] = None
             if u.path == "/api/login/start":
                 # Either a config.toml label (the original callers) or a pool
                 # account_id (the Account Control Panel). See _login_start.
