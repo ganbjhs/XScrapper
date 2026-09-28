@@ -1763,6 +1763,15 @@ before changing the engine; nearly every "obvious" idea has been tried.)
   "Add existing…" picker sat on Loading… in production (2026-09-25). Count
   in a loop the way `watchlists()` does; the suite cannot see this, only a
   real-sized table can.
+- **A bounded number says it is bounded.** `total` on a cursor page of
+  /api/tweets is counted at most ten pages ahead (so an old cursor never
+  costs a full scan) — and Watch-Tower read the 31 at limit=3 as "only 31
+  rows exist" and filed it as a bug (2026-09-28). Any count we cap carries
+  a flag beside it (`total_capped`, `total_note`); a limit we enforce is
+  stated in the response (X-RateLimit-Limit / -Remaining / -Reset on every
+  keyed reply, 60/min per key, all endpoints). A consumer tuning against
+  429s, or against a number that quietly means something else, is a bug
+  report we caused.
 - **`python3 tests/test_all.py` stays green, offline, and grows a test for the
   new behavior.** The suite is the contract; it needs no accounts and spends no
   budget. Run it as a script, not under pytest.

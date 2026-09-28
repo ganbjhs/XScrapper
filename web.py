@@ -244,11 +244,26 @@ def _key_scope(presented: str):
 # round-trip on every authenticated request to bound something that has never
 # yet gone wrong. Keys are hashed so a memory dump is not a key list.
 _RATE_HITS: dict = {}
+_RATE_LAST: dict = {}     # key-hash -> (remaining, seconds until the window frees)
 _RATE_LOCK = threading.Lock()
 
 
+def _rate_headers(presented: str) -> dict:
+    """X-RateLimit-Limit / -Remaining / -Reset for a keyed response."""
+    import links as _links
+
+    k = hashlib.sha256(presented.encode()).hexdigest()[:16]
+    remaining, reset = _RATE_LAST.get(k, (_links.RATE_PER_MIN, 60))
+    return {"X-RateLimit-Limit": str(_links.RATE_PER_MIN),
+            "X-RateLimit-Remaining": str(max(0, remaining)),
+            "X-RateLimit-Reset": str(reset)}
+
+
 def _rate_ok(presented: str, now: float | None = None) -> tuple:
-    """(allowed, retry_after_seconds). Sliding 60 s window per key."""
+    """(allowed, retry_after_seconds). Sliding 60 s window per key, ALL
+    endpoints together. The remaining budget is left in _RATE_LAST so the
+    response can carry it (X-RateLimit-*): a consumer should be able to stay
+    under a stated number instead of tuning against 429s."""
     import links as _links
 
     now = time.time() if now is None else now
@@ -257,9 +272,12 @@ def _rate_ok(presented: str, now: float | None = None) -> tuple:
         hits = [t for t in _RATE_HITS.get(k, ()) if now - t < 60]
         if len(hits) >= _links.RATE_PER_MIN:
             _RATE_HITS[k] = hits
+            _RATE_LAST[k] = (0, max(1, int(60 - (now - hits[0])) + 1))
             return False, max(1, int(60 - (now - hits[0])) + 1)
         hits.append(now)
         _RATE_HITS[k] = hits
+        _RATE_LAST[k] = (_links.RATE_PER_MIN - len(hits),
+                         max(1, int(60 - (now - hits[0])) + 1))
         # Keys come and go (revoked, rotated); without this the dict is a slow
         # leak keyed on every key ever presented.
         if len(_RATE_HITS) > 512:
@@ -602,6 +620,15 @@ def _query_tweets(p):
         ).fetchall()
 
     out = {"total": total, "rows": [_row_to_json(r) for r in rows]}
+    if cursoring:
+        # `total` on a cursor page is counted at most ten pages ahead (see
+        # above), so a consumer reading it as "rows available" sees limit*10+1
+        # — 31 at limit=3 — and concludes the archive is tiny. Say which it
+        # is: a lower bound, or exact. Additive (2026-09-28).
+        out["total_capped"] = total >= limit * 10 + 1
+        out["total_note"] = ("total is a lower bound on a cursor page — page until "
+                             "has_more is false" if out["total_capped"] else
+                             "total is exact")
     # Labels are project-scoped, so an unscoped read (a machine key hitting
     # /api/tweets) sees none — which is right: it is asking for the extract.
     try:
@@ -744,6 +771,11 @@ def _query_ig_as_stream(p):
         f["streams"] = [label]
         out_rows.append(f)
     out = {"total": total, "rows": out_rows}
+    if cursoring:
+        out["total_capped"] = total >= limit * 10 + 1
+        out["total_note"] = ("total is a lower bound on a cursor page — page until "
+                             "has_more is false" if out["total_capped"] else
+                             "total is exact")
     _stamp_labels(out["rows"], pid, "instagram")
     if rows:
         last = out_rows[-1]
@@ -6590,6 +6622,14 @@ class Handler(BaseHTTPRequestHandler):
             self.send_header("Cache-Control", "no-store")
         for k, v in (extra or {}).items():
             self.send_header(k, v)
+        # A keyed request always learns its budget, on 200 and on 429 alike.
+        try:
+            presented = _presented_key(self.headers)
+            if presented:
+                for k, v in _rate_headers(presented).items():
+                    self.send_header(k, v)
+        except Exception:
+            pass
         self.end_headers()
         self._note_slow(code)
         if not self._head_only:

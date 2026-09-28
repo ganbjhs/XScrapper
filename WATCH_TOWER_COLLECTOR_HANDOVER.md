@@ -37,9 +37,15 @@ is the API surface, there is no other discovery document. Do not probe.
   X         WATCHLISTS. Kinds:
               xlist     an X List (list_id, owner_handle = the X account it
                         was made on, the only account that can edit members)
-              query     a saved search
-              keywords  a keyword set
-              handles   a handle set
+              query     a HANDLE SET — the ordinary list of @accounts, and
+                        the most common kind. The name is historical; the
+                        row's kind_label says "Handles". Bind it exactly
+                        like an xlist: members[] are the handles, streams[]
+                        are what to pull. (Corrected 2026-09-28 — an earlier
+                        version of this note listed "handles" as a separate
+                        kind; there is no such kind.)
+              keywords  a keyword set — skip for tracked accounts; it
+                        follows no accounts
               links     specific post URLs from a Google Sheet — a different
                         consumer's data; visible, never mirror, never bind
             Each watchlist compiles to one or more STREAMS labelled
@@ -124,6 +130,14 @@ is the API surface, there is no other discovery document. Do not probe.
   Both status calls REQUIRE project=. Without it: {"error":"no project
   selected"} with HTTP 200 — check for an `error` key.
 
+  RATE LIMIT (stated, 2026-09-28): 60 requests per minute PER KEY, all
+  endpoints together, sliding 60-second window. Over it: HTTP 429 with
+  Retry-After. Every keyed response now carries X-RateLimit-Limit,
+  X-RateLimit-Remaining and X-RateLimit-Reset (seconds until the oldest
+  hit leaves the window), so you can pace against the headers instead of
+  against 429s. A full walk of a list at limit=500 is a handful of calls;
+  polling /api/watchlists for 21 projects every pass is what spends it.
+
   Today (18 Sept): projects with Instagram sources are 13 "Varanasi" (10),
   14 "Rajasthan WatchList" (118, three X lists too), 17 "BhajanLal Ji
   Watchlist Media 2" (25 — all still resolving, so 0 posts for now; that is
@@ -201,6 +215,17 @@ is the API surface, there is no other discovery document. Do not probe.
   - /api/ig/posts — still works (newest-first on id, 72h-window loop from
     the 2 Sept note). Superseded by the Instagram stream above; do not run
     both.
+
+  `total` ON A CURSOR PAGE IS A LOWER BOUND, NOT THE ARCHIVE SIZE
+  (clarified 2026-09-28). With since_id / since_collected_ms set, `total`
+  is counted at most ten pages past the current one — limit*10+1 — so it
+  never costs a full scan on an old cursor. At limit=3 that is 31, at
+  limit=500 it is 5001. It is NOT a fixed window and NOT "only 31 rows
+  exist": the rows are all there; page until `has_more` is false. Each
+  cursor page now also carries `total_capped` (true when the bound was
+  hit) and `total_note`. Without a cursor, `total` is exact.
+  since_collected_ms=0 is honoured as "from the beginning" — the
+  fixed-31 report was this bound being read as a row count.
 
 ======================================================================
 4. THE ROW SHAPE (identical across platforms)
