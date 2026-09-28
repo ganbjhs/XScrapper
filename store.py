@@ -896,6 +896,12 @@ def parse_window(spec: str | None) -> int | None:
 _HANDLE_RE = re.compile(r"^[A-Za-z0-9_]{1,15}$")
 
 
+# Human-readable names for watchlists.kind, for consumers and the panel.
+# 'query' is the original name for a handle list and stays in the database.
+KIND_LABELS = {"query": "Handles", "keywords": "Keywords", "xlist": "X List",
+               "links": "Post links", "instagram": "Instagram"}
+
+
 def normalize_handle(raw) -> str | None:
     """'@NatGeo' / 'natgeo' / 'https://x.com/NatGeo' -> 'natgeo'; None if invalid."""
     s = str(raw or "").strip()
@@ -2029,6 +2035,13 @@ class Store:
             d = dict(w)
             d["members"] = members
             d["streams"] = streams
+            # Every row says which platform it is, so a consumer groups on
+            # `platform` alone and never has to know that an X row is the
+            # one WITHOUT the key (the Instagram row always had it). A
+            # readable kind for the same reason — 'query' means handles,
+            # which nobody would guess.
+            d["platform"] = "x"
+            d["kind_label"] = KIND_LABELS.get(w["kind"], w["kind"])
             projs = self._watchlist_projects(w["watchlist_id"])
             d["owner_project_id"] = w["project_id"]
             d["owner_project"] = next(
@@ -2177,6 +2190,8 @@ class Store:
         out = []
         for r in rows:
             d = dict(r)
+            d["platform"] = "x"
+            d["kind_label"] = KIND_LABELS.get(r["kind"], r["kind"])
             # Collected count and liveness per list, the way watchlists()
             # does it: a BOUND 'wl:<id>:%' pattern and one GROUP BY, which
             # the planner turns into an index range per stream. Written as

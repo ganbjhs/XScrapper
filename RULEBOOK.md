@@ -238,7 +238,9 @@ that follow from that:
 - **The consumer API changes shape not at all.** A shared list is simply
   listed under every project that uses it, with the SAME `watchlist_id` and
   `project_id` still the owner's; the new keys (`owner_project_id`,
-  `owner_project`, `projects[]`, `shared`) are additive, and the new
+  `owner_project`, `projects[]`, `shared`, and since 2026-09-28 `platform`
+  on every row plus `kind_label`, so a consumer groups on platform instead
+  of inferring it from a negative id) are additive, and the new
   endpoints are dashboard-only. Watch-Tower is told (handover §5) to key
   cards on `(project_id, watchlist_id)` — nothing about this is observable
   to them until the first list is actually shared, and they are told

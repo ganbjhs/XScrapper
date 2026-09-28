@@ -263,6 +263,10 @@ is the API surface, there is no other discovery document. Do not probe.
       on watchlist_id alone, or the same list bound in two of your
       projects collides. This is the one thing to check in your code.
     * Additive keys on the row, ignore if you like:
+        platform          "x" | "instagram"   on EVERY row now (2026-09-28);
+                          group your picker on this, never on kind or id sign
+        kind_label        "Handles" | "Keywords" | "X List" | "Post links" |
+                          "Instagram" — the readable form of `kind`
         owner_project_id  int   the project that created it (= project_id)
         owner_project     str   its name
         projects          [{project_id, name, owner}]  everyone using it

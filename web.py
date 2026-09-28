@@ -809,6 +809,7 @@ def _ig_pseudo_watchlist(pid: int):
             return {
                 "watchlist_id": -pid, "project_id": pid,
                 "name": "Instagram sources", "kind": "instagram",
+                "kind_label": "Instagram",
                 "platform": "instagram", "list_id": None, "owner_handle": None,
                 "created_at": None, "filters": {}, "paused": s["paused"],
                 "members": [{"handle": m["handle"], "display_name": m["label"],
