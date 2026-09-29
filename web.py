@@ -806,15 +806,26 @@ def _ig_pseudo_streams() -> list:
             counts = {r["project_id"]: r["n"] for r in st.db.execute(
                 "SELECT project_id, COUNT(*) n FROM posts GROUP BY project_id")}
             srcs = {}
+            # The author's picture and real name ride along from the profile
+            # cache (filled by collected posts — never a lookup), so a
+            # consumer can draw the account row the way it draws an X one.
+            have_full = "full_name" in {c["name"] for c in st.db.execute("PRAGMA table_info(profiles)")}
+            fn = "pr.full_name" if have_full else "NULL"
             for r in st.db.execute(
-                    "SELECT label, type, value, platform_id, project_id, account, "
-                    "assigned_account FROM sources WHERE enabled = 1 AND project_id > 0 "
-                    "ORDER BY project_id, label"):
+                    f"SELECT s.label, s.type, s.value, s.platform_id, s.project_id, s.account, "
+                    f"       s.assigned_account, pr.avatar_url, {fn} AS full_name "
+                    f"FROM sources s LEFT JOIN profiles pr ON "
+                    f"  (s.platform_id != '' AND pr.user_pk = CAST(s.platform_id AS INTEGER)) "
+                    f"  OR (s.platform_id = '' AND lower(pr.handle) = lower(s.value)) "
+                    f"WHERE s.enabled = 1 AND s.project_id > 0 "
+                    f"ORDER BY s.project_id, s.label"):
                 srcs.setdefault(int(r["project_id"]), []).append({
                     "handle": r["value"], "label": r["label"], "type": r["type"],
                     "user_id": r["platform_id"] or None,
                     "resolved": bool(r["platform_id"]),
-                    "collector": r["account"] or r["assigned_account"] or ""})
+                    "collector": r["account"] or r["assigned_account"] or "",
+                    "avatar": r["avatar_url"] or None,
+                    "full_name": r["full_name"] or None})
     except Exception:
         return []
     for pid in sorted(srcs):
@@ -846,7 +857,9 @@ def _ig_pseudo_watchlist(pid: int):
                 "platform": "instagram", "list_id": None, "owner_handle": None,
                 "created_at": None, "filters": {}, "paused": s["paused"],
                 "members": [{"handle": m["handle"],
-                             "display_name": _ig_names.get(str(m["handle"]).lower()) or m["label"],
+                             "display_name": (_ig_names.get(str(m["handle"]).lower())
+                                              or m.get("full_name") or m["label"]),
+                             "avatar": m.get("avatar"),
                              "user_id": m["user_id"], "resolved": m["resolved"],
                              "collector": m["collector"], "type": m["type"]}
                             for m in s["sources"]],

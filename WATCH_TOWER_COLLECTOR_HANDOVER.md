@@ -88,7 +88,14 @@ is the API surface, there is no other discovery document. Do not probe.
                     list_id:null, owner_handle:null, paused,
                     members:[{handle, display_name, user_id (numeric
                               Instagram id or null while we resolve it),
-                              resolved, collector, type}],
+                              resolved, collector, type,
+                              avatar (2026-09-29: the account's profile
+                              picture URL from the newest collected post,
+                              null until one is collected)}],
+                    display_name is the account's REAL NAME (from the
+                    posts we collected, or the same person's X name via
+                    identity.py) once known, the handle until then. Draw
+                    the row like an X one: avatar + display_name + @handle.
                     streams:[{stream_id:-P, label:"ig:P:0", paused, tweets}] }
     Negative ids are synthetic on purpose: integers you can key on, never
     colliding with a real row, refused by every POST.
@@ -239,7 +246,7 @@ is the API surface, there is no other discovery document. Do not probe.
     url, text,
     created_at:          post time, ISO UTC     created_ms:   same, epoch ms
     collected_at:        when WE saved it        collected_ms: the cursor field
-    author_username, author_display_name (= handle on Instagram),
+    author_username, author_display_name (Instagram: the real name once a post carried it, else the handle — 2026-09-29),
     author_id:           numeric platform user id ("" while unresolved on IG)
     author_avatar:       url or null
     media:               [{type: photo|video|album|other, url, thumb}]
