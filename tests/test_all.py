@@ -1823,6 +1823,85 @@ def _scoping_boundary_checks(_web):
 
 # ==========================================================================
 # dashboard filters
+
+def test_ig_lists(tmp):
+    """
+    Named Instagram lists: a project's sources sit in lists; the default
+    list appears on migration; pause hides a list's sources from the
+    collector's worklist; delete moves handles rather than losing them.
+    """
+    import sqlite3
+
+    import store_ig
+
+    db = pathlib.Path(tmp) / "ig_results.db"
+
+    print("== migration: pre-list sources land in a default list ==")
+    with store_ig.Store(db) as st:
+        st.add_source("a1", "user", "a1", project_id=7)
+        st.add_source("a2", "user", "a2", project_id=7)
+        st.add_source("b1", "user", "b1", project_id=8)
+        # Simulate rows written before lists existed.
+        st.db.execute("UPDATE sources SET list_id = 0"); st.db.execute("DELETE FROM ig_lists")
+        st.db.commit()
+    with store_ig.Store(db) as st:
+        l7, l8 = st.lists(7), st.lists(8)
+        ok(len(l7) == 1 and l7[0]["name"] == "Instagram sources" and l7[0]["sources"] == 2,
+           f"project 7 gets one default list holding its 2 sources ({l7})")
+        ok(len(l8) == 1 and l8[0]["sources"] == 1, "project 8 gets its own")
+        ok(st.db.execute("SELECT COUNT(*) c FROM sources WHERE list_id = 0").fetchone()["c"] == 0,
+           "no source is left outside a list")
+        d7 = l7[0]["list_id"]
+
+        print()
+        print("== create / rename / add-into / move ==")
+        made = st.create_list(7, "MLAs")
+        ok("list_id" in made, "a named list is created")
+        ok("error" in st.create_list(7, "MLAs"), "a duplicate name in the same project is refused")
+        ok("list_id" in st.create_list(8, "MLAs"), "the same name in another project is fine")
+        ok("error" in st.create_list(7, "  "), "a blank name is refused")
+        st.add_source("m1", "user", "m1", project_id=7, list_id=made["list_id"])
+        try:
+            st.add_source("x", "user", "x", project_id=8, list_id=made["list_id"]); wrong = False
+        except ValueError:
+            wrong = True
+        ok(wrong, "adding into another project's list is refused")
+        st.add_source("m1", "user", "m1", project_id=7)          # re-add, no list named
+        ok(st.db.execute("SELECT list_id FROM sources WHERE label='m1'").fetchone()["list_id"] == made["list_id"],
+           "a re-add that names no list keeps the list it has")
+        ok("error" not in st.set_list("a1", made["list_id"]), "a source moves between lists of its project")
+        ok("error" in st.set_list("b1", made["list_id"]), "…but not across projects")
+        ok(st.rename_list(made["list_id"], "MLAs 2026").get("name") == "MLAs 2026", "rename works")
+        ok("error" in st.rename_list(made["list_id"], "Instagram sources"),
+           "renaming onto an existing name is refused")
+        names = {l["name"]: l["sources"] for l in st.lists(7)}
+        ok(names == {"Instagram sources": 1, "MLAs 2026": 2}, f"counts follow the moves ({names})")
+
+        print()
+        print("== pause hides the list from the collector ==")
+        st.set_list_paused(made["list_id"], True)
+        work = sorted(s.label for s in st.sources(only_enabled=True))
+        ok(work == ["a2", "b1"], f"paused list's sources are off the worklist ({work})")
+        allrows = sorted(s.label for s in st.sources(only_enabled=False))
+        ok(allrows == ["a1", "a2", "b1", "m1"], "…but still exist for the dashboard")
+        st.set_list_paused(made["list_id"], False)
+        ok(len(st.sources(only_enabled=True)) == 4, "resume puts them back")
+
+        print()
+        print("== delete: handles move, or go with the list on request ==")
+        r = st.delete_list(made["list_id"])
+        ok(r.get("sources_moved") == 2 and r.get("removed"), f"deleting a list moves its handles ({r})")
+        ok(st.db.execute("SELECT COUNT(*) c FROM sources WHERE list_id = ?", (d7,)).fetchone()["c"] == 3,
+           "…into the default list")
+        ok("error" in st.delete_list(d7), "the only list with sources cannot just be dropped")
+        r = st.delete_list(d7, delete_sources=True)
+        ok(r.get("sources_removed") == 3, "…but can go together with its sources")
+        ok(st.lists(7) == [], "project 7 has no lists now")
+        st.add_source("n1", "user", "n1", project_id=7)
+        ok(st.lists(7)[0]["name"] == "Instagram sources", "the next add recreates the default list")
+        ok("error" in st.delete_list(999999), "a missing list is refused")
+
+
 # ==========================================================================
 
 def test_filters(tmp):
@@ -7140,6 +7219,7 @@ def main():
         section("projects & watchlists (dashboard state -> compiled streams)")
         test_projects_watchlists(fresh("projects"))
         test_shared_watchlists(fresh("shared_wl"))
+        test_ig_lists(fresh("ig_lists"))
 
         section("collections (curation boards)")
         test_collections(fresh("collections"))

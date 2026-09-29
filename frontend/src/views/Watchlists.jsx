@@ -91,6 +91,7 @@ function AddModal({ pid, onDone, onClose }) {
   const [owner, setOwner] = useState("");
   const [handles, setHandles] = useState("");
   const [igValue, setIgValue] = useState("");
+  const [igList, setIgList] = useState("");        // Instagram: the list's name
   const [sheet, setSheet] = useState("");
   const [synced, setSynced] = useState(null);   // links+sheet: the first sync's report
   const [err, setErr] = useState("");
@@ -121,9 +122,21 @@ function AddModal({ pid, onDone, onClose }) {
         if (kind === "favorites") await api.fbSettings({ mode: "favorites" });
         for (const n of names) await api.fbAddSource(pid, n);
       } else if (platform === "ig") {
+        // A named list, like X: the list is created first and the handles
+        // land in it in the same request. No name = the project's default
+        // list ("Instagram sources"), which is what every add did before.
+        const listName = igList.trim();
+        let listId = 0;
+        if (listName) {
+          const made = await api.igLists({ action: "create", project: pid, name: listName,
+                                           type: kind === "following" ? "user" : kind,
+                                           handles: kind === "following" ? "" : handles });
+          if (made.warning) { setErr(made.warning); return; }
+          listId = made.list_id;
+        }
         if (kind === "following") {
-          await api.igSource({ action: "add", label: "home", type: "following", value: "", project: pid });
-        } else {
+          await api.igSource({ action: "add", label: "home", type: "following", value: "", project: pid, list_id: listId });
+        } else if (!listName) {
           // Bulk: one source per line/word — paste many at once (like Facebook).
           const items = handles.split(/[\s,]+/).filter(Boolean);
           for (const it of items) {
@@ -253,6 +266,13 @@ function AddModal({ pid, onDone, onClose }) {
         </Field>
       )}
 
+      {platform === "ig" && (
+        <Field label="List name" optional
+               hint="A named Instagram list, like an X watchlist — rename, pause and delete it on its own. Leave blank to add into the project's default list.">
+          <input value={igList} onChange={(e) => setIgList(e.target.value)}
+                 placeholder="e.g. Rajasthan MLAs" maxLength={120} />
+        </Field>
+      )}
       {platform === "ig" && kind !== "following" && (
         <Field label={kind === "user" ? "Usernames or numeric ids" : "Hashtags"}
                hint={kind === "user"
@@ -1482,13 +1502,105 @@ export function IgIdPending({ pid, sources, reload }) {
 
 // Instagram detail panel
 
-function IgDetail({ pid, data, reload, gotoSettings, onBack }) {
+// Rename an Instagram list — the same modal shape as X's RenameModal.
+function IgRenameModal({ pid, list, onChanged, onClose }) {
+  const [val, setVal] = useState(list.name || "");
+  const [busy, setBusy] = useState(false);
+  const [err, setErr] = useState("");
+  const save = async () => {
+    const name = val.trim();
+    if (!name || name === list.name) { onClose(); return; }
+    setBusy(true); setErr("");
+    try {
+      const r = await api.igLists({ action: "rename", project: pid, list_id: list.list_id, name });
+      if (r && r.error) { setErr(r.error); return; }
+      onChanged(); onClose();
+    } catch (e) { setErr(String(e.message || e)); }
+    finally { setBusy(false); }
+  };
+  return (
+    <Modal title="Rename Instagram list" sub="Display name only — collection is unaffected." onClose={onClose}>
+      <div className="field">
+        <label htmlFor="iglname">Name</label>
+        <input id="iglname" value={val} autoFocus maxLength={120}
+               onChange={(e) => setVal(e.target.value)}
+               onKeyDown={(e) => e.key === "Enter" && save()} />
+      </div>
+      {err && <div className="err">{err}</div>}
+      <div className="row">
+        <button className="btn btn-ghost" onClick={onClose}>Cancel</button>
+        <button className="btn btn-brand" disabled={busy || !val.trim()} onClick={save}>Save</button>
+      </div>
+    </Modal>
+  );
+}
+
+// Delete an Instagram list. The handles are a person's work: by default they
+// move to the project's default list; deleting them too is a second, explicit
+// choice. Posts are never deleted here.
+function IgDeleteModal({ pid, list, others, onChanged, onClose }) {
+  const [withSources, setWithSources] = useState(others === 0);
+  const [busy, setBusy] = useState(false);
+  const [err, setErr] = useState("");
+  const go = async () => {
+    setBusy(true); setErr("");
+    try {
+      const r = await api.igLists({ action: "delete", project: pid, list_id: list.list_id,
+                                    delete_sources: withSources });
+      if (r && r.error) { setErr(r.error); return; }
+      onClose(); onChanged();
+    } catch (e) { setErr(String(e.message || e)); }
+    finally { setBusy(false); }
+  };
+  return (
+    <Modal title={`Delete “${list.name}”?`} onClose={onClose}
+           sub="Posts already collected stay in the database either way.">
+      {list.sources > 0 && (
+        <div className="field" style={{ marginTop: 10 }}>
+          <label style={{ display: "flex", gap: 8, alignItems: "center", textTransform: "none", letterSpacing: 0 }}>
+            <input type="checkbox" checked={withSources} disabled={others === 0}
+                   onChange={(e) => setWithSources(e.target.checked)} />
+            <span>Also remove its {list.sources} source{list.sources === 1 ? "" : "s"} (collection stops for them)</span>
+          </label>
+          <div className="fhint">
+            {others === 0
+              ? "This is the project's only Instagram list, so its sources go with it."
+              : withSources ? "Handles are deleted." : "Handles move to the project's other list and keep collecting."}
+          </div>
+        </div>
+      )}
+      {err && <div className="err">{err}</div>}
+      <div className="row">
+        <button className="btn btn-ghost" onClick={onClose}>Keep it</button>
+        <button className="btn btn-danger" disabled={busy} onClick={go}>Delete</button>
+      </div>
+    </Modal>
+  );
+}
+
+function IgDetail({ pid, data, reload, gotoSettings, onBack, list }) {
   const [msg, setMsg] = useState("");
   const [fetching, setFetching] = useState(false);
   const [result, setResult] = useState(null);
   const [adding, setAdding] = useState("");
   const [busyAdd, setBusyAdd] = useState(false);
-  const sources = sortBy(data?.sources || [], "label");
+  const [renaming, setRenaming] = useState(false);
+  const [confirming, setConfirming] = useState(false);
+  const [busyList, setBusyList] = useState(false);
+  useEffect(() => { setMsg(""); setResult(null); setAdding(""); }, [list?.list_id]);
+  // This panel is ONE list's sources when a list is selected; the whole
+  // project's when the project has no lists yet.
+  const sources = sortBy((data?.sources || []).filter((s) => !list || s.list_id === list.list_id), "label");
+  const otherLists = (data?.lists || []).filter((l) => !list || l.list_id !== list.list_id).length;
+  const listPaused = !!list?.paused;
+  const toggleList = async () => {
+    setBusyList(true); setMsg("");
+    try {
+      const r = await api.igLists({ action: listPaused ? "resume" : "pause", project: pid, list_id: list.list_id });
+      if (r && r.error) setMsg(r.error); else reload();
+    } catch (e) { setMsg(String(e.message || e)); }
+    finally { setBusyList(false); }
+  };
   const paused = !!data?.paused;
   const anyCheckpoint = (data?.accounts || []).some((a) => a.checkpoint_at);
   const anyActive = (data?.accounts || []).some((a) => a.active);
@@ -1511,7 +1623,7 @@ function IgDetail({ pid, data, reload, gotoSettings, onBack }) {
   const fetchNow = async () => {
     setFetching(true); setResult(null); setMsg("");
     try {
-      const r = await api.igFetch(pid);
+      const r = await api.igFetch(pid, list?.list_id);
       if (r.error) setMsg(r.error);
       else setResult(r);
       reload();
@@ -1526,7 +1638,8 @@ function IgDetail({ pid, data, reload, gotoSettings, onBack }) {
     try {
       for (const u of adding.split(/[\s,]+/).filter(Boolean)) {
         const name = u.replace(/^[@#]/, "");
-        await api.igSource({ action: "add", label: name, type: "user", value: name, project: pid });
+        await api.igSource({ action: "add", label: name, type: "user", value: name, project: pid,
+                             list_id: list?.list_id || 0 });
       }
       setAdding(""); reload();
     } catch (e) { setMsg(String(e.message || e)); }
@@ -1539,9 +1652,12 @@ function IgDetail({ pid, data, reload, gotoSettings, onBack }) {
         <div className="dtitle">
           {onBack && <button className="icon-btn back" onClick={onBack} aria-label="All watchlists">{icons.back}</button>}
           <span className="badge platform-ig">IG</span>
-          <h3>Instagram sources</h3>
-          <span className={`chip ${paused ? "warn" : anyActive ? "good" : "warn"}`}>
-            {paused ? "paused" : anyActive ? "collecting" : "no active session"}
+          <h3 title={list?.name || "Instagram sources"}>{list?.name || "Instagram sources"}</h3>
+          {list && (
+            <button className="icon-btn xs" title="Rename" aria-label="Rename" onClick={() => setRenaming(true)}>{icons.edit}</button>
+          )}
+          <span className={`chip ${paused || listPaused ? "warn" : anyActive ? "good" : "warn"}`}>
+            {listPaused ? "list paused" : paused ? "paused" : anyActive ? "collecting" : "no active session"}
           </span>
           {(anyCheckpoint || !anyActive) && (
             <button className="chip crit as-btn" onClick={gotoSettings} title="Open Network & settings to fix the session">
@@ -1550,10 +1666,20 @@ function IgDetail({ pid, data, reload, gotoSettings, onBack }) {
           )}
         </div>
         <div className="dactions">
-          <button className="btn btn-brand btn-sm" disabled={fetching || paused || sources.length === 0} onClick={fetchNow}
-                  title="Check every source now instead of waiting for the next cycle">
+          <button className="btn btn-brand btn-sm" disabled={fetching || paused || listPaused || sources.length === 0} onClick={fetchNow}
+                  title="Run one Instagram pass now instead of waiting for the next cycle (a pass covers every list of the project)">
             {fetching ? "Fetching…" : "Fetch now"}
           </button>
+          {list && (
+            <button className="btn btn-ghost btn-sm" disabled={busyList} onClick={toggleList}
+                    title={listPaused ? "Put this list's sources back on the collector's worklist"
+                                      : "Take this list's sources off the collector's worklist; nothing collected is lost"}>
+              {busyList ? "…" : listPaused ? "Resume" : "Pause"}
+            </button>
+          )}
+          {list && (
+            <button className="btn btn-danger btn-sm" onClick={() => setConfirming(true)}>Delete</button>
+          )}
           <button className="btn btn-ghost btn-sm" onClick={gotoSettings}>Settings →</button>
         </div>
       </div>
@@ -1620,10 +1746,16 @@ function IgDetail({ pid, data, reload, gotoSettings, onBack }) {
         ))}
         {sources.length === 0 && (
           <div style={{ color: "var(--ink-3)", fontSize: 13, padding: "12px 0" }}>
-            No Instagram sources yet — paste usernames below, or use “+ New watchlist”.
+            No Instagram sources {list ? "in this list" : "yet"} — paste usernames below, or use “+ New watchlist”.
           </div>
         )}
       </div>
+      {renaming && list && (
+        <IgRenameModal pid={pid} list={list} onChanged={reload} onClose={() => setRenaming(false)} />
+      )}
+      {confirming && list && (
+        <IgDeleteModal pid={pid} list={list} others={otherLists} onChanged={reload} onClose={() => setConfirming(false)} />
+      )}
       <div className="filters" style={{ marginTop: 10, marginBottom: 0 }}>
         <input value={adding} placeholder="instagram usernames — one or many, e.g. natgeo nasa isro"
                style={{ flex: 1, minWidth: 200 }}
@@ -1955,11 +2087,25 @@ export default function Watchlists({ onMenu }) {
       sub: `${(fb.data?.sources || []).length} pages · ${fmtN(fb.data?.totals?.posts ?? 0)} collected`,
       live: !!fb.data?.enabled && !fb.data?.paused && !fb.data?.health?.blocked,
     });
-    out.push({
-      id: "ig", platform: "ig", name: "Instagram sources",
-      sub: `${(ig.data?.sources || []).length} sources · ${fmtN(ig.data?.totals?.posts ?? 0)} collected`,
-      live: (ig.data?.accounts || []).some((a) => a.active),
-    });
+    // Instagram: one row per named list (ig_lists). A project with sources
+    // always has at least the default list; with none it gets the same
+    // starting row it always had.
+    const igLive = (ig.data?.accounts || []).some((a) => a.active) && !ig.data?.paused;
+    const igLists = ig.data?.lists || [];
+    if (igLists.length === 0) {
+      out.push({
+        id: "ig", platform: "ig", name: "Instagram sources",
+        sub: `${(ig.data?.sources || []).length} sources · ${fmtN(ig.data?.totals?.posts ?? 0)} collected`,
+        live: igLive,
+      });
+    }
+    for (const l of igLists) {
+      out.push({
+        id: `ig:${l.list_id}`, platform: "ig", name: l.name, igList: l,
+        sub: `${l.sources} source${l.sources === 1 ? "" : "s"} · ${fmtN(l.posts)} collected${l.paused ? " · paused" : ""}`,
+        live: igLive && !l.paused && l.enabled > 0,
+      });
+    }
     return out;
   }, [xLists, fb.data, ig.data, pid]);
 
@@ -2123,8 +2269,9 @@ export default function Watchlists({ onMenu }) {
                   <FbDetail pid={pid} data={fb.data} reload={fb.reload} onBack={back}
                             gotoSettings={() => setTab("settings")} />
                 )}
-                {selected?.id === "ig" && (
+                {selected?.platform === "ig" && (
                   <IgDetail pid={pid} data={ig.data} reload={ig.reload} onBack={back}
+                            list={selected.igList || null}
                             gotoSettings={() => setTab("settings")} />
                 )}
               </div>}

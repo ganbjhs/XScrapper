@@ -142,6 +142,30 @@ CREATE TABLE IF NOT EXISTS settings (
   key    TEXT PRIMARY KEY,                -- e.g. 'ig_paused', 'ig_interval_s'
   value  TEXT
 );
+
+-- Named Instagram lists (2026-09-29). Until now a project's Instagram
+-- handles were one undifferentiated pool ("Instagram sources"); X has had
+-- named, renamable, pausable lists all along and the operator wanted the
+-- same controls here. A list is a project-scoped name over a subset of
+-- `sources` (sources.list_id); it owns nothing else. Pause is per list and
+-- is honoured where the collector reads its worklist (Store.sources with
+-- only_enabled=True), so no collector code had to learn about lists.
+--
+-- What a consumer sees is UNCHANGED: /api/watchlists still carries one
+-- synthetic "Instagram sources" row per project (ig:P:0) whose members are
+-- every source of the project, lists or no lists. Exposing lists to
+-- Watch-Tower is a separate, later decision.
+--
+-- Every project that has sources gets a default list, "Instagram sources",
+-- created by _migrate and reused whenever a source is added with no list.
+CREATE TABLE IF NOT EXISTS ig_lists (
+  list_id     INTEGER PRIMARY KEY AUTOINCREMENT,
+  project_id  INTEGER NOT NULL,
+  name        TEXT NOT NULL,
+  paused      INTEGER NOT NULL DEFAULT 0,
+  created_at  INTEGER NOT NULL,
+  UNIQUE(project_id, name)
+);
 """
 
 
@@ -234,6 +258,9 @@ class Store:
         if "assigned_account" not in have:
             self.db.execute(
                 "ALTER TABLE sources ADD COLUMN assigned_account TEXT NOT NULL DEFAULT ''")
+        if "list_id" not in have:
+            self.db.execute(
+                "ALTER TABLE sources ADD COLUMN list_id INTEGER NOT NULL DEFAULT 0")
         havep = {r["name"] for r in self.db.execute("PRAGMA table_info(posts)")}
         if "project_id" not in havep:
             self.db.execute(
@@ -247,6 +274,19 @@ class Store:
             "CREATE INDEX IF NOT EXISTS ix_posts_project ON posts(project_id)")
         self.db.execute(
             "CREATE INDEX IF NOT EXISTS ix_sources_project ON sources(project_id)")
+        self.db.execute(
+            "CREATE INDEX IF NOT EXISTS ix_sources_list ON sources(list_id)")
+        # Every source of a project sits in a list: the ones written before
+        # lists existed (list_id 0) go to the project's default list, created
+        # on demand. Idempotent — only list_id 0 rows with a real project move.
+        for r in self.db.execute(
+                "SELECT DISTINCT project_id FROM sources "
+                "WHERE list_id = 0 AND project_id != 0").fetchall():
+            lid = self.default_list(r["project_id"])
+            self.db.execute(
+                "UPDATE sources SET list_id = ? WHERE list_id = 0 AND project_id = ?",
+                (lid, r["project_id"]))
+        self.db.commit()
 
     def close(self):
         if self.db:
@@ -279,7 +319,7 @@ class Store:
 
     # -- sources ------------------------------------------------------------
     def add_source(self, label, type_, value="", account="", platform_id="",
-                   project_id=0) -> None:
+                   project_id=0, list_id=0) -> None:
         """Register (or update) a source.
 
         label is the person; value is the handle. platform_id is optional and
@@ -299,9 +339,31 @@ class Store:
         platform_id = str(platform_id or "").strip()
         if type_ == "user" and value.isdigit() and not platform_id:
             value, platform_id = "", value
+        # Every source sits in a list of its project. A caller that names
+        # none gets the project's default list; a re-add that names none
+        # keeps the list it already has (see the ON CONFLICT clause).
+        lid = int(list_id or 0)
+        if lid:
+            l = self.list_row(lid)
+            if not l:
+                raise ValueError(f"no Instagram list {lid}")
+            if int(project_id or 0) and int(l["project_id"]) != int(project_id):
+                raise ValueError("that list belongs to another project")
+            project_id = l["project_id"]
+        elif int(project_id or 0):
+            # No list named: a source this project already has keeps its
+            # list; a new one (or one moving in from another project) goes
+            # to the project's default list.
+            cur = self.db.execute(
+                "SELECT project_id, list_id FROM sources WHERE label = ?",
+                (label,)).fetchone()
+            if cur and int(cur["project_id"]) == int(project_id) and cur["list_id"]:
+                lid = int(cur["list_id"])
+            else:
+                lid = self.default_list(project_id)
         self.db.execute(
             "INSERT INTO sources(label,type,value,platform_id,project_id,account,"
-            "enabled,created_at) VALUES(?,?,?,?,?,?,1,?) "
+            "enabled,created_at,list_id) VALUES(?,?,?,?,?,?,1,?,?) "
             "ON CONFLICT(label) DO UPDATE SET "
             "type=excluded.type, value=excluded.value, account=excluded.account, "
             "platform_id = CASE "
@@ -311,9 +373,147 @@ class Store:
             # A re-add that names no project keeps the one it already has —
             # re-adding a source is not a request to un-assign it.
             "project_id = CASE WHEN excluded.project_id != 0 "
-            "  THEN excluded.project_id ELSE sources.project_id END",
-            (label, type_, value, platform_id, int(project_id or 0), account, _now()))
+            "  THEN excluded.project_id ELSE sources.project_id END, "
+            "list_id = CASE WHEN excluded.list_id != 0 "
+            "  THEN excluded.list_id ELSE sources.list_id END",
+            (label, type_, value, platform_id, int(project_id or 0), account, _now(), lid))
         self.db.commit()
+
+    # ------------------------------------------------------------------
+    # named lists (ig_lists) — see the schema comment
+    # ------------------------------------------------------------------
+
+    DEFAULT_LIST_NAME = "Instagram sources"
+
+    def default_list(self, project_id) -> int:
+        """The project's default list id, created if it does not exist yet."""
+        pid = int(project_id or 0)
+        row = self.db.execute(
+            "SELECT list_id FROM ig_lists WHERE project_id = ? ORDER BY list_id LIMIT 1",
+            (pid,)).fetchone()
+        if row:
+            return int(row["list_id"])
+        cur = self.db.execute(
+            "INSERT INTO ig_lists(project_id, name, created_at) VALUES(?,?,?)",
+            (pid, self.DEFAULT_LIST_NAME, _now()))
+        return int(cur.lastrowid)
+
+    def lists(self, project_id) -> list:
+        """The project's lists with a source count, a live-source count and
+        how many posts their sources have collected — the sidebar's rows."""
+        pid = int(project_id or 0)
+        out = []
+        for l in self.db.execute(
+                "SELECT l.*, "
+                "  (SELECT COUNT(*) FROM sources s WHERE s.list_id = l.list_id) AS sources, "
+                "  (SELECT COUNT(*) FROM sources s WHERE s.list_id = l.list_id "
+                "     AND s.enabled = 1) AS enabled, "
+                "  (SELECT COUNT(*) FROM posts p JOIN sources s ON s.label = p.source_label "
+                "     WHERE s.list_id = l.list_id) AS posts "
+                "FROM ig_lists l WHERE l.project_id = ? ORDER BY l.list_id", (pid,)):
+            d = dict(l)
+            d["paused"] = bool(d["paused"])
+            out.append(d)
+        return out
+
+    def list_row(self, list_id):
+        r = self.db.execute("SELECT * FROM ig_lists WHERE list_id = ?",
+                            (int(list_id),)).fetchone()
+        return dict(r) if r else None
+
+    def create_list(self, project_id, name) -> dict:
+        name = str(name or "").strip()
+        if not name:
+            return {"error": "a list needs a name"}
+        pid = int(project_id or 0)
+        if not pid:
+            return {"error": "no project selected"}
+        try:
+            cur = self.db.execute(
+                "INSERT INTO ig_lists(project_id, name, created_at) VALUES(?,?,?)",
+                (pid, name, _now()))
+        except sqlite3.IntegrityError:
+            return {"error": f"this project already has an Instagram list called {name!r}"}
+        self.db.commit()
+        return {"list_id": int(cur.lastrowid), "name": name, "project_id": pid}
+
+    def rename_list(self, list_id, name) -> dict:
+        """A rename is a label change and nothing else: sources key on
+        list_id, posts on source_label, so nothing moves and nothing
+        recollects (the same rule as X's rename_watchlist)."""
+        l = self.list_row(list_id)
+        if not l:
+            return {"error": f"no Instagram list {list_id}"}
+        name = str(name or "").strip()
+        if not name:
+            return {"error": "a list needs a name"}
+        try:
+            self.db.execute("UPDATE ig_lists SET name = ? WHERE list_id = ?",
+                            (name, int(list_id)))
+        except sqlite3.IntegrityError:
+            return {"error": f"this project already has an Instagram list called {name!r}"}
+        self.db.commit()
+        return {"list_id": int(list_id), "name": name}
+
+    def set_list_paused(self, list_id, paused: bool) -> dict:
+        """Pause one list. The collector's worklist (sources(only_enabled=True))
+        excludes sources in a paused list, so this takes effect on the next
+        pass with no collector change; posts already collected stay."""
+        l = self.list_row(list_id)
+        if not l:
+            return {"error": f"no Instagram list {list_id}"}
+        self.db.execute("UPDATE ig_lists SET paused = ? WHERE list_id = ?",
+                        (1 if paused else 0, int(list_id)))
+        self.db.commit()
+        return {"list_id": int(list_id), "paused": bool(paused)}
+
+    def delete_list(self, list_id, delete_sources: bool = False) -> dict:
+        """Remove a list. Its sources either go with it (delete_sources) or
+        move to the project's default list — the handles were typed by a
+        person and are not thrown away by a click on the wrong list. The
+        default list itself can only go together with its sources. Posts are
+        never deleted here: they are the project's collected history."""
+        l = self.list_row(list_id)
+        if not l:
+            return {"error": f"no Instagram list {list_id}"}
+        lid, pid = int(list_id), int(l["project_id"])
+        n = self.db.execute("SELECT COUNT(*) c FROM sources WHERE list_id = ?",
+                            (lid,)).fetchone()["c"]
+        moved = removed = 0
+        if delete_sources:
+            removed = self.db.execute("DELETE FROM sources WHERE list_id = ?",
+                                      (lid,)).rowcount
+        elif n:
+            others = self.db.execute(
+                "SELECT list_id FROM ig_lists WHERE project_id = ? AND list_id != ? "
+                "ORDER BY list_id LIMIT 1", (pid, lid)).fetchone()
+            if not others:
+                return {"error": f"{l['name']!r} is this project's only Instagram "
+                                 f"list and holds {n} source(s) — delete them with "
+                                 "it, or move them to another list first"}
+            moved = self.db.execute(
+                "UPDATE sources SET list_id = ? WHERE list_id = ?",
+                (int(others["list_id"]), lid)).rowcount
+        self.db.execute("DELETE FROM ig_lists WHERE list_id = ?", (lid,))
+        self.db.commit()
+        return {"removed": True, "list_id": lid, "sources_moved": moved,
+                "sources_removed": removed, "posts_kept": True}
+
+    def set_list(self, label, list_id) -> dict:
+        """Move one source to another list of the SAME project."""
+        l = self.list_row(list_id)
+        if not l:
+            return {"error": f"no Instagram list {list_id}"}
+        r = self.db.execute("SELECT project_id FROM sources WHERE label = ?",
+                            (label,)).fetchone()
+        if not r:
+            return {"error": f"no source {label!r}"}
+        if int(r["project_id"]) != int(l["project_id"]):
+            return {"error": "a source can only move between lists of its own project"}
+        self.db.execute("UPDATE sources SET list_id = ? WHERE label = ?",
+                        (int(list_id), label))
+        self.db.commit()
+        return {"ok": True}
 
     def set_project(self, label, project_id) -> None:
         """Move one source to a project (0 un-assigns it, hiding it from every
@@ -371,15 +571,19 @@ class Store:
         why that policy is enforced at the boundary and not here."""
         where, args = [], []
         if only_enabled:
-            where.append("enabled=1")
+            # Enabled AND not in a paused list: this is the collector's
+            # worklist, so a list's Pause is honoured here and nowhere else.
+            where.append("s.enabled=1")
+            where.append("COALESCE(l.paused, 0) = 0")
         if project_id is not None:
-            where.append("project_id=?"); args.append(int(project_id))
-        q = "SELECT * FROM sources"
+            where.append("s.project_id=?"); args.append(int(project_id))
+        q = ("SELECT s.* FROM sources s "
+             "LEFT JOIN ig_lists l ON l.list_id = s.list_id")
         if where:
             q += " WHERE " + " AND ".join(where)
         return [Source(r["label"], r["type"], r["value"], r["account"],
                        r["platform_id"], r["project_id"], r["assigned_account"])
-                for r in self.db.execute(q + " ORDER BY label", args)]
+                for r in self.db.execute(q + " ORDER BY s.label", args)]
 
     def assign_sources(self, accounts, *, log=lambda m: None) -> dict:
         """

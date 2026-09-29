@@ -202,6 +202,34 @@ change to the delivery contract. The write endpoint
 (`POST /api/watchlists/owner`) is cookie-only: a read integration does not get
 to restamp ownership.
 
+### An Instagram list is a NAME over sources — pause lives in the worklist, delete moves handles (2026-09-29)
+
+X had named, renamable, pausable lists; Instagram was one pool per project.
+Now `ig_lists` gives Instagram the same controls, and the rules that keep it
+cheap:
+
+- **A list is a name over `sources.list_id` and owns nothing else.** Rename
+  changes one string. Posts key on `source_label`, sources on `list_id`, so
+  nothing moves and nothing recollects.
+- **Pause is honoured in ONE place: `Store.sources(only_enabled=True)`**, the
+  collector's worklist, which now also excludes sources in a paused list.
+  No collector code learned about lists; a paused list simply is not
+  handed out. `only_enabled=False` still returns everything, for the panel.
+- **Delete moves handles by default.** A list's sources go to the project's
+  other list unless the operator ticks "also remove its sources"; the only
+  list holding sources cannot be dropped without that tick. The handles are
+  someone's typed work, and a click on the wrong list is not a reason to
+  lose them. Posts are never deleted by a list delete.
+- **Every source is in a list.** `_migrate` creates one default list per
+  project ("Instagram sources") and adopts `list_id = 0` rows into it, so
+  the panel never shows a handle that belongs to nothing. A re-add that
+  names no list keeps the list it has; a source moving in from another
+  project lands in the new project's default list.
+- **The consumer sees nothing new.** `/api/watchlists` still carries one
+  synthetic `ig:P:0` row whose `members[]` are every source of the project,
+  lists or no lists — Watch-Tower's Instagram mirror is built on that label.
+  Exposing lists to them is a separate decision, to be announced first.
+
 ### A watchlist is shared by LINKING, never by copying — one list, one fetch, every project that added it (2026-09-25)
 
 A watchlist is created in one project — `watchlists.project_id`, which from

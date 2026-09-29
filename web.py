@@ -2188,6 +2188,10 @@ def _project_other_platforms(pid: int, do_delete: bool) -> dict:
             if do_delete:
                 db.execute("DELETE FROM posts WHERE project_id = ?", (pid,))
                 db.execute("DELETE FROM sources WHERE project_id = ?", (pid,))
+                try:
+                    db.execute("DELETE FROM ig_lists WHERE project_id = ?", (pid,))
+                except sqlite3.OperationalError:
+                    pass   # a database from before named lists
                 db.commit()
             out[key] = {"sources": n_src, "posts": n_posts}
         except sqlite3.OperationalError:
@@ -5631,12 +5635,15 @@ def _ig_status(q=None):
                 # a human reads and the thing that maps to the other platforms.
                 out["sources"] = [dict(r) for r in st.db.execute(
                     "SELECT label, type, value, platform_id, project_id, account, "
-                    "assigned_account, enabled FROM sources WHERE project_id = ? "
-                    "ORDER BY label",
+                    "assigned_account, enabled, list_id FROM sources "
+                    "WHERE project_id = ? ORDER BY label",
                     (pid,))]
                 for row in out["sources"]:
                     row["collector"] = row.get("account") or row.get("assigned_account") or ""
                 out["totals"] = st.stats(project_id=pid)
+                # Named lists (2026-09-29): the sidebar draws one row per
+                # list; every source above carries its list_id. Additive.
+                out["lists"] = st.lists(pid)
         except Exception as e:
             out["sources_error"] = f"{type(e).__name__}: {e}"
     out["paused"] = settings.get("ig_paused") == "1"
@@ -6047,12 +6054,26 @@ def _ig_fetch(body):
     rp = _CFG.root / "ig_results.db"
     import store_ig
     srcs = []
+    # A list's "Fetch now" runs the project's pass (one pass covers every
+    # list — the collector works per account, not per list); the list id is
+    # only used to say honestly when THAT list has nothing live to fetch.
+    lid = _int_or(body.get("list_id"), 0)
     if rp.exists():
         try:
             with store_ig.Store(rp) as st:
                 srcs = [r for r in st.db.execute(
                     "SELECT label FROM sources WHERE enabled = 1 "
                     "AND project_id = ?", (pid,))]
+                if lid:
+                    l = st.list_row(lid)
+                    if not l:
+                        return {"error": f"no Instagram list {lid}"}
+                    if l["paused"]:
+                        return {"error": f"{l['name']!r} is paused — resume it first"}
+                    if not st.db.execute(
+                            "SELECT 1 FROM sources WHERE enabled = 1 AND list_id = ?",
+                            (lid,)).fetchone():
+                        return {"error": f"{l['name']!r} has no live source to fetch"}
         except Exception as e:
             return {"error": f"{type(e).__name__}: {e}"}
     if not srcs:
@@ -6109,9 +6130,11 @@ def _ig_source_post(body):
                 # A username is the expected input now; the collector resolves it
                 # to a numeric id once and caches that in platform_id. A numeric
                 # value is still accepted and routed to platform_id by
-                # store_ig.add_source, so old callers keep working.
+                # store_ig.add_source, so old callers keep working. `list_id`
+                # picks the named list; absent, the project's default list.
                 st.add_source(label, typ, value, str(body.get("account") or ""),
-                              str(body.get("platform_id") or ""), project_id=pid)
+                              str(body.get("platform_id") or ""), project_id=pid,
+                              list_id=_int_or(body.get("list_id"), 0))
             except ValueError as e:
                 return {"error": str(e)}
         elif action == "set-project":
@@ -6126,10 +6149,68 @@ def _ig_source_post(body):
             st.db.commit()
         elif action == "enable":
             st.set_enabled(label, bool(body.get("enabled")))
+        elif action == "move":
+            r = st.set_list(label, _int_or(body.get("list_id"), 0))
+            if "error" in r:
+                return r
         else:
             return {"error": "action must be add, remove, enable, set-id, "
-                             "or set-project"}
+                             "set-project or move"}
     return {"ok": True}
+
+
+def _ig_lists_post(body):
+    """
+    Named Instagram lists — create / rename / pause / resume / delete. The
+    same small controls an X watchlist has, over the project's Instagram
+    sources. Dashboard-only. Nothing a consumer reads changes: the
+    synthetic ig:P:0 row on /api/watchlists still carries every source of
+    the project.
+    """
+    import store_ig
+    action = (body.get("action") or "").lower()
+    pid = _project_or_none(body)
+    lid = _int_or(body.get("list_id"), 0)
+    rp = _CFG.root / "ig_results.db"
+    with store_ig.Store(rp) as st:
+        if action == "create":
+            if not pid:
+                return dict(_NO_PROJECT)
+            made = st.create_list(pid, body.get("name"))
+            if "error" in made:
+                return made
+            # Handles typed into the create form land in the new list at once.
+            items = [x.strip().lstrip("@#") for x in
+                     str(body.get("handles") or "").replace(",", " ").split()]
+            typ = (body.get("type") or "user").lower()
+            added = 0
+            for it in items:
+                if not it:
+                    continue
+                try:
+                    st.add_source(it, typ, it, project_id=pid, list_id=made["list_id"])
+                    added += 1
+                except ValueError as e:
+                    return {**made, "warning": str(e), "added": added}
+            return {**made, "added": added}
+        if not lid:
+            return {"error": "list_id must be a number"}
+        if action == "rename":
+            return st.rename_list(lid, body.get("name"))
+        if action in ("pause", "resume"):
+            r = st.set_list_paused(lid, action == "pause")
+            if "error" not in r:
+                try:
+                    import activity_log
+                    activity_log.log_event(
+                        "instagram", f"list {lid} {action.upper()}D by operator",
+                        db=str(_CFG.root / "activity.db"))
+                except Exception:
+                    pass
+            return r
+        if action == "delete":
+            return st.delete_list(lid, bool(body.get("delete_sources")))
+    return {"error": "action must be create, rename, pause, resume or delete"}
 
 
 def _ig_posts(q):
@@ -7108,6 +7189,8 @@ class Handler(BaseHTTPRequestHandler):
                 return self._send(200, _xlist_refresh(body))
             if u.path == "/api/stress/run":
                 return self._send(200, _stress_run(body))
+            if u.path == "/api/ig/lists":
+                return self._send(200, _ig_lists_post(body))
             if u.path == "/api/ig/source":
                 return self._send(200, _ig_source_post(body))
             if u.path == "/api/ig/fetch":

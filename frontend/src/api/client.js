@@ -92,7 +92,9 @@ export const api = {
     request("/api/ig/account", { method: "POST", body: { username, active } }),
   igReseed: (username) => request("/api/ig/reseed", { method: "POST", body: { username } }),
   igSource: (body) => request("/api/ig/source", { method: "POST", body }),
-  igFetch: (project) => request("/api/ig/fetch", { method: "POST", body: { project } }),
+  igFetch: (project, list_id) => request("/api/ig/fetch", { method: "POST", body: { project, list_id } }),
+  // Named Instagram lists (2026-09-29): create / rename / pause / resume / delete.
+  igLists: (body) => request("/api/ig/lists", { method: "POST", body }),
   igControl: (action) => request("/api/ig/control", { method: "POST", body: { action } }),
   igSettings: (body) => request("/api/ig/settings", { method: "POST", body }),
   // Shared display-name identity: link handles across X/FB/IG so the picture is shared.
