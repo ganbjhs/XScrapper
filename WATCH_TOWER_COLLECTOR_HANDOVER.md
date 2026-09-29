@@ -137,7 +137,7 @@ is the API surface, there is no other discovery document. Do not probe.
   Both status calls REQUIRE project=. Without it: {"error":"no project
   selected"} with HTTP 200 — check for an `error` key.
 
-  RATE LIMIT (stated, 2026-09-28): 60 requests per minute PER KEY, all
+  RATE LIMIT (stated 2026-09-28, raised 2026-09-29): 180 requests per minute PER KEY, all
   endpoints together, sliding 60-second window. Over it: HTTP 429 with
   Retry-After. Every keyed response now carries X-RateLimit-Limit,
   X-RateLimit-Remaining and X-RateLimit-Reset (seconds until the oldest

@@ -235,7 +235,7 @@ def _key_scope(presented: str):
 
 # A per-key request ceiling. There was none: a consumer stuck in a retry loop
 # could spend a night walking the same 4 pages and we would find out from the
-# access log. 60/min is far above anything the contract needs — a full walk of
+# access log. 180/min is far above anything the contract needs — a full walk of
 # 1,869 links at limit=500 is FOUR requests — so this constrains no correct
 # caller and stops an incorrect one.
 #

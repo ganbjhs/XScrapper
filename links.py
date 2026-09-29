@@ -390,7 +390,12 @@ DEFAULT_REFRESH_S = 86_400
 # has to discover by being throttled is one they discover at 3am, in a
 # scheduled run nobody is watching.
 MAX_LIMIT = 500
-RATE_PER_MIN = 60
+# 180, up from 60 (2026-09-29): Watch-Tower mirrors 7 projects x 8-9 lists
+# plus Instagram per pass and hit 429 on the old number the moment a list
+# was added — the new list's first pull never completed. Every keyed
+# response carries X-RateLimit-* so a consumer can pace under this; the
+# number is headroom, not permission to skip the headers.
+RATE_PER_MIN = 180
 MIN_REFRESH_S = 3_600
 
 # An unavailable post is retried on its normal cadence up to this many

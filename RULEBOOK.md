@@ -1030,7 +1030,7 @@ session got opened on a live account (§6, "never signed in twice").
   grant here would let any scoped key bind a sheet to somebody else's project.
   Test: `test_links.test_web`.
 - **A per-key request ceiling exists, and it is a courtesy brake, not a
-  security control** (2026-09-10). `links.RATE_PER_MIN` (60/min), enforced
+  security control** (2026-09-10). `links.RATE_PER_MIN` (180/min since 2026-09-29; 60 before), enforced
   in-process per worker on a hash of the key, answered as `429` with
   `Retry-After`. It is far above anything the contract needs — a full walk of
   1,869 links at `limit=500` is four requests — so it constrains no correct
@@ -1853,7 +1853,7 @@ before changing the engine; nearly every "obvious" idea has been tried.)
   rows exist" and filed it as a bug (2026-09-28). Any count we cap carries
   a flag beside it (`total_capped`, `total_note`); a limit we enforce is
   stated in the response (X-RateLimit-Limit / -Remaining / -Reset on every
-  keyed reply, 60/min per key, all endpoints). A consumer tuning against
+  keyed reply, 180/min per key, all endpoints). A consumer tuning against
   429s, or against a number that quietly means something else, is a bug
   report we caused.
 - **`python3 tests/test_all.py` stays green, offline, and grows a test for the
