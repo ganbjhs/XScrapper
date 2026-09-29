@@ -1579,10 +1579,16 @@ function IgDetail({ pid, data, reload, gotoSettings, onBack, list }) {
   const [renaming, setRenaming] = useState(false);
   const [confirming, setConfirming] = useState(false);
   const [busyList, setBusyList] = useState(false);
-  useEffect(() => { setMsg(""); setResult(null); setAdding(""); }, [list?.list_id]);
+  const [search, setSearch] = useState("");
+  useEffect(() => { setMsg(""); setResult(null); setAdding(""); setSearch(""); }, [list?.list_id]);
   // This panel is ONE list's sources when a list is selected; the whole
   // project's when the project has no lists yet.
-  const sources = sortBy((data?.sources || []).filter((s) => !list || s.list_id === list.list_id), "label");
+  const allSources = sortBy((data?.sources || []).filter((s) => !list || s.list_id === list.list_id), "label");
+  // Search matches the handle AND the person's name, like the X panel.
+  const q = search.trim().toLowerCase();
+  const sources = q
+    ? allSources.filter((s) => `${s.label} ${s.value || ""} ${s.display_name || ""}`.toLowerCase().includes(q))
+    : allSources;
   const otherLists = (data?.lists || []).filter((l) => !list || l.list_id !== list.list_id).length;
   const listPaused = !!list?.paused;
   const toggleList = async () => {
@@ -1650,7 +1656,7 @@ function IgDetail({ pid, data, reload, gotoSettings, onBack, list }) {
           )}
         </div>
         <div className="dactions">
-          <button className="btn btn-brand btn-sm" disabled={fetching || paused || listPaused || sources.length === 0} onClick={fetchNow}
+          <button className="btn btn-brand btn-sm" disabled={fetching || paused || listPaused || allSources.length === 0} onClick={fetchNow}
                   title="Run one Instagram pass now instead of waiting for the next cycle (a pass covers every list of the project)">
             {fetching ? "Fetching…" : "Fetch now"}
           </button>
@@ -1668,7 +1674,7 @@ function IgDetail({ pid, data, reload, gotoSettings, onBack, list }) {
         </div>
       </div>
       <div className="dmeta">
-        <span className="chip">{sources.length} source{sources.length === 1 ? "" : "s"}</span>
+        <span className="chip">{allSources.length} source{allSources.length === 1 ? "" : "s"}</span>
         <span className="chip">{fmtN(data?.totals?.posts ?? 0)} collected</span>
       </div>
 
@@ -1700,8 +1706,18 @@ function IgDetail({ pid, data, reload, gotoSettings, onBack, list }) {
         runs one pass immediately. Use “+ New watchlist” above to add a user,
         hashtag, or the home feed.
       </div>
-      <IgIdPending pid={pid} sources={sources} reload={reload} />
+      <IgIdPending pid={pid} sources={allSources} reload={reload} />
+      {allSources.length > 8 && (
+        <div className="filters" style={{ marginTop: 8, marginBottom: 0 }}>
+          <input className="mini" value={search} placeholder={`search ${allSources.length} accounts…`}
+                 style={{ flex: 1, minWidth: 200 }}
+                 onChange={(e) => setSearch(e.target.value)} />
+        </div>
+      )}
       <div className="members-box" style={{ maxHeight: 320, padding: "0 12px" }}>
+        {q && sources.length === 0 && allSources.length > 0 && (
+          <div className="muted" style={{ padding: "12px 0" }}>no match for “{search}”</div>
+        )}
         {sources.map((s) => (
           <div className="wl-row" key={s.label} style={{ opacity: s.enabled ? 1 : 0.55 }}>
             <div className="who">
@@ -1725,7 +1741,7 @@ function IgDetail({ pid, data, reload, gotoSettings, onBack, list }) {
             </div>
           </div>
         ))}
-        {sources.length === 0 && (
+        {allSources.length === 0 && (
           <div style={{ color: "var(--ink-3)", fontSize: 13, padding: "12px 0" }}>
             No Instagram sources {list ? "in this list" : "yet"} — paste usernames below, or use “+ New watchlist”.
           </div>
