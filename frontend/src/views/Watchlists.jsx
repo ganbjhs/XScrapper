@@ -1166,16 +1166,12 @@ function FbDetail({ pid, data, reload, gotoSettings, onBack }) {
   const sources = sortBy(data?.sources || [], "label");
   const paused = !!data?.paused;
   const health = data?.health || {};
-  const nm = useApi(() => api.identities("fb"), []);
-  const nameOf = (h) => (nm.data?.names || {})[String(h).toLowerCase()] || "";
-  const editName = async (handle) => {
-    const val = prompt(
-      "Common display name for this page — links X / FB / IG by name and fixes the "
-      + "profile picture (use the person's real name, same across platforms):",
-      nameOf(handle));
-    if (val === null) return;
-    try { await api.setIdentity("fb", handle, val); nm.reload(); }
-    catch (e) { alert(String(e.message || e)); }
+  // Names come from the identity model (the page's own display name, or the
+  // same person's name on another platform) — nothing to type here.
+  const nm = useApi(() => api.identities("fb"), [pid]);
+  const nameOf = (h) => {
+    const v = (nm.data?.names || {})[String(h).toLowerCase()] || "";
+    return v && v.toLowerCase() !== String(h).toLowerCase() ? v : "";
   };
 
   const add = async () => {
@@ -1260,9 +1256,9 @@ function FbDetail({ pid, data, reload, gotoSettings, onBack }) {
         {sources.map((s) => (
           <div className="wl-row" key={s.label} style={{ opacity: s.enabled ? 1 : 0.55 }}>
             <div className="who">
-              <b>{s.label}{!s.enabled && " (paused)"}</b>
+              <b>{nameOf(s.label) || s.label}{!s.enabled && " (paused)"}</b>
               <small>
-                {fmtN(s.posts)} collected ·{" "}
+                {nameOf(s.label) ? `${s.label} · ` : ""}{fmtN(s.posts)} collected ·{" "}
                 {s.last_run ? `checked ${fmtAgo(s.last_run * 1000)}` : "not checked yet"}
               </small>
             </div>
@@ -1274,10 +1270,6 @@ function FbDetail({ pid, data, reload, gotoSettings, onBack }) {
               <button className="btn btn-ghost btn-sm"
                       onClick={async () => { await api.fbSetEnabled(s.label, !s.enabled); reload(); }}>
                 {s.enabled ? "Pause" : "Resume"}
-              </button>
-              <button className="btn btn-ghost btn-sm" onClick={() => editName(s.label)}
-                      title="Set a common name to link this across X/FB/IG and fix the picture">
-                Name{nameOf(s.label) ? " ✓" : ""}
               </button>
               <button className="btn btn-ghost btn-sm" aria-label={`remove ${s.label}`}
                       onClick={async () => { await api.fbRemoveSource(s.label); reload(); }}>
@@ -1604,17 +1596,9 @@ function IgDetail({ pid, data, reload, gotoSettings, onBack, list }) {
   const paused = !!data?.paused;
   const anyCheckpoint = (data?.accounts || []).some((a) => a.checkpoint_at);
   const anyActive = (data?.accounts || []).some((a) => a.active);
-  const nm = useApi(() => api.identities("ig"), []);
-  const nameOf = (h) => (nm.data?.names || {})[String(h).toLowerCase()] || "";
-  const editName = async (handle) => {
-    const val = prompt(
-      "Common display name for this account — links X / FB / IG by name and fixes the "
-      + "profile picture (use the person's real name, same across platforms):",
-      nameOf(handle));
-    if (val === null) return;
-    try { await api.setIdentity("ig", handle, val); nm.reload(); }
-    catch (e) { alert(String(e.message || e)); }
-  };
+  // The real name comes with the data: /api/ig/status carries display_name
+  // per source (identity.py — the account's own full name once a collected
+  // post carried it, or the same person's X name). Nothing to type here.
   const act = async (body) => {
     setMsg("");
     try { await api.igSource({ project: pid, ...body }); reload(); }
@@ -1721,18 +1705,15 @@ function IgDetail({ pid, data, reload, gotoSettings, onBack, list }) {
         {sources.map((s) => (
           <div className="wl-row" key={s.label} style={{ opacity: s.enabled ? 1 : 0.55 }}>
             <div className="who">
-              <b>{s.label}{!s.enabled && " (paused)"}</b>
+              <b>{s.display_name || s.label}{!s.enabled && " (paused)"}</b>
               <small>
-                {s.type}{s.value ? ` · ${s.value}` : ""}
+                {s.display_name ? `@${s.value || s.label}` : s.type}{!s.display_name && s.value && s.value !== s.label ? ` · ${s.value}` : ""}
+                {s.type !== "user" ? ` · ${s.type}` : ""}
                 {s.account ? ` · pinned to @${s.account}` : (s.collector ? ` · via @${s.collector}` : " · not yet assigned")}
                 {s.platform_id ? "" : " · id pending"}
               </small>
             </div>
             <div className="right" style={{ display: "flex", gap: 6, alignItems: "center" }}>
-              <button className="btn btn-ghost btn-sm" onClick={() => editName(s.value || s.label)}
-                      title="Set a common name to link this across X/FB/IG and fix the picture">
-                Name{nameOf(s.value || s.label) ? " ✓" : ""}
-              </button>
               <button className="btn btn-ghost btn-sm"
                       onClick={() => act({ action: "enable", label: s.label, enabled: !s.enabled })}>
                 {s.enabled ? "Pause" : "Resume"}

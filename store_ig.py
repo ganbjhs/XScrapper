@@ -68,7 +68,10 @@ CREATE TABLE IF NOT EXISTS profiles (
   user_pk     INTEGER PRIMARY KEY,        -- Instagram's numeric id for the author
   handle      TEXT NOT NULL DEFAULT '',   -- the username at the time, for legibility
   avatar_url  TEXT,                       -- the newest profile-picture URL a post carried
-  updated_at  INTEGER NOT NULL            -- unix seconds, when a post last confirmed it
+  updated_at  INTEGER NOT NULL,           -- unix seconds, when a post last confirmed it
+  full_name   TEXT                        -- the author's real name, from the same
+                                          -- media row (2026-09-29); NULL until a
+                                          -- post carrying it is collected
 );
 
 CREATE TABLE IF NOT EXISTS sources (
@@ -267,6 +270,9 @@ class Store:
                 "ALTER TABLE posts ADD COLUMN project_id INTEGER NOT NULL DEFAULT 0")
         if "author_avatar" not in havep:
             self.db.execute("ALTER TABLE posts ADD COLUMN author_avatar TEXT")
+        havepr = {r["name"] for r in self.db.execute("PRAGMA table_info(profiles)")}
+        if "full_name" not in havepr:
+            self.db.execute("ALTER TABLE profiles ADD COLUMN full_name TEXT")
         # Created here, unconditionally, for BOTH paths: a fresh database (the
         # column came from SCHEMA) and an upgraded one (the column came from
         # the ALTER above). IF NOT EXISTS makes the repeat free.
@@ -735,13 +741,14 @@ class Store:
                     "UPDATE posts SET author_avatar = ? WHERE pk = ? "
                     "AND (author_avatar IS NULL OR author_avatar = '')",
                     (avatar, pk))
-            if avatar:
-                self.set_profile(r.get("user_pk"), r.get("username"), avatar, now)
+            if avatar or r.get("author_name"):
+                self.set_profile(r.get("user_pk"), r.get("username"), avatar, now,
+                                 full_name=r.get("author_name"))
         self.db.commit()
         return new
 
     # -- profile pictures (per-author cache) ---------------------------------
-    def set_profile(self, user_pk, handle, avatar_url, at=None) -> None:
+    def set_profile(self, user_pk, handle, avatar_url, at=None, full_name=None) -> None:
         """Remember the newest profile picture a collected post carried for
         this author. The ONLY writer is upsert_posts, so the only thing that
         can ever land here is what a media row said about its own author —
@@ -751,16 +758,19 @@ class Store:
             user_pk = int(user_pk or 0)
         except (TypeError, ValueError):
             user_pk = 0
-        if not user_pk or not avatar_url:
+        full_name = str(full_name or "").strip() or None
+        if not user_pk or not (avatar_url or full_name):
             return
         self.db.execute(
-            "INSERT INTO profiles(user_pk, handle, avatar_url, updated_at) "
-            "VALUES(?,?,?,?) ON CONFLICT(user_pk) DO UPDATE SET "
+            "INSERT INTO profiles(user_pk, handle, avatar_url, updated_at, full_name) "
+            "VALUES(?,?,?,?,?) ON CONFLICT(user_pk) DO UPDATE SET "
             "  handle = CASE WHEN excluded.handle != '' THEN excluded.handle "
             "                ELSE profiles.handle END, "
-            "  avatar_url = excluded.avatar_url, "
+            "  avatar_url = COALESCE(excluded.avatar_url, profiles.avatar_url), "
+            "  full_name = COALESCE(excluded.full_name, profiles.full_name), "
             "  updated_at = excluded.updated_at",
-            (user_pk, str(handle or ""), str(avatar_url), int(at or _now())))
+            (user_pk, str(handle or ""), str(avatar_url) if avatar_url else None,
+             int(at or _now()), full_name))
 
     def profile_avatar(self, user_pk):
         """The cached picture for one author (None when no post ever carried it)."""
@@ -777,7 +787,8 @@ class Store:
         unqualified, and a join at that level would make `username`
         ambiguous the day the cache grows a column of that name."""
         rows = self.db.execute(
-            "SELECT p.*, COALESCE(pp.avatar_url, p.author_avatar) AS _avatar_resolved "
+            "SELECT p.*, COALESCE(pp.avatar_url, p.author_avatar) AS _avatar_resolved, "
+            "       pp.full_name AS _full_name "
             f"FROM ({inner_sql}) p "
             "LEFT JOIN profiles pp ON pp.user_pk = p.user_pk "
             "ORDER BY p.pk DESC", args)
@@ -785,6 +796,7 @@ class Store:
         for r in rows:
             d = dict(r)
             d["author_avatar"] = d.pop("_avatar_resolved") or None
+            d["author_name"] = d.pop("_full_name") or None
             out.append(d)
         return out
 
@@ -938,9 +950,9 @@ def to_feed(row: dict) -> dict:
         "created_at": created,
         "collected_at": collected,
         "author_username": row.get("username"),
-        # Instagram gives no display name on a media row, so the handle stands
-        # in. Saying the handle twice is honest; inventing a name is not.
-        "author_display_name": row.get("username"),
+        # The real name when a collected post carried it (profiles.full_name,
+        # joined in by _with_avatars); the handle until then. Never invented.
+        "author_display_name": row.get("author_name") or row.get("username"),
         "author_avatar": row.get("author_avatar") or None,
         "media": media,
         "like_count": row.get("like_count"),
@@ -965,7 +977,9 @@ def to_api(row: dict) -> dict:
         "url": row.get("url"),
         "shortcode": row.get("code"),
         "created_at": iso,
-        "author": {"username": row.get("username"), "id": str(row.get("user_pk") or "")},
+        "author": {"username": row.get("username"), "id": str(row.get("user_pk") or ""),
+                   # additive (2026-09-29): the real name when known
+                   "display_name": row.get("author_name") or None},
         "text": row.get("caption") or "",
         "media": {
             "type": {1: "photo", 2: "video", 8: "album"}.get(row.get("media_type"), "other"),

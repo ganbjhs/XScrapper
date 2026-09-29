@@ -1902,6 +1902,99 @@ def test_ig_lists(tmp):
         ok("error" in st.delete_list(999999), "a missing list is refused")
 
 
+
+def test_identity(tmp):
+    """
+    identity.py: the same person across X / Instagram / Facebook, linked
+    from the platforms' own data — same handle, or same cleaned name with
+    handle overlap — never a guess; manual corrections win and stick.
+    """
+    import sqlite3
+
+    import identity as I
+
+    root = pathlib.Path(tmp)
+    xdb = root / "results.db"
+    con = sqlite3.connect(xdb)
+    con.executescript("""
+    CREATE TABLE watchlists(watchlist_id INTEGER PRIMARY KEY, kind TEXT);
+    CREATE TABLE watchlist_members(watchlist_id INTEGER, handle TEXT);
+    CREATE TABLE xlist_members(list_id TEXT, user_id TEXT, username TEXT, display_name TEXT, avatar TEXT, fetched_ms INTEGER);
+    CREATE TABLE tweets(tweet_id INTEGER PRIMARY KEY, author_username TEXT, author_display_name TEXT, created_ms INTEGER, raw_json TEXT);
+    CREATE TABLE tweet_raw(tweet_id INTEGER PRIMARY KEY, raw_json TEXT);
+    CREATE TABLE handle_names(platform TEXT, handle TEXT, display_name TEXT, updated_ms INTEGER, PRIMARY KEY(platform, handle));
+    INSERT INTO watchlists VALUES(1,'query');
+    INSERT INTO watchlist_members VALUES(1,'narendramodi'),(1,'drprembairwa'),(1,'fanpage_modi');
+    INSERT INTO tweets VALUES(1,'narendramodi','Narendra Modi',5,'{"user":{"profileImageUrl":"x-modi.jpg"}}');
+    INSERT INTO tweets VALUES(2,'drprembairwa','Dr Prem Chand Bairwa',5,'{}');
+    INSERT INTO tweets VALUES(3,'fanpage_modi','Narendra Modi',5,'{}');
+    INSERT INTO handle_names VALUES('ig','oldname_handle','Typed By Hand',1);
+    """)
+    con.commit(); con.close()
+    con = sqlite3.connect(root / "ig_results.db")
+    con.executescript("""
+    CREATE TABLE sources(label TEXT PRIMARY KEY, type TEXT, value TEXT, platform_id TEXT);
+    CREATE TABLE profiles(user_pk INTEGER PRIMARY KEY, handle TEXT, avatar_url TEXT, updated_at INTEGER, full_name TEXT);
+    INSERT INTO sources VALUES('narendramodi','user','narendramodi','1');
+    INSERT INTO sources VALUES('drprembairwa_official','user','drprembairwa_official','2');
+    INSERT INTO sources VALUES('someone_else','user','someone_else','3');
+    INSERT INTO sources VALUES('oldname_handle','user','oldname_handle','4');
+    INSERT INTO profiles VALUES(1,'narendramodi','ig-modi.jpg',1,'Narendra Modi');
+    INSERT INTO profiles VALUES(2,'drprembairwa_official','ig-prem.jpg',1,'Prem Chand Bairwa (मोदी का परिवार) 🇮🇳');
+    INSERT INTO profiles VALUES(3,'someone_else','',1,'Narendra Modi');
+    """)
+    con.commit(); con.close()
+    con = sqlite3.connect(root / "fb_results.db")
+    con.executescript("""
+    CREATE TABLE sources(label TEXT PRIMARY KEY);
+    CREATE TABLE page_profiles(handle TEXT PRIMARY KEY, avatar_url TEXT, display_name TEXT, updated_ms INTEGER);
+    INSERT INTO sources VALUES('narendramodi');
+    INSERT INTO page_profiles VALUES('narendramodi','fb-modi.jpg','Narendra Modi',1);
+    """)
+    con.commit(); con.close()
+
+    print("== normalisation ==")
+    ok(I.norm_name("Dr. Prem Chand Bairwa (मोदी का परिवार) 🇮🇳") == "prem chand bairwa",
+       "honorifics, parentheticals and emoji are stripped")
+    ok(I.norm_name("श्री भजनलाल शर्मा जी") == "भजनलाल शर्मा", "Devanagari keeps its vowel signs; जी/श्री go")
+    ok(I.norm_handle("@Narendra_Modi") == "narendramodi", "handles normalise")
+
+    print()
+    print("== linking ==")
+    res = I.resolve(root, xdb, force=True)
+    bh = res["by_handle"]
+    pid = lambda k: bh[k]["person_id"]
+    ok(pid("x:narendramodi") == pid("ig:narendramodi") == pid("fb:narendramodi"),
+       "the same handle on three platforms is one person")
+    ok(bh["ig:narendramodi"]["name"] == "Narendra Modi", "named from the platforms' own data")
+    ok(pid("x:fanpage_modi") != pid("x:narendramodi"), "same name on the SAME platform is never merged")
+    ok(pid("ig:someone_else") != pid("x:narendramodi"),
+       "a name two X handles share is ambiguous — not merged")
+    ok(pid("x:drprembairwa") == pid("ig:drprembairwa_official") and bh["ig:drprembairwa_official"]["confidence"] == 0.85,
+       "cleaned name equal + handle overlap -> merged at 0.85")
+    ok(bh["ig:drprembairwa_official"]["name"] == "Dr Prem Chand Bairwa", "the X display name is shown")
+    ok(bh["ig:oldname_handle"]["link"] == "manual" and bh["ig:oldname_handle"]["name"] == "Typed By Hand",
+       "a legacy handle_names row is kept as a manual name")
+    ok(I.names_map(root, xdb, "ig").get("narendramodi") == "Narendra Modi", "names_map serves the old shape")
+    ok(I.avatar_map(root, xdb, "ig").get("narendramodi") == "x-modi.jpg", "the X picture is preferred")
+
+    print()
+    print("== corrections stick ==")
+    I.unlink(root, "ig", "drprembairwa_official", "Prem Bairwa (IG)")
+    r2 = I.resolve(root, xdb, force=True)["by_handle"]
+    ok(r2["ig:drprembairwa_official"]["person_id"] != r2["x:drprembairwa"]["person_id"]
+       and r2["ig:drprembairwa_official"]["name"] == "Prem Bairwa (IG)",
+       "unlink splits the handle out and the next pass leaves it split")
+    I.link(root, "ig", "drprembairwa_official", r2["x:drprembairwa"]["person_id"])
+    r3 = I.resolve(root, xdb, force=True)["by_handle"]
+    ok(r3["ig:drprembairwa_official"]["person_id"] == r3["x:drprembairwa"]["person_id"], "link joins it back")
+    I.rename(root, r3["x:narendramodi"]["person_id"], "Narendra Modi (PM)")
+    r4 = I.resolve(root, xdb, force=True)
+    ok(r4["by_handle"]["fb:narendramodi"]["name"] == "Narendra Modi (PM)", "a manual name shows on every platform")
+    ok(any(p["name"] == "Narendra Modi (PM)" and len(p["handles"]) == 3 for p in I.people(root, xdb)),
+       "people() lists the person with all three handles")
+
+
 # ==========================================================================
 
 def test_filters(tmp):
@@ -7220,6 +7313,7 @@ def main():
         test_projects_watchlists(fresh("projects"))
         test_shared_watchlists(fresh("shared_wl"))
         test_ig_lists(fresh("ig_lists"))
+        test_identity(fresh("identity"))
 
         section("collections (curation boards)")
         test_collections(fresh("collections"))

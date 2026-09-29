@@ -202,6 +202,36 @@ change to the delivery contract. The write endpoint
 (`POST /api/watchlists/owner`) is cookie-only: a read integration does not get
 to restamp ownership.
 
+### A person is one entity across platforms — linked from the platforms' own data, named from it, never guessed (2026-09-29)
+
+`identity.py` replaces the per-handle "Name" button. The rules:
+
+- **Observe, don't ask.** Every followed handle's name and picture come from
+  what the platform itself reported: X author fields on collected tweets
+  and the X List member cache; Instagram `profiles.full_name` (the
+  UserShort on every media row — free, like the avatar, RULEBOOK §6 "no
+  request for a picture"); Facebook `page_profiles`. No lookup is ever made
+  to name someone.
+- **Two signals link handles, both strong.** The same normalised handle on
+  two platforms (0.95); the same cleaned display name (honorifics,
+  parentheticals, emoji stripped; Devanagari kept whole) on two platforms
+  with handle overlap (0.85) or without (0.70). Same name on the SAME
+  platform never merges (fan pages), and a name two handles share on one
+  platform merges nothing. A wrong merge files one person's posts under
+  another's name; a missed one shows two cards — so the model misses.
+- **A human always wins, and stays won.** Manual links, manual names and
+  `unlink` splits (persons marked `isolated`) are never overridden by a
+  pass. The legacy `handle_names` rows are imported as manual names once.
+- **Its own file.** `identity.db` beside the platform databases: reading
+  Instagram must never create or write results.db (the X watcher's file).
+- **Cost is bounded by followed handles**, one indexed lookup per X handle,
+  cached 5 minutes per process — never a scan of `tweets`.
+- **Consumers see it additively**: `author.display_name` on Instagram
+  posts, `display_name` on the ig:P:0 members, `display_name` on
+  /api/ig/status sources. `/api/identities?platform=` keeps its old shape;
+  `?people=1` lists persons; POST /api/identity takes rename / link /
+  unlink for corrections.
+
 ### An Instagram list is a NAME over sources — pause lives in the worklist, delete moves handles (2026-09-29)
 
 X had named, renamable, pausable lists; Instagram was one pool per project.

@@ -223,6 +223,10 @@ def record(media) -> dict:
         # post sat with a blank circle unless its handle matched an X account.
         "author_avatar": (str(getattr(u, "profile_pic_url", "") or "")
                           if u else ""),
+        # The author's REAL NAME, as the same UserShort carries it. Free for
+        # the same reason as the picture, and it is what the dashboard shows
+        # instead of a bare handle once it is known (identity.py).
+        "author_name": (str(getattr(u, "full_name", "") or "") if u else ""),
     }
 
 

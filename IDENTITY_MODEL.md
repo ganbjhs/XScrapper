@@ -1,6 +1,6 @@
 # The identity model: one person, three handles, three ids
 
-**Status:** implemented for Instagram. Designed, not yet implemented, for Facebook and X.
+**Status:** the three-column split is implemented for Instagram; designed for Facebook and X. **Cross-platform linking is implemented (2026-09-29) in `identity.py`** — see RULEBOOK §2 "A person is one entity across platforms": handles are linked from the platforms' own data (same handle, or same cleaned display name with handle overlap), named from it, stored in `identity.db`, corrected by hand with rename / link / unlink. The old per-handle "Name" button is gone; its `handle_names` rows were imported as manual names.
 
 ## The rule
 

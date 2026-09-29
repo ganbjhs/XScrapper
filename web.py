@@ -836,6 +836,7 @@ def _ig_pseudo_watchlist(pid: int):
     signal that this row is synthetic — none of the watchlist POST actions
     accept it.
     """
+    _ig_names = _handle_names_map("ig")
     for s in _ig_pseudo_streams():
         if s["project_id"] == pid:
             return {
@@ -844,7 +845,8 @@ def _ig_pseudo_watchlist(pid: int):
                 "kind_label": "Instagram",
                 "platform": "instagram", "list_id": None, "owner_handle": None,
                 "created_at": None, "filters": {}, "paused": s["paused"],
-                "members": [{"handle": m["handle"], "display_name": m["label"],
+                "members": [{"handle": m["handle"],
+                             "display_name": _ig_names.get(str(m["handle"]).lower()) or m["label"],
                              "user_id": m["user_id"], "resolved": m["resolved"],
                              "collector": m["collector"], "type": m["type"]}
                             for m in s["sources"]],
@@ -1016,15 +1018,22 @@ def _set_handle_name(platform, handle, display_name):
 
 
 def _handle_names_map(platform):
-    """{handle_lower: display_name} for a platform."""
+    """{handle_lower: person name} for a platform — from identity.py, which
+    links the same person's handles across X / Instagram / Facebook from the
+    platforms' own data and imports the old handle_names rows as manual
+    names. Same shape as before, so every caller keeps working."""
     try:
-        con = _names_con()
-        try:
-            return {r["handle"]: r["display_name"] for r in con.execute(
-                "SELECT handle, display_name FROM handle_names WHERE platform = ?",
-                (platform,))}
-        finally:
-            con.close()
+        import identity
+        return identity.names_map(_CFG.root, _CFG.db_results, platform)
+    except Exception:
+        return {}
+
+
+def _identity_avatars(platform):
+    """{handle_lower: best avatar across the person's platforms}."""
+    try:
+        import identity
+        return identity.avatar_map(_CFG.root, _CFG.db_results, platform)
     except Exception:
         return {}
 
@@ -1053,24 +1062,20 @@ def _x_avatars_by_name(names):
 
 
 def _fill_avatars_by_name(posts, platform, handle_of):
-    """For posts still missing an avatar, resolve it via the source's display
-    name → the X author with that name. `handle_of(post)` returns the post's
-    source handle, lowercased."""
-    names = _handle_names_map(platform)
-    if not names:
+    """For posts still missing an avatar, use the person's best picture from
+    any platform (identity.py links the handles). `handle_of(post)` returns
+    the post's source handle, lowercased."""
+    if not any(not p.get("author_avatar") for p in posts):
         return
-    want = {names[h] for h in
-            (handle_of(p) for p in posts if not p.get("author_avatar"))
-            if h in names}
-    if not want:
+    avby = _identity_avatars(platform)
+    if not avby:
         return
-    avby = _x_avatars_by_name(want)
     for p in posts:
         if p.get("author_avatar"):
             continue
-        nm = names.get(handle_of(p))
-        if nm and avby.get(nm.lower()):
-            p["author_avatar"] = avby[nm.lower()]
+        av = avby.get(handle_of(p))
+        if av:
+            p["author_avatar"] = av
 
 
 # /api/status is polled by every open dashboard tab every ~30 s, and it is
@@ -5638,8 +5643,14 @@ def _ig_status(q=None):
                     "assigned_account, enabled, list_id FROM sources "
                     "WHERE project_id = ? ORDER BY label",
                     (pid,))]
+                names = _handle_names_map("ig")
                 for row in out["sources"]:
                     row["collector"] = row.get("account") or row.get("assigned_account") or ""
+                    # The person's name (identity.py) — the real name once a
+                    # post carried it, or the same person's X name; the handle
+                    # until then, never a guess.
+                    nm = names.get(str(row.get("value") or "").lower())
+                    row["display_name"] = nm if nm and nm.lower() != str(row.get("value") or "").lower() else ""
                 out["totals"] = st.stats(project_id=pid)
                 # Named lists (2026-09-29): the sidebar draws one row per
                 # list; every source above carries its list_id. Additive.
@@ -6282,6 +6293,14 @@ def _ig_posts(q):
 
 
 def _identities_json(q):
+    """?platform=x|ig|fb -> {names: {handle: name}} (the old shape), plus
+    ?people=1 -> {people: [...]} — every person the model knows, with the
+    handles it linked and how sure it is."""
+    import identity
+    if str(q.get("people") or "") in ("1", "true"):
+        if str(q.get("refresh") or "") in ("1", "true"):
+            identity.invalidate()
+        return {"people": identity.people(_CFG.root, _CFG.db_results)}
     platform = (q.get("platform") or "").strip().lower()
     if platform not in ("x", "ig", "fb"):
         return {"error": "platform must be x | ig | fb"}
@@ -6289,14 +6308,37 @@ def _identities_json(q):
 
 
 def _identity_post(body):
+    """
+    Corrections to the identity model, by hand:
+      {action:"rename", person_id, name}          name a person (manual, wins)
+      {action:"link",   platform, handle, person_id}  this handle IS that person
+      {action:"unlink", platform, handle, name?}  split a handle out
+    Legacy {platform, handle, display_name} (the old per-handle Name button)
+    renames the handle's person, so old callers still do something sensible.
+    """
+    import identity
+    action = (body.get("action") or "").strip().lower()
     platform = (body.get("platform") or "").strip().lower()
     handle = (body.get("handle") or "").strip()
+    if action == "rename":
+        return identity.rename(_CFG.root, _int_or(body.get("person_id"), 0),
+                               body.get("name"))
+    if action in ("link", "unlink") and platform not in ("x", "ig", "fb"):
+        return {"error": "platform must be x | ig | fb"}
+    if action == "link":
+        return identity.link(_CFG.root, platform, handle,
+                             _int_or(body.get("person_id"), 0))
+    if action == "unlink":
+        return identity.unlink(_CFG.root, platform, handle, body.get("name") or "")
     if platform not in ("x", "ig", "fb"):
         return {"error": "platform must be x | ig | fb"}
     if not handle:
         return {"error": "handle is required"}
-    _set_handle_name(platform, handle, body.get("display_name") or "")
-    return {"ok": True}
+    res = identity.resolve(_CFG.root, _CFG.db_results)
+    ent = res["by_handle"].get(f"{platform}:{handle.lower().lstrip('@')}")
+    if not ent:
+        return {"error": f"{handle} is not a followed {platform} handle"}
+    return identity.rename(_CFG.root, ent["person_id"], body.get("display_name") or "")
 
 
 # ---------------------------------------------------------------------------
