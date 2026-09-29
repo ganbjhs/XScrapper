@@ -5651,10 +5651,19 @@ def _ig_status(q=None):
                 # resolved (fetching by id) and which still owe a name lookup.
                 # It is diagnostic only — the handle in `value` stays the thing
                 # a human reads and the thing that maps to the other platforms.
+                # The profile picture rides along from the per-author cache
+                # (filled by collected posts — never a lookup), joined by the
+                # resolved id or, until one is cached, by handle.
+                have_full = "full_name" in {c["name"] for c in st.db.execute("PRAGMA table_info(profiles)")}
+                fn = "pr.full_name" if have_full else "NULL"
                 out["sources"] = [dict(r) for r in st.db.execute(
-                    "SELECT label, type, value, platform_id, project_id, account, "
-                    "assigned_account, enabled, list_id FROM sources "
-                    "WHERE project_id = ? ORDER BY label",
+                    f"SELECT s.label, s.type, s.value, s.platform_id, s.project_id, s.account, "
+                    f"       s.assigned_account, s.enabled, s.list_id, "
+                    f"       pr.avatar_url AS avatar, {fn} AS full_name "
+                    f"FROM sources s LEFT JOIN profiles pr ON "
+                    f"  (s.platform_id != '' AND pr.user_pk = CAST(s.platform_id AS INTEGER)) "
+                    f"  OR (s.platform_id = '' AND lower(pr.handle) = lower(s.value)) "
+                    f"WHERE s.project_id = ? ORDER BY s.label",
                     (pid,))]
                 names = _handle_names_map("ig")
                 for row in out["sources"]:
@@ -5662,7 +5671,8 @@ def _ig_status(q=None):
                     # The person's name (identity.py) — the real name once a
                     # post carried it, or the same person's X name; the handle
                     # until then, never a guess.
-                    nm = names.get(str(row.get("value") or "").lower())
+                    nm = (names.get(str(row.get("value") or "").lower())
+                          or row.get("full_name") or "")
                     row["display_name"] = nm if nm and nm.lower() != str(row.get("value") or "").lower() else ""
                 out["totals"] = st.stats(project_id=pid)
                 # Named lists (2026-09-29): the sidebar draws one row per

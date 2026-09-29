@@ -1570,6 +1570,21 @@ function IgDeleteModal({ pid, list, others, onChanged, onClose }) {
   );
 }
 
+// The account's picture from the profile cache; the initial until a post
+// has carried one (the same fallback the feed card uses).
+function IgPfp({ src, name }) {
+  const [broken, setBroken] = useState(false);
+  const st = { width: 30, height: 30, borderRadius: "50%", flex: "none" };
+  if (src && !broken) {
+    return <img src={src} alt="" loading="lazy" style={{ ...st, objectFit: "cover" }} onError={() => setBroken(true)} />;
+  }
+  return (
+    <span className="pfp" style={{ ...st, background: "var(--brand)", fontSize: 12 }}>
+      {String(name || "?").slice(0, 1).toUpperCase()}
+    </span>
+  );
+}
+
 function IgDetail({ pid, data, reload, gotoSettings, onBack, list }) {
   const [msg, setMsg] = useState("");
   const [fetching, setFetching] = useState(false);
@@ -1720,6 +1735,7 @@ function IgDetail({ pid, data, reload, gotoSettings, onBack, list }) {
         )}
         {sources.map((s) => (
           <div className="wl-row" key={s.label} style={{ opacity: s.enabled ? 1 : 0.55 }}>
+            <IgPfp src={s.avatar} name={s.display_name || s.value || s.label} />
             <div className="who">
               <b>{s.display_name || s.label}{!s.enabled && " (paused)"}</b>
               <small>
