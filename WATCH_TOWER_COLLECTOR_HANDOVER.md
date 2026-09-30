@@ -96,13 +96,14 @@ is the API surface, there is no other discovery document. Do not probe.
                               expiry, cacheable forever. Instagram's own
                               CDN URL refuses hot-linking and expires, so
                               we fetch the bytes once and you get our
-                              copy; where we have no Instagram picture yet
-                              you get the same person's X picture; null
-                              until either exists)}],
-                    display_name is the account's REAL NAME (from the
-                    posts we collected, or the same person's X name via
-                    identity.py) once known, the handle until then. Draw
-                    the row like an X one: avatar + display_name + @handle.
+                              copy; null until we have fetched it — every
+                              visit to the account refreshes name and
+                              picture, so it arrives within a day)}],
+                    display_name is the account's REAL NAME as Instagram
+                    shows it (refreshed on every visit), the handle until
+                    the first visit. Never X's name for the same person —
+                    one platform, one record. Draw the row like an X one:
+                    avatar + display_name + @handle.
                     streams:[{stream_id:-P, label:"ig:P:0", paused, tweets}] }
     Negative ids are synthetic on purpose: integers you can key on, never
     colliding with a real row, refused by every POST.
@@ -253,8 +254,8 @@ is the API surface, there is no other discovery document. Do not probe.
     url, text,
     created_at:          post time, ISO UTC     created_ms:   same, epoch ms
     collected_at:        when WE saved it        collected_ms: the cursor field
-    author_username, author_display_name (Instagram: the real name once a post carried it,
-                         else the same person's X name via identity.py, else the handle — 2026-09-30),
+    author_username, author_display_name (Instagram: the account's own real name once a
+                         visit has read it, else the handle — never X's name — 2026-09-30),
     author_id:           numeric platform user id ("" while unresolved on IG)
     author_avatar:       url or null (Instagram, 2026-09-30: OUR copy at
                          https://<collector>/media/fb/… once fetched — never

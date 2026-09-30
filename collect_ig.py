@@ -421,6 +421,12 @@ async def collect_source(engine, store, source, *, page_size=12, max_pages=2, lo
     """
     wm = store.watermark(source.label)
     collected, newest, stop = [], None, False
+    # The author as the FIRST page describes them (name + profile picture off
+    # the media row's own user object). Taken from ANY row, new or already
+    # known: until 2026-09-30 the profile was written only with a NEW post,
+    # so an account that posts rarely never got its name or picture at all.
+    # Same request, no lookup — every visit now refreshes both.
+    seen_author = None
 
     first_page = True
     async for page in engine.pages_for(source, page_size=page_size, max_pages=max_pages):
@@ -432,6 +438,11 @@ async def collect_source(engine, store, source, *, page_size=12, max_pages=2, lo
         first_page = False
         if newest is None and page.result_ids:
             newest = max(page.result_ids)
+        if seen_author is None:
+            for rec in page.entries_by_id.values():
+                if rec.get("user_pk") and (rec.get("author_avatar") or rec.get("author_name")):
+                    seen_author = rec
+                    break
         for pk in page.result_ids:
             if wm and pk <= wm:          # reached known ground
                 stop = True
@@ -445,6 +456,10 @@ async def collect_source(engine, store, source, *, page_size=12, max_pages=2, lo
     # project_id comes from the source row, not from this call — see
     # store_ig.upsert_posts. A post belongs to whoever was watching for it.
     new = store.upsert_posts(collected, source.label, source.project_id)
+    if seen_author is not None and source.type == "user":
+        store.set_profile(seen_author.get("user_pk"), seen_author.get("username"),
+                          seen_author.get("author_avatar") or None,
+                          full_name=seen_author.get("author_name"))
     if newest and (not wm or newest > wm):
         store.set_watermark(source.label, newest)
     log(f"  [{source.label}] type={source.type} handle={source.value or '-'} "

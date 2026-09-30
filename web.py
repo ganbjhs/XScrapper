@@ -762,17 +762,14 @@ def _query_ig_as_stream(p):
 
     label = ig_stream_label(pid)
     out_rows = []
-    _ig_names = _handle_names_map("ig")
     for r in rows:
         d = dict(r)
         d["author_avatar"] = store_ig.public_media_url(d.pop("_avatar")) or None
+        # Instagram's OWN name for the account (profiles.full_name, refreshed
+        # on every visit) — never another platform's name for the same
+        # person: one platform, one record, no drift between databases.
         d["author_name"] = d.pop("_full_name") or None
         f = store_ig.to_feed(d)
-        # The person's name (identity.py) when the post itself carried none —
-        # the same person's X name, never a guess; the handle stays the key.
-        if f.get("author_display_name") == f.get("author_username"):
-            f["author_display_name"] = (_ig_names.get(str(d.get("username") or "").lower())
-                                        or f["author_display_name"])
         f["created_ms"] = int(d.get("taken_at") or 0) * 1000
         f["collected_ms"] = int(d.get("collected_at") or 0) * 1000
         f["author_id"] = str(d.get("user_pk") or "")
@@ -859,8 +856,6 @@ def _ig_pseudo_watchlist(pid: int):
     signal that this row is synthetic — none of the watchlist POST actions
     accept it.
     """
-    _ig_names = _handle_names_map("ig")
-    _ig_avs = _identity_avatars("ig")      # the same person's X picture as fallback
     for s in _ig_pseudo_streams():
         if s["project_id"] == pid:
             return {
@@ -870,10 +865,10 @@ def _ig_pseudo_watchlist(pid: int):
                 "platform": "instagram", "list_id": None, "owner_handle": None,
                 "created_at": None, "filters": {}, "paused": s["paused"],
                 "members": [{"handle": m["handle"],
-                             "display_name": (_ig_names.get(str(m["handle"]).lower())
-                                              or m.get("full_name") or m["label"]),
-                             "avatar": (m.get("avatar")
-                                        or _ig_avs.get(str(m["handle"]).lower()) or None),
+                             # Instagram's own name and picture only (2026-09-30):
+                             # the label until a visit has brought the name.
+                             "display_name": m.get("full_name") or m["label"],
+                             "avatar": m.get("avatar"),
                              "user_id": m["user_id"], "resolved": m["resolved"],
                              "collector": m["collector"], "type": m["type"]}
                             for m in s["sources"]],
@@ -5681,21 +5676,17 @@ def _ig_status(q=None):
                     f"  OR (s.platform_id = '' AND lower(pr.handle) = lower(s.value)) "
                     f"WHERE s.project_id = ? ORDER BY s.label",
                     (pid,))]
-                names = _handle_names_map("ig")
-                avs = _identity_avatars("ig")
                 for row in out["sources"]:
                     row["collector"] = row.get("account") or row.get("assigned_account") or ""
-                    # Our held copy of the Instagram picture; else the same
-                    # person's picture from X (identity.py); else nothing —
+                    # Our held copy of the Instagram picture, else nothing —
                     # a bare CDN URL is served too, but a browser cannot
                     # load it, so the row falls back to the initial.
-                    row["avatar"] = (store_ig.public_media_url(row.get("avatar"))
-                                     or avs.get(str(row.get("value") or "").lower()) or None)
-                    # The person's name (identity.py) — the real name once a
-                    # post carried it, or the same person's X name; the handle
-                    # until then, never a guess.
-                    nm = (names.get(str(row.get("value") or "").lower())
-                          or row.get("full_name") or "")
+                    row["avatar"] = store_ig.public_media_url(row.get("avatar")) or None
+                    # Instagram's OWN name for the account (profiles.full_name,
+                    # refreshed on every visit) — never X's name for the same
+                    # person (2026-09-30: one platform, one record); the
+                    # handle until a visit has brought it.
+                    nm = row.get("full_name") or ""
                     row["display_name"] = nm if nm and nm.lower() != str(row.get("value") or "").lower() else ""
                 out["totals"] = st.stats(project_id=pid)
                 # Named lists (2026-09-29): the sidebar draws one row per
@@ -6335,13 +6326,6 @@ def _ig_posts(q):
     # Cross-handle: a display name set on the source links it to the X avatar.
     _fill_avatars_by_name(posts, "ig",
                           lambda p: str((p.get("author") or {}).get("username") or "").lower())
-    # Post-level real name: the profile's own when a post carried it (to_api),
-    # else the person's name from identity.py (the same person's X name).
-    _ig_names = _handle_names_map("ig")
-    for _p in posts:
-        _a = _p.get("author") or {}
-        if not _a.get("display_name"):
-            _a["display_name"] = _ig_names.get(str(_a.get("username") or "").lower()) or None
     # to_api keys the post as `id`, not `tweet_id`; _stamp_labels reads
     # tweet_id, so map it here rather than teaching the stamper two shapes.
     for _p in posts:

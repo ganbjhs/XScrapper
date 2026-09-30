@@ -217,9 +217,18 @@ re-signed URL is not a re-fetch and a changed picture is. A failed fetch is
 retried after an hour, not every pass. Who fetches: the collector after each
 pass (30), the dashboard lazily in a background thread (8, at most every
 45 s) so a fresh deploy fills in without waiting for posts. Where there is
-no Instagram picture, the same person's X picture (identity.py) stands in.
 The `/media/fb/` prefix is historical and shared; renaming it would only
 break Watch-Tower's links.
+
+**Name and picture are Instagram's OWN, refreshed on every visit, never
+another platform's (2026-09-30).** A visit takes the author's `full_name`
+and picture off the first page it read — from ANY row, new or already known
+(until 2026-09-30 the profile was written only with a NEW post, so an
+account that posts rarely never got either). Same request, no lookup. On an
+Instagram row the name is `profiles.full_name` or the handle, the picture
+our held copy or nothing: X's name or picture for the same person is NOT
+substituted — one platform, one record, no drift between databases.
+identity.py still links the person for cross-platform views.
 
 ### A person is one entity across platforms — linked from the platforms' own data, named from it, never guessed (2026-09-29)
 
