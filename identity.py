@@ -234,17 +234,26 @@ def _observe_ig(root) -> list:
     except sqlite3.Error:
         return out
     try:
-        have_full = "full_name" in {r["name"] for r in con.execute("PRAGMA table_info(profiles)")}
-        fn = "pr.full_name" if have_full else "''"
+        cols = {r["name"] for r in con.execute("PRAGMA table_info(profiles)")}
+        fn = "pr.full_name" if "full_name" in cols else "''"
+        # Our held copy first (ig_avatars.py) — a CDN URL cannot be shown by
+        # a browser, so as a person's picture it is worth nothing.
+        av = ("COALESCE(pr.avatar_local, pr.avatar_url)" if "avatar_local" in cols
+              else "pr.avatar_url")
         for r in con.execute(
                 f"SELECT s.value AS handle, s.label, s.platform_id, "
-                f"       {fn} AS full_name, pr.avatar_url "
+                f"       {fn} AS full_name, {av} AS avatar_url "
                 f"FROM sources s "
                 f"LEFT JOIN profiles pr ON (s.platform_id != '' AND pr.user_pk = CAST(s.platform_id AS INTEGER)) "
                 f"   OR (s.platform_id = '' AND lower(pr.handle) = lower(s.value)) "
                 f"WHERE s.type = 'user' AND s.value != ''"):
             h = str(r["handle"]).lower().lstrip("@")
-            out.append(Obs("ig", h, str(r["full_name"] or ""), str(r["avatar_url"] or ""),
+            try:
+                import store_ig
+                av_url = store_ig.public_media_url(r["avatar_url"] or "")
+            except Exception:
+                av_url = r["avatar_url"] or ""
+            out.append(Obs("ig", h, str(r["full_name"] or ""), str(av_url or ""),
                            {"label": r["label"]}))
     except sqlite3.Error:
         pass

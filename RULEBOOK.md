@@ -202,6 +202,25 @@ change to the delivery contract. The write endpoint
 (`POST /api/watchlists/owner`) is cookie-only: a read integration does not get
 to restamp ownership.
 
+### An Instagram profile picture is BYTES we hold, never a CDN link we hope in (2026-09-30)
+
+Instagram signs its profile-picture URLs with an expiry (`oe=`) and its CDN
+refuses a browser that hot-links one from another origin — measured
+2026-09-29: 23 of 25 sources had a URL, 0 of 4 tested rendered, expired or
+not. So a URL is only a lead. `ig_avatars.py` fetches the bytes once (plain
+HTTP, no session, no proxy, never a lookup — nothing counts against an
+account) into the shared media store and `profiles.avatar_local` is what
+every reader shows: `/media/fb/<aa>/<hash>.<ext>`, absolutized against
+`PUBLIC_BASE_URL` on the way out (`store_ig.public_media_url`), no expiry, no
+login. `avatar_src` (host+path, no query) says which picture it is, so a
+re-signed URL is not a re-fetch and a changed picture is. A failed fetch is
+retried after an hour, not every pass. Who fetches: the collector after each
+pass (30), the dashboard lazily in a background thread (8, at most every
+45 s) so a fresh deploy fills in without waiting for posts. Where there is
+no Instagram picture, the same person's X picture (identity.py) stands in.
+The `/media/fb/` prefix is historical and shared; renaming it would only
+break Watch-Tower's links.
+
 ### A person is one entity across platforms — linked from the platforms' own data, named from it, never guessed (2026-09-29)
 
 `identity.py` replaces the per-handle "Name" button. The rules:

@@ -19,6 +19,7 @@ answers that can disagree. The engagement numbers Instagram already returns
 """
 
 import sqlite3
+import urllib.parse
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -69,9 +70,17 @@ CREATE TABLE IF NOT EXISTS profiles (
   handle      TEXT NOT NULL DEFAULT '',   -- the username at the time, for legibility
   avatar_url  TEXT,                       -- the newest profile-picture URL a post carried
   updated_at  INTEGER NOT NULL,           -- unix seconds, when a post last confirmed it
-  full_name   TEXT                        -- the author's real name, from the same
+  full_name   TEXT,                       -- the author's real name, from the same
                                           -- media row (2026-09-29); NULL until a
                                           -- post carrying it is collected
+  avatar_local TEXT,                      -- OUR copy of the picture: '/media/fb/aa/<hash>.jpg'
+                                          -- (fb_media store, shared), fetched once by
+                                          -- ig_avatars.py while the signed URL was alive.
+                                          -- Never expires; what every reader should show.
+  avatar_src   TEXT,                      -- CDN host+path the local copy came from (no
+                                          -- query string): re-fetch only when it changes
+  avatar_failed_at INTEGER                -- unix seconds of the last failed fetch, so a
+                                          -- dead URL is retried hourly, not every pass
 );
 
 CREATE TABLE IF NOT EXISTS sources (
@@ -273,6 +282,10 @@ class Store:
         havepr = {r["name"] for r in self.db.execute("PRAGMA table_info(profiles)")}
         if "full_name" not in havepr:
             self.db.execute("ALTER TABLE profiles ADD COLUMN full_name TEXT")
+        for col, typ in (("avatar_local", "TEXT"), ("avatar_src", "TEXT"),
+                         ("avatar_failed_at", "INTEGER")):
+            if col not in havepr:
+                self.db.execute(f"ALTER TABLE profiles ADD COLUMN {col} {typ}")
         # Created here, unconditionally, for BOTH paths: a fresh database (the
         # column came from SCHEMA) and an upgraded one (the column came from
         # the ALTER above). IF NOT EXISTS makes the repeat free.
@@ -773,11 +786,57 @@ class Store:
              int(at or _now()), full_name))
 
     def profile_avatar(self, user_pk):
-        """The cached picture for one author (None when no post ever carried it)."""
+        """The cached picture for one author (None when no post ever carried
+        it): our own copy when ig_avatars.py has fetched it, the CDN URL
+        until then."""
         r = self.db.execute(
-            "SELECT avatar_url FROM profiles WHERE user_pk = ?",
+            "SELECT COALESCE(avatar_local, avatar_url) AS a FROM profiles WHERE user_pk = ?",
             (int(user_pk or 0),)).fetchone()
-        return r["avatar_url"] if r else None
+        return public_media_url(r["a"]) if r else None
+
+    # ---- profile pictures we hold (ig_avatars.py) ----
+    #
+    # Instagram's CDN refuses a browser that hot-links the signed URL, and the
+    # signature expires anyway, so a URL is only ever a lead: the bytes are
+    # fetched once into the shared media store and `avatar_local` is what
+    # every reader shows. These three are the whole contract with
+    # ig_avatars.ensure().
+    AVATAR_RETRY_S = 3600
+
+    def profiles_needing_avatar(self, limit=30) -> list:
+        """Profiles with a URL but no local copy, or whose URL now points at a
+        different picture (host+path changed), or whose last fetch failed over
+        an hour ago. Enabled sources' authors first, most recently seen first."""
+        now = _now()
+        rows = self.db.execute(
+            "SELECT pr.user_pk, pr.handle, pr.avatar_url, pr.avatar_local, pr.avatar_src, "
+            "       pr.avatar_failed_at, "
+            "       EXISTS(SELECT 1 FROM sources s WHERE s.enabled = 1 AND "
+            "              s.platform_id = CAST(pr.user_pk AS TEXT)) AS live "
+            "FROM profiles pr "
+            "WHERE pr.avatar_url IS NOT NULL AND pr.avatar_url != '' "
+            "  AND (pr.avatar_failed_at IS NULL OR pr.avatar_failed_at < ?) "
+            "ORDER BY live DESC, pr.updated_at DESC LIMIT ?",
+            (now - self.AVATAR_RETRY_S, max(1, int(limit)) * 4)).fetchall()
+        out = []
+        for r in rows:
+            d = dict(r)
+            if d["avatar_local"] and d["avatar_src"] == _src_key(d["avatar_url"]):
+                continue                       # same picture, already held
+            out.append(d)
+            if len(out) >= int(limit):
+                break
+        return out
+
+    def set_avatar_local(self, user_pk, rel, src) -> None:
+        self.db.execute(
+            "UPDATE profiles SET avatar_local = ?, avatar_src = ?, avatar_failed_at = NULL "
+            "WHERE user_pk = ?", (str(rel), str(src or ""), int(user_pk or 0)))
+
+    def note_avatar_failure(self, user_pk) -> None:
+        self.db.execute(
+            "UPDATE profiles SET avatar_failed_at = ? WHERE user_pk = ?",
+            (_now(), int(user_pk or 0)))
 
     def _with_avatars(self, inner_sql, args) -> list:
         """Run a posts SELECT and resolve each row's author_avatar through the
@@ -787,7 +846,8 @@ class Store:
         unqualified, and a join at that level would make `username`
         ambiguous the day the cache grows a column of that name."""
         rows = self.db.execute(
-            "SELECT p.*, COALESCE(pp.avatar_url, p.author_avatar) AS _avatar_resolved, "
+            "SELECT p.*, COALESCE(pp.avatar_local, pp.avatar_url, p.author_avatar) "
+            "         AS _avatar_resolved, "
             "       pp.full_name AS _full_name "
             f"FROM ({inner_sql}) p "
             "LEFT JOIN profiles pp ON pp.user_pk = p.user_pk "
@@ -795,7 +855,7 @@ class Store:
         out = []
         for r in rows:
             d = dict(r)
-            d["author_avatar"] = d.pop("_avatar_resolved") or None
+            d["author_avatar"] = public_media_url(d.pop("_avatar_resolved")) or None
             d["author_name"] = d.pop("_full_name") or None
             out.append(d)
         return out
@@ -902,6 +962,28 @@ class Store:
 
 def _now() -> int:
     return int(time.time())
+
+
+def _src_key(url) -> str:
+    """A CDN URL without its signature (host + path): same picture, same key."""
+    try:
+        u = urllib.parse.urlsplit(str(url or ""))
+        return f"{u.netloc}{u.path}"
+    except ValueError:
+        return str(url or "")
+
+
+def public_media_url(v):
+    """Our own '/media/fb/...' path made absolute against PUBLIC_BASE_URL so it
+    opens from Watch-Tower's machine too; anything else passes through."""
+    if isinstance(v, str) and v.startswith("/media/fb/"):
+        try:
+            import fb_media
+            base = fb_media.public_base()
+        except Exception:
+            base = ""
+        return (base + v) if base else v
+    return v
 
 
 def _wal(con) -> None:

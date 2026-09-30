@@ -754,17 +754,25 @@ def _query_ig_as_stream(p):
         # it, but with THIS order kept — that helper re-sorts newest-first,
         # which would break a cursor walk.
         rows = st.db.execute(
-            f"SELECT p.*, COALESCE(pp.avatar_url, p.author_avatar) AS _avatar "
+            f"SELECT p.*, COALESCE(pp.avatar_local, pp.avatar_url, p.author_avatar) AS _avatar, "
+            f"       pp.full_name AS _full_name "
             f"FROM posts p LEFT JOIN profiles pp ON pp.user_pk = p.user_pk "
             f"WHERE {cond} ORDER BY {order_by} {order} LIMIT ? OFFSET ?",
             [*params, limit, offset]).fetchall()
 
     label = ig_stream_label(pid)
     out_rows = []
+    _ig_names = _handle_names_map("ig")
     for r in rows:
         d = dict(r)
-        d["author_avatar"] = d.pop("_avatar") or None
+        d["author_avatar"] = store_ig.public_media_url(d.pop("_avatar")) or None
+        d["author_name"] = d.pop("_full_name") or None
         f = store_ig.to_feed(d)
+        # The person's name (identity.py) when the post itself carried none —
+        # the same person's X name, never a guess; the handle stays the key.
+        if f.get("author_display_name") == f.get("author_username"):
+            f["author_display_name"] = (_ig_names.get(str(d.get("username") or "").lower())
+                                        or f["author_display_name"])
         f["created_ms"] = int(d.get("taken_at") or 0) * 1000
         f["collected_ms"] = int(d.get("collected_at") or 0) * 1000
         f["author_id"] = str(d.get("user_pk") or "")
@@ -809,11 +817,15 @@ def _ig_pseudo_streams() -> list:
             # The author's picture and real name ride along from the profile
             # cache (filled by collected posts — never a lookup), so a
             # consumer can draw the account row the way it draws an X one.
-            have_full = "full_name" in {c["name"] for c in st.db.execute("PRAGMA table_info(profiles)")}
-            fn = "pr.full_name" if have_full else "NULL"
+            cols = {c["name"] for c in st.db.execute("PRAGMA table_info(profiles)")}
+            fn = "pr.full_name" if "full_name" in cols else "NULL"
+            # Our own copy of the picture first (never expires, opens from
+            # anywhere); the CDN URL only until ig_avatars.py has fetched it.
+            av = ("COALESCE(pr.avatar_local, pr.avatar_url)" if "avatar_local" in cols
+                  else "pr.avatar_url")
             for r in st.db.execute(
                     f"SELECT s.label, s.type, s.value, s.platform_id, s.project_id, s.account, "
-                    f"       s.assigned_account, pr.avatar_url, {fn} AS full_name "
+                    f"       s.assigned_account, {av} AS avatar_url, {fn} AS full_name "
                     f"FROM sources s LEFT JOIN profiles pr ON "
                     f"  (s.platform_id != '' AND pr.user_pk = CAST(s.platform_id AS INTEGER)) "
                     f"  OR (s.platform_id = '' AND lower(pr.handle) = lower(s.value)) "
@@ -824,7 +836,7 @@ def _ig_pseudo_streams() -> list:
                     "user_id": r["platform_id"] or None,
                     "resolved": bool(r["platform_id"]),
                     "collector": r["account"] or r["assigned_account"] or "",
-                    "avatar": r["avatar_url"] or None,
+                    "avatar": store_ig.public_media_url(r["avatar_url"]) or None,
                     "full_name": r["full_name"] or None})
     except Exception:
         return []
@@ -848,6 +860,7 @@ def _ig_pseudo_watchlist(pid: int):
     accept it.
     """
     _ig_names = _handle_names_map("ig")
+    _ig_avs = _identity_avatars("ig")      # the same person's X picture as fallback
     for s in _ig_pseudo_streams():
         if s["project_id"] == pid:
             return {
@@ -859,7 +872,8 @@ def _ig_pseudo_watchlist(pid: int):
                 "members": [{"handle": m["handle"],
                              "display_name": (_ig_names.get(str(m["handle"]).lower())
                                               or m.get("full_name") or m["label"]),
-                             "avatar": m.get("avatar"),
+                             "avatar": (m.get("avatar")
+                                        or _ig_avs.get(str(m["handle"]).lower()) or None),
                              "user_id": m["user_id"], "resolved": m["resolved"],
                              "collector": m["collector"], "type": m["type"]}
                             for m in s["sources"]],
@@ -5654,20 +5668,29 @@ def _ig_status(q=None):
                 # The profile picture rides along from the per-author cache
                 # (filled by collected posts — never a lookup), joined by the
                 # resolved id or, until one is cached, by handle.
-                have_full = "full_name" in {c["name"] for c in st.db.execute("PRAGMA table_info(profiles)")}
-                fn = "pr.full_name" if have_full else "NULL"
+                cols = {c["name"] for c in st.db.execute("PRAGMA table_info(profiles)")}
+                fn = "pr.full_name" if "full_name" in cols else "NULL"
+                av = ("COALESCE(pr.avatar_local, pr.avatar_url)" if "avatar_local" in cols
+                      else "pr.avatar_url")
                 out["sources"] = [dict(r) for r in st.db.execute(
                     f"SELECT s.label, s.type, s.value, s.platform_id, s.project_id, s.account, "
                     f"       s.assigned_account, s.enabled, s.list_id, "
-                    f"       pr.avatar_url AS avatar, {fn} AS full_name "
+                    f"       {av} AS avatar, {fn} AS full_name "
                     f"FROM sources s LEFT JOIN profiles pr ON "
                     f"  (s.platform_id != '' AND pr.user_pk = CAST(s.platform_id AS INTEGER)) "
                     f"  OR (s.platform_id = '' AND lower(pr.handle) = lower(s.value)) "
                     f"WHERE s.project_id = ? ORDER BY s.label",
                     (pid,))]
                 names = _handle_names_map("ig")
+                avs = _identity_avatars("ig")
                 for row in out["sources"]:
                     row["collector"] = row.get("account") or row.get("assigned_account") or ""
+                    # Our held copy of the Instagram picture; else the same
+                    # person's picture from X (identity.py); else nothing —
+                    # a bare CDN URL is served too, but a browser cannot
+                    # load it, so the row falls back to the initial.
+                    row["avatar"] = (store_ig.public_media_url(row.get("avatar"))
+                                     or avs.get(str(row.get("value") or "").lower()) or None)
                     # The person's name (identity.py) — the real name once a
                     # post carried it, or the same person's X name; the handle
                     # until then, never a guess.
@@ -5678,6 +5701,14 @@ def _ig_status(q=None):
                 # Named lists (2026-09-29): the sidebar draws one row per
                 # list; every source above carries its list_id. Additive.
                 out["lists"] = st.lists(pid)
+                # Fill a few missing pictures on demand (throttled inside):
+                # a freshly deployed server shows them without waiting for
+                # the next post from each account.
+                try:
+                    import ig_avatars
+                    ig_avatars.ensure_lazy(_CFG.root, st, _fb_media_store())
+                except Exception:
+                    pass
         except Exception as e:
             out["sources_error"] = f"{type(e).__name__}: {e}"
     out["paused"] = settings.get("ig_paused") == "1"
@@ -6304,6 +6335,13 @@ def _ig_posts(q):
     # Cross-handle: a display name set on the source links it to the X avatar.
     _fill_avatars_by_name(posts, "ig",
                           lambda p: str((p.get("author") or {}).get("username") or "").lower())
+    # Post-level real name: the profile's own when a post carried it (to_api),
+    # else the person's name from identity.py (the same person's X name).
+    _ig_names = _handle_names_map("ig")
+    for _p in posts:
+        _a = _p.get("author") or {}
+        if not _a.get("display_name"):
+            _a["display_name"] = _ig_names.get(str(_a.get("username") or "").lower()) or None
     # to_api keys the post as `id`, not `tweet_id`; _stamp_labels reads
     # tweet_id, so map it here rather than teaching the stamper two shapes.
     for _p in posts:

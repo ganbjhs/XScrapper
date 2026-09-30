@@ -1903,6 +1903,61 @@ def test_ig_lists(tmp):
 
 
 
+def test_ig_avatars(tmp):
+    """
+    ig_avatars.py: Instagram's profile-picture URLs are signed, expire, and
+    refuse hot-linking, so the bytes are fetched once into the shared media
+    store and every reader shows OUR path — absolute for Watch-Tower, never
+    expiring, re-fetched only when the picture (host+path) changes.
+    """
+    import store_ig, fb_media, ig_avatars
+
+    root = pathlib.Path(tmp)
+    old_base = os.environ.get("PUBLIC_BASE_URL")
+    os.environ["PUBLIC_BASE_URL"] = "https://scraper.example.in"
+    png = b"\x89PNG\r\n\x1a\n" + b"0" * 64
+    real_fetch = ig_avatars.fetch
+    ig_avatars.fetch = lambda url, timeout=8: ((png, "image/png") if "good" in url else (None, "boom"))
+    try:
+        with store_ig.Store(root / "ig_results.db") as st:
+            st.add_source("Modi", "user", "narendramodi", project_id=1)
+            st.db.execute("UPDATE sources SET platform_id = '11'")
+            st.set_profile(11, "narendramodi", "https://cdn.x/t51/good.jpg?oe=aaa&sig=1", full_name="Narendra Modi")
+            st.set_profile(12, "other", "https://cdn.x/t51/bad.jpg?oe=aaa")
+            st.upsert_posts([{"pk": 1, "code": "c1", "user_pk": 11, "username": "narendramodi",
+                              "taken_at": 100, "author_avatar": "https://cdn.x/t51/good.jpg?oe=aaa"}],
+                            "Modi", project_id=1)
+            st.db.commit()
+            print("== fetch once, serve our own path ==")
+            need = [r["user_pk"] for r in st.profiles_needing_avatar(30)]
+            ok(need == [11, 12] or sorted(need) == [11, 12], f"both profiles need a picture ({need})")
+            res = ig_avatars.ensure(root, st, fb_media.MediaStore(root), limit=30)
+            ok(res == {"cached": 1, "failed": 1, "tried": 2}, f"one cached, one failed ({res})")
+            av = st.profile_avatar(11)
+            ok(av.startswith("https://scraper.example.in/media/fb/") and av.endswith(".png"),
+               f"the held copy is served absolute from our host ({av})")
+            row = st.query(project_id=1, limit=5)[0]
+            ok(row["author_avatar"] == av, "posts carry the held copy, not the CDN URL")
+            ok(row["author_name"] == "Narendra Modi", "posts carry the profile's real name")
+            ok(st.profiles_needing_avatar(30) == [], "nothing left to fetch: the failure waits an hour")
+            print("== re-fetch only when the picture changes ==")
+            st.set_profile(11, "narendramodi", "https://cdn.x/t51/good.jpg?oe=bbb&sig=2")
+            ok(st.profiles_needing_avatar(30) == [], "a new signature on the same picture is not a change")
+            st.set_profile(11, "narendramodi", "https://cdn.x/t51/good2.jpg?oe=bbb")
+            ok([r["user_pk"] for r in st.profiles_needing_avatar(30)] == [11], "a new picture is")
+            st.db.execute("UPDATE profiles SET avatar_failed_at = avatar_failed_at - 7200 WHERE user_pk = 12")
+            ok(sorted(r["user_pk"] for r in st.profiles_needing_avatar(30)) == [11, 12],
+               "...and a failure older than an hour is retried")
+            ok(store_ig.public_media_url("https://x.cdn/a.jpg") == "https://x.cdn/a.jpg",
+               "a foreign URL passes through public_media_url untouched")
+    finally:
+        ig_avatars.fetch = real_fetch
+        if old_base is None:
+            os.environ.pop("PUBLIC_BASE_URL", None)
+        else:
+            os.environ["PUBLIC_BASE_URL"] = old_base
+
+
 def test_identity(tmp):
     """
     identity.py: the same person across X / Instagram / Facebook, linked
@@ -7314,6 +7369,7 @@ def main():
         test_shared_watchlists(fresh("shared_wl"))
         test_ig_lists(fresh("ig_lists"))
         test_identity(fresh("identity"))
+        test_ig_avatars(fresh("ig_avatars"))
 
         section("collections (curation boards)")
         test_collections(fresh("collections"))

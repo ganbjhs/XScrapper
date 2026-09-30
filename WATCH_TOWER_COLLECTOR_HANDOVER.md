@@ -89,9 +89,16 @@ is the API surface, there is no other discovery document. Do not probe.
                     members:[{handle, display_name, user_id (numeric
                               Instagram id or null while we resolve it),
                               resolved, collector, type,
-                              avatar (2026-09-29: the account's profile
-                              picture URL from the newest collected post,
-                              null until one is collected)}],
+                              avatar (2026-09-30: the account's profile
+                              picture served from OUR host —
+                              https://<collector>/media/fb/<aa>/<hash>.jpg,
+                              same store as Facebook media: no login, no
+                              expiry, cacheable forever. Instagram's own
+                              CDN URL refuses hot-linking and expires, so
+                              we fetch the bytes once and you get our
+                              copy; where we have no Instagram picture yet
+                              you get the same person's X picture; null
+                              until either exists)}],
                     display_name is the account's REAL NAME (from the
                     posts we collected, or the same person's X name via
                     identity.py) once known, the handle until then. Draw
@@ -246,9 +253,13 @@ is the API surface, there is no other discovery document. Do not probe.
     url, text,
     created_at:          post time, ISO UTC     created_ms:   same, epoch ms
     collected_at:        when WE saved it        collected_ms: the cursor field
-    author_username, author_display_name (Instagram: the real name once a post carried it, else the handle — 2026-09-29),
+    author_username, author_display_name (Instagram: the real name once a post carried it,
+                         else the same person's X name via identity.py, else the handle — 2026-09-30),
     author_id:           numeric platform user id ("" while unresolved on IG)
-    author_avatar:       url or null
+    author_avatar:       url or null (Instagram, 2026-09-30: OUR copy at
+                         https://<collector>/media/fb/… once fetched — never
+                         expires; a bare Instagram CDN URL only until then,
+                         and that one a browser cannot load)
     media:               [{type: photo|video|album|other, url, thumb}]
                          X and Facebook media do not expire (Facebook's are
                          re-hosted on OUR host, /media/fb/…). Instagram media

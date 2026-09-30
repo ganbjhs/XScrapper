@@ -856,6 +856,16 @@ async def run_once(store_path="ig_results.db", account_override="", *,
             if total or not quiet:
                 log(f"done: {total} new post(s) stored"
                     + (f" across {len(runnable)} account(s)" if len(owners) > 1 else ""))
+            # Profile pictures we hold (ig_avatars.py): fetch the bytes of a
+            # few newly seen / changed ones while their signed URL is alive.
+            # Plain HTTP to the CDN, no Instagram session, never a lookup —
+            # nothing here counts against an account.
+            try:
+                import fb_media
+                import ig_avatars
+                ig_avatars.ensure(root, store, fb_media.MediaStore(root), limit=30, log=log)
+            except Exception as e:
+                log(f"  profile pictures: skipped — {type(e).__name__}: {e}")
             return total
     finally:
         lock.release()
