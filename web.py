@@ -5698,8 +5698,13 @@ def _ig_status(q=None):
                 try:
                     import ig_avatars
                     ig_avatars.ensure_lazy(_CFG.root, st, _fb_media_store())
-                except Exception:
-                    pass
+                    # What the last run did (counts, first errors) — so a
+                    # picture that never appears can be diagnosed from here.
+                    out["avatar_cache"] = dict(ig_avatars.LAST)
+                    out["avatar_cache"]["held"] = st.db.execute(
+                        "SELECT COUNT(*) FROM profiles WHERE avatar_local IS NOT NULL").fetchone()[0]
+                except Exception as e:
+                    out["avatar_cache"] = {"errors": [f"{type(e).__name__}: {e}"]}
         except Exception as e:
             out["sources_error"] = f"{type(e).__name__}: {e}"
     out["paused"] = settings.get("ig_paused") == "1"
