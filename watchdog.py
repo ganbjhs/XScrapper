@@ -200,6 +200,10 @@ class Probe:
     detail: str = ""                  # the newest failure, if that is what it is doing
     error: str = ""                   # the probe itself could not read
     exists: bool = True               # the database is there at all
+    cadence_ms: int = 0               # the platform's OWN "each source at most
+                                      # every N" setting: quiet for less than
+                                      # that plus slack is the setting working,
+                                      # not an outage (Instagram, 2026-09-30)
 
     @property
     def watched(self) -> bool:
@@ -281,6 +285,19 @@ def probe_instagram(root) -> Probe:
             p.last_seen_ms = max(p.last_seen_ms or 0, int(float(t) * 1000))
     except (OSError, ValueError, TypeError):
         pass
+    # "Each account at most once every N" (ig_interval_s): with N sources
+    # and a long cadence the collector is quiet by design for stretches of
+    # cadence / N — so the stale window is never shorter than the cadence.
+    try:
+        con = _ro(Path(root) / "ig_results.db")
+        try:
+            row = con.execute("SELECT value FROM settings WHERE key = 'ig_interval_s'").fetchone()
+            if row and str(row["value"] or "").isdigit():
+                p.cadence_ms = int(row["value"]) * 1000
+        finally:
+            con.close()
+    except (sqlite3.Error, OSError):
+        pass
     return p
 
 
@@ -321,6 +338,10 @@ def decide(state: dict, p: Probe, cfg: dict, now_ms: int) -> tuple:
     st = state
     st.setdefault("first_seen_ms", now_ms)
     stale_ms = cfg["stale_min"][p.platform] * 60_000
+    if p.cadence_ms:
+        # Quiet for up to one cadence plus an hour of slack is the setting
+        # doing its job (each source visited at most that often).
+        stale_ms = max(stale_ms, p.cadence_ms + 60 * 60_000)
     remind_ms = cfg["remind_min"] * 60_000
     stale = is_stale(p, stale_ms, st["first_seen_ms"], now_ms)
     st["stale"] = stale

@@ -202,6 +202,18 @@ change to the delivery contract. The write endpoint
 (`POST /api/watchlists/owner`) is cookie-only: a read integration does not get
 to restamp ownership.
 
+### The Instagram cadence is a per-account FLOOR, and it goes up to once a day (2026-09-30)
+
+`ig_interval_s` ("each account at most every …", Watchlists → Network &
+settings) is not a schedule: a source is due only when its `last_run` is
+older than the setting, and every visit reads ONE most-overdue source. So
+24 hours means every Instagram account is read once a day and no more —
+the setting for few collectors over many accounts, or a throttled session.
+Phone-time sessions and the daily budget still apply on top; nothing here
+adds a request. The dashboard offers 2 min … 24 h; the API refuses below
+60 s. The watchdog reads the same setting: quiet for up to one cadence plus
+an hour is the setting working, not a stale collector.
+
 ### An Instagram profile picture is BYTES we hold, never a CDN link we hope in (2026-09-30)
 
 Instagram signs its profile-picture URLs with an expiry (`oe=`) and its CDN

@@ -1929,9 +1929,15 @@ function FbSettings({ data, reload }) {
   );
 }
 
+// "Each account at most once every …": a source is re-visited only once
+// this much time has passed since its last visit. The collector still moves
+// through the accounts one at a time in phone-time; this is the per-account
+// floor. 24 hours = every Instagram account read once a day, which is what a
+// small set of collectors over many accounts should run at.
 const IG_INTERVALS = [
   ["120", "2 minutes"], ["300", "5 minutes"], ["600", "10 minutes"],
-  ["1800", "30 minutes"], ["3600", "1 hour"],
+  ["1800", "30 minutes"], ["3600", "1 hour"], ["10800", "3 hours"],
+  ["21600", "6 hours"], ["43200", "12 hours"], ["86400", "24 hours"],
 ];
 
 function IgSettings({ data, reload }) {
@@ -1949,8 +1955,8 @@ function IgSettings({ data, reload }) {
     <div className="panel detail">
       <NetHead platform="ig" name="Instagram"
                right={<>
-                 <PillSelect label="check every" value={interval} options={IG_INTERVALS} disabled={busy}
-                             title="How often every Instagram source is checked. Applies from the service's next cycle — no restart."
+                 <PillSelect label="each account at most every" value={interval} options={IG_INTERVALS} disabled={busy}
+                             title="An Instagram account is re-visited only after this much time since its last visit (the collector's phone-time and daily budget still apply on top). 24 hours = every account once a day. Applies from the service's next cycle — no restart; the watchdog allows this much quiet before calling Instagram stale."
                              onChange={(v) => go(() => api.igSettings({ interval_s: v }))} />
                  <button className={`btn btn-sm ${paused ? "btn-brand" : "btn-ghost"}`} disabled={busy}
                          title="Master switch — the background service honours it within a minute"
