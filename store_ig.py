@@ -178,7 +178,87 @@ CREATE TABLE IF NOT EXISTS ig_lists (
   created_at  INTEGER NOT NULL,
   UNIQUE(project_id, name)
 );
+
+-- Shared Instagram lists (2026-09-30) — the Instagram twin of X's
+-- project_watchlists. ig_lists.project_id stays and means OWNER (the
+-- project that created the list); this table says which projects USE it,
+-- the owner included. One list = one set of sources = collected ONCE, and
+-- its posts show in every project that uses it.
+--
+-- Nothing is copied. A source keeps one row (label is still the primary
+-- key) and its project_id is its list's owner; posts keep the project_id
+-- they were collected under (the owner's). A project that ADDED the list
+-- sees them through post_scope(): "posts of project P" is its own posts
+-- plus the owner's posts from the handles of every list P added. That is
+-- why re-typing a handle that already lives in another project is now
+-- refused instead of silently moving it there (see SourceElsewhere).
+CREATE TABLE IF NOT EXISTS ig_list_projects (
+  list_id     INTEGER NOT NULL,
+  project_id  INTEGER NOT NULL,
+  added_at    INTEGER NOT NULL,
+  PRIMARY KEY (list_id, project_id)
+);
+CREATE INDEX IF NOT EXISTS ix_ig_list_projects_project ON ig_list_projects(project_id);
 """
+
+
+class SourceElsewhere(ValueError):
+    """The handle is already a source of ANOTHER project's list.
+
+    Adding it again used to move the row (label is the primary key), so the
+    first project silently stopped collecting it. Now the add is refused
+    and the caller is told where the handle lives, so the operator can add
+    that list with "Add existing…" (shared, collected once) or ask for an
+    explicit move. A ValueError, so every caller that already reports
+    ValueError as an error keeps working unchanged."""
+
+    def __init__(self, label, handle, project_id, list_id, list_name):
+        self.label, self.handle = label, handle
+        self.project_id, self.list_id, self.list_name = project_id, list_id, list_name
+        who = f"@{handle}" if handle else repr(label)
+        super().__init__(
+            f"{who} is already collected for another project (project "
+            f"{project_id}, list {list_name!r}). Use \"Add existing…\" to share "
+            f"that list with this project, or move the handle here explicitly.")
+
+
+def post_scope(db, project_id, alias="posts"):
+    """(sql, args): the posts that belong to project P — its own, plus the
+    owner's posts from the handles of every Instagram list P has added from
+    another project. The ONE definition of "P's Instagram posts"; every
+    scoped read (store, dashboard, API, Watch-Tower's feed) builds on it.
+
+    `db` is any connection on ig_results.db. A project that has added no
+    list gets the plain indexed `project_id = ?` — sharing costs nothing
+    until it is used. A database from before sharing (no table yet) gets
+    the plain clause too."""
+    pid = int(project_id)
+    a = alias
+    try:
+        shared = db.execute(
+            "SELECT 1 FROM ig_list_projects lp JOIN ig_lists l ON l.list_id = lp.list_id "
+            "WHERE lp.project_id = ? AND l.project_id != ? LIMIT 1", (pid, pid)).fetchone()
+    except sqlite3.OperationalError:
+        shared = None
+    if not shared:
+        return f"{a}.project_id = ?", [pid]
+    return (f"({a}.project_id = ? OR ({a}.project_id, {a}.source_label) IN ("
+            f"SELECT l_.project_id, s_.label FROM ig_list_projects lp_ "
+            f"JOIN ig_lists l_ ON l_.list_id = lp_.list_id "
+            f"JOIN sources s_ ON s_.list_id = l_.list_id "
+            f"WHERE lp_.project_id = ? AND l_.project_id != ?))", [pid, pid, pid])
+
+
+def source_scope(db, project_id, alias="sources"):
+    """(sql, args): the sources project P sees — its own plus those in the
+    lists it added from other projects."""
+    pid = int(project_id)
+    try:
+        db.execute("SELECT 1 FROM ig_list_projects LIMIT 1").fetchone()
+    except sqlite3.OperationalError:
+        return f"{alias}.project_id = ?", [pid]
+    return (f"({alias}.project_id = ? OR {alias}.list_id IN "
+            f"(SELECT list_id FROM ig_list_projects WHERE project_id = ?))", [pid, pid])
 
 
 @dataclass
@@ -305,6 +385,14 @@ class Store:
             self.db.execute(
                 "UPDATE sources SET list_id = ? WHERE list_id = 0 AND project_id = ?",
                 (lid, r["project_id"]))
+        # Shared lists (2026-09-30): every list is used by its owner. One
+        # row per list, INSERT OR IGNORE — idempotent; rows of lists that no
+        # longer exist are dropped. Rollback = drop ig_list_projects.
+        self.db.execute(
+            "INSERT OR IGNORE INTO ig_list_projects(list_id, project_id, added_at) "
+            "SELECT list_id, project_id, created_at FROM ig_lists")
+        self.db.execute(
+            "DELETE FROM ig_list_projects WHERE list_id NOT IN (SELECT list_id FROM ig_lists)")
         self.db.commit()
 
     def close(self):
@@ -338,7 +426,7 @@ class Store:
 
     # -- sources ------------------------------------------------------------
     def add_source(self, label, type_, value="", account="", platform_id="",
-                   project_id=0, list_id=0) -> None:
+                   project_id=0, list_id=0, move=False) -> None:
         """Register (or update) a source.
 
         label is the person; value is the handle. platform_id is optional and
@@ -358,28 +446,44 @@ class Store:
         platform_id = str(platform_id or "").strip()
         if type_ == "user" and value.isdigit() and not platform_id:
             value, platform_id = "", value
-        # Every source sits in a list of its project. A caller that names
-        # none gets the project's default list; a re-add that names none
-        # keeps the list it already has (see the ON CONFLICT clause).
+        # Every source sits in a list. A caller that names none gets the
+        # project's default list; a re-add that names none keeps the list it
+        # already has (see the ON CONFLICT clause). The list may be one this
+        # project ADDED from another project (shared): the source then
+        # belongs to the list's owner — one row, collected once, seen by all.
         lid = int(list_id or 0)
+        pid = int(project_id or 0)
+        cur = self.db.execute(
+            "SELECT project_id, list_id FROM sources WHERE label = ?",
+            (label,)).fetchone()
         if lid:
             l = self.list_row(lid)
             if not l:
                 raise ValueError(f"no Instagram list {lid}")
-            if int(project_id or 0) and int(l["project_id"]) != int(project_id):
+            if pid and int(l["project_id"]) != pid and not self.list_used_by(lid, pid):
                 raise ValueError("that list belongs to another project")
-            project_id = l["project_id"]
-        elif int(project_id or 0):
-            # No list named: a source this project already has keeps its
-            # list; a new one (or one moving in from another project) goes
-            # to the project's default list.
-            cur = self.db.execute(
-                "SELECT project_id, list_id FROM sources WHERE label = ?",
-                (label,)).fetchone()
-            if cur and int(cur["project_id"]) == int(project_id) and cur["list_id"]:
-                lid = int(cur["list_id"])
+            owner = int(l["project_id"])
+        elif pid:
+            if cur and cur["list_id"] and (int(cur["project_id"]) == pid
+                                           or self.list_used_by(cur["list_id"], pid)):
+                # Already here (its own list, or a list this project added).
+                lid, owner = int(cur["list_id"]), int(cur["project_id"])
             else:
-                lid = self.default_list(project_id)
+                owner = pid
+        else:
+            owner = 0
+        # The handle lives in ANOTHER project: refuse rather than move it
+        # out from under that project (it would silently stop collecting
+        # there). An explicit move=True is the operator saying "move it".
+        if (cur and int(cur["project_id"] or 0) and owner
+                and int(cur["project_id"]) != owner and not move):
+            cl = self.list_row(cur["list_id"]) if cur["list_id"] else None
+            raise SourceElsewhere(label, value, int(cur["project_id"]),
+                                  int(cur["list_id"] or 0),
+                                  (cl or {}).get("name") or "Instagram sources")
+        if owner and not lid:
+            lid = self.default_list(owner)
+        project_id = owner
         self.db.execute(
             "INSERT INTO sources(label,type,value,platform_id,project_id,account,"
             "enabled,created_at,list_id) VALUES(?,?,?,?,?,?,1,?,?) "
@@ -415,25 +519,110 @@ class Store:
         cur = self.db.execute(
             "INSERT INTO ig_lists(project_id, name, created_at) VALUES(?,?,?)",
             (pid, self.DEFAULT_LIST_NAME, _now()))
+        self._link(int(cur.lastrowid), pid)
         return int(cur.lastrowid)
 
-    def lists(self, project_id) -> list:
-        """The project's lists with a source count, a live-source count and
-        how many posts their sources have collected — the sidebar's rows."""
-        pid = int(project_id or 0)
+    def _link(self, list_id, project_id) -> bool:
+        """Record that a project uses a list. True if it was new."""
+        return self.db.execute(
+            "INSERT OR IGNORE INTO ig_list_projects(list_id, project_id, added_at) "
+            "VALUES(?,?,?)", (int(list_id), int(project_id), _now())).rowcount > 0
+
+    def list_used_by(self, list_id, project_id) -> bool:
+        return bool(self.db.execute(
+            "SELECT 1 FROM ig_list_projects WHERE list_id = ? AND project_id = ?",
+            (int(list_id), int(project_id))).fetchone())
+
+    def list_projects(self, list_id) -> list:
+        """Every project using the list, the owner first."""
+        l = self.list_row(list_id)
+        if not l:
+            return []
+        rows = [int(r["project_id"]) for r in self.db.execute(
+            "SELECT project_id FROM ig_list_projects WHERE list_id = ? "
+            "ORDER BY added_at, project_id", (int(list_id),))]
+        owner = int(l["project_id"])
+        return [owner] + [p for p in rows if p != owner]
+
+    def post_scope(self, project_id, alias="posts"):
+        return post_scope(self.db, project_id, alias)
+
+    def source_scope(self, project_id, alias="sources"):
+        return source_scope(self.db, project_id, alias)
+
+    _LIST_COUNTS = (
+        "  (SELECT COUNT(*) FROM sources s WHERE s.list_id = l.list_id) AS sources, "
+        "  (SELECT COUNT(*) FROM sources s WHERE s.list_id = l.list_id "
+        "     AND s.enabled = 1) AS enabled, "
+        "  (SELECT COUNT(*) FROM posts p JOIN sources s ON s.label = p.source_label "
+        "     WHERE s.list_id = l.list_id AND p.project_id = l.project_id) AS posts ")
+
+    def _list_dict(self, row, project_id=None) -> dict:
+        d = dict(row)
+        d["paused"] = bool(d["paused"])
+        projs = self.list_projects(d["list_id"])
+        d["owner_project_id"] = int(d["project_id"])
+        d["projects"] = projs
+        d["shared"] = len(projs) > 1
+        if project_id is not None:
+            d["owned"] = int(d["project_id"]) == int(project_id)
+        return d
+
+    def list_library(self, exclude_project=None) -> list:
+        """Every Instagram list, for the "Add existing…" picker: owner,
+        counts, who uses it, and whether `exclude_project` already does."""
         out = []
         for l in self.db.execute(
-                "SELECT l.*, "
-                "  (SELECT COUNT(*) FROM sources s WHERE s.list_id = l.list_id) AS sources, "
-                "  (SELECT COUNT(*) FROM sources s WHERE s.list_id = l.list_id "
-                "     AND s.enabled = 1) AS enabled, "
-                "  (SELECT COUNT(*) FROM posts p JOIN sources s ON s.label = p.source_label "
-                "     WHERE s.list_id = l.list_id) AS posts "
-                "FROM ig_lists l WHERE l.project_id = ? ORDER BY l.list_id", (pid,)):
-            d = dict(l)
-            d["paused"] = bool(d["paused"])
+                "SELECT l.*, " + self._LIST_COUNTS + "FROM ig_lists l ORDER BY l.list_id"):
+            d = self._list_dict(l)
+            if exclude_project is not None:
+                d["attached"] = int(exclude_project) in d["projects"]
             out.append(d)
         return out
+
+    def attach_list(self, project_id, list_id) -> dict:
+        """Let a project use another project's list. Idempotent. Nothing is
+        copied: the list's handles, pause and posts are the same rows."""
+        pid = int(project_id or 0)
+        if not pid:
+            return {"error": "no project selected"}
+        l = self.list_row(list_id)
+        if not l:
+            return {"error": f"no Instagram list {list_id}"}
+        new = self._link(l["list_id"], pid)
+        self.db.commit()
+        return {"ok": True, "list_id": int(l["list_id"]), "name": l["name"],
+                "owner_project_id": int(l["project_id"]), "already": not new}
+
+    def detach_list(self, project_id, list_id) -> dict:
+        """Stop a project using a list it ADDED. The owner cannot detach —
+        it deletes (or first hands the list over by deleting the project)."""
+        pid = int(project_id or 0)
+        l = self.list_row(list_id)
+        if not l:
+            return {"error": f"no Instagram list {list_id}"}
+        if int(l["project_id"]) == pid:
+            return {"error": f"{l['name']!r} was created in this project — delete it instead"}
+        n = self.db.execute(
+            "DELETE FROM ig_list_projects WHERE list_id = ? AND project_id = ?",
+            (int(list_id), pid)).rowcount
+        self.db.commit()
+        if not n:
+            return {"error": f"this project does not use {l['name']!r}"}
+        return {"ok": True, "detached": True, "list_id": int(list_id)}
+
+    def lists(self, project_id) -> list:
+        """The lists a project USES — the ones it created and the ones it
+        added from other projects — with a source count, a live-source count
+        and how many posts their sources have collected: the sidebar's rows.
+        Each carries owner_project_id, projects[] (owner first), shared and
+        owned (False for a list added from elsewhere)."""
+        pid = int(project_id or 0)
+        return [self._list_dict(l, pid) for l in self.db.execute(
+            "SELECT l.*, " + self._LIST_COUNTS +
+            "FROM ig_lists l WHERE l.project_id = ? OR l.list_id IN "
+            "(SELECT list_id FROM ig_list_projects WHERE project_id = ?) "
+            "ORDER BY l.list_id", (pid, pid))]
 
     def list_row(self, list_id):
         r = self.db.execute("SELECT * FROM ig_lists WHERE list_id = ?",
@@ -453,6 +642,7 @@ class Store:
                 (pid, name, _now()))
         except sqlite3.IntegrityError:
             return {"error": f"this project already has an Instagram list called {name!r}"}
+        self._link(int(cur.lastrowid), pid)
         self.db.commit()
         return {"list_id": int(cur.lastrowid), "name": name, "project_id": pid}
 
@@ -486,7 +676,8 @@ class Store:
         self.db.commit()
         return {"list_id": int(list_id), "paused": bool(paused)}
 
-    def delete_list(self, list_id, delete_sources: bool = False) -> dict:
+    def delete_list(self, list_id, delete_sources: bool = False,
+                    project_id=None) -> dict:
         """Remove a list. Its sources either go with it (delete_sources) or
         move to the project's default list — the handles were typed by a
         person and are not thrown away by a click on the wrong list. The
@@ -496,6 +687,16 @@ class Store:
         if not l:
             return {"error": f"no Instagram list {list_id}"}
         lid, pid = int(list_id), int(l["project_id"])
+        # Shared lists: a project that only ADDED the list removes it from
+        # itself (detach); the owner cannot delete it out from under the
+        # projects still using it.
+        if project_id is not None and int(project_id) != pid:
+            return self.detach_list(project_id, lid)
+        others = [p for p in self.list_projects(lid) if p != pid]
+        if others:
+            return {"error": f"{l['name']!r} is also used by project(s) "
+                             f"{', '.join(map(str, others))} — remove it there first",
+                    "used_by": others}
         n = self.db.execute("SELECT COUNT(*) c FROM sources WHERE list_id = ?",
                             (lid,)).fetchone()["c"]
         moved = removed = 0
@@ -514,9 +715,74 @@ class Store:
                 "UPDATE sources SET list_id = ? WHERE list_id = ?",
                 (int(others["list_id"]), lid)).rowcount
         self.db.execute("DELETE FROM ig_lists WHERE list_id = ?", (lid,))
+        self.db.execute("DELETE FROM ig_list_projects WHERE list_id = ?", (lid,))
         self.db.commit()
         return {"removed": True, "list_id": lid, "sources_moved": moved,
                 "sources_removed": removed, "posts_kept": True}
+
+    def delete_project(self, project_id, apply=False) -> dict:
+        """What deleting a project does to Instagram — and, with apply, does it.
+
+        A list the project created but other projects still use is NOT
+        deleted: it is handed to the oldest other user (same rule as X's
+        shared watchlists), with its sources and the posts they collected
+        here, so the projects that added it lose nothing. Everything else the
+        project owns goes; the lists it only added are simply let go.
+        Returns counts of what goes plus lists_transferred [{list_id, name,
+        to_project}]."""
+        pid = int(project_id)
+        moves = []
+        for l in self.db.execute(
+                "SELECT * FROM ig_lists WHERE project_id = ? ORDER BY list_id",
+                (pid,)).fetchall():
+            others = [x for x in self.list_projects(l["list_id"]) if x != pid]
+            if others:
+                moves.append((dict(l), others[0]))
+        kept_labels = []
+        for l, _ in moves:
+            kept_labels += [r["label"] for r in self.db.execute(
+                "SELECT label FROM sources WHERE list_id = ?", (l["list_id"],))]
+        marks = ",".join("?" * len(kept_labels)) or "''"
+        n_src = self.db.execute(
+            f"SELECT COUNT(*) FROM sources WHERE project_id = ? AND label NOT IN ({marks})",
+            (pid, *kept_labels)).fetchone()[0]
+        n_posts = self.db.execute(
+            f"SELECT COUNT(*) FROM posts WHERE project_id = ? AND "
+            f"(source_label IS NULL OR source_label NOT IN ({marks}))",
+            (pid, *kept_labels)).fetchone()[0]
+        out = {"sources": n_src, "posts": n_posts,
+               "lists_transferred": [{"list_id": l["list_id"], "name": l["name"],
+                                      "to_project": to} for l, to in moves]}
+        if not apply:
+            return out
+        for l, to in moves:
+            name = l["name"]
+            if self.db.execute("SELECT 1 FROM ig_lists WHERE project_id = ? AND name = ?",
+                               (to, name)).fetchone():
+                name = f"{name} (from project {pid})"
+            self.db.execute("UPDATE ig_lists SET project_id = ?, name = ? WHERE list_id = ?",
+                            (to, name, l["list_id"]))
+            labels = [r["label"] for r in self.db.execute(
+                "SELECT label FROM sources WHERE list_id = ?", (l["list_id"],))]
+            self.db.execute("UPDATE sources SET project_id = ? WHERE list_id = ?",
+                            (to, l["list_id"]))
+            if labels:
+                m = ",".join("?" * len(labels))
+                self.db.execute(
+                    f"UPDATE posts SET project_id = ? WHERE project_id = ? "
+                    f"AND source_label IN ({m})", (to, pid, *labels))
+            out["lists_transferred"][[x["list_id"] for x in out["lists_transferred"]]
+                                     .index(l["list_id"])]["name"] = name
+        self.db.execute("DELETE FROM ig_list_projects WHERE project_id = ?", (pid,))
+        self.db.execute("DELETE FROM posts WHERE project_id = ?", (pid,))
+        self.db.execute("DELETE FROM sources WHERE project_id = ?", (pid,))
+        gone = [r["list_id"] for r in self.db.execute(
+            "SELECT list_id FROM ig_lists WHERE project_id = ?", (pid,))]
+        self.db.execute("DELETE FROM ig_lists WHERE project_id = ?", (pid,))
+        for lid in gone:
+            self.db.execute("DELETE FROM ig_list_projects WHERE list_id = ?", (lid,))
+        self.db.commit()
+        return out
 
     def set_list(self, label, list_id) -> dict:
         """Move one source to another list of the SAME project."""
@@ -539,8 +805,12 @@ class Store:
         scoped read). Posts already collected keep the project they were
         collected under — history is not retroactively reassigned, because a
         post genuinely was gathered for whoever was watching at the time."""
-        self.db.execute("UPDATE sources SET project_id=? WHERE label=?",
-                        (int(project_id or 0), label))
+        pid = int(project_id or 0)
+        # The list follows the project: a source moved to P sits in P's
+        # default list, never in a list of the project it left.
+        lid = self.default_list(pid) if pid else 0
+        self.db.execute("UPDATE sources SET project_id=?, list_id=? WHERE label=?",
+                        (pid, lid, label))
         self.db.commit()
 
     def set_platform_id(self, label, platform_id) -> None:
@@ -595,7 +865,8 @@ class Store:
             where.append("s.enabled=1")
             where.append("COALESCE(l.paused, 0) = 0")
         if project_id is not None:
-            where.append("s.project_id=?"); args.append(int(project_id))
+            sq, sa = self.source_scope(project_id, "s")
+            where.append(sq); args += sa
         q = ("SELECT s.* FROM sources s "
              "LEFT JOIN ig_lists l ON l.list_id = s.list_id")
         if where:
@@ -886,7 +1157,8 @@ class Store:
         """
         where, args = self._post_filter(
             project_id=project_id, since=since, until=until,
-            source=source, username=username, before_pk=before_pk)
+            source=source, username=username, before_pk=before_pk,
+            scope=self.post_scope(project_id) if project_id is not None else None)
         sql = "SELECT * FROM posts"
         if where:
             sql += " WHERE " + " AND ".join(where)
@@ -896,7 +1168,7 @@ class Store:
 
     @staticmethod
     def _post_filter(*, project_id=None, since=None, until=None, source=None,
-                     username=None, before_pk=None):
+                     username=None, before_pk=None, scope=None):
         """
         The posts WHERE clause, built once for both `query` and `count`.
 
@@ -910,7 +1182,10 @@ class Store:
         """
         where, args = [], []
         if project_id is not None:
-            where.append("project_id = ?"); args.append(int(project_id))
+            # `scope` is post_scope() for this project (shared lists
+            # included); without a connection to build it, the plain clause.
+            sq, sa = scope or ("project_id = ?", [int(project_id)])
+            where.append(sq); args += list(sa)
         if since is not None:
             where.append("taken_at >= ?"); args.append(int(since))
         if until is not None:
@@ -935,7 +1210,8 @@ class Store:
         """
         where, args = self._post_filter(
             project_id=project_id, since=since, until=until,
-            source=source, username=username)
+            source=source, username=username,
+            scope=self.post_scope(project_id) if project_id is not None else None)
         sql = "SELECT COUNT(*) n FROM posts"
         if where:
             sql += " WHERE " + " AND ".join(where)
@@ -947,12 +1223,14 @@ class Store:
         c = self.db.execute
         pw, pa = "", []
         if project_id is not None:
-            pw, pa = " WHERE project_id = ?", [int(project_id)]
+            sq, pa = self.post_scope(project_id)
+            pw = " WHERE " + sq
         total = c(f"SELECT COUNT(*) n FROM posts{pw}", pa).fetchone()["n"]
         newest = c(f"SELECT MAX(taken_at) t FROM posts{pw}", pa).fetchone()["t"]
         sw, sa = "enabled=1", []
         if project_id is not None:
-            sw += " AND project_id = ?"; sa = [int(project_id)]
+            sq, sa = self.source_scope(project_id)
+            sw += " AND " + sq
         srcs = c(f"SELECT COUNT(*) n FROM sources WHERE {sw}", sa).fetchone()["n"]
         unres = c(f"SELECT COUNT(*) n FROM sources WHERE {sw} AND type='user' "
                   f"AND platform_id='' AND value != ''", sa).fetchone()["n"]

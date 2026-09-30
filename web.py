@@ -681,7 +681,11 @@ def _query_ig_as_stream(p):
         return empty
     import store_ig
 
-    where, params = ["p.project_id = ?"], [pid]
+    # P's posts = its own + the owner's posts from Instagram lists P added
+    # from another project (shared lists, 2026-09-30). Same row shape.
+    with store_ig.Store(rp) as _st:
+        _sq, _sa = _st.post_scope(pid, "p")
+    where, params = [_sq], list(_sa)
     if p.get("q"):
         where.append("(p.caption LIKE ? OR p.username LIKE ?)")
         params += [f"%{p['q']}%"] * 2
@@ -808,8 +812,12 @@ def _ig_pseudo_streams() -> list:
     try:
         with store_ig.Store(rp) as st:
             paused = (st.setting("ig_paused") == "1")
-            counts = {r["project_id"]: r["n"] for r in st.db.execute(
-                "SELECT project_id, COUNT(*) n FROM posts GROUP BY project_id")}
+            # Which projects use each list (shared lists, 2026-09-30): a
+            # source shows under its owner AND every project that added
+            # its list, and each project's count is its scoped count.
+            users = {}
+            for r in st.db.execute("SELECT list_id, project_id FROM ig_list_projects"):
+                users.setdefault(int(r["list_id"]), set()).add(int(r["project_id"]))
             srcs = {}
             # The author's picture and real name ride along from the profile
             # cache (filled by collected posts — never a lookup), so a
@@ -822,19 +830,23 @@ def _ig_pseudo_streams() -> list:
                   else "pr.avatar_url")
             for r in st.db.execute(
                     f"SELECT s.label, s.type, s.value, s.platform_id, s.project_id, s.account, "
-                    f"       s.assigned_account, {av} AS avatar_url, {fn} AS full_name "
+                    f"       s.assigned_account, s.list_id, {av} AS avatar_url, {fn} AS full_name "
                     f"FROM sources s LEFT JOIN profiles pr ON "
                     f"  (s.platform_id != '' AND pr.user_pk = CAST(s.platform_id AS INTEGER)) "
                     f"  OR (s.platform_id = '' AND lower(pr.handle) = lower(s.value)) "
                     f"WHERE s.enabled = 1 AND s.project_id > 0 "
                     f"ORDER BY s.project_id, s.label"):
-                srcs.setdefault(int(r["project_id"]), []).append({
+                for _p in sorted({int(r["project_id"])} | users.get(int(r["list_id"] or 0), set())):
+                  srcs.setdefault(_p, []).append({
                     "handle": r["value"], "label": r["label"], "type": r["type"],
                     "user_id": r["platform_id"] or None,
                     "resolved": bool(r["platform_id"]),
                     "collector": r["account"] or r["assigned_account"] or "",
                     "avatar": store_ig.public_media_url(r["avatar_url"]) or None,
                     "full_name": r["full_name"] or None})
+            for _p in srcs:
+                srcs[_p].sort(key=lambda m: m["label"])
+            counts = {_p: st.count(project_id=_p) for _p in srcs}
     except Exception:
         return []
     for pid in sorted(srcs):
@@ -2103,10 +2115,12 @@ def _metrics_json(q=None):
             try:
                 con.row_factory = sqlite3.Row
                 # store_ig keys taken_at in unix SECONDS.
+                import store_ig
+                _sq, _sa = store_ig.post_scope(con, pid)
                 ig_by_day = {int(r["d"]): r["c"] for r in con.execute(
                     "SELECT (taken_at * 1000) / ? AS d, COUNT(*) c FROM posts "
-                    "WHERE taken_at * 1000 >= ? AND project_id = ? GROUP BY d",
-                    (day_ms, week_ago, pid))}
+                    f"WHERE taken_at * 1000 >= ? AND {_sq} GROUP BY d",
+                    (day_ms, week_ago, *_sa))}
             finally:
                 con.close()
         except Exception:
@@ -2200,7 +2214,20 @@ def _project_other_platforms(pid: int, do_delete: bool) -> dict:
     them the rule is simple: what this project owns goes with it.
     """
     out = {}
-    for key, fn in (("instagram", "ig_results.db"), ("facebook", "fb_results.db")):
+    # Instagram lists can be shared (2026-09-30): a list this project
+    # created but others still use is handed over, not deleted — the
+    # store decides, the same way X's shared watchlists are transferred.
+    rp = _CFG.root / "ig_results.db"
+    if rp.exists():
+        try:
+            import store_ig
+            with store_ig.Store(rp) as st:
+                out["instagram"] = st.delete_project(pid, apply=do_delete)
+        except sqlite3.OperationalError:
+            out["instagram"] = {"sources": 0, "posts": 0}
+    else:
+        out["instagram"] = {"sources": 0, "posts": 0}
+    for key, fn in (("facebook", "fb_results.db"),):
         rp = _CFG.root / fn
         if not rp.exists():
             out[key] = {"sources": 0, "posts": 0}
@@ -3719,9 +3746,10 @@ def _ig_unlabelled(pid: int, labelled: set, limit: int = 0):
     out, n = [], 0
     try:
         with store_ig.Store(rp) as st:
+            _sq, _sa = st.post_scope(int(pid))
             for r in st.db.execute(
                     "SELECT pk, caption, username, collected_at FROM posts "
-                    "WHERE project_id = ? ORDER BY pk DESC", (int(pid),)):
+                    f"WHERE {_sq} ORDER BY pk DESC", _sa):
                 if ("instagram", str(r["pk"])) in labelled:
                     continue
                 n += 1
@@ -5674,8 +5702,8 @@ def _ig_status(q=None):
                     f"FROM sources s LEFT JOIN profiles pr ON "
                     f"  (s.platform_id != '' AND pr.user_pk = CAST(s.platform_id AS INTEGER)) "
                     f"  OR (s.platform_id = '' AND lower(pr.handle) = lower(s.value)) "
-                    f"WHERE s.project_id = ? ORDER BY s.label",
-                    (pid,))]
+                    f"WHERE {st.source_scope(pid, 's')[0]} ORDER BY s.label",
+                    st.source_scope(pid, 's')[1])]
                 for row in out["sources"]:
                     row["collector"] = row.get("account") or row.get("assigned_account") or ""
                     # Our held copy of the Instagram picture, else nothing —
@@ -5691,7 +5719,7 @@ def _ig_status(q=None):
                 out["totals"] = st.stats(project_id=pid)
                 # Named lists (2026-09-29): the sidebar draws one row per
                 # list; every source above carries its list_id. Additive.
-                out["lists"] = st.lists(pid)
+                out["lists"] = _ig_lists_named(st.lists(pid))
                 # Fill a few missing pictures on demand (throttled inside):
                 # a freshly deployed server shows them without waiting for
                 # the next post from each account.
@@ -6122,9 +6150,9 @@ def _ig_fetch(body):
     if rp.exists():
         try:
             with store_ig.Store(rp) as st:
+                _sq, _sa = st.source_scope(pid)
                 srcs = [r for r in st.db.execute(
-                    "SELECT label FROM sources WHERE enabled = 1 "
-                    "AND project_id = ?", (pid,))]
+                    f"SELECT label FROM sources WHERE enabled = 1 AND {_sq}", _sa)]
                 if lid:
                     l = st.list_row(lid)
                     if not l:
@@ -6195,7 +6223,10 @@ def _ig_source_post(body):
                 # picks the named list; absent, the project's default list.
                 st.add_source(label, typ, value, str(body.get("account") or ""),
                               str(body.get("platform_id") or ""), project_id=pid,
-                              list_id=_int_or(body.get("list_id"), 0))
+                              list_id=_int_or(body.get("list_id"), 0),
+                              move=bool(body.get("move")))
+            except store_ig.SourceElsewhere as e:
+                return _ig_elsewhere(e)
             except ValueError as e:
                 return {"error": str(e)}
         elif action == "set-project":
@@ -6244,16 +6275,47 @@ def _ig_lists_post(body):
             items = [x.strip().lstrip("@#") for x in
                      str(body.get("handles") or "").replace(",", " ").split()]
             typ = (body.get("type") or "user").lower()
-            added = 0
+            added, elsewhere = 0, []
             for it in items:
                 if not it:
                     continue
                 try:
                     st.add_source(it, typ, it, project_id=pid, list_id=made["list_id"])
                     added += 1
+                except store_ig.SourceElsewhere as e:
+                    # Already collected for another project: left there (not
+                    # moved), and named so the operator can share that list.
+                    elsewhere.append(_ig_elsewhere(e)["elsewhere"])
                 except ValueError as e:
                     return {**made, "warning": str(e), "added": added}
-            return {**made, "added": added}
+            out = {**made, "added": added}
+            if elsewhere:
+                out["elsewhere"] = elsewhere
+                out["warning"] = (f"{len(elsewhere)} handle(s) are already collected for "
+                                  "another project and were left there — add that "
+                                  "list with \"Add existing…\" instead: " + ", ".join(
+                                      f"@{x['handle']} ({x['project'] or 'project ' + str(x['project_id'])}"
+                                      f" · {x['list']})" for x in elsewhere))
+            return out
+        if action == "library":
+            if not pid:
+                return dict(_NO_PROJECT)
+            return {"lists": _ig_lists_named(st.list_library(exclude_project=pid))}
+        if action in ("attach", "detach"):
+            if not pid:
+                return dict(_NO_PROJECT)
+            if not lid:
+                return {"error": "list_id must be a number"}
+            r = (st.attach_list if action == "attach" else st.detach_list)(pid, lid)
+            if "error" not in r:
+                try:
+                    import activity_log
+                    activity_log.log_event(
+                        "instagram", f"project {pid} {'added' if action == 'attach' else 'removed'} "
+                        f"shared Instagram list {lid}", db=str(_CFG.root / "activity.db"))
+                except Exception:
+                    pass
+            return r
         if not lid:
             return {"error": "list_id must be a number"}
         if action == "rename":
@@ -6270,8 +6332,54 @@ def _ig_lists_post(body):
                     pass
             return r
         if action == "delete":
-            return st.delete_list(lid, bool(body.get("delete_sources")))
-    return {"error": "action must be create, rename, pause, resume or delete"}
+            # From a project that only ADDED the list this removes it from
+            # that project (detach); the owner deletes — refused while other
+            # projects still use it.
+            r = st.delete_list(lid, bool(body.get("delete_sources")),
+                               project_id=pid or None)
+            if r.get("used_by"):
+                names = _project_names()
+                r["error"] = (f"this list is also used by "
+                              f"{', '.join(names.get(p, f'project {p}') for p in r['used_by'])}"
+                              " — remove it there first")
+            return r
+    return {"error": "action must be create, rename, pause, resume, delete, "
+                     "library, attach or detach"}
+
+
+def _project_names() -> dict:
+    """{project_id: name} from results.db; {} if it cannot be read."""
+    try:
+        with _connect() as con:
+            return {int(r["project_id"]): r["name"]
+                    for r in con.execute("SELECT project_id, name FROM projects")}
+    except Exception:
+        return {}
+
+
+def _ig_lists_named(rows: list) -> list:
+    """Add owner_project (name) and projects [{project_id, name, owner}] to
+    Instagram list rows — the same keys an X watchlist row carries."""
+    names = _project_names()
+    for d in rows:
+        owner = d.get("owner_project_id")
+        d["owner_project"] = names.get(owner, f"#{owner}")
+        d["projects"] = [{"project_id": p, "name": names.get(p, f"#{p}"),
+                          "owner": p == owner} for p in d.get("projects") or []]
+    return rows
+
+
+def _ig_elsewhere(e) -> dict:
+    """The dashboard's answer when a handle is already another project's."""
+    name = _project_names().get(e.project_id)
+    msg = (f"@{e.handle or e.label} is already collected for "
+           f"{name or 'project ' + str(e.project_id)} (list {e.list_name!r}). "
+           "Use \"Add existing…\" to share that list here — collected once, "
+           "shown in both — or move the handle here (it then stops in "
+           f"{name or 'that project'}).")
+    return {"error": msg, "elsewhere": {
+        "label": e.label, "handle": e.handle, "project_id": e.project_id,
+        "project": name, "list_id": e.list_id, "list": e.list_name}}
 
 
 def _ig_posts(q):

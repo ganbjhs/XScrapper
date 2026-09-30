@@ -1006,8 +1006,15 @@ def main() -> int:
         if args.type == "hashtag" and not args.value:
             print("--value is the hashtag for a hashtag source"); return 1
         with store_ig.Store(store_path) as st:
-            st.add_source(args.label, args.type, args.value, args.account,
-                          project_id=args.project)
+            try:
+                st.add_source(args.label, args.type, args.value, args.account,
+                              project_id=args.project)
+            except store_ig.SourceElsewhere as e:
+                # Refused, not moved: the handle is collected for another
+                # project. `set-project` is the explicit move.
+                print(str(e)); print("  to move it: collect_ig.py set-project "
+                                     f"--label '{args.label}' --project {args.project}")
+                return 1
         where = f"project {args.project}" if args.project else "NO project (parked)"
         print(f"added source '{args.label}' ({args.type} {args.value}) -> {where}")
         if not args.project:

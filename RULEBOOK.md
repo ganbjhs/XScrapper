@@ -347,9 +347,35 @@ that follow from that:
   `INSERT OR IGNORE` one link per existing list on `open()`; rollback is
   dropping the table, because the owner column never went away.
 
-Instagram and Facebook sources are NOT shared this way: their posts carry
-`project_id` directly, with no stream join to link. That is a separate
-design (phase 2), not a smaller version of this one.
+Facebook sources are NOT shared this way: their posts carry `project_id`
+directly. Instagram lists are shared since 2026-09-30 — see the next rule.
+
+### An Instagram list is shared by LINKING too — and a handle in another project is refused, never moved (2026-09-30)
+
+`sources.label` is the primary key, so one handle is ONE row with ONE
+`project_id`. Re-typing it in a second project used to rewrite that row:
+the first project silently stopped collecting it. The rules:
+
+- **Adding a handle another project owns raises `SourceElsewhere`.** The
+  dashboard offers "Add that list here" (share) or "Move here" (explicit,
+  `move=True`); the CLI names `set-project`. Nothing moves by accident.
+- **Sharing is a link, `ig_list_projects`.** `ig_lists.project_id` is the
+  OWNER; a source's `project_id` is its list's owner; posts keep the
+  project they were collected under. Nothing is copied and nothing is
+  collected twice.
+- **"Project P's Instagram posts" has ONE definition: `store_ig.post_scope`**
+  (and `source_scope` for sources) — P's own rows plus the owner's rows for
+  the handles of every list P added. Every scoped read uses it: store
+  query/count/stats, the Watch-Tower feed, ig:P:0, the chart, the
+  classifier backlog. A hand-written `posts.project_id = ?` on a user-facing
+  read is the bug this rule exists to prevent.
+- **Consumer shapes do not change.** ig:P:0 stays one row/stream per
+  project; it simply contains the shared handles and posts. A post can
+  therefore arrive under two of our projects — Watch-Tower dedupes per its
+  project (handover §5).
+- **The owner cannot pull a list from under its users.** Deleting a shared
+  list is refused; deleting the owner project hands the list, its sources
+  and their posts to the oldest other user. A non-owner "delete" detaches.
 
 ### A watchlist's name is a label; its id is the key — so rename freely, and count what you actually follow (2026-09-24)
 

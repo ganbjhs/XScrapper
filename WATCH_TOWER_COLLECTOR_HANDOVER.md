@@ -324,8 +324,23 @@ is the API surface, there is no other discovery document. Do not probe.
       you mirror two of our projects that share a list, you will receive
       the same tweet_id once per project — dedupe on tweet_id per your
       project, exactly as a tweet matched by two lists already required.
-    * Nothing changes for Instagram or Facebook: sources there are still
-      per-project.
+    * Instagram lists can be shared the same way (2026-09-30). Nothing
+      about ig:P:0 changes shape: it is still ONE synthetic row / stream
+      per project (watchlist_id -P, label ig:P:0). What changes is its
+      content: if project P added an Instagram list created in project Q,
+      P's ig:P:0 `members[]` include that list's handles, its `tweets`
+      count includes their posts, and GET /api/tweets?platform=instagram
+      &project=P returns those posts with streams ["ig:P:0"]. The same
+      post (same tweet_id) is then also served under ig:Q:0 — dedupe on
+      tweet_id per YOUR project, exactly as for a shared X list; never
+      across your projects. /api/ig/status → lists[] gains
+      owner_project_id, owner_project, projects[], shared, owned (additive),
+      and sources[] under P may carry project_id Q (the list's owner).
+    * History after an add: the shared list's older posts appear under P
+      with their ORIGINAL collected_ms. A cursor already past that point
+      will not see them; to backfill, re-walk that project from
+      since_collected_ms=0 once (dedupe makes it safe). Same as X.
+    * Facebook: unchanged, sources are still per-project.
   Until the first list is actually shared, none of this is observable;
   we will tell you before that happens.
 

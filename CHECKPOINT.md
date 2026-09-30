@@ -19,6 +19,54 @@ must respect belongs in the rulebook, not here.
 
 ---
 
+## 2026-09-30 — Instagram lists shareable across projects ("Add existing…")
+
+**Why.** Typing an Instagram handle that another project already collected
+MOVED it (sources.label is the primary key, one project_id): the first
+project silently stopped collecting it. X has had shared lists since
+2026-09-25; Instagram had no way to reuse a list.
+
+**Changed**
+
+- `store_ig.py` — new `ig_list_projects(list_id, project_id, added_at)`,
+  backfilled with one owner row per list in `_migrate` (idempotent; rollback
+  = drop the table). `ig_lists.project_id` now means OWNER. `post_scope()` /
+  `source_scope()` are the one definition of "project P's posts / sources":
+  own rows plus the owner's rows for handles in lists P added (plain
+  indexed `project_id = ?` while P has added nothing). `query`, `count`,
+  `stats`, `sources(project_id=…)` use them. `attach_list`, `detach_list`,
+  `list_library`, `list_projects`, `delete_project` (hands a shared owned
+  list to the oldest other user with its sources and posts). `lists(P)`
+  includes added lists with owner_project_id / projects / shared / owned.
+  `add_source` raises `SourceElsewhere` (a ValueError) instead of moving a
+  handle out of another project; `move=True` is the explicit move.
+  `delete_list(project_id=…)` from a non-owner detaches; the owner is
+  refused while others use it. `set_project` now also moves the source into
+  the new project's default list.
+- `web.py` — the Watch-Tower feed (`/api/tweets?platform=instagram`), the
+  ig:P:0 pseudo-stream/watchlist, the dashboard chart, classification
+  backlog, `/api/ig/status`, fetch-now and project delete all scope through
+  the store helpers. `POST /api/ig/lists` gains `library`, `attach`,
+  `detach`; `/api/ig/source` add answers `{error, elsewhere:{…}}` and takes
+  `move`. Dashboard-only; no API-key path added.
+- `collect_ig.py add-source` prints the refusal and the `set-project` move.
+- Frontend: "Add existing…" lists Instagram lists too; an IG list added from
+  elsewhere shows "shared · from X" and "Remove"; an add that hits another
+  project's handle offers "Add that list here" or "Move here".
+- `WATCH_TOWER_COLLECTOR_HANDOVER.md` §5: Instagram sharing, dedupe per
+  project, backfill by re-walking.
+
+**Verified.** Suite green (1638 checks), new `test_ig_shared_lists` pins the
+refusal, attach/detach, scoped counts, owner transfer on project delete,
+migration backfill, and that ig:P:0 / the feed keep their shape. Also fixed
+a stale pin in the avatar-cache test (33eb27a added `at`/`errors`).
+
+**Open.** Watch-Tower must dedupe Instagram posts per its project (not
+globally) before the first Instagram list is shared. Facebook sharing not
+started.
+
+---
+
 ## 2026-09-24 — Watchlists: rename, and a project-wide "accounts followed" count
 
 **Changed**

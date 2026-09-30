@@ -1903,6 +1903,169 @@ def test_ig_lists(tmp):
 
 
 
+def test_ig_shared_lists(tmp):
+    """
+    Shared Instagram lists (2026-09-30), the Instagram twin of X's shared
+    watchlists: a list created in one project can be ADDED to another —
+    one list, one set of sources, collected once, and its posts show under
+    every project using it. Re-typing a handle that another project
+    collects is refused (it used to MOVE the row, silently stopping the
+    first project). Watch-Tower's shapes do not change: ig:P:0 and
+    /api/tweets?platform=instagram simply include the shared posts.
+    """
+    import store_ig, web
+    import pathlib as _pl
+
+    root = _pl.Path(str(tmp))
+    rp = root / "ig_results.db"
+    rec = lambda pk, u: {"pk": pk, "code": f"c{pk}", "taken_at": 1000 + pk,
+                         "username": u, "user_pk": 50 + pk % 7, "caption": f"p{pk}",
+                         "media_type": 1}
+    with store_ig.Store(str(rp)) as st:
+        print("== a handle already in another project is refused, not moved ==")
+        L = st.create_list(7, "Leaders")["list_id"]
+        st.add_source("a1", "user", "a1", project_id=7, list_id=L)
+        st.add_source("a2", "user", "a2", project_id=7, list_id=L)
+        st.add_source("b1", "user", "b1", project_id=8)
+        try:
+            st.add_source("a1", "user", "a1", project_id=8); err = None
+        except store_ig.SourceElsewhere as e:
+            err = e
+        ok(err is not None and err.project_id == 7 and err.list_id == L,
+           "adding a1 to project 8 raises SourceElsewhere naming project 7's list")
+        ok(isinstance(err, ValueError), "…a ValueError, so old callers report it as an error")
+        r = st.db.execute("SELECT project_id, list_id FROM sources WHERE label='a1'").fetchone()
+        ok((r["project_id"], r["list_id"]) == (7, L), "…and a1 stays where it was")
+        ok(st.post_scope(8) == ("posts.project_id = ?", [8]),
+           "a project that added nothing keeps the plain indexed clause")
+
+        st.upsert_posts([rec(1, "a1"), rec(2, "a1")], "a1")
+        st.upsert_posts([rec(3, "a2")], "a2")
+        st.upsert_posts([rec(4, "b1")], "b1")
+        ok(st.count(project_id=7) == 3 and st.count(project_id=8) == 1,
+           "before sharing each project sees its own posts")
+
+        print()
+        print("== add existing: one list, both projects ==")
+        r = st.attach_list(8, L)
+        ok(r.get("ok") and not r.get("already"), f"project 8 adds project 7's list ({r})")
+        ok(st.attach_list(8, L).get("already"), "adding twice is idempotent")
+        l8 = {l["list_id"]: l for l in st.lists(8)}
+        ok(L in l8 and l8[L]["owned"] is False and l8[L]["shared"] is True
+           and l8[L]["projects"] == [7, 8] and l8[L]["owner_project_id"] == 7,
+           f"lists(8) shows it: not owned, shared, owner first ({l8.get(L)})")
+        ok(st.lists(7)[-1]["shared"] is True and st.lists(7)[-1]["owned"] is True,
+           "…and the owner sees it as shared")
+        ok(sorted(s.label for s in st.sources(only_enabled=False, project_id=8))
+           == ["a1", "a2", "b1"], "project 8's sources include the shared list's handles")
+        ok(sorted(s.label for s in st.sources(only_enabled=True)) == ["a1", "a2", "b1"],
+           "the collector still sees each handle ONCE")
+        ok(st.count(project_id=8) == 4 and st.count(project_id=7) == 3,
+           "project 8 now sees the shared posts plus its own; 7 unchanged")
+        ok(sorted(p["pk"] for p in st.query(project_id=8)) == [1, 2, 3, 4],
+           "query() and count() agree")
+        ok(st.stats(project_id=8)["posts"] == 4 and st.stats(project_id=8)["sources_enabled"] == 3,
+           "stats() is scoped the same way")
+        st.add_source("a1", "user", "a1", project_id=8)
+        ok(st.db.execute("SELECT project_id FROM sources WHERE label='a1'").fetchone()[0] == 7,
+           "re-typing a handle the project already has through a shared list is a no-op")
+        st.add_source("c1", "user", "c1", project_id=8, list_id=L)
+        ok(tuple(st.db.execute("SELECT project_id, list_id FROM sources WHERE label='c1'").fetchone())
+           == (7, L), "a handle added into the shared list from 8 belongs to the list's owner")
+        st.upsert_posts([rec(5, "c1")], "c1")
+        ok(st.count(project_id=7) == 4 and st.count(project_id=8) == 5,
+           "its posts show in both")
+        try:
+            st.add_source("x9", "user", "x9", project_id=9, list_id=L); wrong = False
+        except ValueError:
+            wrong = True
+        ok(wrong, "a project that did not add the list still cannot write into it")
+
+        print()
+        print("== remove / delete ==")
+        ok("error" in st.delete_list(L), "the owner cannot delete a list others use")
+        ok("error" in st.detach_list(7, L), "the owner cannot detach its own list")
+        r = st.delete_list(L, project_id=8)
+        ok(r.get("detached"), f"'delete' from the adding project just removes it there ({r})")
+        ok(L not in {l["list_id"] for l in st.lists(8)} and st.count(project_id=8) == 1,
+           "project 8 is back to its own posts")
+        ok(st.db.execute("SELECT COUNT(*) FROM sources WHERE list_id=?", (L,)).fetchone()[0] == 3,
+           "…and the list's handles are untouched")
+
+        print()
+        print("== an explicit move still works ==")
+        st.add_source("a2", "user", "a2", project_id=8, move=True)
+        r = st.db.execute("SELECT project_id, list_id FROM sources WHERE label='a2'").fetchone()
+        ok(r["project_id"] == 8 and r["list_id"] == st.default_list(8),
+           "move=True puts it in project 8's default list")
+        st.set_project("a2", 7)
+        ok(st.db.execute("SELECT list_id FROM sources WHERE label='a2'").fetchone()[0]
+           == st.default_list(7), "set_project lands the source in the new project's list")
+
+        print()
+        print("== deleting the owner hands a shared list over ==")
+        st.attach_list(8, L)
+        K = st.create_list(7, "Own")["list_id"]      # a list nobody else uses
+        ok("error" not in st.set_list("a2", K), "a2 moves to project 7's unshared list")
+        plan = st.delete_project(7)
+        ok(plan["lists_transferred"] == [{"list_id": L, "name": "Leaders", "to_project": 8}],
+           f"the plan says the shared list goes to project 8 ({plan})")
+        ok(plan["sources"] == 1 and plan["posts"] == 1,
+           f"…and counts only what really goes (a2 and its post) ({plan})")
+        st.delete_project(7, apply=True)
+        ok(st.list_row(L)["project_id"] == 8 and st.lists(7) == [],
+           "after the delete project 8 owns the list; project 7 has none")
+        ok(st.count(project_id=8) == 4, "the shared posts stayed with project 8")
+        ok(st.count(project_id=7) == 0, "project 7's own posts are gone")
+
+        print()
+        print("== migration: an existing list is used by its owner ==")
+        st.db.execute("DELETE FROM ig_list_projects"); st.db.commit()
+    with store_ig.Store(str(rp)) as st:
+        ok(st.list_projects(L) == [8], "reopening backfills the owner row")
+
+    print()
+    print("== Watch-Tower shapes: unchanged, shared posts included ==")
+    with store_ig.Store(str(rp)) as st:
+        M = st.create_list(9, "Nine")["list_id"]
+        st.add_source("n1", "user", "n1", project_id=9, list_id=M)
+        st.upsert_posts([rec(20, "n1")], "n1")
+        st.attach_list(10, L)
+
+    class Cfg:
+        pass
+    Cfg.root = root
+    Cfg.db_results = root / "results.db"
+    saved = web._CFG
+    web._CFG = Cfg()
+    try:
+        r = web._query_tweets({"platform": "instagram", "project": "10",
+                               "since_collected_ms": "0"})
+        ok(sorted(x["tweet_id"] for x in r["rows"]) == ["1", "2", "5"]
+           and all(x["streams"] == ["ig:10:0"] for x in r["rows"]),
+           f"ig:10:0 carries the shared list's posts under its own label ({[x['tweet_id'] for x in r['rows']]})")
+        ps = {s["project_id"]: s for s in web._ig_pseudo_streams()}
+        ok(10 in ps and ps[10]["tweets"] == 3 and sorted(m["label"] for m in ps[10]["sources"])
+           == ["a1", "c1"], f"the ig:10:0 pseudo-stream lists the shared handles and count ({ps.get(10)})")
+        ok(ps[8]["tweets"] == 4 and ps[9]["tweets"] == 1, "the owner's and others' counts are unchanged")
+        wl = web._ig_pseudo_watchlist(10)
+        ok(wl and wl["watchlist_id"] == -10 and set(wl) >= {"members", "streams", "kind"},
+           "the synthetic watchlist row keeps its shape")
+        r = web._ig_lists_post({"action": "library", "project": 9})
+        ok(any(x["list_id"] == L and x["owner_project"] for x in r["lists"]),
+           "the dashboard library lists every Instagram list with its owner")
+        r = web._ig_source_post({"action": "add", "project": 9, "label": "a1",
+                                 "type": "user", "value": "a1"})
+        ok("error" in r and r.get("elsewhere", {}).get("project_id") == 8,
+           f"the dashboard answers a cross-project add with where it lives ({r.get('elsewhere')})")
+        r = web._ig_lists_post({"action": "create", "project": 9, "name": "Mix",
+                                "handles": "a1 z1"})
+        ok(r.get("added") == 1 and len(r.get("elsewhere") or []) == 1 and "warning" in r,
+           "a create with handles adds the free ones and names the ones left elsewhere")
+    finally:
+        web._CFG = saved
+
+
 def test_ig_avatars(tmp):
     """
     ig_avatars.py: Instagram's profile-picture URLs are signed, expire, and
@@ -1932,7 +2095,9 @@ def test_ig_avatars(tmp):
             need = [r["user_pk"] for r in st.profiles_needing_avatar(30)]
             ok(need == [11, 12] or sorted(need) == [11, 12], f"both profiles need a picture ({need})")
             res = ig_avatars.ensure(root, st, fb_media.MediaStore(root), limit=30)
-            ok(res == {"cached": 1, "failed": 1, "tried": 2}, f"one cached, one failed ({res})")
+            # 33eb27a added `at` and `errors` to the result; the counts are the pin.
+            ok({k: res.get(k) for k in ("cached", "failed", "tried")}
+               == {"cached": 1, "failed": 1, "tried": 2}, f"one cached, one failed ({res})")
             av = st.profile_avatar(11)
             ok(av.startswith("https://scraper.example.in/media/fb/") and av.endswith(".png"),
                f"the held copy is served absolute from our host ({av})")
@@ -7368,6 +7533,7 @@ def main():
         test_projects_watchlists(fresh("projects"))
         test_shared_watchlists(fresh("shared_wl"))
         test_ig_lists(fresh("ig_lists"))
+        test_ig_shared_lists(fresh("ig_shared_lists"))
         test_identity(fresh("identity"))
         test_ig_avatars(fresh("ig_avatars"))
 

@@ -131,7 +131,10 @@ function AddModal({ pid, onDone, onClose }) {
           const made = await api.igLists({ action: "create", project: pid, name: listName,
                                            type: kind === "following" ? "user" : kind,
                                            handles: kind === "following" ? "" : handles });
-          if (made.warning) { setErr(made.warning); return; }
+          if (made.error) { setErr(made.error); return; }
+          // Handles already collected for another project are left there
+          // (not moved) and named — the list itself was still created.
+          if (made.warning) { setErr(made.warning); onDone(platform); return; }
           listId = made.list_id;
         }
         if (kind === "following") {
@@ -139,10 +142,13 @@ function AddModal({ pid, onDone, onClose }) {
         } else if (!listName) {
           // Bulk: one source per line/word — paste many at once (like Facebook).
           const items = handles.split(/[\s,]+/).filter(Boolean);
+          const errs = [];
           for (const it of items) {
             const v = it.replace(/^[@#]/, "");
-            await api.igSource({ action: "add", label: v, type: kind, value: v, project: pid });
+            const r = await api.igSource({ action: "add", label: v, type: kind, value: v, project: pid });
+            if (r && r.error) errs.push(r.error);
           }
+          if (errs.length) { setErr(errs.join("\n")); onDone(platform); return; }
         }
       }
       onDone(platform); onClose();
@@ -527,7 +533,7 @@ function DepthRow({ w, onChanged }) {
 
 // Shared watchlists — one list, several projects.
 
-const KIND_LABEL = { xlist: "X List", keywords: "keywords", links: "links", query: "handles" };
+const KIND_LABEL = { xlist: "X List", keywords: "keywords", links: "links", query: "handles", instagram: "Instagram" };
 
 // "shared · created in A · also used by B" — only when there is something to say.
 function SharedLine({ w, pid }) {
@@ -591,12 +597,20 @@ function WatchlistDeleteModal({ w, pid, onClose, onChanged, sub }) {
 // The picker: every X watchlist in every other project, grouped by the
 function AddExistingModal({ pid, onDone, onClose }) {
   const lib = useApi(() => api.watchlistLibrary(pid), [pid]);
+  // Instagram lists can be shared too (2026-09-30) — same picker, one more kind.
+  const igLib = useApi(() => api.igLists({ action: "library", project: pid }), [pid]);
   const [q, setQ] = useState("");
   const [busy, setBusy] = useState(null);     // watchlist_id being added
   const [err, setErr] = useState("");
   const [added, setAdded] = useState(() => new Set());
 
-  const rows = sortBy((lib.data?.watchlists || []).filter((w) => w.project_id !== pid));
+  const igRows = (igLib.data?.lists || []).map((l) => ({
+    watchlist_id: `ig:${l.list_id}`, ig_list_id: l.list_id, name: l.name, kind: "instagram",
+    project_id: l.owner_project_id, owner_project: l.owner_project, attached: l.attached,
+    members: l.sources, tweets: l.posts, live: !l.paused && l.enabled > 0,
+    shared: l.shared, projects: l.projects,
+  }));
+  const rows = sortBy([...(lib.data?.watchlists || []), ...igRows].filter((w) => w.project_id !== pid));
   const needle = q.trim().toLowerCase();
   const shown = needle
     ? rows.filter((w) => `${w.name} ${w.owner_project} ${KIND_LABEL[w.kind] || w.kind}`.toLowerCase().includes(needle))
@@ -612,7 +626,9 @@ function AddExistingModal({ pid, onDone, onClose }) {
   const add = async (w) => {
     setBusy(w.watchlist_id); setErr("");
     try {
-      const r = await api.attachWatchlist(pid, w.watchlist_id);
+      const r = w.kind === "instagram"
+        ? await api.igLists({ action: "attach", project: pid, list_id: w.ig_list_id })
+        : await api.attachWatchlist(pid, w.watchlist_id);
       if (r?.error) { setErr(r.error); return; }
       setAdded((s) => new Set([...s, w.watchlist_id]));
       onDone();
@@ -623,6 +639,7 @@ function AddExistingModal({ pid, onDone, onClose }) {
   const size = (w) => w.kind === "xlist" ? "X List"
     : w.kind === "links" ? `${fmtN(w.links)} link${w.links === 1 ? "" : "s"}`
     : `${fmtN(w.members)} ${w.kind === "keywords" ? "keyword" : "handle"}${w.members === 1 ? "" : "s"}`;
+  const kindOf = (w) => w.kind === "instagram" ? "Instagram" : `X ${KIND_LABEL[w.kind] || w.kind}`;
 
   return (
     <Modal title="Add an existing watchlist"
@@ -656,7 +673,7 @@ function AddExistingModal({ pid, onDone, onClose }) {
                   <div className="name">
                     <b>{w.name}</b>
                     <small>
-                      {KIND_LABEL[w.kind] || w.kind} · {size(w)} · {fmtN(w.tweets)} collected
+                      {kindOf(w)} · {size(w)} · {fmtN(w.tweets)} collected
                       {w.shared && <> · also in {w.projects.filter((p) => !p.owner).map((p) => p.name).join(", ")}</>}
                     </small>
                   </div>
@@ -1532,6 +1549,7 @@ function IgRenameModal({ pid, list, onChanged, onClose }) {
 // choice. Posts are never deleted here.
 function IgDeleteModal({ pid, list, others, onChanged, onClose }) {
   const [withSources, setWithSources] = useState(others === 0);
+  const addedHere = list.owned === false;
   const [busy, setBusy] = useState(false);
   const [err, setErr] = useState("");
   const go = async () => {
@@ -1544,6 +1562,18 @@ function IgDeleteModal({ pid, list, others, onChanged, onClose }) {
     } catch (e) { setErr(String(e.message || e)); }
     finally { setBusy(false); }
   };
+  if (addedHere) {
+    return (
+      <Modal title={`Remove “${list.name}” from this project?`} onClose={onClose}
+             sub={`It was created in ${list.owner_project || "another project"} and stays there, collecting as before. Its posts stop showing here.`}>
+        {err && <div className="err">{err}</div>}
+        <div className="row">
+          <button className="btn btn-ghost" onClick={onClose}>Keep it</button>
+          <button className="btn btn-danger" disabled={busy} onClick={go}>Remove</button>
+        </div>
+      </Modal>
+    );
+  }
   return (
     <Modal title={`Delete “${list.name}”?`} onClose={onClose}
            sub="Posts already collected stay in the database either way.">
@@ -1604,7 +1634,11 @@ function IgDetail({ pid, data, reload, gotoSettings, onBack, list }) {
   const sources = q
     ? allSources.filter((s) => `${s.label} ${s.value || ""} ${s.display_name || ""}`.toLowerCase().includes(q))
     : allSources;
-  const otherLists = (data?.lists || []).filter((l) => !list || l.list_id !== list.list_id).length;
+  const otherLists = (data?.lists || []).filter((l) => l.owned !== false && (!list || l.list_id !== list.list_id)).length;
+  // Handles the last add found in another project's list: offered as
+  // "add that list here" (shared, collected once) or an explicit move.
+  const [elsewhere, setElsewhere] = useState([]);
+  useEffect(() => { setElsewhere([]); }, [list?.list_id]);
   const listPaused = !!list?.paused;
   const toggleList = async () => {
     setBusyList(true); setMsg("");
@@ -1639,16 +1673,34 @@ function IgDetail({ pid, data, reload, gotoSettings, onBack, list }) {
   // Facebook-style inline add: paste one or many usernames, added as user
   // sources (label = username; the engine resolves it to the pk at collect time).
   const addBulk = async () => {
-    setBusyAdd(true); setMsg("");
+    setBusyAdd(true); setMsg(""); setElsewhere([]);
     try {
+      const errs = [], found = [];
       for (const u of adding.split(/[\s,]+/).filter(Boolean)) {
         const name = u.replace(/^[@#]/, "");
-        await api.igSource({ action: "add", label: name, type: "user", value: name, project: pid,
-                             list_id: list?.list_id || 0 });
+        const r = await api.igSource({ action: "add", label: name, type: "user", value: name, project: pid,
+                                       list_id: list?.list_id || 0 });
+        if (r && r.elsewhere) found.push(r.elsewhere);
+        else if (r && r.error) errs.push(`@${name}: ${r.error}`);
       }
+      setElsewhere(found);
+      if (errs.length) setMsg(errs.join("\n"));
       setAdding(""); reload();
     } catch (e) { setMsg(String(e.message || e)); }
     finally { setBusyAdd(false); }
+  };
+  const shareIn = async (e) => {
+    setMsg("");
+    const r = await api.igLists({ action: "attach", project: pid, list_id: e.list_id });
+    if (r && r.error) { setMsg(r.error); return; }
+    setElsewhere((xs) => xs.filter((x) => x.list_id !== e.list_id)); reload();
+  };
+  const moveHere = async (e) => {
+    setMsg("");
+    const r = await api.igSource({ action: "add", label: e.label, type: "user", value: e.handle || e.label,
+                                   project: pid, list_id: list?.list_id || 0, move: true });
+    if (r && r.error) { setMsg(r.error); return; }
+    setElsewhere((xs) => xs.filter((x) => x.label !== e.label)); reload();
   };
 
   return (
@@ -1683,7 +1735,10 @@ function IgDetail({ pid, data, reload, gotoSettings, onBack, list }) {
             </button>
           )}
           {list && (
-            <button className="btn btn-danger btn-sm" onClick={() => setConfirming(true)}>Delete</button>
+            <button className="btn btn-danger btn-sm" onClick={() => setConfirming(true)}
+                    title={list.owned === false ? "Stop using this list in this project — it stays in the project that created it" : undefined}>
+              {list.owned === false ? "Remove" : "Delete"}
+            </button>
           )}
           <button className="btn btn-ghost btn-sm" onClick={gotoSettings}>Settings →</button>
         </div>
@@ -1691,6 +1746,7 @@ function IgDetail({ pid, data, reload, gotoSettings, onBack, list }) {
       <div className="dmeta">
         <span className="chip">{allSources.length} source{allSources.length === 1 ? "" : "s"}</span>
         <span className="chip">{fmtN(data?.totals?.posts ?? 0)} collected</span>
+        {list && <SharedLine w={list} pid={pid} />}
       </div>
 
       {fetching && (
@@ -1778,7 +1834,23 @@ function IgDetail({ pid, data, reload, gotoSettings, onBack, list }) {
           Add
         </button>
       </div>
-      {msg && <div style={{ color: "var(--critical)", fontSize: 12.5 }}>{msg}</div>}
+      {elsewhere.length > 0 && (
+        <div className="members-box" style={{ padding: "8px 12px", marginTop: 8 }}>
+          {elsewhere.map((e) => (
+            <div className="wl-row" key={e.label}>
+              <div className="who">
+                <b>@{e.handle || e.label} is already collected for {e.project || `project #${e.project_id}`}</b>
+                <small>list “{e.list}” — add that list here to share it (collected once, shown in both), or move the handle here (it stops there)</small>
+              </div>
+              <div className="right" style={{ display: "flex", gap: 6 }}>
+                <button className="btn btn-brand btn-sm" onClick={() => shareIn(e)}>Add “{e.list}” here</button>
+                <button className="btn btn-ghost btn-sm" onClick={() => moveHere(e)}>Move here</button>
+              </div>
+            </div>
+          ))}
+        </div>
+      )}
+      {msg && <div style={{ color: "var(--critical)", fontSize: 12.5, whiteSpace: "pre-wrap" }}>{msg}</div>}
     </div>
   );
 }
@@ -2121,7 +2193,8 @@ export default function Watchlists({ onMenu }) {
     for (const l of igLists) {
       out.push({
         id: `ig:${l.list_id}`, platform: "ig", name: l.name, igList: l,
-        sub: `${l.sources} source${l.sources === 1 ? "" : "s"} · ${fmtN(l.posts)} collected${l.paused ? " · paused" : ""}`,
+        sub: `${l.sources} source${l.sources === 1 ? "" : "s"} · ${fmtN(l.posts)} collected${l.paused ? " · paused" : ""}`
+             + (l.owned === false ? ` · from ${l.owner_project || `#${l.owner_project_id}`}` : l.shared ? " · shared" : ""),
         live: igLive && !l.paused && l.enabled > 0,
       });
     }
