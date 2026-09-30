@@ -39,6 +39,7 @@ UA = ("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 "
 
 _LOCK = threading.Lock()
 _LAST_LAZY = 0.0
+LAST = {}                # what the last run did — shown on /api/ig/status as avatar_cache
 LAZY_EVERY_S = 45        # the dashboard's on-demand batch runs at most this often
 
 
@@ -69,28 +70,53 @@ def ensure(root, ig_store, media_store, limit: int = 30, log=None) -> dict:
     """
     Cache up to `limit` profile pictures that have a URL but no bytes (or a
     changed URL). Returns counts. Safe to call from anywhere; the store's
-    writes are small and serialised by its own lock.
+    writes are small and serialised by its own lock. Every failure is
+    recorded on the row AND in LAST["errors"], so a silent zero is impossible.
     """
+    global LAST
     log = log or (lambda m: None)
     done = failed = 0
-    rows = ig_store.profiles_needing_avatar(limit)
+    errors = []
+    try:
+        rows = ig_store.profiles_needing_avatar(limit)
+    except Exception as e:                                   # noqa: BLE001
+        LAST = {"at": time.time(), "cached": 0, "failed": 0, "tried": 0,
+                "errors": [f"select: {type(e).__name__}: {e}"]}
+        log(f"profile pictures: cannot list — {type(e).__name__}: {e}")
+        return dict(LAST)
+    if media_store is None:
+        LAST = {"at": time.time(), "cached": 0, "failed": 0, "tried": len(rows),
+                "errors": ["media store not open"]}
+        log("profile pictures: media store not open")
+        return dict(LAST)
     for r in rows:
         url = r["avatar_url"]
-        data, ctype = fetch(url)
-        if data is None:
+        try:
+            data, ctype = fetch(url)
+            if data is None:
+                raise RuntimeError(f"fetch: {ctype}")
+            rel = media_store.put(data, ctype, src=url)
+            if not rel:
+                raise RuntimeError(f"unstorable ({ctype or 'no content-type'}, {len(data)} bytes)")
+            ig_store.set_avatar_local(r["user_pk"], rel, src_key(url))
+            done += 1
+        except Exception as e:                               # noqa: BLE001
             failed += 1
-            ig_store.note_avatar_failure(r["user_pk"])
-            continue
-        rel = media_store.put(data, ctype, src=url)
-        if not rel:
-            failed += 1
-            ig_store.note_avatar_failure(r["user_pk"])
-            continue
-        ig_store.set_avatar_local(r["user_pk"], rel, src_key(url))
-        done += 1
+            errors.append(f"{r.get('handle') or r['user_pk']}: {e}")
+            try:
+                ig_store.note_avatar_failure(r["user_pk"])
+            except Exception:
+                pass
+    try:
+        ig_store.db.commit()
+    except Exception:
+        pass
     if done or failed:
-        log(f"profile pictures: {done} cached, {failed} failed, {len(rows)} tried")
-    return {"cached": done, "failed": failed, "tried": len(rows)}
+        log(f"profile pictures: {done} cached, {failed} failed, {len(rows)} tried"
+            + (f" — first failure: {errors[0]}" if errors else ""))
+    LAST = {"at": time.time(), "cached": done, "failed": failed, "tried": len(rows),
+            "errors": errors[:5]}
+    return dict(LAST)
 
 
 def ensure_lazy(root, ig_store_or_path, media_store, limit: int = 8):
@@ -107,12 +133,14 @@ def ensure_lazy(root, ig_store_or_path, media_store, limit: int = 8):
     path = getattr(ig_store_or_path, "path", ig_store_or_path)
 
     def run():
+        global LAST
         try:
             import store_ig
             with store_ig.Store(path) as st:
                 ensure(root, st, media_store, limit=limit)
-        except Exception:
-            pass
+        except Exception as e:                               # noqa: BLE001
+            LAST = {"at": time.time(), "cached": 0, "failed": 0, "tried": 0,
+                    "errors": [f"thread: {type(e).__name__}: {e}"]}
 
     t = threading.Thread(target=run, name="ig-avatars", daemon=True)
     t.start()
