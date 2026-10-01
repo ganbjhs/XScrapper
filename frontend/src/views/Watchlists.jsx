@@ -768,7 +768,8 @@ function XDetail({ w, pid, onChanged, onBack }) {
 
       <div className="dmeta">
         {w.kind === "xlist"
-          ? <span className="chip" title="Members are managed on x.com">List {w.list_id}</span>
+          ? <a className="chip as-btn as-link" href={`https://x.com/i/lists/${w.list_id}`} target="_blank" rel="noopener noreferrer"
+               title="Open this List on x.com (new tab). Members are managed there.">List {w.list_id} <span className="chev">↗</span></a>
           : <span className="chip">{fmtN(w.members.length)} {unit}{w.members.length === 1 ? "" : "s"}</span>}
         <span className={`chip ${live.length ? "good" : ""}`} title="Compiled streams the collector is polling for this watchlist">
           {live.length} live stream{live.length === 1 ? "" : "s"}
