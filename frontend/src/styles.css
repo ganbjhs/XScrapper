@@ -1105,3 +1105,6 @@ button.tl-who:hover { color: var(--brand); text-decoration: underline; }
   .tl-row { grid-template-columns: 58px 34px minmax(0, 1fr); row-gap: 2px; padding: 6px 12px; }
   .tl-row .tl-msg { grid-column: 1 / -1; }
 }
+
+.log-main { min-width: 0; }
+.log-main .panel { margin-bottom: 0; }

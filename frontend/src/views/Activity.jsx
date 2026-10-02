@@ -162,11 +162,13 @@ function Timeline({ q, setQ, live }) {
           collector run, a change made from the dashboard.
         </Empty>
       )}
-      {data && all.length > 0 && events.length === 0 && (
-        <Empty title="No line matches">They look through the latest {all.length} lines.</Empty>
-      )}
-
       <div className="cols log-cols">
+        {/* The left column always exists, so the side panels stay on the right
+            even when the filters match nothing. */}
+        <div className="log-main">
+        {data && all.length > 0 && events.length === 0 && (
+          <Empty title="No line matches">They look through the latest {all.length} lines.</Empty>
+        )}
         {events.length > 0 && (
           <div className="panel tl" role="log">
             {events.map((e) => {
@@ -194,6 +196,7 @@ function Timeline({ q, setQ, live }) {
             )}
           </div>
         )}
+        </div>
 
         {data && all.length > 0 && (
           <aside>
