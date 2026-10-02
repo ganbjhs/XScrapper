@@ -358,11 +358,39 @@ class AccountStore:
 
     def set_status(self, account_id: int, status: str, health: str = "") -> None:
         status = self._check_status(status)
+        try:
+            before = dict(self._row(account_id))
+        except Exception:
+            before = None
         self.db.execute(
             "UPDATE managed_accounts SET status = ?, health = ?, updated_at = ? "
             "WHERE account_id = ?",
             (status, health, _iso_ms(_now_ms()), account_id),
         )
+        self._log_status_change(before, status, health)
+
+    def _log_status_change(self, before, status, health) -> None:
+        """An account leaving or re-entering rotation, on the Activity Log.
+        Written beside the accounts db; an in-memory store (tests) logs nothing.
+        Never raises."""
+        try:
+            if not before or before.get("status") == status:
+                return
+            path = self.db.execute("PRAGMA database_list").fetchone()[2]
+            if not path:
+                return
+            import activity_log
+            who = before.get("username") or before.get("label") or before.get("account_id")
+            activity_log.log_event(
+                before.get("platform") or "system",
+                f"[accounts] {who}: {before.get('status')} -> {status}"
+                + (f" — {health}" if health else ""),
+                account=str(who),
+                level=("error" if status in (QUARANTINED, DEAD)
+                       else "warn" if status == NEEDS_LOGIN else "info"),
+                db=os.path.join(os.path.dirname(os.path.abspath(path)), "activity.db"))
+        except Exception:
+            pass
 
     def active(self, platform: str) -> Account | None:
         """The one active account for a platform (newest if somehow >1)."""

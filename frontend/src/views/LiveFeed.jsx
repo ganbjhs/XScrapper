@@ -1,5 +1,5 @@
 // The main screen: incoming posts for this project, stat strip, and the
-import React, { useEffect, useMemo, useState } from "react";
+import React, { useEffect, useMemo, useRef, useState } from "react";
 import { api, fmtAgo, fmtLag, fmtN, useApi } from "../api/client.js";
 import { PageHead, useProject } from "../App.jsx";
 import CollectedChart from "../components/CollectedChart.jsx";
@@ -7,7 +7,7 @@ import CollectionPicker from "../components/CollectionPicker.jsx";
 import HandoverPanel, { HandoverStat } from "../components/Handover.jsx";
 import PostCard from "../components/PostCard.jsx";
 import { useClassifyButton, useLabelRun } from "../components/Sentiments.jsx";
-import { Empty, ErrorState, Loading } from "../components/ui.jsx";
+import { Empty, ErrorState, Pill } from "../components/ui.jsx";
 
 // "Collected today" follows the Source filter (2026-10-02). It used to show
 // X's number whatever the filter said, so an Instagram view with nothing
@@ -99,6 +99,18 @@ function CollectedToday({ m, source }) {
   );
 }
 
+function FeedSkeleton() {
+  return (
+    <div role="status" aria-label="Loading the feed">
+      {[0, 1, 2].map((i) => (
+        <div className="card nomedia skel" key={i}>
+          <div><i style={{ width: "34%" }} /><i /><i style={{ width: "82%" }} /><i style={{ width: "46%" }} /></div>
+        </div>
+      ))}
+    </div>
+  );
+}
+
 const normIg = (p) => ({
   platform: "instagram",
   tweet_id: p.id,
@@ -166,23 +178,83 @@ function writeFilters(pid, flt) {
   }
 }
 
-// The whole pill is the control: the transparent <select> is stretched over
-function Pill({ label, value, onChange, options }) {
-  const current = options.find(([v]) => v === value);
+// Extra filters behind the header's Filters button. They narrow the posts
+// already loaded (nothing new is asked of the server) and are not remembered
+// between visits. Nothing changes until Apply.
+//
+// FUTURE ADDITIONS (each needs backend work, deliberately skipped 2026-10-02):
+//   - Verified only: verification is not stored per post. Needs a column on
+//     tweets filled from the user object at collection time.
+//   - Server-side filtering: language / min views / min followers / date range
+//     as query parameters on the feed endpoints, so they search the whole
+//     database and not only the loaded page. New OPTIONAL parameters only —
+//     the existing response shape must not change (Watch-Tower reads it).
+//   - Min followers for Instagram and Facebook: only X rows carry
+//     author_followers today.
+//   - Saved searches ("Saved" / "Save this search"): needs a per-project table.
+//   - Export PDF, and CSV export of the whole filtered set (today: loaded posts).
+const NO_ADV = { lang: "", minViews: "", minFollowers: "", from: "", to: "" };
+const advCount = (a) => Object.values(a).filter((v) => v !== "").length;
+
+function AdvFilters({ value, langs, onApply, onExport, count, onClose }) {
+  const [d, setD] = useState(value);
+  useEffect(() => { setD(value); }, [value]);
+  const box = useRef(null);
+  useEffect(() => {
+    // The Filters button toggles the panel itself, so a click on it is not "away".
+    const away = (e) => {
+      if (box.current && !box.current.contains(e.target) && !e.target.closest?.(".fbtn")) onClose();
+    };
+    const esc = (e) => { if (e.key === "Escape") onClose(); };
+    document.addEventListener("mousedown", away);
+    document.addEventListener("keydown", esc);
+    return () => {
+      document.removeEventListener("mousedown", away);
+      document.removeEventListener("keydown", esc);
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+  const set = (k) => (e) => setD((s) => ({ ...s, [k]: e.target.value }));
+  const submit = (e) => { e.preventDefault(); onApply(d); };
   return (
-    <div className="fpill fpill-block">
-      <span>{label}:</span>
-      <span className="fpill-val">{current ? current[1] : value}</span>
-      <svg className="fpill-caret" viewBox="0 0 24 24" aria-hidden="true">
-        <path d="M6 9.5l6 6 6-6" />
-      </svg>
-      <select value={value} aria-label={label}
-              onChange={(e) => onChange(e.target.value)}>
-        {options.map(([v, text, disabled]) => (
-          <option key={v} value={v} disabled={disabled}>{text}</option>
-        ))}
-      </select>
-    </div>
+    <form className="panel advf" ref={box} onSubmit={submit}>
+      <div className="advf-grid">
+        <div className="field">
+          <label htmlFor="af-lang">Language</label>
+          <select id="af-lang" value={d.lang} onChange={set("lang")}>
+            <option value="">Any</option>
+            {langs.map((l) => <option key={l} value={l}>{l.toUpperCase()}</option>)}
+          </select>
+        </div>
+        <div className="field">
+          <label htmlFor="af-views">Min views</label>
+          <input id="af-views" type="number" min="0" inputMode="numeric" placeholder="e.g. 1000"
+                 value={d.minViews} onChange={set("minViews")} />
+        </div>
+        <div className="field">
+          <label htmlFor="af-fol">Min followers</label>
+          <input id="af-fol" type="number" min="0" inputMode="numeric" placeholder="e.g. 10000"
+                 value={d.minFollowers} onChange={set("minFollowers")} />
+        </div>
+        <div className="field">
+          <label htmlFor="af-from">From date</label>
+          <input id="af-from" type="date" value={d.from} max={d.to || undefined} onChange={set("from")} />
+        </div>
+        <div className="field">
+          <label htmlFor="af-to">To date</label>
+          <input id="af-to" type="date" value={d.to} min={d.from || undefined} onChange={set("to")} />
+        </div>
+      </div>
+      <div className="advf-foot">
+        <button type="submit" className="btn btn-brand">Apply</button>
+        <button type="button" className="btn btn-ghost"
+                onClick={() => { setD(NO_ADV); onApply(NO_ADV); }}>Clear all</button>
+        <span className="grow" />
+        <button type="button" className="btn btn-ghost" disabled={!count} onClick={onExport}>
+          Export CSV ({fmtN(count)})
+        </button>
+      </div>
+    </form>
   );
 }
 
@@ -194,6 +266,11 @@ export default function LiveFeed({ onMenu }) {
                                                 flt: readFilters(pid) }));
   if (pid && fstate.pid !== pid) setFState({ pid, flt: readFilters(pid) });
   const flt = fstate.flt;
+  // Search within the posts already loaded (text, name, handle). Not saved
+  // with the filters: a forgotten search term would hide the feed next visit.
+  const [q, setQ] = useState("");
+  const [advOpen, setAdvOpen] = useState(false);
+  const [adv, setAdv] = useState(NO_ADV);
   const setFlt = (next) => setFState((s) => ({
     ...s, flt: typeof next === "function" ? next(s.flt) : next,
   }));
@@ -412,10 +489,54 @@ export default function LiveFeed({ onMenu }) {
     }[flt.sort];
     return by ? [...out].sort(by) : out;
   }, [latest, flt]);
-  const visible = useMemo(
-    () => (shownIds ? filtered.filter((t) => shownIds.has(keyOf(t))) : filtered),
-    [filtered, shownIds],
-  );
+  const needle = q.trim().toLowerCase();
+  const narrowed = Boolean(needle) || advCount(adv) > 0;
+  const visible = useMemo(() => {
+    const shown = shownIds ? filtered.filter((t) => shownIds.has(keyOf(t))) : filtered;
+    if (!narrowed) return shown;
+    const minV = adv.minViews !== "" ? Number(adv.minViews) : null;
+    const minF = adv.minFollowers !== "" ? Number(adv.minFollowers) : null;
+    // Dates are whole local days, both ends included.
+    const from = adv.from ? new Date(`${adv.from}T00:00:00`).getTime() : null;
+    const to = adv.to ? new Date(`${adv.to}T23:59:59.999`).getTime() : null;
+    return shown.filter((t) => {
+      if (needle && !`${t.text || ""}\n${t.author_username || ""}\n${t.author_display_name || ""}`
+        .toLowerCase().includes(needle)) return false;
+      if (adv.lang && String(t.lang || "").toLowerCase() !== adv.lang) return false;
+      if (minV != null && !((t.view_count ?? t.metrics?.views ?? -1) >= minV)) return false;
+      if (minF != null && !((t.author_followers ?? -1) >= minF)) return false;
+      if (from != null || to != null) {
+        const c = Date.parse(t.created_at || "");
+        const when = Number.isNaN(c) ? Date.parse(t.collected_at || "") : c;
+        if (Number.isNaN(when)) return false;
+        if (from != null && when < from) return false;
+        if (to != null && when > to) return false;
+      }
+      return true;
+    });
+  }, [filtered, shownIds, needle, adv, narrowed]);
+  const langs = useMemo(
+    () => [...new Set(latest.map((t) => String(t.lang || "").toLowerCase()).filter(Boolean))].sort(),
+    [latest]);
+  const exportCsv = () => {
+    const cell = (v) => `"${String(v ?? "").replace(/"/g, '""')}"`;
+    const head = ["platform", "name", "handle", "text", "url", "posted", "collected",
+                  "likes", "replies", "views", "followers", "language", "category"];
+    const lines = visible.map((t) => [
+      t.platform, t.author_display_name, t.author_username, t.text, t.url,
+      t.created_at, t.collected_at, t.like_count ?? t.metrics?.likes,
+      t.reply_count ?? t.metrics?.comments, t.view_count ?? t.metrics?.views,
+      t.author_followers, t.lang, t.label,
+    ].map(cell).join(","));
+    const blob = new Blob(["\ufeff" + [head.join(","), ...lines].join("\r\n")],
+                          { type: "text/csv;charset=utf-8" });
+    const a = document.createElement("a");
+    a.href = URL.createObjectURL(blob);
+    a.download = `live-feed-${project?.name || pid}-${new Date().toISOString().slice(0, 10)}.csv`;
+    a.click();
+    setTimeout(() => URL.revokeObjectURL(a.href), 1000);
+  };
+  const loaded = shownIds ? filtered.filter((t) => shownIds.has(keyOf(t))).length : filtered.length;
   useEffect(() => {
     setShownIds((prev) => {
       if (!latest.length) return prev;
@@ -428,7 +549,11 @@ export default function LiveFeed({ onMenu }) {
     });
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [latest, feedRows]);
-  const fresh = shownIds ? filtered.length - visible.length : 0;
+  const fresh = shownIds ? filtered.length - loaded : 0;
+  const total = flt.source === "x" ? (feed.data?.xTotal ?? 0)
+    : flt.source === "instagram" ? (feed.data?.igTotal ?? 0)
+    : flt.source === "facebook" ? (feed.data?.fbTotal ?? 0)
+    : (feed.data?.xTotal ?? 0) + (feed.data?.igTotal ?? 0) + (feed.data?.fbTotal ?? 0);
 
   const m = metrics.data;
   // The pid of a live collector process — the one honest signal that posts
@@ -472,6 +597,29 @@ export default function LiveFeed({ onMenu }) {
   return (
     <>
       <PageHead title="Live Feed" onMenu={onMenu}
+                center={<>
+                  <div className="fsearch">
+                    <svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="11" cy="11" r="7" /><path d="M20 20l-3.5-3.5" /></svg>
+                    <input type="search" value={q} placeholder="Search posts, names, @handles…"
+                           aria-label="Search loaded posts"
+                           onChange={(e) => setQ(e.target.value)}
+                           onKeyDown={(e) => { if (e.key === "Escape") { setQ(""); e.currentTarget.blur(); } }} />
+                  </div>
+                  <button className="btn btn-brand fbtn" aria-expanded={advOpen}
+                          onClick={() => setAdvOpen((o) => !o)}>
+                    <svg viewBox="0 0 24 24" aria-hidden="true">
+                      <path d="M4 6h10M18 6h2M4 12h4M12 12h8M4 18h12" />
+                      <circle cx="16" cy="6" r="2" /><circle cx="10" cy="12" r="2" /><circle cx="18" cy="18" r="2" />
+                    </svg>
+                    Filters{advCount(adv) > 0 ? <span className="fmenu-n">{advCount(adv)}</span> : null}
+                  </button>
+                  {/* Floats over the dashboard: opening it moves nothing. */}
+                  {advOpen && (
+                    <AdvFilters value={adv} langs={langs} onApply={setAdv}
+                                onExport={exportCsv} count={visible.length}
+                                onClose={() => setAdvOpen(false)} />
+                  )}
+                </>}
                 sub={project ? `${project.name} — ${handleCount} handles · ${wlCount} watchlists` : "No project yet"}>
         <span className="chip-live">
           <span className={`dot${!status.data ? " off" : !watcherUp ? " bad" : paused ? " warn" : liveOk ? " pulse" : ""}`} />
@@ -548,9 +696,7 @@ export default function LiveFeed({ onMenu }) {
         <Pill label="Duration" value={flt.dur}
               onChange={(v) => setFlt((s) => ({ ...s, dur: v }))}
               options={Object.entries(DUR_LABEL)} />
-        {/* Counts come from the whole project, not the loaded page: the number
-            beside a category is how many posts carry it, which is the number
-            somebody would go looking for. */}
+        {/* Counts come from the whole project, not the loaded page. */}
         <Pill label="Category" value={flt.label}
               onChange={(v) => setFlt((s) => ({ ...s, label: v }))}
               options={[
@@ -569,17 +715,11 @@ export default function LiveFeed({ onMenu }) {
         <section>
           <div className="feed-head">
             <h2>Incoming</h2>
-            <span className="newpill" style={{ cursor: "default" }} title="posts matching the filters above">
-              {fmtN(
-                flt.source === "x"
-                  ? feed.data?.xTotal ?? 0
-                  : flt.source === "instagram"
-                    ? feed.data?.igTotal ?? 0
-                    : flt.source === "facebook"
-                      ? feed.data?.fbTotal ?? 0
-                      : (feed.data?.xTotal ?? 0) + (feed.data?.igTotal ?? 0) +
-                        (feed.data?.fbTotal ?? 0),
-              )}{" "}posts
+            <span className="newpill" style={{ cursor: "default" }}
+                  title={narrowed ? "matches among the posts loaded so far" : "posts matching the filters above"}>
+              {narrowed
+                ? `${fmtN(visible.length)} of ${fmtN(loaded)} loaded match`
+                : `${fmtN(total)} posts`}
             </span>
             {fresh > 0 && (
               <button className="newpill"
@@ -598,11 +738,16 @@ export default function LiveFeed({ onMenu }) {
 
           {projectsError && <ErrorState error={projectsError} />}
           {((feed.loading && !feed.data) || (feed.pending && visible.length === 0 && !feed.error)) &&
-            <Loading label="Loading the feed…" />}
+            <FeedSkeleton />}
           {feed.error && (!feed.data || (flt.source === "x" && visible.length === 0)) &&
             <ErrorState error={feed.error} retry={feed.reload} />}
           {feed.data && !feed.pending && !(feed.error && flt.source === "x") && visible.length === 0 && (
-            wlCount === 0 ? (
+            narrowed ? (
+              <Empty title="No loaded post matches the search and filters">
+                They look through the {fmtN(loaded)} posts loaded so far.{" "}
+                <button className="freset" onClick={() => { setQ(""); setAdv(NO_ADV); }}>Clear them</button>
+              </Empty>
+            ) : wlCount === 0 ? (
               <Empty title="This project isn't watching anything yet">
                 Create a watchlist under <b>Watchlists</b> — collection starts
                 automatically{watcherUp ? " within a minute" : " once the collector is on"},
@@ -621,21 +766,15 @@ export default function LiveFeed({ onMenu }) {
                       onPin={setPinTarget} terms={keywordTerms}
                       cats={labels.data?.categories} onLabel={relabel} />
           ))}
-          {feed.data && visible.length > 0 && (() => {
-            const total = flt.source === "x" ? (feed.data.xTotal ?? 0)
-              : flt.source === "instagram" ? (feed.data.igTotal ?? 0)
-              : flt.source === "facebook" ? (feed.data.fbTotal ?? 0)
-              : (feed.data.xTotal ?? 0) + (feed.data.igTotal ?? 0) + (feed.data.fbTotal ?? 0);
-            return visible.length < total ? (
-              <div style={{ textAlign: "center", margin: "16px 0 4px" }}>
-                <button className="btn btn-ghost" disabled={feed.loading}
-                        onClick={() => setPageN((n) => n + 1)}>
-                  {feed.loading ? "Loading…"
-                    : `Load more — showing ${fmtN(visible.length)} of ${fmtN(total)}`}
-                </button>
-              </div>
-            ) : null;
-          })()}
+          {feed.data && (visible.length > 0 || narrowed) && loaded < total && (
+            <div style={{ textAlign: "center", margin: "16px 0 4px" }}>
+              <button className="btn btn-ghost" disabled={feed.loading}
+                      onClick={() => setPageN((n) => n + 1)}>
+                {feed.loading ? "Loading…"
+                  : `Load more — ${fmtN(loaded)} of ${fmtN(total)} loaded`}
+              </button>
+            </div>
+          )}
           {pinTarget && pid && (
             <CollectionPicker t={pinTarget} pid={pid} onClose={() => setPinTarget(null)} />
           )}
@@ -697,9 +836,17 @@ export default function LiveFeed({ onMenu }) {
                       : `${w.members.length} handles · ${w.streams.filter((s) => !s.paused).length} stream${w.streams.filter((s) => !s.paused).length === 1 ? "" : "s"}`}
                   </small>
                 </div>
-                <div className="right">
-                  {fmtN(w.streams.reduce((a, s) => a + (s.tweets || 0), 0))} collected
-                </div>
+                {(() => {
+                  // Is this list being collected right now — not how much it
+                  // has ever collected.
+                  const on = w.streams.filter((s) => !s.paused).length;
+                  return (
+                    <div className="right wl-live">
+                      <span className={`dot ${on ? "" : "warn"}`} />
+                      {on ? "collecting" : "paused"}
+                    </div>
+                  );
+                })()}
               </div>
             ))}
           </div>

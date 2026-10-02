@@ -189,6 +189,24 @@ export default function PostCard({ t, onPin, onUnpin, terms, cats, onLabel }) {
   const fbFrame = isFb && media.length > 0
     && (imgDead || fbLinkDead(media[0].thumb || media[0].url));
   const tallFrame = /\/reel\/|\/videos\//.test(String(t.url || ""));
+  // Long posts are clamped so the feed stays scannable; one click opens them.
+  const long = String(t.text || "").length > 420 || String(t.text || "").split("\n").length > 8;
+  const [open, setOpen] = React.useState(false);
+  const [copied, setCopied] = React.useState(false);
+  const copyLink = async () => {
+    try {
+      await navigator.clipboard.writeText(t.url);
+      setCopied(true);
+      setTimeout(() => setCopied(false), 1500);
+    } catch { /* clipboard refused — the Open link is right beside it */ }
+  };
+  // Only the numbers this platform actually reports: no row of dashes.
+  const stats = [
+    ["❤", "likes", t.like_count ?? t.metrics?.likes],
+    ["↻", "reposts", t.retweet_count],
+    ["💬", "replies", t.reply_count ?? t.metrics?.comments],
+    ["👁", "views", t.view_count ?? t.metrics?.views],
+  ].filter(([, , v]) => v != null);
   return (
     <article className={`card${media.length ? "" : " nomedia"}`
                         + (fbFrame ? " fbframe" : "")}>
@@ -208,25 +226,34 @@ export default function PostCard({ t, onPin, onUnpin, terms, cats, onLabel }) {
           )}
           {t.is_retweet ? <span className="badge rt">RT</span> : null}
           <LabelChip t={t} cats={cats} />
+          <span className="ctime" title={t.created_at
+            ? `posted ${new Date(t.created_at).toLocaleString("en-IN")}` : ""}>
+            {fmtPosted(t.created_at)}
+          </span>
         </div>
-        <p className="ctext">{withLinks(t.text, terms)}</p>
-        <div className="cwl" title={t.created_at
-          ? `posted ${new Date(t.created_at).toLocaleString("en-IN")}` : ""}>
+        <p className={"ctext" + (long && !open ? " clamp" : "")}>{withLinks(t.text, terms)}</p>
+        {long && (
+          <button className="cmore" onClick={() => setOpen((o) => !o)}>
+            {open ? "Show less" : "Show more"}
+          </button>
+        )}
+        <div className="cwl">
           {t.streams?.length ? `Stream: ${t.streams.join(", ")} · ` : ""}
-          collected {fmtAgo(t.collected_at)} · posted {fmtPosted(t.created_at)}
+          collected {fmtAgo(t.collected_at)}
         </div>
-        <div className="cstats">
-          <span>❤ {fmtN(t.like_count ?? t.metrics?.likes)}</span>
-          <span>↻ {fmtN(t.retweet_count)}</span>
-          <span>💬 {fmtN(t.reply_count ?? t.metrics?.comments)}</span>
-          <span>👁 {fmtN(t.view_count ?? t.metrics?.views)}</span>
-          {t.lang ? <span>{String(t.lang).toUpperCase()}</span> : null}
-        </div>
+        {(stats.length > 0 || t.lang) && (
+          <div className="cstats">
+            {stats.map(([icon, label, v]) => (
+              <span key={label} title={label}>{icon} {fmtN(v)}</span>
+            ))}
+            {t.lang ? <span>{String(t.lang).toUpperCase()}</span> : null}
+          </div>
+        )}
         <div className="cactions">
           <a href={t.url} target="_blank" rel="noreferrer">
             Open on {{ instagram: "Instagram", facebook: "Facebook" }[t.platform] || "X"}
           </a>
-          <button onClick={() => navigator.clipboard?.writeText(t.url)}>Copy link</button>
+          <button onClick={copyLink}>{copied ? "Copied ✓" : "Copy link"}</button>
           {/* Every platform can be pinned now: boards key on
               (platform, post_id), not on an X tweet id. */}
           {onPin && <button onClick={() => onPin(t)}>+ Collection</button>}

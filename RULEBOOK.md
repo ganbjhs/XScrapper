@@ -1102,6 +1102,27 @@ session got opened on a live account (§6, "never signed in twice").
   1,869 links at `limit=500` is four requests — so it constrains no correct
   caller and stops a retry loop from spending a night. One key's exhaustion
   never throttles another. Test: `test_report_contract.test_rate_limit`.
+- **Who touched the tool is written down — and a secret never is**
+  (2026-10-02). The operator asked for an Activity Log that shows, second by
+  second, what happened in the tool, security first. Until then a wrong
+  password, a rejected key or a setting changed from the dashboard left no
+  trace anywhere. `web._audit` writes one line into `activity.db` (the same
+  table the collectors log to; the category rides in `platform`):
+  `security` — sign-in ok / FAILED / BLOCKED, sign-out, invalid key, key
+  rate-limited, a key outside its paths or its project, an unauthenticated
+  request; `api` — every accepted key request (Watch-Tower's pulls);
+  `operator` — every dashboard POST with its path, status and IP. 
+  `store_accounts.set_status` logs an account changing status, and
+  `watchdog.send` logs every alert under `system`, delivered or not.
+  Three rules hold it together. (1) **Never a secret**: no password, no
+  request body, no query value, no whole key — a path, a status, an IP, the
+  last four characters of a key. (2) **Repeats are folded**, not written: the
+  same event from the same caller inside its window is counted and the next
+  line says how many — the log is bounded (20,000 lines) and a polling client
+  must not push a failed sign-in out of it. (3) **The audit never breaks a
+  request and never changes a response**: `_audit` swallows every error, and
+  no status code, header or body is different because of it — Watch-Tower
+  sees exactly what it saw before.
 
 ## 6. Per-platform hard rules
 
@@ -2325,8 +2346,12 @@ wording. Every change appends an entry in the same commit (2026-08-25).
   (`profiles/pool_<id>`), and writes the outcome back onto the card. The
   profile directory is the trusted-device state — it must stay derived from the
   immutable account id, never from a renameable label.
-- Activity Log page: structured X poll history + raw account log with
-  platform/level filters.
+- Activity Log page: a per-second timeline of the whole tool (collector
+  lines, sign-ins, API keys, operator actions, account status, watchdog
+  alerts) with category/platform and level filters, search, security tiles
+  and the threat-watch panel; plus the structured X poll history.
+- Live Feed: search in the top bar and the Filters panel (language, min
+  views/followers, dates, CSV export of what is shown).
 - Collections (cross-platform pins keyed (platform, post_id), CSV export), Alerts (velocity → Telegram), Delivery
   (targets, backfill, behind-count), Search, Guard views.
 - Every operational switch editable in the dashboard; service loops re-read

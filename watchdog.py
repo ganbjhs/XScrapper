@@ -481,8 +481,25 @@ def tg_send(token: str, chat: str, text: str, timeout=15) -> tuple:
 def send(root, text: str) -> tuple:
     token, chat = bot_token(root), bot_chat(root)
     if not token or not chat:
+        _note_alert(root, text, False, "no watchdog bot configured")
         return False, "no watchdog bot — set WATCHDOG_TELEGRAM_BOT_TOKEN and a chat id"
-    return tg_send(token, chat, text)
+    ok, err = tg_send(token, chat, text)
+    _note_alert(root, text, ok, err)
+    return ok, err
+
+
+def _note_alert(root, text: str, ok: bool, err) -> None:
+    """Every alert the watchdog raised, on the Activity Log — delivered or not."""
+    try:
+        import activity_log
+        first = " ".join(str(text).split())[:300]
+        activity_log.log_event(
+            "system",
+            f"[watchdog] alert {'sent' if ok else 'NOT delivered (' + str(err)[:80] + ')'}: {first}",
+            level="warn" if ok else "error",
+            db=str(Path(root) / "activity.db"))
+    except Exception:
+        pass
 
 
 # --------------------------------------------------------------------------

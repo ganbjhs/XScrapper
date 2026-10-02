@@ -344,3 +344,35 @@ export function useMediaQuery(q) {
   }, [q]);
   return m;
 }
+
+// The whole pill is the control: the transparent <select> is stretched over it.
+export function Pill({ label, value, onChange, options }) {
+  const current = options.find(([v]) => v === value);
+  return (
+    <div className="fpill fpill-block">
+      <span>{label}:</span>
+      <span className="fpill-val">{current ? current[1] : value}</span>
+      <svg className="fpill-caret" viewBox="0 0 24 24" aria-hidden="true">
+        <path d="M6 9.5l6 6 6-6" />
+      </svg>
+      <select value={value} aria-label={label}
+              onChange={(e) => onChange(e.target.value)}>
+        {options.map(([v, text, disabled]) => (
+          <option key={v} value={v} disabled={disabled}>{text}</option>
+        ))}
+      </select>
+    </div>
+  );
+}
+
+// The navbar search box (PageHead's `center` slot). Esc clears it.
+export function HeadSearch({ value, onChange, placeholder }) {
+  return (
+    <div className="fsearch">
+      <svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="11" cy="11" r="7" /><path d="M20 20l-3.5-3.5" /></svg>
+      <input type="search" value={value} placeholder={placeholder} aria-label={placeholder}
+             onChange={(e) => onChange(e.target.value)}
+             onKeyDown={(e) => { if (e.key === "Escape") { onChange(""); e.currentTarget.blur(); } }} />
+    </div>
+  );
+}

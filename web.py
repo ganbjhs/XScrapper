@@ -74,6 +74,45 @@ _SECRET = secrets.token_bytes(32)
 _attempts: dict[str, list] = {}
 _attempts_lock = threading.Lock()
 
+# ---------------- audit trail (2026-10-02) ----------------
+# Who touched the tool, from where, and what the tool did about it — written
+# into the same activity.db the collectors log to, so the Activity Log page is
+# one timeline. Categories ride in the `platform` column:
+#   security  sign-ins (good and bad), lockouts, rejected or over-reaching keys,
+#             unauthenticated requests
+#   api       a machine key reading data (Watch-Tower's pulls)
+#   operator  a signed-in person changing something from the dashboard
+# Values that can carry secrets (passwords, request bodies, query VALUES, whole
+# keys) are never written: a path, a status, an IP, the last 4 of a key.
+# Repeats are folded: the same event from the same caller inside `window`
+# seconds is counted, not written, and the next line says how many were folded
+# — a polling client must not push everything else out of a bounded log.
+_AUDIT_SEEN: dict = {}
+_AUDIT_LOCK = threading.Lock()
+
+
+def _audit(category, message, actor=None, level="info", dedupe=None, window=60):
+    """One audit line. Never raises: a log must not break a request."""
+    try:
+        if dedupe is not None:
+            now = time.time()
+            with _AUDIT_LOCK:
+                last, folded = _AUDIT_SEEN.get(dedupe, (0.0, 0))
+                if now - last < window:
+                    _AUDIT_SEEN[dedupe] = (last, folded + 1)
+                    return
+                _AUDIT_SEEN[dedupe] = (now, 0)
+                if len(_AUDIT_SEEN) > 4000:
+                    for k in sorted(_AUDIT_SEEN, key=lambda k: _AUDIT_SEEN[k][0])[:2000]:
+                        _AUDIT_SEEN.pop(k, None)
+            if folded:
+                message += f" (+{folded} more like this since the last line)"
+        import activity_log
+        db = str(_CFG.root / "activity.db") if _CFG else None
+        activity_log.log_event(category, message, account=actor, level=level, db=db)
+    except Exception:
+        pass
+
 
 # .env ships with these filled in so the keys are visible and uncommented.
 # They must never count as real credentials: a placeholder that satisfies the
@@ -2061,7 +2100,8 @@ def _activity_logs_json(q):
     while acting as the burner accounts — session reuse, login attempts,
     logged-out walls, fetches, avatar captures, errors. This is the "what are
     the accounts actually doing" view; filters: ?platform=facebook|instagram,
-    ?level=info|warn|error, ?limit=N.
+    ?level=info|warn|error, ?limit=N. Since 2026-10-02 the same log also holds
+    the audit trail (platform = security | api | operator | system).
     """
     import activity_log
     try:
@@ -7064,7 +7104,12 @@ class Handler(BaseHTTPRequestHandler):
         # that also happens to carry a stale cookie still gets key semantics.
         presented = _presented_key(self.headers)
         if presented:
+            _ip = self._client_ip()
+            _hint = "…" + presented[-4:]
+            _m = (self.command or "").upper()
             if not _valid_api_key(presented):
+                _audit("security", f"INVALID API key {_hint} rejected: {_m} {path} from {_ip}",
+                       actor=_ip, level="error", dedupe=("badkey", _ip, _hint))
                 self._send(401, {"error": "invalid API key"})
                 return False
             ok, retry = _rate_ok(presented)
@@ -7078,6 +7123,8 @@ class Handler(BaseHTTPRequestHandler):
                                               key_hint="…" + presented[-4:])
                 except Exception:
                     pass
+                _audit("security", f"key {_hint} hit the rate limit: {_m} {path} from {_ip}",
+                       actor=_hint, level="warn", dedupe=("rate", _hint))
                 import links as _links
                 self._send(429, {
                     "error": f"rate limit: {_links.RATE_PER_MIN} requests per minute",
@@ -7098,6 +7145,9 @@ class Handler(BaseHTTPRequestHandler):
                 write_ok = (method == "POST" and path in API_KEY_SCOPED_WRITE_PATHS)
                 if not write_ok and (method != "GET"
                                      or path not in API_KEY_SCOPED_PATHS):
+                    _audit("security", f"key {_hint} (locked to project {scope}) REFUSED: "
+                           f"{method} {path} is outside its allowed paths, from {_ip}",
+                           actor=_hint, level="error", dedupe=("scope", _hint, method, path))
                     self._send(403, {
                         "error": f"this key cannot {method} {path}",
                         "allowed_get": sorted(API_KEY_SCOPED_PATHS),
@@ -7114,14 +7164,19 @@ class Handler(BaseHTTPRequestHandler):
                 if write_ok:
                     self._via_api_key = True
                     self._key_project = scope
+                    self._audit_key_ok(_hint, method, path, scope, _ip)
                     return True
                 if str(asked).strip() != str(scope):
+                    _audit("security", f"key {_hint} (locked to project {scope}) REFUSED: "
+                           f"asked for project {str(asked)[:20]!r} on {path}, from {_ip}",
+                           actor=_hint, level="error", dedupe=("proj", _hint, str(asked)[:20]))
                     self._send(403, {
                         "error": f"this key is locked to project {scope}",
                         "detail": f"pass ?project={scope} — this key sees no other project",
                     })
                     return False
                 self._via_api_key = True
+                self._audit_key_ok(_hint, method, path, scope, _ip)
                 return True
             allowed = (method == "GET" and path in API_KEY_READ_PATHS) \
                 or path in API_KEY_WRITE_PATHS
@@ -7131,6 +7186,8 @@ class Handler(BaseHTTPRequestHandler):
                 # completely different paths, and guessing between them is what
                 # makes a caller retry variants of a URL that will never work.
                 readable_via_get = path in API_KEY_READ_PATHS
+                _audit("security", f"key {_hint} REFUSED: an API key cannot {method} {path}, from {_ip}",
+                       actor=_hint, level="error", dedupe=("deny", _hint, method, path))
                 self._send(403, {
                     "error": (f"an API key cannot {method} {path}"
                               if readable_via_get else
@@ -7148,19 +7205,35 @@ class Handler(BaseHTTPRequestHandler):
                 })
                 return False
             self._via_api_key = True
+            _aq = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
+            self._audit_key_ok(_hint, method, path, (_aq.get("project") or [""])[0], _ip)
             return True
 
         if self._authed():
             return True
+        _ip = self._client_ip()
         if path.startswith("/api/"):
+            # Usually an expired session still polling; a stranger looks the same.
+            _audit("security", f"not signed in: {(self.command or '').upper()} {path[:80]} from {_ip}",
+                   actor=_ip, level="warn", dedupe=("anon", _ip), window=300)
             self._send(401, {
                 "error": "not signed in",
                 "detail": "Browsers sign in at /login. Programs send "
                           "'Authorization: Bearer <key>' with a key from API_KEYS.",
             })
         else:
+            if path not in ("/", "/login") and not path.startswith("/app"):
+                # Nothing here answers to this path: a scanner, or a stale link.
+                _audit("security", f"unauthenticated visit to {path[:80]!r} from {_ip}",
+                       actor=_ip, level="warn", dedupe=("probe", _ip), window=600)
             self._send(200, self._login_html(), "text/html; charset=utf-8")
         return False
+
+    def _audit_key_ok(self, hint, method, path, project, ip):
+        """A key that was let in. Folded per key+path+project per minute."""
+        proj = f" project {str(project)[:20]}" if project not in (None, "") else ""
+        _audit("api", f"key {hint} {method} {path}{proj} from {ip}", actor=hint,
+               dedupe=("pull", hint, method, path, str(project)[:20]))
 
     def _login_html(self, error: str = "") -> str:
         block = f'<div class="err">{error}</div>' if error else ""
@@ -7170,6 +7243,9 @@ class Handler(BaseHTTPRequestHandler):
         ip = self._client_ip()
         wait = _locked_out(ip)
         if wait:
+            _audit("security", f"sign-in BLOCKED: {ip} is locked out after "
+                   f"{MAX_ATTEMPTS} wrong passwords ({wait}s left)", actor=ip,
+                   level="error", dedupe=("lockout", ip))
             return self._send(429, self._login_html(
                 f"Too many tries. Wait {wait // 60 + 1} minute(s) and try again."),
                 "text/html; charset=utf-8")
@@ -7182,6 +7258,9 @@ class Handler(BaseHTTPRequestHandler):
         if not _check_credentials(user, pwd):
             _record_failure(ip)
             left = MAX_ATTEMPTS - len(_attempts.get(ip, []))
+            _audit("security", f"sign-in FAILED for user {user[:40]!r} from {ip} "
+                   f"({max(left, 0)} tries left before lockout)", actor=ip,
+                   level="error" if left <= 3 else "warn")
             return self._send(401, self._login_html(
                 "That username or password is not right."
                 + (f" {left} more tr{'y' if left == 1 else 'ies'} before this "
@@ -7189,6 +7268,7 @@ class Handler(BaseHTTPRequestHandler):
                 "text/html; charset=utf-8")
 
         _clear_failures(ip)
+        _audit("security", f"signed in: user {user[:40]!r} from {ip}", actor=ip)
         # Secure is set only behind a proxy terminating TLS; setting it on a
         # plain-HTTP localhost run would make the browser drop the cookie and
         # produce an unexplainable login loop.
@@ -7203,6 +7283,7 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
 
     def _do_logout(self):
+        _audit("security", f"signed out from {self._client_ip()}", actor=self._client_ip())
         self.send_response(303)
         self.send_header("Location", "/login")
         self.send_header("Set-Cookie", f"{SESSION_COOKIE}=; Max-Age=0; Path=/")
@@ -7398,6 +7479,13 @@ class Handler(BaseHTTPRequestHandler):
             pass
         self.end_headers()
         self._note_slow(code)
+        op = getattr(self, "_op_audit", None)
+        if op:
+            self._op_audit = None
+            ip = self._client_ip()
+            _audit("operator", f"POST {op[:120]} -> {code} from {ip}", actor=ip,
+                   level="info" if code < 400 else "warn",
+                   dedupe=("op", op, ip, code), window=30)
         if not self._head_only:
             self.wfile.write(data)
 
@@ -7418,6 +7506,7 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_GET(self):
         self._t0 = time.time()
+        self._op_audit = None
         u = urllib.parse.urlparse(self.path)
         q = {k: v[0] for k, v in urllib.parse.parse_qs(u.query).items()}
         try:
@@ -7605,12 +7694,17 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_POST(self):
         self._t0 = time.time()
+        self._op_audit = None
         u = urllib.parse.urlparse(self.path)
         try:
             if u.path == "/login":
                 return self._do_login()
             if not self._require_auth():
                 return
+            if not self._via_api_key:
+                # Path only — the body can hold passwords, cookies, proxy URLs.
+                # _send writes the line once the outcome is known.
+                self._op_audit = u.path
             n = int(self.headers.get("Content-Length") or 0)
             body = json.loads(self.rfile.read(n) or "{}")
             # Any POST may change what the sidebar shows (stream speed, a

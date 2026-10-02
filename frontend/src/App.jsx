@@ -3,7 +3,7 @@
 import React, { createContext, useContext, useEffect, useMemo, useState } from "react";
 import { NavLink, Navigate, Route, Routes, useNavigate } from "react-router-dom";
 import { api, sortBy, useApi } from "./api/client.js";
-import { Modal, ShortcutsModal, ToastHost, WtBadge, icons, toast } from "./components/ui.jsx";
+import { Modal, ShortcutsModal, ToastHost, icons, toast } from "./components/ui.jsx";
 import LiveFeed from "./views/LiveFeed.jsx";
 import Watchlists from "./views/Watchlists.jsx";
 import Search from "./views/Search.jsx";
@@ -141,7 +141,6 @@ function ManageProjects({ onClose }) {
                 <small>#{p.project_id} · {p.watchlists} watchlist(s) · {p.streams} stream(s){p.archived ? " · archived" : ""}</small>
               </div>
             )}
-            <WtBadge consumers={consumers} project={p} />
             <div className="acts">
               <button className="btn btn-ghost btn-sm" disabled={busy}
                       onClick={() => { setEditing(p.project_id); setDraft(p.name); }}>Rename</button>
@@ -193,7 +192,6 @@ function ProjectSwitcher() {
       <button onClick={() => setOpen((o) => !o)} aria-expanded={open} title={project?.name}>
         <span className="pmark">{(project?.name || "?").slice(0, 1).toUpperCase()}</span>
         <span className="pname">{project ? project.name : "No project"}</span>
-        {project && <WtBadge consumers={consumers} project={project} compact />}
         <svg className="caret" viewBox="0 0 24 24" aria-hidden="true"><path d="M6 9l6 6 6-6" /></svg>
       </button>
       {open && (
@@ -203,7 +201,6 @@ function ProjectSwitcher() {
                     className={p.project_id === project?.project_id ? "sel" : ""}
                     onClick={() => { setProjectId(p.project_id); setOpen(false); }}>
               <span className="pname">{p.name}{p.archived ? " (archived)" : ""}</span>
-              <WtBadge consumers={consumers} project={p} />
             </button>
           ))}
           <button className="new" onClick={() => { setOpen(false); setCreating(true); }}>
@@ -456,7 +453,7 @@ export default function App() {
 }
 
 // Shared page header with the mobile menu button.
-export function PageHead({ title, sub, onMenu, children }) {
+export function PageHead({ title, sub, onMenu, center, children }) {
   return (
     <header className="top">
       <button className="menu-btn" onClick={onMenu} aria-label="Open navigation">
@@ -466,7 +463,7 @@ export function PageHead({ title, sub, onMenu, children }) {
         <h1>{title}</h1>
         {sub && <div className="sub">{sub}</div>}
       </div>
-      <div className="grow" />
+      {center ? <div className="top-center">{center}</div> : <div className="grow" />}
       {children}
     </header>
   );

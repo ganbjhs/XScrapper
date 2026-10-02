@@ -19,6 +19,41 @@ must respect belongs in the rulebook, not here.
 
 ---
 
+## 2026-10-02 — The Activity Log becomes an audit trail; Live Feed gets a top bar
+
+**Asked for.** The operator wanted the Activity Log to show, second by second,
+what happened in the tool — security and threats first — and the dashboard
+pages laid out like Watch-Tower's (search in a top bar, a Filters button).
+
+**What was missing.** `activity.db` held only what the Facebook/Instagram
+collectors print. Sign-ins, failed passwords, API key use and changes made
+from the dashboard were recorded nowhere, so no page could show them.
+
+**Changed.**
+- `web.py`: `_audit()` and its call sites in `_do_login`, `_do_logout`,
+  `_require_auth`, `do_POST`/`_send` (RULEBOOK §5, "Who touched the tool is
+  written down"). `store_accounts.set_status` and `watchdog.send` log too.
+  No response is altered; `/api/activity/logs` simply returns the new lines.
+- `frontend`: Activity Log rebuilt as a timeline (5 s refresh, security
+  tiles, threat watch, X polls kept as a tab). Live Feed: search + Filters in
+  the top bar (`PageHead` `center` slot), Filters panel filters the LOADED
+  posts client-side, CSV export, long posts clamped, skeleton loading. The
+  filter row (Source / Sort / Duration / Category dropdowns) is unchanged.
+  The header is a sticky bar on every page.
+- Removed at the operator's request: the Watch-Tower badge in the project
+  switcher, its list and Manage projects (the Collector → Watch-Tower panel
+  replaces it); the lifetime "N collected" per watchlist on the Live Feed
+  side panel (now collecting / paused).
+
+**Verified.** `py_compile` on the three Python files; `_audit` folding
+exercised by hand against a temp db; `tests/test_watchdog.py` passes;
+`vite build` passes. **Not verified:** the pages in a browser against real
+data, and the accounts tests (no `pyotp` where this was written).
+
+**Left for later** (noted in `LiveFeed.jsx` above `AdvFilters`): verified-only
+filter, server-side filtering, saved searches, PDF export. X collector events
+are still only in the poll history, not the timeline.
+
 ## 2026-09-30 — Instagram lists shareable across projects ("Add existing…")
 
 **Why.** Typing an Instagram handle that another project already collected
