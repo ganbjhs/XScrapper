@@ -845,7 +845,7 @@ function FixCard({ c, focus, accounts, onAdopt, onChanged, onSignin }) {
           )}
           {(c.meta?.pending || []).length > 0 && (
             <div style={{ fontSize: 12.5, color: "var(--ink-3)", marginBottom: 8 }}>
-              {c.kind === "proxy_broken" ? "Handles that will resolve once the proxy works" : "Waiting for an id"}: {c.meta.pending.join(", ")}
+              {["proxy_broken", "proxy_auth"].includes(c.kind) ? "Handles that will resolve once the proxy works" : "Waiting for an id"}: {c.meta.pending.join(", ")}
             </div>
           )}
 
@@ -883,7 +883,7 @@ function FixCard({ c, focus, accounts, onAdopt, onChanged, onSignin }) {
             {c.actions.includes("retry") && (
               <button className="btn btn-sm" disabled={busy}
                       onClick={() => run({ action: "retry" }, () => "hold cleared — the next pass probes once")}>
-                {c.kind === "proxy_broken" ? "Proxy fixed — retry now" : "Retry lookups now"}
+                {["proxy_broken", "proxy_auth"].includes(c.kind) ? "Proxy fixed — retry now" : "Retry lookups now"}
               </button>
             )}
             {c.actions.includes("resume") && (

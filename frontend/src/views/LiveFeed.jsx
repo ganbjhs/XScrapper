@@ -125,43 +125,65 @@ export default function LiveFeed({ onMenu }) {
   const [pageN, setPageN] = useState(1);
   useEffect(() => { setPageN(1); }, [pid, flt.dur, flt.sort, flt.source]);
 
-  const feed = useApi(
-    async () => {
-      const lim = pageN * PAGE;
-      const since = flt.dur !== "all" ? flt.dur : undefined;
-      const [x, ig, fb] = await Promise.all([
-        pid
-          ? api.tweets({
-              project: pid, limit: lim, since,
-              sort: flt.sort === "likes" || flt.sort === "views" ? flt.sort : undefined,
-              order: flt.sort === "oldest" ? "asc" : undefined,
-            })
-          : Promise.resolve({ rows: [] }),
-        pid ? api.igPosts({ project: pid, limit: lim, since }).catch(() => ({ posts: [] }))
-            : Promise.resolve({ posts: [] }),
-        pid ? api.fbPosts({ project: pid, limit: lim, since }).catch(() => ({ posts: [] }))
-            : Promise.resolve({ posts: [] }),
-      ]);
-      const rows = [
-        ...(x.rows || []).map((r) => ({ ...r, platform: "x" })),
-        ...(ig.posts || []).map(normIg),
-        ...(fb.posts || []),   // already in feed shape (store_fb.to_feed)
-      ];
-      rows.sort((a, b) => Date.parse(b.collected_at || 0) - Date.parse(a.collected_at || 0));
-      // *Total is the SERVER's count for the window — the TRUE number, not the
-      // page size, so the "N posts" figure is real for every platform.
-      return {
+  // One request per platform, each shown AS IT ARRIVES (2026-10-02). These
+  // used to be a single Promise.all, so the list stayed at "0 posts / Nothing
+  // in this view yet" until the slowest of the three had answered — a quick
+  // Instagram reply sat hidden behind a slow or queued X one.
+  const lim = pageN * PAGE;
+  const since = flt.dur !== "all" ? flt.dur : undefined;
+  // The stream below is the real-time path; these refetches are the safety
+  // net that also picks up Instagram (which the stream does not carry yet).
+  const feedX = useApi(
+    () => (pid
+      ? api.tweets({
+          project: pid, limit: lim, since,
+          sort: flt.sort === "likes" || flt.sort === "views" ? flt.sort : undefined,
+          order: flt.sort === "oldest" ? "asc" : undefined,
+        })
+      : Promise.resolve({ rows: [] })),
+    [pid, flt.dur, flt.sort, pageN], { every: 60_000 });
+  const feedIg = useApi(
+    () => (pid ? api.igPosts({ project: pid, limit: lim, since }).catch(() => ({ posts: [] }))
+               : Promise.resolve({ posts: [] })),
+    [pid, flt.dur, pageN], { every: 60_000 });
+  const feedFb = useApi(
+    () => (pid ? api.fbPosts({ project: pid, limit: lim, since }).catch(() => ({ posts: [] }))
+               : Promise.resolve({ posts: [] })),
+    [pid, flt.dur, pageN], { every: 60_000 });
+  const feed = useMemo(() => {
+    const x = feedX.data, ig = feedIg.data, fb = feedFb.data;
+    const reload = (soft) => { feedX.reload(soft); feedIg.reload(soft); feedFb.reload(soft); };
+    const loading = feedX.loading || feedIg.loading || feedFb.loading;
+    // A platform is "in" once it has answered (or failed). The empty state
+    // waits for the platforms the Source filter is actually showing.
+    const inX = !!x || !!feedX.error, inIg = !!ig, inFb = !!fb;
+    const pending = flt.source === "x" ? !inX
+      : flt.source === "instagram" ? !inIg
+      : flt.source === "facebook" ? !inFb
+      : !(inX && inIg && inFb);
+    if (!x && !ig && !fb) {
+      return { data: null, loading, pending, error: feedX.error, reload };
+    }
+    const rows = [
+      ...(x?.rows || []).map((r) => ({ ...r, platform: "x" })),
+      ...(ig?.posts || []).map(normIg),
+      ...(fb?.posts || []),   // already in feed shape (store_fb.to_feed)
+    ];
+    rows.sort((a, b) => Date.parse(b.collected_at || 0) - Date.parse(a.collected_at || 0));
+    // *Total is the SERVER's count for the window — the TRUE number, not the
+    // page size, so the "N posts" figure is real for every platform.
+    return {
+      data: {
         rows,
-        xTotal: x.total ?? (x.rows || []).length,
-        igTotal: ig.total ?? (ig.posts || []).length,
-        fbTotal: fb.total ?? (fb.posts || []).length,
-      };
-    },
-    [pid, flt.dur, flt.sort, pageN],
-    // The stream below is the real-time path; this refetch is the safety net
-    // that also picks up Instagram (which the stream does not carry yet).
-    { every: 60_000 },
-  );
+        xTotal: x ? (x.total ?? (x.rows || []).length) : 0,
+        igTotal: ig ? (ig.total ?? (ig.posts || []).length) : 0,
+        fbTotal: fb ? (fb.total ?? (fb.posts || []).length) : 0,
+      },
+      loading, pending, error: feedX.error, reload,
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [feedX.data, feedIg.data, feedFb.data, feedX.loading, feedIg.loading,
+      feedFb.loading, feedX.error, flt.source]);
 
   // Real-time: an event stream from the server pushes each post the moment
   // it is stored. Posts arriving here merge with the fetched backlog.
@@ -503,9 +525,11 @@ export default function LiveFeed({ onMenu }) {
           </div>
 
           {projectsError && <ErrorState error={projectsError} />}
-          {feed.loading && !feed.data && <Loading label="Loading the feed…" />}
-          {feed.error && !feed.data && <ErrorState error={feed.error} retry={feed.reload} />}
-          {feed.data && visible.length === 0 && (
+          {((feed.loading && !feed.data) || (feed.pending && visible.length === 0 && !feed.error)) &&
+            <Loading label="Loading the feed…" />}
+          {feed.error && (!feed.data || (flt.source === "x" && visible.length === 0)) &&
+            <ErrorState error={feed.error} retry={feed.reload} />}
+          {feed.data && !feed.pending && !(feed.error && flt.source === "x") && visible.length === 0 && (
             wlCount === 0 ? (
               <Empty title="This project isn't watching anything yet">
                 Create a watchlist under <b>Watchlists</b> — collection starts

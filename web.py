@@ -1126,6 +1126,39 @@ STATUS_TTL_S = 15
 _STATUS_LOCK = threading.Lock()
 _STATUS_CACHE: dict = {"at": 0.0, "out": None}
 
+# The same idea for the other polled numbers (2026-10-02). The Live Feed asks
+# for /api/metrics every 30 s and /api/labels/status every 60 s FROM EVERY
+# OPEN TAB, each took 3-9 s on the live server, and the site is HTTP/1.1, so a
+# browser's six connections filled with them and a 40 ms request then waited
+# 20-30 s in the queue behind them. One computation per key at a time, reused
+# for its TTL; a second caller waits for the first instead of starting its own.
+# The values are returned as-is and must be treated as read-only.
+METRICS_TTL_S = 30
+LABELS_WAITING_TTL_S = 60
+LABELS_WAITING_RUNNING_TTL_S = 5     # a classify run is moving the number
+_TTL_GUARD = threading.Lock()
+_TTL_LOCKS: dict = {}
+_TTL_CACHE: dict = {}
+
+
+def _ttl_cached(key, ttl_s: float, fn):
+    with _TTL_GUARD:
+        lock = _TTL_LOCKS.setdefault(key, threading.Lock())
+    with lock:
+        hit = _TTL_CACHE.get(key)
+        if hit is not None and time.monotonic() - hit[0] <= ttl_s:
+            return hit[1]
+        val = fn()
+        _TTL_CACHE[key] = (time.monotonic(), val)
+        return val
+
+
+def _ttl_drop(prefix: str = "") -> None:
+    """Forget cached values (all, or those whose key starts with `prefix`)."""
+    for k in list(_TTL_CACHE):
+        if not prefix or str(k[0]).startswith(prefix):
+            _TTL_CACHE.pop(k, None)
+
 
 def _status():
     """Accounts, streams, budget, totals — everything the sidebar shows."""
@@ -2056,6 +2089,11 @@ def _metrics_json(q=None):
         pid = int((q or {}).get("project") or 0)
     except (TypeError, ValueError):
         pid = 0
+    return _ttl_cached(("metrics", pid), METRICS_TTL_S,
+                       lambda: _metrics_uncached(pid))
+
+
+def _metrics_uncached(pid: int):
     out = {"today": {"collected": 0, "photos": 0, "videos": 0,
                      "median_lag_ms": None, "p95_lag_ms": None},
            "per_day": [], "totals": {"tweets": 0}}
@@ -2074,9 +2112,17 @@ def _metrics_json(q=None):
 
     if _CFG.db_results.exists():
         with _connect() as con:
+            # The all-time total has no time bound, so with the EXISTS scope
+            # it read EVERY row of tweets (raw_json and all) to count one
+            # project's. Start from the project's own hits instead: same rows,
+            # same number, and only this project's tweets are touched.
+            total_scope = (
+                " AND t.tweet_id IN (SELECT ph.tweet_id FROM tweet_hits ph "
+                "   JOIN project_streams ps ON ps.stream_id = ph.stream_id "
+                "   WHERE ps.project_id = ?)") if pid else ""
             out["totals"]["tweets"] = con.execute(
-                f"SELECT COUNT(*) c FROM tweets t WHERE t.source = 'result'{scope}",
-                scope_params).fetchone()["c"]
+                "SELECT COUNT(*) c FROM tweets t WHERE t.source = 'result'"
+                f"{total_scope}", scope_params).fetchone()["c"]
             r = con.execute(
                 "SELECT COUNT(*) c, "
                 "  SUM(CASE WHEN t.media_json LIKE '%\"photo\"%' THEN 1 ELSE 0 END) p, "
@@ -3710,10 +3756,12 @@ def _x_unlabelled(pid: int, labelled: set, limit: int = 0) -> list:
     """
     if not _CFG.db_results.exists():
         return 0 if not limit else []
+    # IN, not a correlated EXISTS: this has no time bound, and the EXISTS
+    # form scanned the whole tweets table to find one project's posts.
     sql = ("FROM tweets t WHERE t.source = 'result' "
-           "AND EXISTS (SELECT 1 FROM tweet_hits ph JOIN project_streams ps "
-           "            ON ps.stream_id = ph.stream_id "
-           "            WHERE ph.tweet_id = t.tweet_id AND ps.project_id = ?) "
+           "AND t.tweet_id IN (SELECT ph.tweet_id FROM tweet_hits ph "
+           "            JOIN project_streams ps ON ps.stream_id = ph.stream_id "
+           "            WHERE ps.project_id = ?) "
            "AND NOT EXISTS (SELECT 1 FROM post_labels l WHERE l.project_id = ? "
            "                AND l.platform = 'x' "
            "                AND l.post_id = CAST(t.tweet_id AS TEXT))")
@@ -3846,9 +3894,17 @@ def _labels_status_json(q):
             await st.seed_post_label_categories(pid, cls.DEFAULT_CATEGORIES)
             cfg = await _classify_settings(st)
             labelled = await st.labelled_post_ids(pid)
-            waiting = (_x_unlabelled(pid, labelled)
-                       + _ig_unlabelled(pid, labelled)
-                       + _fb_unlabelled(pid, labelled))
+            run_now = _classify_run_for(pid)
+            # Three counts over three databases, polled once a minute by
+            # every open tab: reuse the number for a minute (5 s while a run
+            # is moving it). Any POST drops it, so a hand label shows at once.
+            waiting = _ttl_cached(
+                ("labels_waiting", pid),
+                LABELS_WAITING_RUNNING_TTL_S if run_now.get("running")
+                else LABELS_WAITING_TTL_S,
+                lambda: (_x_unlabelled(pid, labelled)
+                         + _ig_unlabelled(pid, labelled)
+                         + _fb_unlabelled(pid, labelled)))
             spent = await st.label_spend_month(_month_start_ms())
             last = await st.last_label_run(pid)
             return {
@@ -3869,7 +3925,7 @@ def _labels_status_json(q):
                 # time across the whole server, and reporting another
                 # project's progress here would be a bar counting posts that
                 # are not on this screen.
-                "run": _classify_run_for(pid),
+                "run": run_now,
             }
         return run()
 
@@ -4536,6 +4592,55 @@ _POOL_TO_CFG_PLATFORM = {"x": "x", "ig": "instagram"}
 def _pool_store():
     from store_accounts import AccountStore
     return AccountStore(os.getenv("ACCOUNTS_DB", "pool.db")).open()
+
+
+def _ig_sync_proxies(log=print) -> list:
+    """
+    Copy each Instagram account's proxy from the pool into its saved session.
+
+    The dashboard's "Edit → proxy" writes the pool (encrypted). The Instagram
+    collector reads the proxy from the session sidecar, written at sign-in,
+    and cannot read the pool's copy (no key in its service). Nothing joined
+    the two, so an edited proxy was never used (ig_session.set_proxy_on_file
+    has the incident). This is the join: it runs when the dashboard starts
+    and after every account edit, in the one process that holds the key.
+
+    Returns the usernames whose proxy changed. Never raises: a dashboard that
+    cannot sync a proxy must still start and still save the edit.
+    """
+    changed = []
+    try:
+        import ig_session
+        st = _pool_store()
+    except Exception as e:
+        log(f"[ig] proxy sync skipped: {type(e).__name__}: {e}")
+        return changed
+    try:
+        import pool_link
+        # Start from the sessions that exist and find each one's pool row the
+        # way the dashboard does (login first, then label), so the two halves
+        # agree on which account is which.
+        folder = Path(_CFG.root) / ig_session.SETTINGS_DIR
+        users = sorted(p.stem[3:] for p in folder.glob("ig_*.json")
+                       if not p.stem.startswith("ig_device_"))
+        for user in users:
+            try:
+                hit = pool_link._lookup(st, "ig", user)
+                if hit is None:
+                    continue
+                url = st.get_proxy(int(hit.account_id))
+                if ig_session.set_proxy_on_file(user, url, root=_CFG.root, log=log):
+                    changed.append(user)
+            except Exception as e:
+                log(f"[ig] proxy sync: @{user} skipped ({type(e).__name__}: {e})")
+    except Exception as e:
+        log(f"[ig] proxy sync failed: {type(e).__name__}: {e}")
+    finally:
+        try:
+            st.close()
+        except Exception:
+            pass
+    return changed
 
 
 def _pool_account_cfg(account_id: int):
@@ -7244,6 +7349,7 @@ class Handler(BaseHTTPRequestHandler):
             # promoted account, a paused watchlist): drop the cached status so
             # the next poll recomputes rather than serving a 15 s old picture.
             _STATUS_CACHE["out"] = None
+            _ttl_drop("labels_waiting")
             if u.path == "/api/login/start":
                 # Either a config.toml label (the original callers) or a pool
                 # account_id (the Account Control Panel). See _login_start.
@@ -7436,8 +7542,12 @@ class Handler(BaseHTTPRequestHandler):
                 return self._send(200, _decider_post(body))
             if u.path == "/api/pool" or u.path.startswith("/api/pool/"):
                 import accounts_api
-                return self._send(200, accounts_api.handle(
-                    "POST", u.path[len("/api/pool"):], body, {}))
+                res = accounts_api.handle(
+                    "POST", u.path[len("/api/pool"):], body, {})
+                # An edited proxy must reach the session the collector reads.
+                if u.path in ("/api/pool/update", "/api/pool/add"):
+                    _ig_sync_proxies()
+                return self._send(200, res)
             return self._send(404, {"error": "not found"})
         except Exception as e:
             import traceback
@@ -7485,6 +7595,11 @@ def serve(cfg, host="127.0.0.1", port=8765, log=print, behind_proxy=False):
         return EXIT_REFUSED
 
     _start_loop()
+    # Proxies edited in the dashboard before this join existed are still not
+    # in the sessions; bring them across once at every start.
+    moved = _ig_sync_proxies(log=log)
+    if moved:
+        log(f"[serve] Instagram proxy updated from the pool for: {', '.join(moved)}")
     try:
         srv = ThreadingHTTPServer((host, port), Handler)
     except OSError as e:

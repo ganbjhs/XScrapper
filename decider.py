@@ -341,6 +341,45 @@ RULES = {
         actions=("retry", "resolve"),
         needs_human=True,
     ),
+    "proxy_auth": Rule(
+        # The proxy ITSELF answered, and the answer was "407 Proxy
+        # Authentication Required". That is not a flaky exit: the provider is
+        # refusing our username/password — the plan expired, the data ran out,
+        # the sub-user was removed or the IP allowlist changed. It never heals
+        # by waiting. Filed under 'proxy_flaky' it paged once after two hours
+        # and then stayed silent: on 2026-09-29 all six Instagram accounts
+        # went 407 within eleven hours and Instagram collected nothing for
+        # four days while every card read "warn / fixes itself". So: same
+        # back-off as the other proxy kinds (one probe every 30m, doubling to
+        # 4h, so it picks up by itself once the provider is paid or the
+        # credentials are fixed), but tell the operator AT ONCE, mark it as
+        # needing a person, and say so again after a day if it is still open.
+        "backoff", 30 * 60, max_wait_s=4 * H, escalate_after_s=0,
+        level="error", browser="no",
+        title="the proxy REFUSES our login — {detail}",
+        short="Check the proxy provider: plan / data balance / password for "
+              "@{account}'s proxy, then Retry",
+        fix=("Every request from @{account} is turned away by its PROXY "
+             "before it leaves for Instagram: {detail}. Instagram has not "
+             "refused anything and there is nothing to clear in the browser "
+             "— the account is fine, the proxy login is not.",
+             "407 means the provider no longer accepts the proxy's username "
+             "and password. Open the provider's dashboard and check, in this "
+             "order: is the plan still active (not expired / unpaid), is "
+             "there data left, does the sub-user still exist with this "
+             "password, and is this server's IP still on the allowlist.",
+             "If SEVERAL accounts show this card at the same time, it is the "
+             "provider account as a whole, not one proxy — fix it there "
+             "once; do not edit the accounts one by one.",
+             "Test it on the server exactly as the collector does: "
+             "curl -x '<this account's proxy URL>' -sS -o /dev/null "
+             "-w '%{{http_code}}\\n' https://www.instagram.com/ — you want "
+             "200 or 302. 407 again = still refused.",
+             "Once the curl passes, click Retry. Nothing else needs doing: "
+             "the collector resumes by itself on the next visit."),
+        actions=("retry", "resolve"),
+        needs_human=True,
+    ),
     "proxy_flaky": Rule(
         # The OTHER half of what used to be one 'proxy_broken' (2026-09-12).
         # The connection died before Instagram answered — the residential
@@ -528,7 +567,8 @@ class Decision:
         source; test_ig_stop_stands caught it the same hour.
         """
         return (self.action in ("quarantine", "relogin", "rest")
-                or self.kind in ("rate_limited", "proxy_broken", "proxy_flaky"))
+                or self.kind in ("rate_limited", "proxy_broken", "proxy_flaky",
+                                 "proxy_auth"))
 
 
 def _fmt_dur(s: float) -> str:

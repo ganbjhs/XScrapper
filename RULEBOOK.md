@@ -1231,6 +1231,33 @@ streamed login is dead; the phone-shaped one (above) is the third door.
   `python3 engine_ig.py <username>` once on the server with a real session (the
   built-in smoke test), and after any instagrapi bump run it again.
 
+### A proxy edited in the dashboard must reach the session the collector reads (2026-10-02)
+
+- The Instagram collector takes its proxy from the session sidecar
+  (`profiles/ig_<user>.json`, `meta.proxy`), written at sign-in. It cannot
+  read the pool's copy: that one is encrypted and the collector service holds
+  no key. "Edit → proxy" writes the pool. Until 2026-10-02 nothing joined the
+  two, so an edited proxy changed the card's label and nothing the collector
+  dials. When the rotating plan expired on 2026-09-29 all six accounts were
+  moved to static proxies in the dashboard and went on dialling the dead
+  gateway (407) for four days.
+- The join is `web._ig_sync_proxies` → `ig_session.set_proxy_on_file`: at
+  dashboard start and after every `/api/pool/update` / `/api/pool/add`, in the
+  one process that holds the key. It writes `meta.proxy` ONLY — never the
+  session, the cookies or the device seed — and an empty pool proxy never
+  blanks a sidecar. Any new place that stores a proxy must be added to this
+  join, not left to a re-sign-in.
+- A proxy that answers **407** is refusing our credentials (expired plan,
+  used-up data, removed sub-user). It does not heal by waiting, so it is
+  `proxy_auth` (needs a person, pages at once), never `proxy_flaky`. 502s and
+  resets stay `proxy_flaky`.
+- A number every open tab polls (`/api/metrics`, the waiting count in
+  `/api/labels/status`) is computed once per TTL and shared
+  (`web._ttl_cached`), and an all-time count is driven from the project's own
+  `tweet_hits`, never from a scan of `tweets`. The site is HTTP/1.1: a slow
+  polled request holds one of the browser's six connections and queues the
+  fast ones behind it.
+
 ### Instagram is the STRICT platform — treat every rule here as non-negotiable
 
 Instagram's bot detection watches rhythm, volume, IP and device as much as any

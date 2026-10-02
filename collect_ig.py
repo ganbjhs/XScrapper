@@ -335,6 +335,11 @@ def _proxy_broken(dec, acct, group, e, why, *, log=print):
                      if x.type == "user" and not x.platform_id
                      and not str(x.value).isdigit())
     kind = "proxy_broken" if why == "tls_intercepted" else "proxy_flaky"
+    # A 407 is the proxy refusing our credentials (expired plan, used-up
+    # data, removed sub-user). It does not heal by waiting, so it is NOT
+    # 'flaky': it gets its own kind, which pages at once (decider.proxy_auth).
+    if why != "tls_intercepted" and m and m.group(1).strip().startswith("407"):
+        kind = "proxy_auth"
     dec.fold(acct, "unresolved_source", kind,
              keep=lambda m: m.get("why") in ("tls_intercepted", "network", "unknown", None))
     return dec.on(kind, acct, detail=detail,

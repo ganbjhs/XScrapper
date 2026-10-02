@@ -680,6 +680,48 @@ def _now() -> str:
     return time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime())
 
 
+def set_proxy_on_file(username: str, proxy: str, *, root: Path | str = ".",
+                      log=lambda m: None) -> bool:
+    """Point @username's saved session at `proxy`. True when the file changed.
+
+    WHY THIS EXISTS (2026-10-02). The collector does not ask the account pool
+    for a proxy: load_client() uses the URL frozen in the sidecar at sign-in,
+    because the pool's copy is encrypted and the collector service holds no
+    key. So editing an account's proxy in the dashboard changed the pool and
+    NOTHING the collector reads. On 2026-09-29 the old rotating plan expired,
+    all six accounts were moved to static proxies in the dashboard, and all
+    six went on dialling the dead gateway (407) for four days while every
+    card showed the NEW proxy's label.
+
+    Only meta.proxy is written. The session, the cookies and the device seed
+    are untouched, so this is not a sign-in and costs no request. No sidecar,
+    an unreadable one, an empty proxy or an unchanged one: nothing is written.
+    """
+    proxy = (proxy or "").strip()
+    if not proxy:
+        return False
+    path = sidecar_path(username, root)
+    if not path.exists():
+        return False
+    data = _read_sidecar(path)
+    if not data or not isinstance(data.get("meta"), dict):
+        return False
+    meta = dict(data["meta"])
+    if (meta.get("proxy") or "") == proxy:
+        return False
+    was = redact_proxy(meta.get("proxy") or "") or "none"
+    meta["proxy"] = proxy
+    meta["proxy_changed"] = _now()
+    try:
+        _write_sidecar(path, {**data, "meta": meta})
+    except OSError as e:
+        log(f"[ig] @{username}: could not write the new proxy to the sidecar "
+            f"({type(e).__name__})")
+        return False
+    log(f"[ig] @{username}: proxy on file changed {was} -> {redact_proxy(proxy)}")
+    return True
+
+
 # --------------------------------------------------------------------------
 # the exit — prove the proxy BEFORE a login is spent through it
 # --------------------------------------------------------------------------
