@@ -1293,6 +1293,13 @@ streamed login is dead; the phone-shaped one (above) is the third door.
 - The proof ends at the hand-over. What Watch-Tower does with a row afterwards
   (its keyword / relevance filters, its push into a project) is not visible
   here, and the panel must keep saying so rather than imply delivery to a feed.
+- The wait before a post is taken is timed only on the LAST page of a walk
+  that reaches new ground; cadence is the gap between walks (pages within a
+  minute are one visit). Timing every page made a re-walk of old rows read as
+  "3h avg, 13h max" and the cadence as "every ~247ms".
+- The Delivery page shows the same hand-over panel above its push targets;
+  it used to say "Nothing is delivered anywhere yet" for a project Watch-
+  Tower was pulling every few minutes.
 - `/api/handover` is dashboard-only: it is in no API-key allowlist. Recording
   is observational — it must never change a response or fail a request.
 

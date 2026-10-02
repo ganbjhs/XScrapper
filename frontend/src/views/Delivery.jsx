@@ -2,6 +2,7 @@
 import React, { useEffect, useState } from "react";
 import { api, fmtAgo, fmtN, useApi } from "../api/client.js";
 import { PageHead, useProject } from "../App.jsx";
+import HandoverPanel from "../components/Handover.jsx";
 import { Empty, ErrorState, Loading, Modal } from "../components/ui.jsx";
 
 function Copyable({ label, value, rows }) {
@@ -508,6 +509,11 @@ export default function Delivery({ onMenu }) {
   const [adding, setAdding] = useState(false);
 
   const targets = data?.targets || [];
+  // Watch-Tower is not a target on this page: it PULLS with an API key. This
+  // page said "Nothing is delivered anywhere yet" for a project Watch-Tower
+  // was reading every few minutes, because it only knew about pushes.
+  const handover = useApi(() => (pid ? api.handover(pid) : Promise.resolve(null)),
+                          [pid], { every: 20_000 });
   const own = targets.filter((t) => t.scope !== "global");
   const global = targets.filter((t) => t.scope === "global");
 
@@ -520,11 +526,15 @@ export default function Delivery({ onMenu }) {
 
       {loading && !data && <Loading />}
       {error && !data && <ErrorState error={error} retry={reload} />}
+      <HandoverPanel data={handover.data} loading={handover.loading}
+                     error={handover.error} source="all" projectName={project?.name} />
+
       {data && targets.length === 0 && (
-        <Empty title="Nothing is delivered anywhere yet">
-          Add a target — a Watch-Tower webhook, a Telegram chat or a Google
-          Sheet — and every post this project collects is sent there, seconds
-          after collection.
+        <Empty title="No push targets">
+          Watch-Tower is not listed here because it pulls from this project
+          itself (the panel above). Add a target — a webhook, a Telegram chat
+          or a Google Sheet — only if posts should also be PUSHED somewhere,
+          seconds after collection.
         </Empty>
       )}
 

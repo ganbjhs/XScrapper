@@ -148,7 +148,7 @@ def _day(ms: int) -> str:
 
 
 def record_pull(project, platform, *, since_ms=None, rows=0, to_ms=None,
-                status=200, key_hint: str = "") -> None:
+                status=200, key_hint: str = "", tip: bool = True) -> None:
     """One cursored pull, answered. `since_ms` is the since_collected_ms the
     consumer presented (None when it walked by id), `to_ms` the collected_ms
     of the last row handed back (None for an empty page or an error)."""
@@ -167,6 +167,7 @@ def record_pull(project, platform, *, since_ms=None, rows=0, to_ms=None,
             "since_ms": now_ms, "ack_ms": None, "served_ms": None,
             "last_ms": 0, "last_ok_ms": 0, "last_rows": 0, "last_status": 0,
             "days": {}, "recent": []})
+        prev_served = led.get("served_ms")
         led["last_ms"] = now_ms
         led["last_status"] = int(status)
         led["last_rows"] = int(rows or 0)
@@ -178,7 +179,7 @@ def record_pull(project, platform, *, since_ms=None, rows=0, to_ms=None,
                 led["served_ms"] = int(to_ms)
         day = led["days"].setdefault(_day(now_ms), {
             "pulls": 0, "rows": 0, "empty": 0, "errors": 0,
-            "wait_sum_ms": 0, "wait_n": 0, "wait_max_ms": 0})
+            "tip_wait_sum_ms": 0, "tip_wait_n": 0, "tip_wait_max_ms": 0})
         day["pulls"] += 1
         if not ok:
             day["errors"] += 1
@@ -187,12 +188,19 @@ def record_pull(project, platform, *, since_ms=None, rows=0, to_ms=None,
         else:
             day["rows"] += int(rows)
             # How long the NEWEST row of this page sat with us before it was
-            # taken: the freshest measure of the consumer's own cadence.
-            if to_ms is not None and now_ms >= to_ms:
+            # taken — but only for a page at the TIP that reaches NEW ground:
+            # the last page of a walk (`tip`), ending past anything served
+            # before. The first version timed every page, and a consumer
+            # re-walking old rows (a backfill, a resync, the first walk after
+            # this ledger began) read as "a post waits 3h, 13h max" on a
+            # project being pulled every few minutes (live, 2026-10-02). The
+            # tally keys carry a new name so that day's figures are dropped.
+            if (tip and to_ms is not None and prev_served is not None
+                    and to_ms > prev_served and now_ms >= to_ms):
                 w = now_ms - int(to_ms)
-                day["wait_sum_ms"] += w
-                day["wait_n"] += 1
-                day["wait_max_ms"] = max(day["wait_max_ms"], w)
+                day["tip_wait_sum_ms"] = day.get("tip_wait_sum_ms", 0) + w
+                day["tip_wait_n"] = day.get("tip_wait_n", 0) + 1
+                day["tip_wait_max_ms"] = max(day.get("tip_wait_max_ms", 0), w)
         for k in sorted(led["days"])[:-PULL_DAYS]:
             led["days"].pop(k, None)
         led["recent"].append({"at_ms": now_ms, "since_ms": since_ms,

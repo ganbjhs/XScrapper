@@ -2375,7 +2375,11 @@ def _handover_uncached(pid: int):
             day = (led.get("days") or {}).get(today) or {}
             recent = led.get("recent") or []
             ok_times = [r["at_ms"] for r in recent if 200 <= r.get("status", 0) < 300]
-            gaps = sorted(b - a for a, b in zip(ok_times, ok_times[1:]))
+            # A walk is several pages a few hundred ms apart; the cadence is
+            # the gap between WALKS, so pages within a minute are one visit.
+            # (The first version reported "every ~247ms".)
+            gaps = sorted(g for g in (b - a for a, b in zip(ok_times, ok_times[1:]))
+                          if g >= 60_000)
             last_ok = led.get("last_ok_ms") or 0
             if not led or not last_ok:
                 state = "never"
@@ -2405,9 +2409,9 @@ def _handover_uncached(pid: int):
                 "empty_today": day.get("empty", 0),
                 "errors_today": day.get("errors", 0),
                 "typical_gap_ms": gaps[len(gaps) // 2] if gaps else None,
-                "avg_wait_ms": (day["wait_sum_ms"] // day["wait_n"]
-                                if day.get("wait_n") else None),
-                "max_wait_ms": day.get("wait_max_ms") or None,
+                "avg_wait_ms": (day["tip_wait_sum_ms"] // day["tip_wait_n"]
+                                if day.get("tip_wait_n") else None),
+                "max_wait_ms": day.get("tip_wait_max_ms") or None,
                 "days": led.get("days") or {},
                 "recent": recent[-15:][::-1],
             }
@@ -7361,6 +7365,7 @@ class Handler(BaseHTTPRequestHandler):
                 to_ms = (body.get("cursor") or {}).get("since_collected_ms")
             consumers.record_pull(
                 q.get("project"), plat, since_ms=since_ms, rows=rows,
+                tip=not (isinstance(body, dict) and body.get("has_more")),
                 to_ms=int(to_ms) if to_ms is not None else None, status=status,
                 key_hint="…" + (_presented_key(self.headers) or "")[-4:])
         except Exception:
