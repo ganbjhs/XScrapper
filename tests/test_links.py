@@ -877,6 +877,13 @@ class _FakeHandler:
     def _authed(self):
         return False
 
+    def _client_ip(self):
+        # _require_auth names the caller in the audit trail (51278a4).
+        return "127.0.0.1"
+
+    def _audit_key_ok(self, *a, **k):
+        pass                    # the audit line is not what this test checks
+
 
 def test_web(ok):
     print("== web: /api/links and project-locked keys ==")
