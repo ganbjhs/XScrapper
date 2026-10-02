@@ -316,8 +316,28 @@ header.top .grow { flex: 1; }
 .stats {
   display: grid; grid-template-columns: repeat(4, 1fr);
   background: var(--surface); border: 1px solid var(--ring); box-shadow: var(--shadow-sm);
-  border-radius: var(--radius); margin-bottom: 16px; overflow: hidden;
+  border-radius: var(--radius); margin-bottom: 16px;
 }
+/* The strip no longer clips (the hover breakdown hangs below it), so the end
+   cells round their own corners for the hover tint. */
+.stat:first-child { border-radius: var(--radius) 0 0 var(--radius); }
+.stat:last-child { border-radius: 0 var(--radius) var(--radius) 0; }
+.stat-hover { position: relative; cursor: default; }
+.stat-hover:focus { outline: none; }
+.stat-pop {
+  display: none; position: absolute; left: 10px; top: calc(100% - 4px); z-index: 20;
+  min-width: 230px; max-width: min(320px, 86vw);
+  background: var(--surface); border: 1px solid var(--ring); box-shadow: var(--shadow-md);
+  border-radius: 10px; padding: 10px 12px 8px;
+}
+.stat-hover:hover .stat-pop, .stat-hover:focus .stat-pop, .stat-hover:focus-within .stat-pop { display: block; }
+.stat-pop-sec + .stat-pop-sec { margin-top: 10px; }
+.stat-pop-h { display: flex; justify-content: space-between; gap: 10px; font-size: 12.5px; padding-bottom: 5px; }
+.stat-pop-h span { color: var(--ink-2); font-variant-numeric: tabular-nums; font-weight: 600; }
+.stat-pop .kv { padding: 4px 0; font-size: 11.5px; }
+.stat-pop-last { font-size: 11.5px; color: var(--ink-3); padding-top: 5px; border-top: 1px solid var(--ring); }
+.stat-pop-last.st-crit { color: var(--critical); }
+.stat-pop-foot { font-size: 10.5px; color: var(--ink-3); margin-top: 9px; line-height: 1.4; }
 .stat { padding: 13px 18px; border-right: 1px solid var(--ring); min-width: 0; transition: background 0.14s; }
 .stat:hover { background: var(--surface-2); }
 .stat:last-child { border-right: 0; }

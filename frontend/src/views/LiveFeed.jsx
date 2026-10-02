@@ -8,6 +8,96 @@ import PostCard from "../components/PostCard.jsx";
 import { useClassifyButton, useLabelRun } from "../components/Sentiments.jsx";
 import { Empty, ErrorState, Loading } from "../components/ui.jsx";
 
+// "Collected today" follows the Source filter (2026-10-02). It used to show
+// X's number whatever the filter said, so an Instagram view with nothing
+// collected for four days still read "1,802" — a number that says "all is
+// well" over an empty list. Now it is the selected platform's own count for
+// today, with WHEN that platform last collected anything, and the full
+// breakdown on hover. Older servers have no `platforms_today`: fall back to
+// the X-only figures they do send.
+const PLATFORM_NAME = { x: "X", instagram: "Instagram", facebook: "Facebook" };
+const STALE_MS = 24 * 3600 * 1000;      // a platform silent for a day is not alive
+
+function CollectedToday({ m, source }) {
+  const pt = m?.platforms_today || (m?.today ? { x: { ...m.today } } : null);
+  const keys = source === "all" ? ["x", "instagram", "facebook"] : [source];
+  const get = (k) => pt?.[k] || {};
+  const total = pt ? keys.reduce((n, k) => n + (get(k).collected || 0), 0) : null;
+  const has = (k) => pt && Object.prototype.hasOwnProperty.call(pt, k);
+
+  const lastLine = (k) => {
+    const last = get(k).last_collected_ms;
+    if (!has(k) || !("last_collected_ms" in get(k))) return null;
+    // Red only for a platform that WAS collecting and has gone quiet; one
+    // that never collected here (no sources) is just stated, not alarmed.
+    const stale = !!last && Date.now() - last > STALE_MS;
+    return {
+      stale,
+      text: last ? `last collected ${fmtAgo(last)}`
+        : (k === "x" ? "nothing collected in 7 days" : "nothing collected yet"),
+    };
+  };
+  const rowsFor = (k) => {
+    const p = get(k);
+    if (k === "x") return [["Posts", p.posts], ["Retweets", p.retweets], ["Replies", p.replies],
+                           ["Quotes", p.quotes], ["With photos", p.photos], ["With video", p.videos]];
+    if (k === "instagram") return [["Photos", p.photos], ["Reels", p.reels],
+                                   ["Videos", p.videos], ["Albums", p.albums]];
+    return [["With photos", p.photos], ["With video", p.videos]];
+  };
+
+  let sub;
+  if (!pt) sub = "—";
+  else if (source === "all") {
+    sub = keys.filter(has).map((k) => `${PLATFORM_NAME[k]} ${fmtN(get(k).collected || 0)}`).join(" · ");
+  } else if (source === "x") {
+    const p = get("x");
+    sub = p.posts != null
+      ? `${fmtN(p.posts)} posts · ${fmtN(p.retweets)} RT · ${fmtN(p.replies)} replies`
+      : `${fmtN(p.photos)} photos · ${fmtN(p.videos)} videos`;
+  } else {
+    sub = lastLine(source)?.text || "—";
+  }
+  const single = source !== "all" ? lastLine(source) : null;
+  const silent = keys.filter((k) => lastLine(k)?.stale).map((k) => PLATFORM_NAME[k]);
+
+  return (
+    <div className="stat stat-hover" tabIndex={0}>
+      <div className="k">
+        Collected today{source !== "all" ? ` · ${PLATFORM_NAME[source]}` : ""}
+      </div>
+      <div className={"v" + (single?.stale ? " st-crit" : "")}>{fmtN(total)}</div>
+      <div className={"d" + (single?.stale ? " st-crit" : "")}>
+        {sub}
+        {source === "all" && silent.length > 0 &&
+          <span className="st-crit"> · {silent.join(", ")} silent</span>}
+      </div>
+      {pt && (
+        <div className="stat-pop" role="tooltip">
+          {keys.filter(has).map((k) => {
+            const ll = lastLine(k);
+            return (
+              <div className="stat-pop-sec" key={k}>
+                <div className="stat-pop-h">
+                  <b>{PLATFORM_NAME[k]}</b>
+                  <span>{fmtN(get(k).collected || 0)} today</span>
+                </div>
+                {rowsFor(k).filter(([, v]) => v != null).map(([label, v]) => (
+                  <div className="kv" key={label}><span>{label}</span><b>{fmtN(v)}</b></div>
+                ))}
+                {ll && (
+                  <div className={"stat-pop-last" + (ll.stale ? " st-crit" : "")}>{ll.text}</div>
+                )}
+              </div>
+            );
+          })}
+          <div className="stat-pop-foot">Today = since midnight UTC (05:30 IST), by when we collected it.</div>
+        </div>
+      )}
+    </div>
+  );
+}
+
 const normIg = (p) => ({
   platform: "instagram",
   tweet_id: p.id,
@@ -428,11 +518,7 @@ export default function LiveFeed({ onMenu }) {
       )}
 
       <section className="stats">
-        <div className="stat">
-          <div className="k">Collected today</div>
-          <div className="v">{fmtN(m?.today?.collected)}</div>
-          <div className="d">{fmtN(m?.today?.photos)} photos · {fmtN(m?.today?.videos)} videos</div>
-        </div>
+        <CollectedToday m={m} source={flt.source} />
         <div className="stat">
           <div className="k">Median lag</div>
           <div className="v">{m?.today?.median_lag_ms != null ? fmtLag(m.today.median_lag_ms) : "—"}</div>

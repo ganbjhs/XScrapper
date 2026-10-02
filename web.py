@@ -2096,7 +2096,23 @@ def _metrics_json(q=None):
 def _metrics_uncached(pid: int):
     out = {"today": {"collected": 0, "photos": 0, "videos": 0,
                      "median_lag_ms": None, "p95_lag_ms": None},
-           "per_day": [], "totals": {"tweets": 0}}
+           "per_day": [], "totals": {"tweets": 0},
+           # ADDED 2026-10-02, additive: what each platform COLLECTED today
+           # (same UTC day as `today`), broken down, plus when it last
+           # collected anything. `today` above is X only and always was; the
+           # dashboard's stat follows its Source filter from this block, so
+           # "Instagram" no longer shows X's number over an empty Instagram
+           # list. last_collected_ms is None when there is nothing in the
+           # last 7 days (X) / ever (Instagram, Facebook).
+           "platforms_today": {
+               "x": {"collected": 0, "posts": 0, "retweets": 0, "replies": 0,
+                     "quotes": 0, "photos": 0, "videos": 0,
+                     "last_collected_ms": None},
+               "instagram": {"collected": 0, "photos": 0, "videos": 0,
+                             "reels": 0, "albums": 0, "last_collected_ms": None},
+               "facebook": {"collected": 0, "photos": 0, "videos": 0,
+                            "last_collected_ms": None}}}
+    pt = out["platforms_today"]
     day_ms = 86_400_000
     now_ms = int(time.time() * 1000)
     midnight = (now_ms // day_ms) * day_ms
@@ -2132,6 +2148,27 @@ def _metrics_uncached(pid: int):
                 [midnight, *scope_params]).fetchone()
             out["today"].update(collected=r["c"], photos=r["p"] or 0,
                                 videos=r["v"] or 0)
+            # The same rows, split by what kind of post each is. One bucket
+            # each, so the four add up to `collected`: a retweet first, then a
+            # reply, then a quote, and what is left is an original post.
+            k = con.execute(
+                "SELECT "
+                "  SUM(CASE WHEN COALESCE(t.is_retweet,0) != 0 THEN 1 ELSE 0 END) rt, "
+                "  SUM(CASE WHEN COALESCE(t.is_retweet,0) = 0 "
+                "        AND COALESCE(t.is_reply,0) != 0 THEN 1 ELSE 0 END) rp, "
+                "  SUM(CASE WHEN COALESCE(t.is_retweet,0) = 0 "
+                "        AND COALESCE(t.is_reply,0) = 0 "
+                "        AND COALESCE(t.is_quote,0) != 0 THEN 1 ELSE 0 END) qt "
+                f"FROM tweets t WHERE t.source = 'result' AND t.collected_ms >= ?{scope}",
+                [midnight, *scope_params]).fetchone()
+            rt, rp, qt = k["rt"] or 0, k["rp"] or 0, k["qt"] or 0
+            last = con.execute(
+                "SELECT MAX(t.collected_ms) m FROM tweets t WHERE t.source = 'result' "
+                f"AND t.collected_ms >= ?{scope}", [week_ago, *scope_params]).fetchone()["m"]
+            pt["x"].update(collected=r["c"], retweets=rt, replies=rp, quotes=qt,
+                           posts=max(0, (r["c"] or 0) - rt - rp - qt),
+                           photos=r["p"] or 0, videos=r["v"] or 0,
+                           last_collected_ms=last)
             lags = [x["lag_ms"] for x in con.execute(
                 "SELECT t.lag_ms FROM tweets t WHERE t.source = 'result' "
                 f"AND t.collected_ms >= ? AND t.lag_ms IS NOT NULL{scope}",
@@ -2167,6 +2204,26 @@ def _metrics_uncached(pid: int):
                     "SELECT (taken_at * 1000) / ? AS d, COUNT(*) c FROM posts "
                     f"WHERE taken_at * 1000 >= ? AND {_sq} GROUP BY d",
                     (day_ms, week_ago, *_sa))}
+                # Collected TODAY (by when we saved it, like X), by kind.
+                # media_type: 1 photo, 2 video, 8 album; a reel is a video
+                # whose product_type is 'clips'.
+                g = con.execute(
+                    "SELECT COUNT(*) c, "
+                    "  SUM(CASE WHEN media_type = 1 THEN 1 ELSE 0 END) ph, "
+                    "  SUM(CASE WHEN media_type = 2 AND COALESCE(product_type,'') "
+                    "        = 'clips' THEN 1 ELSE 0 END) rl, "
+                    "  SUM(CASE WHEN media_type = 2 AND COALESCE(product_type,'') "
+                    "        != 'clips' THEN 1 ELSE 0 END) vd, "
+                    "  SUM(CASE WHEN media_type = 8 THEN 1 ELSE 0 END) al "
+                    f"FROM posts WHERE collected_at >= ? AND {_sq}",
+                    (midnight // 1000, *_sa)).fetchone()
+                last = con.execute(
+                    f"SELECT MAX(collected_at) m FROM posts WHERE {_sq}",
+                    tuple(_sa)).fetchone()["m"]
+                pt["instagram"].update(
+                    collected=g["c"] or 0, photos=g["ph"] or 0, reels=g["rl"] or 0,
+                    videos=g["vd"] or 0, albums=g["al"] or 0,
+                    last_collected_ms=int(last) * 1000 if last else None)
             finally:
                 con.close()
         except Exception:
@@ -2185,6 +2242,17 @@ def _metrics_uncached(pid: int):
                 fb_by_day = {int(r["d"]): r["c"] for r in con.execute(
                     f"SELECT collected_ms / ? AS d, COUNT(*) c FROM posts "
                     f"WHERE {fb_where} GROUP BY d", (day_ms, *fb_params))}
+                g = con.execute(
+                    "SELECT COUNT(*) c, "
+                    "  SUM(CASE WHEN media_json LIKE '%\"photo\"%' THEN 1 ELSE 0 END) ph, "
+                    "  SUM(CASE WHEN media_json LIKE '%\"video\"%' THEN 1 ELSE 0 END) vd "
+                    "FROM posts WHERE collected_ms >= ? AND project_id = ?",
+                    (midnight, pid)).fetchone()
+                last = con.execute(
+                    "SELECT MAX(collected_ms) m FROM posts WHERE project_id = ?",
+                    (pid,)).fetchone()["m"]
+                pt["facebook"].update(collected=g["c"] or 0, photos=g["ph"] or 0,
+                                      videos=g["vd"] or 0, last_collected_ms=last)
             finally:
                 con.close()
         except Exception:

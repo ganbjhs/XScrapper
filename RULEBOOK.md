@@ -1258,6 +1258,23 @@ streamed login is dead; the phone-shaped one (above) is the third door.
   polled request holds one of the browser's six connections and queues the
   fast ones behind it.
 
+### A number on the dashboard answers "is it alive", for the platform on screen (2026-10-02)
+
+- "Collected today" on the Live Feed follows the Source filter. It showed X's
+  count whatever the filter said, so an Instagram view that had collected
+  nothing for four days still read "1,802" — a healthy number over an empty
+  list. With Instagram selected it is Instagram's count for today, and under
+  it WHEN that platform last collected anything, in red once that is more
+  than a day old. A lifetime total ("1,050 collected") says how much we have,
+  never whether it still works; do not put one where a health signal belongs.
+- Hovering the stat gives the breakdown: X as posts / retweets / replies /
+  quotes (one bucket each, so they add up to the count), Instagram as photos /
+  reels / videos / albums, each with its last-collected time.
+- The data is `platforms_today` on `/api/metrics` — a NEW top-level key.
+  `today`, `per_day` and `totals` are byte-for-byte what they were; an
+  integration that reads them is unaffected. Extend this block, never
+  repurpose the old keys.
+
 ### Instagram is the STRICT platform — treat every rule here as non-negotiable
 
 Instagram's bot detection watches rhythm, volume, IP and device as much as any
