@@ -917,3 +917,18 @@ kbd {
 @media (prefers-reduced-motion: reduce) {
   *, *::before, *::after { animation-duration: 0.01ms !important; transition-duration: 0.01ms !important; }
 }
+
+/* Collector → Watch-Tower hand-over panel */
+.ho-sec + .ho-sec { margin-top: 14px; padding-top: 12px; border-top: 1px solid var(--ring); }
+.ho-h { display: flex; justify-content: space-between; align-items: baseline; gap: 10px; font-size: 13px; margin-top: 6px; }
+.ho-h span { font-size: 12px; font-weight: 650; }
+.ho-flow { display: flex; align-items: flex-end; gap: 8px; margin: 8px 0 4px; }
+.ho-flow > div { display: flex; flex-direction: column; min-width: 0; }
+.ho-flow span { font-size: 10.5px; color: var(--ink-3); white-space: nowrap; }
+.ho-flow b { font-size: 18px; font-weight: 650; font-variant-numeric: tabular-nums; letter-spacing: -0.02em; }
+.ho-flow i { font-style: normal; color: var(--ink-3); padding-bottom: 3px; }
+.ho-line { font-size: 11.5px; color: var(--ink-3); margin-bottom: 6px; }
+.ho-foot { font-size: 11px; color: var(--ink-3); line-height: 1.45; margin-top: 12px; padding-top: 10px; border-top: 1px solid var(--ring); }
+.ho-pulls { width: 100%; border-collapse: collapse; font-size: 11.5px; margin-top: 8px; font-variant-numeric: tabular-nums; }
+.ho-pulls th { text-align: left; font-weight: 600; color: var(--ink-3); padding: 3px 0; border-bottom: 1px solid var(--ring); }
+.ho-pulls td { padding: 3px 0; border-bottom: 1px solid var(--ring); }

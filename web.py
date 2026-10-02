@@ -2269,6 +2269,154 @@ def _metrics_uncached(pid: int):
     return out
 
 
+HANDOVER_TTL_S = 10
+# A consumer that mirrors every few minutes and has not asked for this long
+# has stopped. Watch-Tower's own interval was measured at 6-8 minutes.
+HANDOVER_STALLED_S = 30 * 60
+
+
+def _handover_json(q=None):
+    """
+    The hand-over between this collector and its API consumer (Watch-Tower),
+    for ONE project: what was collected, what the consumer has taken, what is
+    still waiting, and the pulls themselves. Dashboard-only.
+
+    The counts come from the posts tables, measured against the two positions
+    the ledger holds (consumers.py): `served_ms` — the newest row we have put
+    on the wire — and `ack_ms` — the newest position the consumer has itself
+    presented, i.e. confirmed stored. So:
+
+        taken      collected_ms <= served_ms         (handed over)
+        confirmed  collected_ms <= ack_ms            (the consumer came back
+                                                      for more after it)
+        waiting    collected_ms >  served_ms         (not asked for yet)
+
+    What the consumer does with a row AFTER taking it (its keyword and
+    relevance filters) is invisible from here, and the answer says so rather
+    than implying a row we handed over is a row on their screen.
+    """
+    try:
+        pid = int((q or {}).get("project") or 0)
+    except (TypeError, ValueError):
+        pid = 0
+    if not pid:
+        return dict(_NO_PROJECT)
+    return _ttl_cached(("handover", pid), HANDOVER_TTL_S,
+                       lambda: _handover_uncached(pid))
+
+
+def _handover_uncached(pid: int):
+    day_ms = 86_400_000
+    now_ms = int(time.time() * 1000)
+    midnight = (now_ms // day_ms) * day_ms
+    today = time.strftime("%Y-%m-%d", time.gmtime(now_ms / 1000))
+    ledger = consumers.pulls(pid)
+
+    def counts_x(lo, hi=None):
+        """(count, newest, oldest) of this project's tweets collected in (lo, hi]."""
+        if not _CFG.db_results.exists():
+            return 0, None, None
+        where = ("t.source = 'result' AND t.collected_ms > ? "
+                 "AND EXISTS (SELECT 1 FROM tweet_hits ph "
+                 "   JOIN project_streams ps ON ps.stream_id = ph.stream_id "
+                 "   WHERE ph.tweet_id = t.tweet_id AND ps.project_id = ?)")
+        args = [lo, pid]
+        if hi is not None:
+            where += " AND t.collected_ms <= ?"
+            args.append(hi)
+        with _connect() as con:
+            r = con.execute("SELECT COUNT(*) c, MAX(t.collected_ms) hi, "
+                            f"MIN(t.collected_ms) lo FROM tweets t WHERE {where}",
+                            args).fetchone()
+        return r["c"] or 0, r["hi"], r["lo"]
+
+    def counts_ig(lo, hi=None):
+        rp = _CFG.root / "ig_results.db"
+        if not rp.exists():
+            return 0, None, None
+        import store_ig
+        con = sqlite3.connect(f"file:{rp}?mode=ro", uri=True, timeout=5)
+        try:
+            con.row_factory = sqlite3.Row
+            _sq, _sa = store_ig.post_scope(con, pid)
+            # The stream's own comparison (collected_at * 1000 > cursor), so
+            # "waiting" here is exactly what the next pull would return.
+            where, args = f"collected_at * 1000 > ? AND {_sq}", [lo, *_sa]
+            if hi is not None:
+                where += " AND collected_at * 1000 <= ?"
+                args.append(hi)
+            r = con.execute("SELECT COUNT(*) c, MAX(collected_at) hi, "
+                            f"MIN(collected_at) lo FROM posts WHERE {where}",
+                            args).fetchone()
+        finally:
+            con.close()
+        return (r["c"] or 0, r["hi"] * 1000 if r["hi"] else None,
+                r["lo"] * 1000 if r["lo"] else None)
+
+    out = {"project_id": pid, "now_ms": now_ms, "day_start_ms": midnight,
+           "stalled_after_s": HANDOVER_STALLED_S, "platforms": {}}
+    for plat, counts in (("x", counts_x), ("instagram", counts_ig)):
+        try:
+            led = ledger.get(plat) or {}
+            collected, newest, _ = counts(midnight - 1)
+            served, ack = led.get("served_ms"), led.get("ack_ms")
+            # The position to measure against. A consumer that has presented a
+            # cursor but been handed nothing since we started writing this
+            # down has still told us how far it is: use what it presented.
+            pos = max([v for v in (served, ack) if v is not None], default=None)
+            if pos is None:
+                taken = confirmed = waiting = None
+                waiting_since = None
+            else:
+                taken = counts(midnight - 1, pos)[0] if pos >= midnight else 0
+                confirmed = (counts(midnight - 1, ack)[0]
+                             if ack is not None and ack >= midnight else 0)
+                waiting, _, waiting_since = counts(pos)
+            day = (led.get("days") or {}).get(today) or {}
+            recent = led.get("recent") or []
+            ok_times = [r["at_ms"] for r in recent if 200 <= r.get("status", 0) < 300]
+            gaps = sorted(b - a for a, b in zip(ok_times, ok_times[1:]))
+            last_ok = led.get("last_ok_ms") or 0
+            if not led or not last_ok:
+                state = "never"
+            elif now_ms - last_ok > HANDOVER_STALLED_S * 1000:
+                state = "stalled"
+            elif waiting and waiting_since and now_ms - waiting_since > HANDOVER_STALLED_S * 1000:
+                state = "behind"
+            else:
+                state = "in_sync" if not waiting else "flowing"
+            out["platforms"][plat] = {
+                "state": state,
+                "collected_today": collected,
+                "newest_collected_ms": newest,
+                "taken_today": taken,
+                "confirmed_today": confirmed,
+                "waiting": waiting,
+                "waiting_since_ms": waiting_since,
+                "served_ms": served,
+                "ack_ms": ack,
+                "last_pull_ms": led.get("last_ms") or None,
+                "last_ok_ms": last_ok or None,
+                "last_status": led.get("last_status") or None,
+                "last_rows": led.get("last_rows"),
+                "recording_since_ms": led.get("since_ms"),
+                "pulls_today": day.get("pulls", 0),
+                "rows_today": day.get("rows", 0),
+                "empty_today": day.get("empty", 0),
+                "errors_today": day.get("errors", 0),
+                "typical_gap_ms": gaps[len(gaps) // 2] if gaps else None,
+                "avg_wait_ms": (day["wait_sum_ms"] // day["wait_n"]
+                                if day.get("wait_n") else None),
+                "max_wait_ms": day.get("wait_max_ms") or None,
+                "days": led.get("days") or {},
+                "recent": recent[-15:][::-1],
+            }
+        except Exception as e:
+            out["platforms"][plat] = {"state": "error",
+                                      "error": f"{type(e).__name__}: {e}"}
+    return out
+
+
 # --------------------------------------------------------------------------
 # projects & watchlists — thin validators over the Store methods
 # --------------------------------------------------------------------------
@@ -6917,6 +7065,15 @@ class Handler(BaseHTTPRequestHandler):
                 return False
             ok, retry = _rate_ok(presented)
             if not ok:
+                try:
+                    _u = urllib.parse.urlparse(self.path)
+                    _q = dict(urllib.parse.parse_qsl(_u.query))
+                    _plat = consumers.mirror_platform(_u.path, _q)
+                    if _plat and _q.get("project"):
+                        consumers.record_pull(_q["project"], _plat, status=429,
+                                              key_hint="…" + presented[-4:])
+                except Exception:
+                    pass
                 import links as _links
                 self._send(429, {
                     "error": f"rate limit: {_links.RATE_PER_MIN} requests per minute",
@@ -7183,6 +7340,32 @@ class Handler(BaseHTTPRequestHandler):
         return self._send(200, f.read_bytes(), ctype,
                           extra={"Cache-Control": "public, max-age=31536000, immutable"})
 
+    def _note_pull(self, path, q, body, status):
+        """Write one cursored pull by a machine key into the hand-over ledger
+        (consumers.record_pull). Observational: it must never fail a request,
+        and it changes nothing the consumer receives."""
+        try:
+            if not getattr(self, "_via_api_key", False) or not q.get("project"):
+                return
+            plat = consumers.mirror_platform(path, q)
+            if not plat:
+                return
+            since = q.get("since_collected_ms")
+            since_ms = int(since) if since not in (None, "") else None
+            rows, to_ms = 0, None
+            if isinstance(body, dict):
+                got = body.get("rows")
+                if got is None:
+                    got = body.get("posts") or []
+                rows = len(got)
+                to_ms = (body.get("cursor") or {}).get("since_collected_ms")
+            consumers.record_pull(
+                q.get("project"), plat, since_ms=since_ms, rows=rows,
+                to_ms=int(to_ms) if to_ms is not None else None, status=status,
+                key_hint="…" + (_presented_key(self.headers) or "")[-4:])
+        except Exception:
+            pass
+
     def _send(self, code, body, ctype="application/json; charset=utf-8", extra=None):
         if isinstance(body, (dict, list)):
             body = json.dumps(body, ensure_ascii=False)
@@ -7304,7 +7487,13 @@ class Handler(BaseHTTPRequestHandler):
                         and (q.get("platform") or "").lower() != "instagram"
                         and not _ig_stream_project(q.get("stream"))):
                     return self._send(200, {"total": 0, "rows": []})
-                return self._send(200, _query_tweets(q))
+                try:
+                    body = _query_tweets(q)
+                except Exception:
+                    self._note_pull(u.path, q, None, 500)
+                    raise
+                self._note_pull(u.path, q, body, 200)
+                return self._send(200, body)
             if u.path == "/api/projects":
                 return self._send(200, _projects_json())
             if u.path == "/api/watchlists":
@@ -7350,6 +7539,10 @@ class Handler(BaseHTTPRequestHandler):
                 return self._send(200, _activity_logs_json(q))
             if u.path == "/api/metrics":
                 return self._send(200, _metrics_json(q))
+            if u.path == "/api/handover":
+                # Dashboard-only (not in any key allowlist): what the API
+                # consumer has taken from this project and what is waiting.
+                return self._send(200, _handover_json(q))
             if u.path == "/api/login/frame":
                 s = _LOGIN["session"]
                 if s is None:
@@ -7372,7 +7565,9 @@ class Handler(BaseHTTPRequestHandler):
             if u.path == "/api/ig/diag":
                 return self._send(200, _ig_diag())
             if u.path == "/api/ig/posts":
-                return self._send(200, _ig_posts(q))
+                body = _ig_posts(q)
+                self._note_pull(u.path, q, body, 200)
+                return self._send(200, body)
             if u.path == "/api/fb/status":
                 return self._send(200, _fb_status(q))
             if u.path == "/api/fb/posts":

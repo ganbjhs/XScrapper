@@ -1275,6 +1275,27 @@ streamed login is dead; the phone-shaped one (above) is the third door.
   integration that reads them is unaffected. Extend this block, never
   repurpose the old keys.
 
+### The hand-over to Watch-Tower is written down, per project (2026-10-02)
+
+- Watch-Tower PULLS (`/api/tweets?project=P&since_collected_ms=…` with an API
+  key); nothing is pushed to it. The Live Feed's "Sent to Watch-Tower: Not set
+  up — declare a [[webhooks]] target" described a path nobody uses, so "did
+  the collector send it?" had no answer on the dashboard.
+- Every cursored pull by a machine key is recorded in `consumers.json`
+  (`consumers.record_pull`): the position presented, rows given, the position
+  of the last row given, the status (a 429 included). Two positions:
+  `served_ms` (newest row put on the wire) and `ack_ms` (newest position the
+  consumer itself presented — confirmed stored).
+- The counts are NOT stored. `/api/handover?project=P` counts the posts tables
+  against those positions: taken = collected at or before `served_ms`, waiting
+  = after it. A repeated page can therefore never be counted twice, and the
+  panel cannot drift from the database.
+- The proof ends at the hand-over. What Watch-Tower does with a row afterwards
+  (its keyword / relevance filters, its push into a project) is not visible
+  here, and the panel must keep saying so rather than imply delivery to a feed.
+- `/api/handover` is dashboard-only: it is in no API-key allowlist. Recording
+  is observational — it must never change a response or fail a request.
+
 ### Instagram is the STRICT platform — treat every rule here as non-negotiable
 
 Instagram's bot detection watches rhythm, volume, IP and device as much as any

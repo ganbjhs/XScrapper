@@ -4,6 +4,7 @@ import { api, fmtAgo, fmtLag, fmtN, useApi } from "../api/client.js";
 import { PageHead, useProject } from "../App.jsx";
 import CollectedChart from "../components/CollectedChart.jsx";
 import CollectionPicker from "../components/CollectionPicker.jsx";
+import HandoverPanel, { HandoverStat } from "../components/Handover.jsx";
 import PostCard from "../components/PostCard.jsx";
 import { useClassifyButton, useLabelRun } from "../components/Sentiments.jsx";
 import { Empty, ErrorState, Loading } from "../components/ui.jsx";
@@ -203,6 +204,9 @@ export default function LiveFeed({ onMenu }) {
   const metrics = useApi(() => api.metrics(pid), [pid], { every: 30_000 });
   const status = useApi(() => api.status(), [], { every: 30_000 });
   const delivery = useApi(() => api.delivery(pid), [pid], { every: 15_000 });
+  // What Watch-Tower has pulled from this project (it pulls; we do not push).
+  const handover = useApi(() => (pid ? api.handover(pid) : Promise.resolve(null)),
+                          [pid], { every: 20_000 });
   const wls = useApi(() => (pid ? api.watchlists(pid) : Promise.resolve({ watchlists: [] })), [pid]);
   // Labelling state: how many posts are waiting, the project's vocabulary, and
   const labels = useApi(
@@ -529,25 +533,7 @@ export default function LiveFeed({ onMenu }) {
           <div className="v">{fmtN(handleCount)}</div>
           <div className="d">handles across {wlCount} watchlist{wlCount === 1 ? "" : "s"}</div>
         </div>
-        <div className="stat">
-          <div className="k">Sent to Watch-Tower</div>
-          {wtTargets.length === 0 ? (
-            <>
-              <div className="v" style={{ fontSize: 18 }}>Not set up</div>
-              <div className="d">declare a [[webhooks]] target</div>
-            </>
-          ) : behind === 0 ? (
-            <>
-              <div className="v st-good" style={{ fontSize: 20 }}>✓ In sync</div>
-              <div className="d">cursor 0 behind</div>
-            </>
-          ) : (
-            <>
-              <div className="v st-warn" style={{ fontSize: 20 }}>⚠ {fmtN(behind)} behind</div>
-              <div className="d">delivery is catching up</div>
-            </>
-          )}
-        </div>
+        <HandoverStat data={handover.data} source={flt.source} />
       </section>
 
       <div className="fbar">
@@ -656,12 +642,16 @@ export default function LiveFeed({ onMenu }) {
         </section>
 
         <aside>
+          <HandoverPanel data={handover.data} loading={handover.loading}
+                         error={handover.error} source={flt.source}
+                         projectName={project?.name} />
+
+          {/* Push targets (webhook / Telegram) only when some exist: nothing
+              is pushed to Watch-Tower today, and an empty "No webhook
+              targets" box read as "nothing is being sent". */}
+          {((delivery.data?.targets || []).length > 0) && (
           <div className="panel">
-            <div className="phead"><h3>Delivery to Watch-Tower</h3><span className="right">webhook</span></div>
-            {delivery.loading && !delivery.data && <div className="sub" style={{ color: "var(--ink-3)" }}>Loading…</div>}
-            {delivery.data && wtTargets.length === 0 && (
-              <div className="kv"><span>No webhook targets</span><b>see config.toml.example</b></div>
-            )}
+            <div className="phead"><h3>Push targets</h3><span className="right">webhook · Telegram</span></div>
             {wtTargets.map((t) => (
               <div key={t.label}>
                 <div className="kv"><span>{t.label} → {t.url}</span><b /></div>
@@ -685,6 +675,7 @@ export default function LiveFeed({ onMenu }) {
               </div>
             ))}
           </div>
+          )}
 
           <div className="panel">
             <div className="phead"><h3>Collected per day</h3><span className="right">Last 7 days</span></div>
