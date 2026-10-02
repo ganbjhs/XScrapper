@@ -1296,6 +1296,22 @@ streamed login is dead; the phone-shaped one (above) is the third door.
 - `/api/handover` is dashboard-only: it is in no API-key allowlist. Recording
   is observational — it must never change a response or fail a request.
 
+### A quarantined Instagram account is not used, and its sources move (2026-10-02)
+
+- `collect_ig.collectors()` benches an account whose POOL status is
+  `quarantined`, alongside inactive / no session / checkpoint. Before this the
+  pool's quarantine was never read by the collector: a quarantined, rate-
+  limited account stayed an owner, kept being sent to Instagram ("Please wait
+  a few minutes"), and held its 28 sources waiting behind it.
+- Benched means `assign_sources` hands its unpinned sources to the least-
+  loaded healthy accounts. Releasing the quarantine on the card makes it an
+  owner again on the next pass; sources do not move back by themselves
+  (stickiness, RULEBOOK above) unless their new owner drops out.
+- A RESTING account (rate limit, dead proxy, budget) still keeps its sources:
+  resting is a pause. To move them now, quarantine the account.
+- A state that lasts is logged when it starts, not on every visit: "is
+  benched" and "rests for Nm" are said once (`_say_once`), not every ~45 s.
+
 ### Instagram is the STRICT platform — treat every rule here as non-negotiable
 
 Instagram's bot detection watches rhythm, volume, IP and device as much as any

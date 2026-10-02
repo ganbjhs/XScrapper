@@ -131,8 +131,17 @@ def collectors(*, store_path=ACCOUNTS_DB, root=".", log=print) -> tuple:
     """(owners, benched): every active login that can collect, and the ones
     that cannot with the reason. An owner keeps its sources even while it
     rests (rate limit / budget) — resting is a pause, not a departure; only a
-    benched account loses them. Benched: inactive, no session at all, or a
-    recorded checkpoint."""
+    benched account loses them. Benched: inactive, no session at all, a
+    recorded checkpoint, or QUARANTINED in the account pool.
+
+    The pool's quarantine was not read here until 2026-10-02. "Quarantine" on
+    a card (and the collector's own quarantine after a checkpoint) changed the
+    pool row and nothing this function looks at, so a quarantined account
+    stayed an owner: it kept its 28 sources, kept being sent to Instagram,
+    and — being rate-limited — kept them waiting behind it instead of
+    letting the other accounts read them. Quarantine means "do not use this
+    account" (ACCOUNTS.md §2); now it does. Releasing it on the card makes
+    it an owner again on the next pass."""
     owners, benched = [], {}
     with ig.Store(store_path) as st:
         rows = st.all()
@@ -158,8 +167,32 @@ def collectors(*, store_path=ACCOUNTS_DB, root=".", log=print) -> tuple:
         if meta.get("checkpoint_at"):
             benched[u] = f"checkpoint at {meta['checkpoint_at']}"
             continue
+        try:
+            row = pool_link.find("ig", u)
+            if row is not None and str(row.status or "").lower() == "quarantined":
+                benched[u] = "quarantined in the account pool"
+                continue
+        except Exception:
+            pass                # no pool on this host: nothing to honour
         owners.append(u)
     return owners, benched
+
+
+# Lines a visit would otherwise repeat every ~45 seconds for as long as a
+# state lasts ("@x is benched", "@x rests for 27m more"). The Activity Log is
+# for what CHANGED: say a state when it starts, and again only if it changes.
+_SAID: dict = {}
+
+
+def _say_once(key, text, log, *, until=None):
+    """Log `text` unless the same `key` already said it and it still holds
+    (`until`: a unix time after which it may be said again)."""
+    now = time.time()
+    prev = _SAID.get(key)
+    if prev and prev[0] == text.split(" for ")[0] and (prev[1] is None or now < prev[1]):
+        return
+    _SAID[key] = (text.split(" for ")[0], until)
+    log(text)
 
 
 class PassLock:
@@ -810,7 +843,10 @@ async def run_once(store_path="ig_results.db", account_override="", *,
             else:
                 owners, benched = collectors(store_path=accounts_path, root=root, log=log)
             for u, why in benched.items():
-                log(f"  @{u} is benched ({why}) — its sources go to the others")
+                _say_once(("benched", u), f"  @{u} is benched ({why}) — "
+                          f"its sources go to the others", log)
+            for key in [k for k in _SAID if k[0] == "benched" and k[1] not in benched]:
+                del _SAID[key]          # back in rotation: say it afresh next time
             if not owners:
                 # No collector at all. Not a crash: a condition, idle on it
                 # and tell the operator once. (session_missing is a
@@ -842,9 +878,12 @@ async def run_once(store_path="ig_results.db", account_override="", *,
                     continue            # asleep by its own clock; quiet
                 w = dec.account_wait(acct)
                 if w > 0:
-                    log(f"  @{acct} rests for {w // 60}m more (open condition) — "
-                        f"{len(group)} source(s) wait with it")
+                    _say_once(("rest", acct),
+                              f"  @{acct} rests for {max(1, w // 60)}m (open condition) — "
+                              f"{len(group)} source(s) wait with it",
+                              log, until=time.time() + w)
                     continue
+                _SAID.pop(("rest", acct), None)
                 runnable[acct] = group
 
             async def one(i, acct, group):
