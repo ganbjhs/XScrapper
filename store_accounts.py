@@ -387,7 +387,8 @@ class AccountStore:
                 + (f" — {health}" if health else ""),
                 account=str(who),
                 level=("error" if status in (QUARANTINED, DEAD)
-                       else "warn" if status == NEEDS_LOGIN else "info"),
+                       else "warn" if status == NEEDS_LOGIN
+                       else "ok" if status == ACTIVE else "info"),
                 db=os.path.join(os.path.dirname(os.path.abspath(path)), "activity.db"))
         except Exception:
             pass

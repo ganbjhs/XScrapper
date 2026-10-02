@@ -1123,6 +1123,14 @@ session got opened on a live account (§6, "never signed in twice").
   request and never changes a response**: `_audit` swallows every error, and
   no status code, header or body is different because of it — Watch-Tower
   sees exactly what it saw before.
+  **Levels are four: `ok`, `info`, `warn`, `error`** (2026-10-02, later the
+  same day). The operator reads this page to find what is wrong, and a wall
+  of white lines hid it. `ok` (green) is a CONFIRMED success only — a sign-in,
+  an accepted key pull, a dashboard change that answered < 400, an account
+  going active, a fetch that stored posts; `info` (dimmed) is routine chatter.
+  `activity_log._OK_RE` is narrow on purpose and runs after the error and
+  warn patterns: a success left grey costs nothing, a failure painted green
+  hides the one line that mattered.
 
 ## 6. Per-platform hard rules
 

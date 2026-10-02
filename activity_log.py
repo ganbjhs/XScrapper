@@ -42,6 +42,15 @@ _WARN_RE = re.compile(
     r"|decision: |still '|operator NOT told", re.I)
 
 
+# A CONFIRMED success ("ok", shown green). Deliberately narrow: only lines that
+# say something worked. Checked after the two patterns above, so "NOT LOGGED
+# IN" can never read as "logged in". Everything else stays "info" (routine,
+# shown dimmed) — a success missed is harmless, a failure painted green is not.
+_OK_RE = re.compile(
+    r"logged in with password|reusing saved session|saved reusable session"
+    r"|can reach the home feed|: \+[1-9]\d* new\b|done: [1-9]\d* new post", re.I)
+
+
 def _con(db=None):
     con = sqlite3.connect(db or DEFAULT_DB, timeout=10)
     # WAL: three collectors and the web server all write here (log lines,
@@ -56,7 +65,7 @@ def _con(db=None):
         "  ts_ms    INTEGER NOT NULL,"
         "  platform TEXT,"            # 'facebook' | 'instagram' | 'x' | ...
         "  account  TEXT,"            # which login was acting, when known
-        "  level    TEXT,"            # 'info' | 'warn' | 'error'
+        "  level    TEXT,"            # 'ok' | 'info' | 'warn' | 'error'
         "  message  TEXT NOT NULL)")
     con.execute("CREATE INDEX IF NOT EXISTS ix_ev_ts ON events(ts_ms)")
     return con
@@ -68,6 +77,8 @@ def classify(message: str) -> str:
         return "error"
     if _WARN_RE.search(message):
         return "warn"
+    if _OK_RE.search(message):
+        return "ok"
     return "info"
 
 

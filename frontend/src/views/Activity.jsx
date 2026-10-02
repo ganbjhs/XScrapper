@@ -49,7 +49,12 @@ const CAT_OPTS = [["", "Everything"], ["security", "Security"], ["api", "API key
   ["operator", "Operator actions"], ["accounts", "Accounts & collectors (all)"],
   ["x", "— X"], ["instagram", "— Instagram"], ["facebook", "— Facebook"],
   ["system", "System / watchdog"], ["classify", "Labelling"]];
-const LEVELS = [["", "All levels"], ["problems", "Warnings + errors"], ["error", "Errors only"]];
+const LEVELS = [["", "All levels"], ["problems", "Warnings + errors"], ["error", "Errors only"],
+  ["warn", "Warnings only"], ["ok", "Successful only"], ["info", "Routine only"]];
+const BAD = (e) => e.level === "warn" || e.level === "error";
+const levelOk = (e, level) => level === "" ? true
+  : level === "problems" ? BAD(e)
+  : (e.level || "info") === level;
 const COLLECTORS = new Set(["x", "instagram", "facebook"]);
 const LIMIT = 1000;
 const DAY = 24 * 3600 * 1000;
@@ -105,7 +110,7 @@ function Timeline({ q, setQ, live }) {
   const suspects = useMemo(() => {
     const by = new Map();
     for (const e of recent) {
-      if (e.platform !== "security" || e.level === "info" || !e.account) continue;
+      if (e.platform !== "security" || !BAD(e) || !e.account) continue;
       const r = by.get(e.account) || { who: e.account, n: 0, errors: 0, last: 0 };
       r.n += 1; if (e.level === "error") r.errors += 1; r.last = Math.max(r.last, e.ts_ms);
       by.set(e.account, r);
@@ -117,7 +122,7 @@ function Timeline({ q, setQ, live }) {
   const needle = q.trim().toLowerCase();
   const events = all.filter((e) =>
     (cat === "" || (cat === "accounts" ? COLLECTORS.has(e.platform) : e.platform === cat))
-    && (level === "" || (level === "problems" ? e.level !== "info" : e.level === "error"))
+    && levelOk(e, level)
     && (!needle || `${e.message || ""}\n${e.account || ""}`.toLowerCase().includes(needle)));
 
   const pick = (c, l) => { setCat(cat === c && level === l ? "" : c); setLevel(cat === c && level === l ? "" : l); };

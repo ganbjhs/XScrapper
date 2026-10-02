@@ -2100,7 +2100,7 @@ def _activity_logs_json(q):
     while acting as the burner accounts — session reuse, login attempts,
     logged-out walls, fetches, avatar captures, errors. This is the "what are
     the accounts actually doing" view; filters: ?platform=facebook|instagram,
-    ?level=info|warn|error, ?limit=N. Since 2026-10-02 the same log also holds
+    ?level=ok|info|warn|error, ?limit=N. Since 2026-10-02 the same log also holds
     the audit trail (platform = security | api | operator | system).
     """
     import activity_log
@@ -7260,7 +7260,7 @@ class Handler(BaseHTTPRequestHandler):
         """A key that was let in. Folded per key+path+project per minute."""
         proj = f" project {str(project)[:20]}" if project not in (None, "") else ""
         _audit("api", f"key {hint} {method} {path}{proj} from {ip}", actor=hint,
-               dedupe=("pull", hint, method, path, str(project)[:20]))
+               level="ok", dedupe=("pull", hint, method, path, str(project)[:20]))
 
     def _login_html(self, error: str = "") -> str:
         block = f'<div class="err">{error}</div>' if error else ""
@@ -7295,7 +7295,7 @@ class Handler(BaseHTTPRequestHandler):
                 "text/html; charset=utf-8")
 
         _clear_failures(ip)
-        _audit("security", f"signed in: user {user[:40]!r} from {ip}", actor=ip)
+        _audit("security", f"signed in: user {user[:40]!r} from {ip}", actor=ip, level="ok")
         # Secure is set only behind a proxy terminating TLS; setting it on a
         # plain-HTTP localhost run would make the browser drop the cookie and
         # produce an unexplainable login loop.
@@ -7511,7 +7511,7 @@ class Handler(BaseHTTPRequestHandler):
             self._op_audit = None
             ip = self._client_ip()
             _audit("operator", f"POST {op[:120]} -> {code} from {ip}", actor=ip,
-                   level="info" if code < 400 else "warn",
+                   level="ok" if code < 400 else "warn",
                    dedupe=("op", op, ip, code), window=30)
         if not self._head_only:
             self.wfile.write(data)

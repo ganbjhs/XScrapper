@@ -1108,3 +1108,8 @@ button.tl-who:hover { color: var(--brand); text-decoration: underline; }
 
 .log-main { min-width: 0; }
 .log-main .panel { margin-bottom: 0; }
+
+/* timeline levels: green = confirmed success, dimmed = routine */
+.tl-row.lv-ok { border-left-color: var(--good); }
+.tl-row.lv-ok .tl-msg { color: var(--good-text); }
+.tl-row.lv-info .tl-msg, .tl-row.lv-info .tl-who { color: var(--ink-3); }
