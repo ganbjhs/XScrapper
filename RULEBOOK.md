@@ -1340,6 +1340,22 @@ streamed login is dead; the phone-shaped one (above) is the third door.
 - A state that lasts is logged when it starts, not on every visit: "is
   benched" and "rests for Nm" are said once (`_say_once`), not every ~45 s.
 
+### Instagram "Fetch now" is a visit to that list, never a pass over everything (2026-10-03)
+
+- The button on ONE list used to run a FULL pass: every account, every source
+  of every project, in parallel, on a one-shot decider with no memory of open
+  conditions. It broke the phone-time rhythm, could send a rate-limited
+  account straight back to Instagram, and inside its 3-minute timeout never
+  reached the list that was asked for.
+- Now (`web._ig_fetch` → `run_once(only_labels=…, max_sources=3,
+  due_after=900)`): only the accounts that OWN that list's sources move; each
+  reads its 3 most overdue ones with the usual human gaps; a profile read in
+  the last 15 minutes is skipped, so a second click walks on. The persistent
+  decider is used (quiet, never pages): a resting or benched account is not
+  used, and the log says so.
+- Do not raise the 3 or drop the floor to "catch up faster". A backlog is
+  cleared by the accounts' own sessions; this button is for a look, now.
+
 ### Instagram is the STRICT platform — treat every rule here as non-negotiable
 
 Instagram's bot detection watches rhythm, volume, IP and device as much as any

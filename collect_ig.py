@@ -780,7 +780,8 @@ STAGGER_S = (15.0, 120.0)
 async def run_once(store_path="ig_results.db", account_override="", *,
                    page_size=12, max_pages=2, log=print, dec=None,
                    accounts_path=ACCOUNTS_DB, root=".", who="loop",
-                   rng=None, awake=None, max_sources=None, due_after=0) -> int:
+                   rng=None, awake=None, max_sources=None, due_after=0,
+                   only_labels=None) -> int:
     """One collection pass: every owning account runs its own sources, in
     parallel, on its own phone. Every condition the pass meets goes through
     the decider (decider.py): it says what to do next, how long to wait, and
@@ -802,7 +803,15 @@ async def run_once(store_path="ig_results.db", account_override="", *,
     `max_sources` turns the pass into a VISIT: each account reads only its
     N most overdue sources not seen within `due_after` seconds, and the
     pass says nothing when there is nothing due. This is the --loop trickle
-    (2026-09-04); Fetch-now and the CLI leave it None and walk everything.
+    (2026-09-04); the CLI leaves it None and walks everything.
+
+    `only_labels`, when given, narrows the pass to those sources: an account
+    that owns none of them does nothing at all. This is the dashboard's
+    Fetch-now (2026-10-03). It used to be a FULL pass — every account, every
+    source of every project, in parallel, on a one-shot decider that did not
+    know an account was resting — fired by a button on ONE project's list:
+    the opposite of the phone-time rhythm everything else here keeps, and it
+    never reached the list that was asked for inside its 3-minute timeout.
     """
     log = _persist_log(log)
     if dec is None:
@@ -862,6 +871,10 @@ async def run_once(store_path="ig_results.db", account_override="", *,
                             # session_missing / pass_error — the pass is on
 
             groups = store.assign_sources(owners, log=log)
+            if only_labels is not None:
+                wanted = set(only_labels)
+                groups = {a: [s for s in g if s.label in wanted]
+                          for a, g in groups.items()}
             plan = {a: [s.label for s in g] for a, g in groups.items() if g}
             quiet = bool(max_sources)       # a visit narrates only what it reads
             if len(owners) > 1 and not quiet:
@@ -877,6 +890,12 @@ async def run_once(store_path="ig_results.db", account_override="", *,
                 if awake is not None and acct not in awake:
                     continue            # asleep by its own clock; quiet
                 w = dec.account_wait(acct)
+                if w > 0 and who != "loop":
+                    # A person pressed a button and is reading this log: say
+                    # it every time, not once.
+                    log(f"  @{acct} rests for {max(1, w // 60)}m more (open "
+                        f"condition) — not used by this fetch")
+                    continue
                 if w > 0:
                     _say_once(("rest", acct),
                               f"  @{acct} rests for {max(1, w // 60)}m (open condition) — "

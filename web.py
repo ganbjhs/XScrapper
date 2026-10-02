@@ -6495,12 +6495,17 @@ def _ig_locked_run(coro, timeout=180):
         return None, {"error": f"{type(e).__name__}: {e}"}
 
 
+IG_FETCH_NOW_SOURCES = 3        # profiles one account reads per click
+IG_FETCH_NOW_FLOOR_S = 15 * 60  # a profile read this recently is not re-read
+
+
 def _ig_fetch(body):
     """
-    The Instagram "Fetch now" button: run ONE collection pass immediately from
-    the dashboard, so collection doesn't depend only on the background service
-    being up. Reports new-post count + the run log, so a checkpoint or a
-    missing source is visible in the UI instead of silent.
+    The Instagram "Fetch now" button: one human-paced VISIT to this list's
+    sources, right now, by the accounts that own them — without waiting for
+    their next phone-time window. Reports new-post count + the run log, so a
+    checkpoint, a resting account or a dead proxy is visible in the UI
+    instead of silent.
     """
     pid = _project_or_none(body)
     if not pid:
@@ -6517,7 +6522,7 @@ def _ig_fetch(body):
             with store_ig.Store(rp) as st:
                 _sq, _sa = st.source_scope(pid)
                 srcs = [r for r in st.db.execute(
-                    f"SELECT label FROM sources WHERE enabled = 1 AND {_sq}", _sa)]
+                    f"SELECT label, list_id FROM sources WHERE enabled = 1 AND {_sq}", _sa)]
                 if lid:
                     l = st.list_row(lid)
                     if not l:
@@ -6543,11 +6548,33 @@ def _ig_fetch(body):
     _lg = activity_log.logger("instagram",
                               echo=lambda m: logs.append(str(m)),
                               db=str(_CFG.root / "activity.db"))
+    # A VISIT to THIS list, not a pass over everything (2026-10-03). Only the
+    # accounts that own this list's sources move; each reads its few most
+    # overdue ones, with the usual human gaps, and a source read in the last
+    # quarter hour is left alone — so pressing the button again walks on to
+    # the next ones instead of re-reading the same profiles. The decider is
+    # the PERSISTENT one (quiet: it never pages), so an account that is
+    # resting after "Please wait a few minutes" is not sent back to Instagram
+    # by a click, and what this visit learns the background loop also knows.
+    import decider
+    labels = [r["label"] for r in srcs if not lid or r["list_id"] == lid]
+    dec = decider.Decider("instagram", log=_lg,
+                          db=str(_CFG.root / "activity.db"), quiet=True)
     n, err = _ig_locked_run(run_once(str(rp), log=_lg, root=str(_CFG.root),
                                      accounts_path=str(_CFG.root / "ig_accounts.db"),
-                                     who="fetch-now"), timeout=180)
+                                     who="fetch-now", dec=dec,
+                                     only_labels=labels,
+                                     max_sources=IG_FETCH_NOW_SOURCES,
+                                     due_after=IG_FETCH_NOW_FLOOR_S), timeout=180)
     if err:
         return {**err, "log": logs}
+    if not n and not any("visits" in l for l in logs):
+        resting = [l.strip() for l in logs if "rests for" in l or "is benched" in l]
+        logs.append("Nothing was read: " + (
+            "; ".join(resting) if resting else
+            f"every source of this list was read in the last "
+            f"{IG_FETCH_NOW_FLOOR_S // 60} minutes, or its account is resting "
+            f"or out of today's budget."))
     busy = next((l for l in logs if "a pass is already running" in l), "")
     if busy:
         return {"error": busy + " — the running pass covers this project.",
