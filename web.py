@@ -6012,6 +6012,11 @@ def _ig_status(q=None):
                             acct["exit"] = {k: ex.get(k) for k in
                                             ("exit_ip", "country", "checked", "ok")}
                         acct["session_updated"] = meta.get("updated")
+                        acct["cleared_at"] = meta.get("cleared_at") or None
+                        # Where it leaves from NOW (ig_session.exit_now) — the
+                        # sign-in exit above can be a previous proxy's address.
+                        import ig_session as _igs
+                        acct["exit_now"] = _igs.exit_now(r["username"], root)
                 except Exception:
                     pass
                 # WHICH PHONE this account is (ig_identity) — the card shows
@@ -6273,6 +6278,78 @@ def _ig_account_post(body):
     return {"ok": True, "username": username, "active": bool(active), "collectors": roster}
 
 
+def _ig_profile_dirs(username: str) -> list:
+    """The Chromium profile directories that hold @username's browser session:
+    the pool account's (profiles/pool_<id>)."""
+    out = []
+    try:
+        import pool_link
+        row = pool_link.find("ig", username)
+        if row is not None and getattr(row, "account_id", None) is not None:
+            out.append(_CFG.profiles_dir / f"pool_{row.account_id}")
+    except Exception:
+        pass
+    return out
+
+
+def _ig_forget_session(username: str, *, why: str = "", log=lambda m: None) -> dict:
+    """Clear @username's saved session everywhere it lives. Closes the sign-in
+    window first if it is open on this account: Chromium must not be running
+    on a profile that is about to be deleted."""
+    import ig_session
+    try:
+        import pool_link
+        row = pool_link.find("ig", username)
+        with _LOGIN_LOCK:
+            busy = (_LOGIN["session"] is not None and row is not None
+                    and _LOGIN.get("pool_id") == getattr(row, "account_id", None))
+        if busy:
+            _login_drop()
+    except Exception:
+        pass
+    return ig_session.clear_session(username, _CFG.root,
+                                    profile_dirs=_ig_profile_dirs(username),
+                                    why=why, log=log)
+
+
+def _ig_session_clear(body):
+    """Operator: remove this account's old session so the next sign-in is a
+    fresh one. The phone, the proxy and the pool row are kept."""
+    username = (body.get("username") or "").strip().lstrip("@")
+    if not username:
+        return {"error": "username is required"}
+    import activity_log
+    import ig
+    with ig.Store(_CFG.root / "ig_accounts.db") as st:
+        if not st.get(username):
+            return {"error": f"no Instagram session row for @{username}"}
+    lines = []
+    res = _ig_forget_session(username, why="operator asked", log=lines.append)
+    activity_log.log_event(
+        "instagram",
+        f"@{username}: saved session cleared by operator from the dashboard "
+        f"(cookies, browser profile) — the phone and proxy are kept; sign in again",
+        db=str(_CFG.root / "activity.db"))
+    return {"ok": True, "username": username, "cleared": res, "lines": lines}
+
+
+def _ig_exit_check(body):
+    """Operator: where does this account's proxy exit RIGHT NOW? Runs the
+    proxy check (no Instagram account request) and records the answer."""
+    username = (body.get("username") or "").strip().lstrip("@")
+    if not username:
+        return {"error": "username is required"}
+    import ig_session
+    lines = []
+    chk = ig_session.check_exit(username, _CFG.root, log=lines.append)
+    if not chk.get("exit_ip"):
+        return {"error": chk.get("detail") or "the proxy did not answer"}
+    return {"ok": True, "username": username,
+            "exit_now": ig_session.exit_now(username, _CFG.root),
+            "usable": bool(chk.get("ok")), "detail": chk.get("detail") or "",
+            "warn": chk.get("warn") or ""}
+
+
 def _ig_reseed(body):
     """Give one account a NEW phone, on the operator's say-so. Its session
     dies with the old phone (Instagram would read the swap as a stolen
@@ -6306,10 +6383,11 @@ def _ig_reseed(body):
         with ig.Store(root / "ig_accounts.db") as st:
             names = [r["username"] for r in st.all() if (r["label"] or "") == label]
         for u in names:
-            ex = ((ig_session._read_sidecar(ig_session.sidecar_path(u, root))
-                   .get("meta") or {}).get("exit") or {})
-            if ex.get("exit_ip"):
-                exit_ip = ex.get("exit_ip") or ""
+            # Where the account leaves from NOW (exit_now) — not the exit of
+            # its last sign-in, which may be a previous proxy's.
+            ex = ig_session.exit_now(u, root)
+            if ex.get("ip"):
+                exit_ip = ex.get("ip") or ""
                 if not country and ig_identity.known_market(ex.get("country")):
                     country = (ex.get("country") or "").upper()
                 break
@@ -6329,10 +6407,17 @@ def _ig_reseed(body):
     except ig_identity.UnknownMarket as e:
         return {"error": str(e)}
     with ig.Store(root / "ig_accounts.db") as st:
-        for r in st.all():
-            if (r["label"] or "") == label:
-                st.set_active(r["username"], False,
-                              error="new phone minted — sign in again to use it")
+        owners = [r["username"] for r in st.all() if (r["label"] or "") == label]
+    # A new phone has never been signed in: the old phone's cookies and its
+    # browser profile go with it (ig_session.clear_session), or the sign-in
+    # window opens as the new handset carrying the old one's session and
+    # Instagram answers "something went wrong".
+    for u in owners:
+        _ig_forget_session(u, why="a new phone was minted", log=lines.append)
+    with ig.Store(root / "ig_accounts.db") as st:
+        for u in owners:
+            st.set_active(u, False,
+                          error="new phone minted — sign in again to use it")
     activity_log.log_event("instagram",
                            f"[{label}] new phone minted by operator: "
                            f"{ig_identity.describe(dev)} — sign in again",
@@ -7789,6 +7874,10 @@ class Handler(BaseHTTPRequestHandler):
                 return self._send(200, _signin_code(body))
             if u.path == "/api/ig/reseed":
                 return self._send(200, _ig_reseed(body))
+            if u.path == "/api/ig/session/clear":
+                return self._send(200, _ig_session_clear(body))
+            if u.path == "/api/ig/exit":
+                return self._send(200, _ig_exit_check(body))
             if u.path == "/api/ig/account":
                 return self._send(200, _ig_account_post(body))
             if u.path == "/api/projects":

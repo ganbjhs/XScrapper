@@ -181,13 +181,22 @@ function EditModal({ a, onDone, onClose }) {
 // where the account's proxy exits: the picker starts on the exit's country and
 // says so when the two disagree. Only THIS account changes — every other
 // account keeps the phone in its own device file.
+// The country this account's requests leave from NOW. `exit_now` (server:
+// ig_session.exit_now) is the latest evidence through the proxy on file; the
+// sign-in exit is used only by an older server that does not send it.
+function exitCountry(live) {
+  if (live?.exit_now) return (live.exit_now.country || "").toUpperCase();
+  return (live?.exit?.country || "").toUpperCase();
+}
+
 function NewPhoneModal({ a, live, onDone, onClose }) {
   const [markets, setMarkets] = useState(null);
   const [country, setCountry] = useState("");
   const [zone, setZone] = useState("");
   const [err, setErr] = useState("");
   const [busy, setBusy] = useState(false);
-  const exitCc = (live?.exit?.country || "").toUpperCase();
+  const exitCc = exitCountry(live);
+  const exitIp = live?.exit_now ? live.exit_now.ip : live?.exit?.exit_ip;
   const nowCc = (live?.identity?.country || "").toUpperCase();
 
   useEffect(() => {
@@ -220,7 +229,8 @@ function NewPhoneModal({ a, live, onDone, onClose }) {
         <b style={{ fontWeight: 500 }}>{live?.identity?.text || "none minted yet"}</b></div>
       <div className="kv"><span>proxy exits in</span>
         <b style={{ fontWeight: 500 }}>
-          {exitCc ? `${exitCc}${live?.exit?.exit_ip ? ` · ${live.exit.exit_ip}` : ""}` : "unknown — no exit recorded yet"}
+          {exitCc ? `${exitCc}${exitIp ? ` · ${exitIp}` : ""}`
+            : "unknown — press Check proxy on the card first, then choose"}
         </b></div>
       {!markets && !err && <Loading />}
       {markets && (
@@ -607,7 +617,8 @@ function SessionRow({ a, live }) {
     return (
       <div className="kv"><span>session</span>
         <b className="st-crit">
-          checkpoint — Instagram wants a human ({fmtAgo(live.checkpoint_at)})
+          checkpoint — Instagram wants a human ({fmtAgo(
+            /Z$|[+-]\d\d:?\d\d$/.test(live.checkpoint_at) ? live.checkpoint_at : live.checkpoint_at + "Z")})
         </b>
       </div>
     );
@@ -673,9 +684,25 @@ function AccountCard({ a, live, onChanged }) {
   const bench = () => act(() => api.igAccount(live.username, false), "benched — its sources move on the next pass");
   const collect = () => act(() => api.igAccount(live.username, true), "collecting again from the next pass");
   const newPhone = () => setModal("phone");
+  const clearSession = () => {
+    if (!confirm(`Remove the saved session for ${a.label}? Its cookies and its browser profile on the server are deleted, so the next sign-in starts clean. The phone and the proxy are kept. The account stops collecting until you sign in again.`)) return;
+    act(() => api.igSessionClear(live.username), "session removed — sign in again");
+  };
+  const [checking, setChecking] = useState(false);
+  const checkProxy = async () => {
+    setChecking(true); setMsg("checking where the proxy exits…");
+    try {
+      const r = await api.igExitCheck(live.username);
+      const e = r.exit_now || {};
+      setMsg(`proxy exits at ${e.ip || "?"}${e.country ? ` (${e.country})` : ""}`
+             + (r.usable ? "" : ` — NOT usable: ${r.detail}`) + (r.warn ? ` — ${r.warn}` : ""));
+      onChanged();
+    } catch (e) { setMsg(String(e.message || e)); } finally { setChecking(false); }
+  };
   // The phone and the proxy must agree about the country (ig_identity.MARKETS).
   const phoneCc = (live?.identity?.country || "").toUpperCase();
-  const exitCc = (live?.exit?.country || "").toUpperCase();
+  const exitCc = exitCountry(live);
+  const en = live?.exit_now;
   const countryClash = !!(phoneCc && exitCc && phoneCc !== exitCc);
 
   return (
@@ -712,13 +739,37 @@ function AccountCard({ a, live, onChanged }) {
           <div className="kv"><span>collecting</span>
             <b className={live.active && !live.checkpoint_at ? "st-good" : "st-warn"}>
               {live.active ? `yes · owns ${live.owns ?? 0} source(s)` : "benched"}
-              {live.exit?.exit_ip ? (
-                <span style={{ color: "var(--ink-3)", fontWeight: 400 }}>
-                  {` · signed in via ${live.exit.exit_ip}${live.exit.country ? ` (${live.exit.country})` : ""}`}
-                </span>
-              ) : null}
             </b>
           </div>
+          {/* TWO addresses, named for what they are. "fetching via" is where
+              requests leave from now; "signed in via" is where the session was
+              created, which after a proxy change is the OLD proxy's address. */}
+          {en && (
+            <div className="kv"><span>fetching via</span>
+              <b style={{ fontWeight: 500 }} className={en.ip ? "" : "st-warn"}>
+                {en.ip
+                  ? `${en.ip}${en.country ? ` (${en.country})` : " (country unknown)"}`
+                  : en.proxy_host
+                    ? `proxy ${en.proxy_host} — exit not checked since the proxy changed`
+                    : "no proxy on file"}
+                {en.ip && en.at ? (
+                  <span style={{ color: "var(--ink-3)", fontWeight: 400 }}>
+                    {` · checked ${fmtAgo(en.at)}`}
+                  </span>
+                ) : null}
+              </b>
+            </div>
+          )}
+          {live.exit?.exit_ip ? (
+            <div className="kv"><span>signed in via</span>
+              <b style={{ fontWeight: 400, color: "var(--ink-3)" }}>
+                {`${live.exit.exit_ip}${live.exit.country ? ` (${live.exit.country})` : ""}`}
+                {live.exit.checked ? ` · ${String(live.exit.checked).slice(0, 10)}` : ""}
+                {en && en.ip && en.ip !== live.exit.exit_ip ? " · a previous proxy" : ""}
+                {en && !en.ip && en.source === "" && en.proxy_host ? " · a previous proxy" : ""}
+              </b>
+            </div>
+          ) : null}
         </>
       )}
       <div className="kv"><span>last success</span>
@@ -736,6 +787,8 @@ function AccountCard({ a, live, onChanged }) {
           ? <button onClick={bench}>Bench</button>
           : <button onClick={collect}>Collect</button>)}
         {isIg && live && <button onClick={newPhone}>New phone</button>}
+        {isIg && live && <button disabled={checking} onClick={checkProxy}>Check proxy</button>}
+        {isIg && live && <button onClick={clearSession}>Clear session</button>}
         {a.status !== "quarantined" && a.status !== "dead"
           ? <button onClick={quarantine}>Quarantine</button>
           : <button onClick={revive}>Return to pool</button>}

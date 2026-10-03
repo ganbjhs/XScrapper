@@ -19,6 +19,27 @@ must respect belongs in the rulebook, not here.
 
 ---
 
+## 2026-10-03 (II) — Clear session; the card shows where an account leaves from NOW
+
+**Why.** After "New phone" the sign-in window showed Instagram's "something
+went wrong": the new handset was carrying the old one's cookies and Chromium
+profile. And three cards showed September's rotating exit IPs for accounts on
+static proxies since 09-29 — the card printed the exit of the last SIGN-IN.
+The Instagram cards had also lost their session details entirely (the
+Accounts page asked the project-scoped status endpoint with no project and
+discarded the answer) — fixed in 14c1f6e.
+
+**What changed.** `ig_session.clear_session` (+ **Clear session** on the card,
+and run by **New phone**); `ig_session.exit_now` / `check_exit` (+ "fetching
+via" and "signed in via" rows, **Check proxy**); `POST /api/ig/session/clear`,
+`POST /api/ig/exit` (dashboard-only). The country warning and the New phone
+picker now read the current exit. See RULEBOOK §6.
+
+**Not verified.** That the stale cookies were the cause of "something went
+wrong" — it is the likeliest reading of the code, not something observed
+against Instagram. If a cleared account still gets that page, the proxy's
+address is being refused and no code here changes that.
+
 ## 2026-10-03 — Instagram phones get a country: one market per account
 
 **Why.** The market (language, country, dialling code, time zone, phone list)

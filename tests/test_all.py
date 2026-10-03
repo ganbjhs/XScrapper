@@ -5098,6 +5098,127 @@ def test_ig_identity(tmp):
        "a first phone is minted for the exit's country when the exit says one")
 
 
+def test_ig_clear_and_exit(tmp):
+    """Two things the operator hit on 2026-10-03.
+
+    (1) "New phone" replaced the handset and left the old phone's cookies and
+    browser profile in place, so the sign-in window opened as a new phone
+    carrying the old session and Instagram answered "something went wrong".
+    clear_session removes the session — and ONLY the session.
+
+    (2) The card showed the exit recorded at the last SIGN-IN. After a proxy
+    change that is the old proxy's address: three cards showed September's
+    rotating exits for accounts that had been on static proxies for days.
+    exit_now answers "where does it leave from NOW", from evidence that went
+    through the proxy on file, or says it does not know.
+    """
+    import ig, ig_identity, ig_session, collect_ig
+    from unittest import mock as _m
+    root = pathlib.Path(tmp)
+    prof = root / "profiles"
+    prof.mkdir(parents=True, exist_ok=True)
+    dev = ig_session.ensure_device("pool_5", root)
+    dev_bytes = (prof / "ig_device_pool_5.json").read_bytes()
+    old_proxy = "http://u-IN-28:pw@p.webshare.io:80"
+    new_proxy = "http://stat:pw@31.98.24.33:5709"
+    side = prof / "ig_saiee.json"
+    side.write_text(json.dumps({
+        "meta": {"username": "saiee", "label": "pool_5", "proxy": new_proxy,
+                 "exit": {"exit_ip": "103.182.221.202", "country": "", "checked": "2026-09-10T09:39:00",
+                          "proxy": ig_session.redact_proxy(old_proxy), "ok": True},
+                 "exits": [{"ip": "103.182.221.202", "country": "IN", "at": "2026-09-28T10:00:00"}],
+                 "proxy_changed": "2026-10-03T09:00:00"},
+        "settings": {"cookies": {"sessionid": "5%3Aabc"}, "authorization_data": {"sessionid": "5%3Aabc"}}}))
+    with ig.Store(root / "ig_accounts.db") as st:
+        st.save(ig.Session(username="saiee", user_id="5", user_agent="ua",
+                           cookies={"sessionid": "5%3Aabc"}), label="pool_5", proxy=new_proxy)
+    chrome = prof / "pool_13"
+    (chrome / "Default").mkdir(parents=True)
+    (chrome / "Default" / "Cookies").write_text("old phone's cookies")
+    outside = root / "elsewhere"
+    outside.mkdir()
+    (outside / "keep.txt").write_text("x")
+
+    print("== exit_now: the address it leaves from NOW, or an honest 'unknown' ==")
+    en = ig_session.exit_now("saiee", root)
+    ok(en["ip"] == "" and en["proxy_host"] == "31.98.24.33" and en["source"] == "",
+       "a sign-in exit and a sample from BEFORE the proxy change are not shown as current: " + str(en))
+    ok("pw" not in json.dumps(en) and "stat" not in json.dumps(en),
+       "and no proxy username or password leaves the server")
+    seen = {}
+    def fake_check(proxy, **kw):
+        seen["proxy"], seen["expect"] = proxy, kw.get("expect_country")
+        return {"ok": True, "exit_ip": "31.98.24.33", "country": "FR", "checked": "2026-10-03T10:40:00",
+                "proxy": ig_session.redact_proxy(proxy), "detail": "exit 31.98.24.33 (FR)", "warn": ""}
+    chk = ig_session.check_exit("saiee", root, check=fake_check)
+    ok(chk["exit_ip"] == "31.98.24.33" and seen["proxy"] == new_proxy and seen["expect"] == "IN",
+       "Check proxy dials the proxy on file and expects the account's own phone's country")
+    en = ig_session.exit_now("saiee", root)
+    ok(en["ip"] == "31.98.24.33" and en["country"] == "FR" and en["source"] == "sample"
+       and en["at"].endswith("Z"),
+       "after a check the card can say where it leaves from, in UTC: " + str(en))
+    ok(json.loads(side.read_text())["settings"]["cookies"]["sessionid"] == "5%3Aabc",
+       "the check wrote the exit history and nothing of the session")
+    (prof / "ig_fresh.json").write_text(json.dumps({"meta": {
+        "username": "fresh", "label": "pool_5", "proxy": new_proxy,
+        "exit": {"exit_ip": "31.98.24.33", "country": "FR", "checked": "2026-10-03T08:00:00",
+                 "proxy": ig_session.redact_proxy(new_proxy)}}, "settings": {}}))
+    ok(ig_session.exit_now("fresh", root)["source"] == "signin"
+       and ig_session.exit_now("fresh", root)["country"] == "FR",
+       "a sign-in exit through the proxy still on file counts")
+    ok(ig_session.exit_now("nobody", root)["ip"] == ""
+       and ig_session.check_exit("nobody", root, check=fake_check)["why"] == "no_proxy",
+       "an account with no saved session has no exit, and says so")
+
+    print()
+    print("== clear_session: the session goes, the phone and the proxy stay ==")
+    lines = []
+    res = ig_session.clear_session("saiee", root, profile_dirs=[chrome, outside], log=lines.append)
+    data = json.loads(side.read_text())
+    ok(data["settings"] == {} and data["meta"].get("cleared_at"),
+       "the sidecar holds no cookies and is marked cleared")
+    ok(data["meta"]["proxy"] == new_proxy and data["meta"]["label"] == "pool_5"
+       and data["meta"]["exits"][-1]["ip"] == "31.98.24.33",
+       "the proxy, the label and the exit history are kept")
+    ok(any(p.name.startswith("ig_saiee.json.bak-") for p in prof.iterdir()),
+       "the old session is kept beside it as a .bak")
+    ok(not chrome.exists() and res["profiles"] == ["pool_13"],
+       "the account's browser profile is deleted")
+    ok((outside / "keep.txt").exists(),
+       "a directory outside profiles/ is never touched, whatever was asked")
+    ok((prof / "ig_device_pool_5.json").read_bytes() == dev_bytes,
+       "the phone is byte-for-byte the same")
+    with ig.Store(root / "ig_accounts.db") as st:
+        row = st.get("saiee")
+    ok(row and not row["active"] and json.loads(row["cookies"] or "{}") == {}
+       and row["label"] == "pool_5",
+       "the roster row is kept (it ties the name to its phone), benched, without cookies")
+
+    print()
+    print("== a cleared session cannot come back by itself ==")
+    with ig.Store(root / "ig_accounts.db") as st:
+        st.set_active("saiee", True)
+    with _m.patch.object(collect_ig.pool_link, "find", return_value=None):
+        owners, benched = collect_ig.collectors(store_path=str(root / "ig_accounts.db"),
+                                                root=root, log=lambda m: None)
+    ok("saiee" not in owners and "cleared" in benched.get("saiee", ""),
+       "even switched back to Collect, the collector benches it: " + str(benched.get("saiee")))
+    for fn in (ig_session.load_client, ig_session.refresh):
+        try:
+            fn("saiee", root=root, store_path=str(root / "ig_accounts.db"))
+            ok(False, f"{fn.__name__} must refuse a cleared session")
+        except ig_session.SessionCleared as e:
+            ok("sign in again" in str(e), f"{fn.__name__} refuses it — nothing logs the account in on its own")
+
+    class Cl:
+        user_agent = "ua"
+        def get_settings(self):
+            return {"cookies": {"sessionid": "5%3Aabc"}}
+    ok(ig_session.touch(Cl(), "saiee", root=root) is False
+       and json.loads(side.read_text())["settings"] == {},
+       "a pass that still held the old session in memory cannot write it back")
+
+
 def test_ig_writeback(tmp):
     """A pass writes back what it LEARNED, and is fenced from what it must not
     touch (2026-09-12).
@@ -7641,6 +7762,8 @@ def main():
         test_ig_stop_stands(fresh("igstop"))
         section("instagram identity (one coherent phone per account, minted once)")
         test_ig_identity(fresh("igid"))
+        section("instagram: clear a session; where an account leaves from now")
+        test_ig_clear_and_exit(fresh("igclear"))
         section("instagram write-back (the claim advances; the handset cannot)")
         test_ig_writeback(fresh("igwb"))
         section("instagram sign-in from the server (code relay, exit check, browser door)")

@@ -103,6 +103,12 @@ export const api = {
   igReseed: (username, country, timezone) =>
     request("/api/ig/reseed", { method: "POST", body: { username, country, timezone } }),
   igMarkets: () => request("/api/ig/markets"),
+  // Remove the saved session (cookies + browser profile); phone and proxy stay.
+  igSessionClear: (username) =>
+    request("/api/ig/session/clear", { method: "POST", body: { username } }),
+  // Ask, now, where this account's proxy exits. Quiet: the card shows the answer.
+  igExitCheck: (username) =>
+    request("/api/ig/exit", { method: "POST", body: { username }, quiet: true }),
   igSource: (body) => request("/api/ig/source", { method: "POST", body }),
   igFetch: (project, list_id) => request("/api/ig/fetch", { method: "POST", body: { project, list_id } }),
   // Named Instagram lists (2026-09-29): create / rename / pause / resume / delete.

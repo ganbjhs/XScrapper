@@ -473,14 +473,19 @@ def touch(cl, username: str, *, root: Path | str = ".", exit: dict | None = None
         log(f"[ig] @{username}: sidecar unreadable — left alone")
         return False
     meta = dict(data.get("meta") or {})
+    if meta.get("cleared_at"):
+        # The operator cleared this session (clear_session) while a pass still
+        # held it in memory. Writing it back would undo that.
+        log(f"[ig] @{username}: session was cleared by the operator — the "
+            f"pass's copy is not written back")
+        return False
     # The seed stays authoritative over anything the session picked up, exactly
     # as it is on the reuse path (new_client).
     settings = _splice_device(settings, load_device(meta.get("label") or "ig_a", root))
     meta["touched"] = _now()
     if exit:
         hist = list(meta.get("exits") or [])
-        hist.append({"ip": exit.get("exit_ip") or "", "country": exit.get("country") or "",
-                     "at": exit.get("checked") or _now()})
+        hist.append(_exit_sample(exit))
         meta["exits"] = hist[-EXIT_HISTORY:]
     try:
         _write_sidecar(path, {"meta": meta, "settings": settings})
@@ -489,6 +494,15 @@ def touch(cl, username: str, *, root: Path | str = ".", exit: dict | None = None
             f"the session is still good in memory, it just did not persist")
         return False
     return True
+
+
+def _exit_sample(chk: dict) -> dict:
+    """One line of exit history from a proxy_check result. `proxy` (redacted:
+    host and session label, never the password) says WHICH proxy the sample
+    went through, so a sample taken before the proxy was changed is never
+    shown as where the account leaves from now."""
+    return {"ip": chk.get("exit_ip") or "", "country": chk.get("country") or "",
+            "at": chk.get("checked") or _now(), "proxy": chk.get("proxy") or ""}
 
 
 def exit_due(username: str, root: Path | str = ".", *, every_h: float = EXIT_SAMPLE_H,
@@ -537,6 +551,167 @@ def sample_exit(username: str, root: Path | str = ".", *,
             f"collection failure, the pass decides on its own requests")
         return None
     return chk if chk.get("exit_ip") else None
+
+
+class SessionCleared(RuntimeError):
+    """The operator cleared this account's session; only a sign-in brings it back."""
+
+
+def _refuse_cleared(username: str, meta: dict) -> None:
+    if (meta or {}).get("cleared_at"):
+        raise SessionCleared(
+            f"@{username}'s session was cleared by the operator at "
+            f"{meta['cleared_at']} — sign in again from the dashboard. Nothing "
+            f"may log this account in on its own.")
+
+
+def clear_session(username: str, root: Path | str = ".", *,
+                  store_path: str | Path | None = None, profile_dirs=(),
+                  why: str = "", log=lambda m: None) -> dict:
+    """
+    Forget that @username is signed in, so the NEXT sign-in starts clean.
+
+    WHY THIS EXISTS (2026-10-03). "New phone" replaced the handset and left
+    everything the OLD handset had earned in place: the cookies in the sidecar
+    and in ig_accounts.db, and the account's Chromium profile on disk. The
+    sign-in window then opened as a brand-new phone carrying the old phone's
+    cookies, and Instagram answered "something went wrong" instead of a login
+    form. A new phone has never been signed in; it must look like it.
+
+    REMOVED: the session half of the sidecar (cookies, authorization, claim —
+    the old file is kept beside it as .bak-<utc>), the cookies in the roster
+    row, and every browser profile directory in `profile_dirs` (only ones
+    inside <root>/profiles are touched).
+
+    KEPT: the phone (device seed), the proxy on file, the label, the exit
+    history, a checkpoint tombstone (that is about the ACCOUNT, and only a
+    successful sign-in clears it), and the roster row itself — benched.
+
+    The sidecar is marked `cleared_at`: the collector benches the account,
+    load_client/refresh refuse it, and touch() will not write a pass's stale
+    copy back. persist() at the next sign-in writes a fresh meta without it.
+    """
+    import shutil
+    root = Path(root)
+    out = {"username": username, "sidecar": False, "row": False, "profiles": []}
+    path = sidecar_path(username, root)
+    data = _read_sidecar(path) if path.exists() else {}
+    if data:
+        bak = path.with_name(path.name + ".bak-" + _now().replace(":", ""))
+        try:
+            _write_sidecar(bak, data)
+            log(f"[ig] @{username}: previous session kept at {bak.name}")
+        except OSError:
+            pass
+        meta = dict(data.get("meta") or {})
+        meta["cleared_at"] = _now()
+        meta.pop("touched", None)
+        _write_sidecar(path, {"meta": meta, "settings": {}})
+        out["sidecar"] = True
+    sp = Path(store_path) if store_path else root / "ig_accounts.db"
+    if sp.exists():
+        try:
+            with ig.Store(sp) as st:
+                if st.get(username):
+                    st.clear_session(username, "session cleared — sign in again")
+                    out["row"] = True
+        except Exception as e:
+            log(f"[ig] @{username}: could not clear the roster row ({type(e).__name__})")
+    base = (root / SETTINGS_DIR).resolve()
+    for d in profile_dirs or ():
+        d = Path(d)
+        try:
+            inside = d.resolve().parent == base
+        except OSError:
+            inside = False
+        if inside and d.is_dir():
+            shutil.rmtree(d, ignore_errors=True)
+            if not d.exists():
+                out["profiles"].append(d.name)
+    log(f"[ig] @{username}: session cleared{(' — ' + why) if why else ''} "
+        f"(sidecar {'yes' if out['sidecar'] else 'none'}, roster row "
+        f"{'yes' if out['row'] else 'none'}, browser profile "
+        f"{', '.join(out['profiles']) or 'none'}). The phone and the proxy are kept.")
+    return out
+
+
+def _proxy_host(proxy: str) -> str:
+    """The host a proxy URL dials — no username, no password, no port."""
+    try:
+        import urllib.parse as up
+        return up.urlsplit(proxy or "").hostname or ""
+    except Exception:
+        return ""
+
+
+def exit_now(username: str, root: Path | str = ".") -> dict:
+    """Where this account's requests leave from NOW, as far as is known.
+
+    The card used to show only meta["exit"]: the exit recorded at the last
+    SIGN-IN. After a proxy change that is the OLD proxy's address, for as long
+    as the session lives — three cards showed September's rotating exits a
+    month after the accounts had moved to static ones (2026-10-03).
+
+    Evidence, newest first, and only if it went through the proxy on file:
+    the latest exit sample (touch / check_exit), else the sign-in exit.
+    A sample with no `proxy` recorded (older files) counts when it is not
+    older than the last proxy change. Nothing qualifies -> ip '' and the card
+    says the exit has not been checked since the proxy changed.
+
+    `at` carries a trailing Z: these stamps are UTC and the browser must not
+    read them as local time."""
+    meta = (_read_sidecar(sidecar_path(username, root)).get("meta") or {})
+    proxy = meta.get("proxy") or ""
+    red = redact_proxy(proxy) if proxy else ""
+    changed = meta.get("proxy_changed") or ""
+    out = {"proxy_host": _proxy_host(proxy), "ip": "", "country": "", "at": "",
+           "source": "", "proxy_changed": (changed + "Z") if changed else ""}
+    if not proxy:
+        return out
+    for h in reversed(meta.get("exits") or []):
+        if not h.get("ip"):
+            continue
+        same = (h.get("proxy") == red) if h.get("proxy") else \
+               (not changed or (h.get("at") or "") >= changed)
+        if same:
+            out.update(ip=h["ip"], country=h.get("country") or "",
+                       at=(h.get("at") or "") + "Z", source="sample")
+            return out
+        break               # the newest sample is from another proxy: stop
+    ex = meta.get("exit") or {}
+    if ex.get("exit_ip") and ex.get("proxy") == red:
+        out.update(ip=ex["exit_ip"], country=ex.get("country") or "",
+                   at=(ex.get("checked") or "") + "Z", source="signin")
+    return out
+
+
+def check_exit(username: str, root: Path | str = ".", *, check=None,
+               log=lambda m: None) -> dict:
+    """Ask, now, where this account's proxy exits, and write it into the exit
+    history. BLOCKING (three third-party requests, none to an Instagram
+    account). The operator's "Check proxy" — the collector samples on its own
+    only every EXIT_SAMPLE_H hours, and never for a benched account.
+
+    Only meta.exits is written; the session and the phone are untouched."""
+    path = sidecar_path(username, root)
+    data = _read_sidecar(path) if path.exists() else {}
+    meta = dict(data.get("meta") or {})
+    proxy = meta.get("proxy") or ""
+    if not data or not proxy:
+        return {"ok": False, "why": "no_proxy",
+                "detail": "no saved session with a proxy on file for this account"}
+    chk = (check or proxy_check)(proxy, expect_country=account_country(username, root))
+    if chk.get("exit_ip"):
+        fresh = _read_sidecar(path) or data      # a pass may have written since
+        meta = dict(fresh.get("meta") or {})
+        hist = list(meta.get("exits") or [])
+        hist.append(_exit_sample(chk))
+        meta["exits"] = hist[-EXIT_HISTORY:]
+        try:
+            _write_sidecar(path, {**fresh, "meta": meta})
+        except OSError as e:
+            log(f"[ig] @{username}: exit checked but not recorded ({type(e).__name__})")
+    return chk
 
 
 def account_device(username: str, root: Path | str = ".") -> dict:
@@ -676,6 +851,7 @@ def load_client(username: str, *, proxy: str = "", store_path: str = "ig_account
 
     data = json.loads(path.read_text())
     meta = data.get("meta", {})
+    _refuse_cleared(username, meta)
     settings = data.get("settings", {})
     label = meta.get("label") or "ig_a"
     use_proxy = proxy or meta.get("proxy") or ""
@@ -720,6 +896,7 @@ def refresh(username: str, *, proxy: str = "", store_path: str = "ig_accounts.db
         raise RuntimeError(f"no saved session for @{username} at {path} to refresh")
     data = json.loads(path.read_text())
     meta = data.get("meta", {})
+    _refuse_cleared(username, meta)
     label = meta.get("label") or "ig_a"
     use_proxy = proxy or meta.get("proxy") or ""
 

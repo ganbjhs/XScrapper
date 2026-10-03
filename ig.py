@@ -176,6 +176,14 @@ class Store:
             (int(active), error or None, _now(), username))
         self.db.commit()
 
+    def clear_session(self, username: str, error: str = "") -> None:
+        """Forget the cookies and bench the row. The ROW stays: it is what
+        ties the username to its phone label, and what the card is drawn from."""
+        self.db.execute(
+            "UPDATE accounts SET cookies=?, active=0, error_msg=?, updated_at=? "
+            "WHERE username=?", ("{}", error or None, _now(), username))
+        self.db.commit()
+
     def active_accounts(self) -> list:
         """Usernames of every row that participates in collection."""
         return [r["username"] for r in self.all() if r.get("active")]

@@ -164,6 +164,9 @@ def collectors(*, store_path=ACCOUNTS_DB, root=".", log=print) -> tuple:
             if not jar.get("sessionid"):
                 benched[u] = "no session"
                 continue
+        if meta.get("cleared_at"):
+            benched[u] = "session cleared by the operator — sign in again"
+            continue
         if meta.get("checkpoint_at"):
             benched[u] = f"checkpoint at {meta['checkpoint_at']}"
             continue

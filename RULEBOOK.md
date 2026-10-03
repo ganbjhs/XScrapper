@@ -1398,6 +1398,32 @@ which has no project — threw the accounts away: every Instagram card said
 Accounts are global. The Accounts page asks with `softError`
 (`api.igAccountsLive`); do not point it back at the project-scoped helper.
 
+### A new phone has never been signed in — and a card names the address it shows (2026-10-03)
+
+- **"New phone" clears the session too** (`ig_session.clear_session`): the
+  sidecar's cookies, the roster row's cookies and the account's Chromium
+  profile (`profiles/pool_<id>`). It used to replace only the handset, so the
+  sign-in window opened as a new phone carrying the old phone's cookies and
+  Instagram answered "something went wrong" instead of a login form. The card
+  also has **Clear session** for the same thing without changing the phone.
+- **Clearing keeps** the phone, the proxy on file, the label, the exit history
+  and a checkpoint tombstone. The old sidecar is kept as `.bak-<utc>`.
+- **A cleared session cannot come back by itself.** The sidecar is marked
+  `cleared_at`: `collectors()` benches it, `load_client`/`refresh` raise
+  `SessionCleared`, `touch()` refuses to write a pass's stale copy back. Only a
+  sign-in (`persist`) removes the mark. Do not add a path that logs in to
+  "repair" a cleared account.
+- **Only directories directly inside `profiles/` are ever deleted.**
+- **Two addresses, two names.** "signed in via" is the exit recorded when the
+  session was created; after a proxy change it is the OLD proxy's address.
+  "fetching via" is `ig_session.exit_now`: the newest exit evidence that went
+  through the proxy on file, or an explicit "not checked since the proxy
+  changed". The phone/proxy country warning and the New phone picker read
+  `exit_now`, never the sign-in exit. **Check proxy** asks on demand
+  (`ig_session.check_exit`; no Instagram account request).
+- Timestamps sent to the browser carry a `Z`. A bare UTC string is read as
+  local time and was showing a checkpoint as 5h30m older than it was.
+
 ### Instagram is the STRICT platform — treat every rule here as non-negotiable
 
 Instagram's bot detection watches rhythm, volume, IP and device as much as any
