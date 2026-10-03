@@ -91,7 +91,11 @@ export const api = {
   igDiag: () => request("/api/ig/diag"),
   igAccount: (username, active) =>
     request("/api/ig/account", { method: "POST", body: { username, active } }),
-  igReseed: (username) => request("/api/ig/reseed", { method: "POST", body: { username } }),
+  // country/timezone are optional: left out, the server uses the country the
+  // account's proxy exits in (ig_identity.MARKETS).
+  igReseed: (username, country, timezone) =>
+    request("/api/ig/reseed", { method: "POST", body: { username, country, timezone } }),
+  igMarkets: () => request("/api/ig/markets"),
   igSource: (body) => request("/api/ig/source", { method: "POST", body }),
   igFetch: (project, list_id) => request("/api/ig/fetch", { method: "POST", body: { project, list_id } }),
   // Named Instagram lists (2026-09-29): create / rename / pause / resume / delete.

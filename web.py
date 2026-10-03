@@ -6294,8 +6294,40 @@ def _ig_reseed(body):
             label = (row or {}).get("label") or ""
         if not label:
             return {"error": f"no Instagram session row for @{username}"}
-    dev = ig_session.reseed(label, root, why="operator asked for a new phone",
-                            log=lines.append)
+    # WHICH COUNTRY the new phone lives in (ig_identity.MARKETS, 2026-10-03).
+    # Asked for by the operator; left out, it is where this account's proxy
+    # last exited, and failing that the phone keeps the country it had
+    # (ig_session.reseed). A country with no catalogue is refused here, with
+    # the old phone and its session untouched.
+    country = (body.get("country") or "").strip().upper()
+    zone = (body.get("timezone") or "").strip()
+    exit_ip = ""
+    try:
+        with ig.Store(root / "ig_accounts.db") as st:
+            names = [r["username"] for r in st.all() if (r["label"] or "") == label]
+        for u in names:
+            ex = ((ig_session._read_sidecar(ig_session.sidecar_path(u, root))
+                   .get("meta") or {}).get("exit") or {})
+            if ex.get("exit_ip"):
+                exit_ip = ex.get("exit_ip") or ""
+                if not country and ig_identity.known_market(ex.get("country")):
+                    country = (ex.get("country") or "").upper()
+                break
+    except Exception:
+        pass
+    if country and not ig_identity.known_market(country):
+        return {"error": f"no phones are catalogued for {country} — known: "
+                         + ", ".join(m["country"] for m in ig_identity.markets_public())
+                         + ". Add it to ig_identity.MARKETS first."}
+    if country and not zone and len(ig_identity.MARKETS[country]["zones"]) > 1:
+        zone = ig_session.geo_timezone(exit_ip)
+    try:
+        dev = ig_session.reseed(label, root, why="operator asked for a new phone"
+                                + (f" in {country}" if country else ""),
+                                country=country or None, timezone=zone,
+                                log=lines.append)
+    except ig_identity.UnknownMarket as e:
+        return {"error": str(e)}
     with ig.Store(root / "ig_accounts.db") as st:
         for r in st.all():
             if (r["label"] or "") == label:
@@ -7685,6 +7717,10 @@ class Handler(BaseHTTPRequestHandler):
                 return self._send(200, _ig_status(q))
             if u.path == "/api/ig/diag":
                 return self._send(200, _ig_diag())
+            if u.path == "/api/ig/markets":
+                import ig_identity
+                return self._send(200, {"markets": ig_identity.markets_public(),
+                                        "default": ig_identity.DEFAULT_COUNTRY})
             if u.path == "/api/ig/posts":
                 body = _ig_posts(q)
                 self._note_pull(u.path, q, body, 200)

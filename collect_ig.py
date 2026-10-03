@@ -1143,7 +1143,20 @@ def main() -> int:
 
         # Account-local timezone for the active-hours window (IST by default,
         # the media house's clock). Env IG_TZ_OFFSET_S overrides.
-        tz_off = int(os.getenv("IG_TZ_OFFSET_S", str(int(5.5 * 3600))))
+        # Since 2026-10-03 a phone can live in another country
+        # (ig_identity.MARKETS): each account's waking hours follow ITS phone's
+        # zone, so a phone in Paris is not awake on Delhi's clock. An explicit
+        # IG_TZ_OFFSET_S still wins for every account, as it always did.
+        tz_env = os.getenv("IG_TZ_OFFSET_S", "").strip()
+        tz_off = int(tz_env) if tz_env.lstrip("-").isdigit() else int(5.5 * 3600)
+
+        def phone_tz(username):
+            if tz_env.lstrip("-").isdigit():
+                return tz_off
+            try:
+                return ig_session.account_tz_offset(username, ".", default=tz_off)
+            except Exception:
+                return tz_off
 
         # ONE decider for the life of the service. Its state lives in
         # activity.db, so an open condition is announced once, not once per
@@ -1179,7 +1192,7 @@ def main() -> int:
                 owners, _ = collectors(log=loop_log)
                 in_hand, until = {}, []
                 for a in owners:
-                    off = tz_off + int(ig_identity.stable_offset(a) * 3600)
+                    off = phone_tz(a) + int(ig_identity.stable_offset(a) * 3600)
                     on, change = ig_human.session_now(a, started, tz_offset_s=off)
                     until.append(change)
                     if on:

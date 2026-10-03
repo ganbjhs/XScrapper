@@ -177,6 +177,91 @@ function EditModal({ a, onDone, onClose }) {
   );
 }
 
+// A NEW PHONE, IN A CHOSEN COUNTRY (ig_identity.MARKETS). The phone must live
+// where the account's proxy exits: the picker starts on the exit's country and
+// says so when the two disagree. Only THIS account changes — every other
+// account keeps the phone in its own device file.
+function NewPhoneModal({ a, live, onDone, onClose }) {
+  const [markets, setMarkets] = useState(null);
+  const [country, setCountry] = useState("");
+  const [zone, setZone] = useState("");
+  const [err, setErr] = useState("");
+  const [busy, setBusy] = useState(false);
+  const exitCc = (live?.exit?.country || "").toUpperCase();
+  const nowCc = (live?.identity?.country || "").toUpperCase();
+
+  useEffect(() => {
+    let dead = false;
+    api.igMarkets().then((r) => {
+      if (dead) return;
+      const list = r.markets || [];
+      setMarkets(list);
+      const has = (cc) => list.some((m) => m.country === cc);
+      setCountry(has(exitCc) ? exitCc : has(nowCc) ? nowCc : (r.default || "IN"));
+    }).catch((e) => { if (!dead) setErr(String(e.message || e)); });
+    return () => { dead = true; };
+  }, []);
+
+  const m = (markets || []).find((x) => x.country === country);
+  const exitKnown = exitCc && (markets || []).some((x) => x.country === exitCc);
+  const go = async () => {
+    setBusy(true); setErr("");
+    try {
+      const r = await api.igReseed(live.username, country, zone);
+      if (r && r.error) { setErr(r.error); return; }
+      onDone(); onClose();
+    } catch (e) { setErr(String(e.message || e)); } finally { setBusy(false); }
+  };
+
+  return (
+    <Modal title={`New phone for ${a.label}`} onClose={onClose}
+           sub="The current session dies with the old phone. You will sign in again on the new one.">
+      <div className="kv"><span>phone now</span>
+        <b style={{ fontWeight: 500 }}>{live?.identity?.text || "none minted yet"}</b></div>
+      <div className="kv"><span>proxy exits in</span>
+        <b style={{ fontWeight: 500 }}>
+          {exitCc ? `${exitCc}${live?.exit?.exit_ip ? ` · ${live.exit.exit_ip}` : ""}` : "unknown — no exit recorded yet"}
+        </b></div>
+      {!markets && !err && <Loading />}
+      {markets && (
+        <>
+          <div className="field"><label>Country of the new phone</label>
+            <select value={country} onChange={(e) => { setCountry(e.target.value); setZone(""); }}>
+              {markets.map((x) => (
+                <option key={x.country} value={x.country}>
+                  {x.name} ({x.country}) · {x.phones} phones{x.country === exitCc ? " · matches the proxy" : ""}
+                </option>
+              ))}
+            </select>
+          </div>
+          {m && m.zones.length > 1 && (
+            <div className="field"><label>Time zone</label>
+              <select value={zone} onChange={(e) => setZone(e.target.value)}>
+                <option value="">Automatic — from the proxy's location</option>
+                {m.zones.map((z) => <option key={z} value={z}>{z}</option>)}
+              </select>
+            </div>
+          )}
+          {exitCc && country !== exitCc && (
+            <div className="err">
+              {exitKnown
+                ? `This account's proxy exits in ${exitCc}, but you are choosing ${country}. A phone and an IP that disagree about the country is what gets an account challenged.`
+                : `This account's proxy exits in ${exitCc}, and there are no phones catalogued for ${exitCc} yet. Any choice here will disagree with the proxy.`}
+            </div>
+          )}
+        </>
+      )}
+      {err && <div className="err">{err}</div>}
+      <div className="row">
+        <button className="btn btn-ghost" onClick={onClose}>Cancel</button>
+        <button className="btn btn-brand" disabled={busy || !country} onClick={go}>
+          Mint the new phone
+        </button>
+      </div>
+    </Modal>
+  );
+}
+
 function CodesModal({ a, onDone, onClose }) {
   const [codes, setCodes] = useState("");
   const [err, setErr] = useState("");
@@ -587,10 +672,11 @@ function AccountCard({ a, live, onChanged }) {
   const isIg = a.platform === "ig";
   const bench = () => act(() => api.igAccount(live.username, false), "benched — its sources move on the next pass");
   const collect = () => act(() => api.igAccount(live.username, true), "collecting again from the next pass");
-  const newPhone = () => {
-    if (!confirm(`Mint a NEW phone for ${a.label}? The current session dies with the old phone; you will sign in again on the new one.`)) return;
-    act(() => api.igReseed(live.username), "new phone minted — sign in again");
-  };
+  const newPhone = () => setModal("phone");
+  // The phone and the proxy must agree about the country (ig_identity.MARKETS).
+  const phoneCc = (live?.identity?.country || "").toUpperCase();
+  const exitCc = (live?.exit?.country || "").toUpperCase();
+  const countryClash = !!(phoneCc && exitCc && phoneCc !== exitCc);
 
   return (
     <div className="panel">
@@ -616,6 +702,13 @@ function AccountCard({ a, live, onChanged }) {
               {live.identity ? live.identity.text : "no phone minted yet — the first sign-in mints one"}
             </b>
           </div>
+          {countryClash && (
+            <div className="kv"><span>country</span>
+              <b className="st-warn">
+                {`phone is in ${live.identity.country_name || phoneCc}, proxy exits in ${exitCc} — use New phone to match, or move the proxy`}
+              </b>
+            </div>
+          )}
           <div className="kv"><span>collecting</span>
             <b className={live.active && !live.checkpoint_at ? "st-good" : "st-warn"}>
               {live.active ? `yes · owns ${live.owns ?? 0} source(s)` : "benched"}
@@ -652,6 +745,7 @@ function AccountCard({ a, live, onChanged }) {
       {modal === "signin" && <SignInModal a={a} onDone={onChanged} onClose={() => setModal(null)} />}
       {modal === "edit" && <EditModal a={a} onDone={onChanged} onClose={() => setModal(null)} />}
       {modal === "codes" && <CodesModal a={a} onDone={onChanged} onClose={() => setModal(null)} />}
+      {modal === "phone" && <NewPhoneModal a={a} live={live} onDone={onChanged} onClose={() => setModal(null)} />}
     </div>
   );
 }

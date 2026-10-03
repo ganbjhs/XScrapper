@@ -1364,6 +1364,30 @@ streamed login is dead; the phone-shaped one (above) is the third door.
 - Do not raise the 3 or drop the floor to "catch up faster". A backlog is
   cleared by the accounts' own sessions; this button is for a look, now.
 
+### An Instagram phone lives where its proxy exits — the country is per account (2026-10-03)
+
+The market (language, country, dialling code, time zone, phone list) was one
+constant, India, for the whole server. Accounts were then moved to static exits
+in France and the US while still presenting an Indian handset on IST, and
+`@sanaakhtar221` was challenged the next day. So:
+
+- **The country is chosen per account, at mint time**, from `ig_identity.MARKETS`,
+  and written into that account's device file. A device file is never rewritten
+  to change country; only the operator's "New phone" (which costs a sign-in) or
+  a label's very first sign-in mints.
+- **Phone and proxy must agree on the country.** The card says so when they do
+  not. A mismatch is still *said, not refused* at sign-in (geo databases are
+  approximate), but it is never left silent.
+- **An unknown country is refused, never minted as India.** Adding a country is
+  one row in `MARKETS`; `validate_markets()` runs in the tests.
+- **Every market's phone speaks English.** A rate limit or a challenge is
+  recognised by its English wording, by instagrapi and by this project. A phone
+  in the local language would make Instagram's answers unclassifiable.
+- **The UTC offset is derived from the zone on the day**, never stored as a
+  truth: Paris and New York change clocks, India does not.
+- **Do not move one account by editing the default.** `DEFAULT_COUNTRY` moves
+  every future mint; it is not a way to relocate an account.
+
 ### Instagram is the STRICT platform — treat every rule here as non-negotiable
 
 Instagram's bot detection watches rhythm, volume, IP and device as much as any

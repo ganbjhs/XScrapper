@@ -37,6 +37,11 @@ this machine actually has (Playwright's Chromium), so the string we send is the
 string a real render would send; only when no browser is installed does the
 env fallback apply.
 
+MARKETS (2026-10-03). "India" in the rule above is now "the country this
+account's proxy exits in". The market is chosen per account at mint time from
+the MARKETS table below and written into that account's device file; adding a
+country is one row there. Existing device files are never rewritten.
+
 Pure module: no network, no instagrapi import at module load, every random
 draw takes an injectable rng. Test: tests/test_all.py::test_ig_identity.
 """
@@ -85,18 +90,238 @@ DEVICES = (
     ("OPPO Reno10 5G",         "OPPO",         "CPH2531",    "OP5A57L1", "mt6877",   "1080x2412", "480dpi", 34, "14"),
 )
 
-# The market the identities are minted for. One value, on purpose: the proxy
-# exits are Indian and a mixed bag of countries across accounts on one server
-# would be its own tell. Change the whole tuple, not one field of it.
-MARKET = {
-    "locale": "en_IN",
-    "country": "IN",
-    "country_code": 91,
-    "timezone_offset": 19800,          # +05:30
-    "timezone_name": "Asia/Kolkata",
-    "web_locale": "en-IN",             # BCP-47, for the browser
-    "accept_language": "en-IN,en;q=0.9,hi;q=0.8",
+# Phones sold through European retail: Samsung's international "B"/"F"
+# models, Xiaomi's global "G" models, Google's own. Shared by every European
+# market below. A model that is also in the Indian list (SM-A155F, SM-S911B)
+# is the same row on purpose — it IS the same handset.
+DEVICES_INTL = (
+    ("Samsung Galaxy A54 5G",  "samsung",      "SM-A546B",   "a54x",     "s5e8835",  "1080x2340", "450dpi", 34, "14"),
+    ("Samsung Galaxy A34 5G",  "samsung",      "SM-A346B",   "a34x",     "mt6877",   "1080x2340", "450dpi", 34, "14"),
+    ("Samsung Galaxy A53 5G",  "samsung",      "SM-A536B",   "a53x",     "s5e8825",  "1080x2400", "450dpi", 34, "14"),
+    ("Samsung Galaxy A15",     "samsung",      "SM-A155F",   "a15",      "mt6789",   "1080x2340", "450dpi", 34, "14"),
+    ("Samsung Galaxy S22",     "samsung",      "SM-S901B",   "r0s",      "s5e9925",  "1080x2340", "480dpi", 34, "14"),
+    ("Samsung Galaxy S23",     "samsung",      "SM-S911B",   "dm1q",     "kalama",   "1080x2340", "450dpi", 34, "14"),
+    ("Samsung Galaxy S24",     "samsung",      "SM-S921B",   "e1s",      "s5e9945",  "1080x2340", "480dpi", 34, "14"),
+    ("Redmi Note 12 5G",       "Xiaomi/Redmi", "22111317G",  "sunstone", "qcom",     "1080x2400", "440dpi", 33, "13"),
+    ("Redmi Note 13 Pro 5G",   "Xiaomi/Redmi", "2312DRA50G", "garnet",   "qcom",     "1220x2712", "480dpi", 34, "14"),
+    ("POCO X5 Pro 5G",         "Xiaomi/POCO",  "22101320G",  "redwood",  "qcom",     "1080x2400", "440dpi", 33, "13"),
+    ("Google Pixel 7",         "Google/google", "Pixel 7",   "panther",  "panther",  "1080x2400", "420dpi", 34, "14"),
+    ("Google Pixel 7a",        "Google/google", "Pixel 7a",  "lynx",     "lynx",     "1080x2400", "420dpi", 34, "14"),
+    ("Google Pixel 8",         "Google/google", "Pixel 8",   "shiba",    "shiba",    "1080x2400", "420dpi", 34, "14"),
+    ("Google Pixel 8a",        "Google/google", "Pixel 8a",  "akita",    "akita",    "1080x2400", "420dpi", 34, "14"),
+)
+
+# Phones sold in the United States: Samsung's unlocked "U1" models and
+# Google's own. (Never "Pixel 8 Pro": that is instagrapi's default handset,
+# the one every script on earth presents — see LEGACY_MODELS.)
+DEVICES_US = (
+    ("Samsung Galaxy A54 5G",  "samsung",      "SM-A546U1",  "a54x",     "s5e8835",  "1080x2340", "450dpi", 34, "14"),
+    ("Samsung Galaxy A53 5G",  "samsung",      "SM-A536U1",  "a53x",     "s5e8825",  "1080x2400", "450dpi", 34, "14"),
+    ("Samsung Galaxy A15 5G",  "samsung",      "SM-A156U1",  "a15x",     "mt6835",   "1080x2340", "450dpi", 34, "14"),
+    ("Samsung Galaxy S22",     "samsung",      "SM-S901U1",  "r0q",      "taro",     "1080x2340", "480dpi", 34, "14"),
+    ("Samsung Galaxy S23",     "samsung",      "SM-S911U1",  "dm1q",     "kalama",   "1080x2340", "450dpi", 34, "14"),
+    ("Samsung Galaxy S23 FE",  "samsung",      "SM-S711U1",  "r11q",     "taro",     "1080x2340", "450dpi", 34, "14"),
+    ("Samsung Galaxy S24",     "samsung",      "SM-S921U1",  "e1q",      "pineapple", "1080x2340", "480dpi", 34, "14"),
+    ("Google Pixel 6a",        "Google/google", "Pixel 6a",  "bluejay",  "bluejay",  "1080x2400", "420dpi", 34, "14"),
+    ("Google Pixel 7",         "Google/google", "Pixel 7",   "panther",  "panther",  "1080x2400", "420dpi", 34, "14"),
+    ("Google Pixel 7a",        "Google/google", "Pixel 7a",  "lynx",     "lynx",     "1080x2400", "420dpi", 34, "14"),
+    ("Google Pixel 8",         "Google/google", "Pixel 8",   "shiba",    "shiba",    "1080x2400", "420dpi", 34, "14"),
+    ("Google Pixel 8a",        "Google/google", "Pixel 8a",  "akita",    "akita",    "1080x2400", "420dpi", 34, "14"),
+)
+
+# One catalogue per retail region. A market names the set its phones come from.
+DEVICE_SETS = {"india": DEVICES, "intl": DEVICES_INTL, "us": DEVICES_US}
+
+# ---------------------------------------------------------------------------
+# markets — the country an account's phone LIVES in (2026-10-03)
+# ---------------------------------------------------------------------------
+#
+# Until 2026-10-03 the market was ONE module constant (India), because every
+# proxy exit was Indian. Then static exits were bought in France and the US
+# and two accounts were moved onto them: an Indian handset on IST, speaking
+# from Paris. @sanaakhtar221 was challenged the next day. A phone must live
+# where its IP lives, so the market is now chosen PER ACCOUNT, at mint time,
+# and written into that account's device file. Nothing here can change a
+# phone that already exists — a device file holds its own copy of every value.
+#
+# TO ADD A COUNTRY: add one row. That is the whole change — the dashboard's
+# country picker, the proxy check and the collector's clock all read this
+# table. validate_markets() (run by the tests) refuses a row that is
+# incomplete, names a time zone this machine does not know, or points at an
+# empty phone list.
+#
+#   name             what the dashboard shows
+#   locale           the PHONE's language_REGION. English everywhere, on
+#                    purpose: Instagram answers in the phone's language, and
+#                    both instagrapi and this project recognise a rate limit
+#                    or a challenge by its ENGLISH wording. A French-language
+#                    phone would turn "Please wait a few minutes" into a
+#                    sentence nothing here can classify. An English-language
+#                    phone living in France is an ordinary thing to be.
+#   country_code     the dialling code instagrapi sends
+#   web_locale       BCP-47, for the browser
+#   accept_language  the browser's header — the local language rides second
+#   zones            IANA time zones; the FIRST is the default. More than one
+#                    only where the country spans several (the US); the mint
+#                    then takes the zone of the proxy's exit when it is known.
+#   devices          a key of DEVICE_SETS
+#
+# The UTC offset is never typed here: it is read from the zone, so daylight
+# saving is right on the day it changes (see live_offset).
+MARKETS = {
+    "IN": {"name": "India", "locale": "en_IN", "country_code": 91,
+           "web_locale": "en-IN", "accept_language": "en-IN,en;q=0.9,hi;q=0.8",
+           "zones": ("Asia/Kolkata",), "devices": "india"},
+    "FR": {"name": "France", "locale": "en_GB", "country_code": 33,
+           "web_locale": "en-GB", "accept_language": "en-GB,en;q=0.9,fr;q=0.8",
+           "zones": ("Europe/Paris",), "devices": "intl"},
+    "DE": {"name": "Germany", "locale": "en_GB", "country_code": 49,
+           "web_locale": "en-GB", "accept_language": "en-GB,en;q=0.9,de;q=0.8",
+           "zones": ("Europe/Berlin",), "devices": "intl"},
+    "GB": {"name": "United Kingdom", "locale": "en_GB", "country_code": 44,
+           "web_locale": "en-GB", "accept_language": "en-GB,en;q=0.9",
+           "zones": ("Europe/London",), "devices": "intl"},
+    "US": {"name": "United States", "locale": "en_US", "country_code": 1,
+           "web_locale": "en-US", "accept_language": "en-US,en;q=0.9",
+           "zones": ("America/New_York", "America/Chicago", "America/Denver",
+                     "America/Los_Angeles", "America/Phoenix"),
+           "devices": "us"},
 }
+DEFAULT_COUNTRY = "IN"
+
+# Offsets for when the zone database is missing (a stripped container). Only
+# the zones named above; standard time. live_offset() prefers the real thing.
+_FALLBACK_OFFSETS = {"Asia/Kolkata": 19800, "Europe/Paris": 3600,
+                     "Europe/Berlin": 3600, "Europe/London": 0,
+                     "America/New_York": -18000, "America/Chicago": -21600,
+                     "America/Denver": -25200, "America/Los_Angeles": -28800,
+                     "America/Phoenix": -25200}
+
+
+class UnknownMarket(ValueError):
+    """Asked to mint a phone for a country that has no row in MARKETS."""
+
+
+def known_market(country) -> bool:
+    return str(country or "").strip().upper() in MARKETS
+
+
+def market(country=None) -> tuple:
+    """(code, row) for a country code. None/'' means the default market.
+    An unknown code is REFUSED, never quietly turned into India: a phone in
+    the wrong country is the fault this table exists to prevent."""
+    cc = str(country or DEFAULT_COUNTRY).strip().upper()
+    if cc not in MARKETS:
+        raise UnknownMarket(
+            f"no phones for country '{cc}' — known: {', '.join(sorted(MARKETS))}. "
+            f"Add a row to ig_identity.MARKETS to support it.")
+    return cc, MARKETS[cc]
+
+
+def utc_offset(zone: str, now=None) -> int | None:
+    """Seconds east of UTC for an IANA zone RIGHT NOW (daylight saving
+    included). None when the zone is unknown to this machine and to the
+    fallback table."""
+    try:
+        import datetime as _dt
+        from zoneinfo import ZoneInfo
+        t = (_dt.datetime.fromtimestamp(now, _dt.timezone.utc) if now is not None
+             else _dt.datetime.now(_dt.timezone.utc))
+        off = t.astimezone(ZoneInfo(zone)).utcoffset()
+        if off is not None:
+            return int(off.total_seconds())
+    except Exception:
+        pass
+    return _FALLBACK_OFFSETS.get(zone)
+
+
+def pick_zone(country=None, zone: str = "") -> str:
+    """The time zone a phone in `country` is set to: `zone` when the market
+    lists it (a US exit in Chicago), else the market's first."""
+    _, mk = market(country)
+    return zone if zone in mk["zones"] else mk["zones"][0]
+
+
+def market_values(country=None, zone: str = "", now=None) -> dict:
+    """Everything a device file records about its country, for one market."""
+    cc, mk = market(country)
+    tz = pick_zone(cc, zone)
+    off = utc_offset(tz, now)
+    return {"locale": mk["locale"], "country": cc,
+            "country_code": mk["country_code"],
+            "timezone_offset": _FALLBACK_OFFSETS.get(tz, 0) if off is None else off,
+            "timezone_name": tz, "web_locale": mk["web_locale"],
+            "accept_language": mk["accept_language"]}
+
+
+# The default market's values, under the name the rest of the project (and
+# every seed minted before 2026-10-03) knows them by. Fallbacks only: a device
+# file's own values always win.
+MARKET = market_values(DEFAULT_COUNTRY)
+
+
+def markets_public() -> list:
+    """What the dashboard's country picker needs. No device internals."""
+    out = []
+    for cc, mk in MARKETS.items():
+        out.append({"country": cc, "name": mk["name"], "locale": mk["locale"],
+                    "zones": list(mk["zones"]),
+                    "phones": len(DEVICE_SETS.get(mk["devices"]) or ()),
+                    "default": cc == DEFAULT_COUNTRY})
+    return sorted(out, key=lambda m: (not m["default"], m["name"]))
+
+
+def validate_markets() -> list:
+    """Every reason the tables above are not safe to mint from. Empty = good.
+    Run by the tests, so a half-typed new country fails there and not at 2am
+    in front of Instagram."""
+    bad = []
+    need = ("name", "locale", "country_code", "web_locale", "accept_language",
+            "zones", "devices")
+    if DEFAULT_COUNTRY not in MARKETS:
+        bad.append(f"DEFAULT_COUNTRY {DEFAULT_COUNTRY} has no row")
+    for cc, mk in MARKETS.items():
+        if not (len(cc) == 2 and cc.isalpha() and cc.isupper()):
+            bad.append(f"{cc}: the key must be an ISO-2 country code in capitals")
+        for k in need:
+            if not mk.get(k):
+                bad.append(f"{cc}: '{k}' is missing")
+        if not re.fullmatch(r"[a-z]{2}_[A-Z]{2}", str(mk.get("locale") or "")):
+            bad.append(f"{cc}: locale must look like en_GB")
+        elif not mk["locale"].startswith("en_"):
+            bad.append(f"{cc}: locale must be English (en_XX) — Instagram's "
+                       f"errors are recognised by their English wording")
+        for z in mk.get("zones") or ():
+            try:
+                from zoneinfo import ZoneInfo
+                ZoneInfo(z)
+            except Exception:
+                if z not in _FALLBACK_OFFSETS:
+                    bad.append(f"{cc}: time zone '{z}' is not one this machine knows")
+        rows = DEVICE_SETS.get(mk.get("devices"))
+        if not rows:
+            bad.append(f"{cc}: phone list '{mk.get('devices')}' is missing or empty")
+    for key, rows in DEVICE_SETS.items():
+        seen = set()
+        for row in rows:
+            if len(row) != 9:
+                bad.append(f"{key}: a phone row needs 9 fields: {row[:1]}")
+                continue
+            name, manu, model, dev, cpu, res, dpi, api, rel = row
+            if not all((name, manu, model, dev, cpu)):
+                bad.append(f"{key}: {name or '?'} has an empty field")
+            if not re.fullmatch(r"\d{3,4}x\d{3,4}", str(res)) \
+                    or not re.fullmatch(r"\d{3}dpi", str(dpi)):
+                bad.append(f"{key}: {name} has a malformed resolution or dpi")
+            if not isinstance(api, int) or not str(rel).isdigit():
+                bad.append(f"{key}: {name} has a malformed Android version")
+            if model in LEGACY_MODELS:
+                bad.append(f"{key}: {name} is the library's default handset")
+            if model in seen:
+                bad.append(f"{key}: {model} is listed twice")
+            seen.add(model)
+    return bad
+
 
 # How likely each app build is: people mostly run the latest, a tail lags.
 # Keyed by app_version; must exist in instagrapi's APP_SETTINGS or it is
@@ -207,7 +432,8 @@ def _pick(rng, weighted):
 # minting
 # ---------------------------------------------------------------------------
 
-def mint(label: str, *, rng=None, chrome=None, taken=()) -> dict:
+def mint(label: str, *, rng=None, chrome=None, taken=(), country=None,
+         timezone: str = "") -> dict:
     """
     A brand-new coherent identity for `label`, as the dict ig_session stores
     under "device" and splices over every instagrapi settings dict.
@@ -215,9 +441,18 @@ def mint(label: str, *, rng=None, chrome=None, taken=()) -> dict:
     `taken` is the set of catalogue model strings other accounts on this
     server already use; the draw avoids them while it can (uniqueness), and
     only repeats a model once the catalogue is exhausted.
+
+    `country` picks the market (MARKETS) the phone lives in — its catalogue,
+    language, dialling code and time zone. Left out, it is the default market
+    (India), which is what every caller did before markets existed. An unknown
+    country raises UnknownMarket. `timezone` is honoured only when that market
+    lists it (pick_zone).
     """
     rng = rng or random.SystemRandom()
-    avail = [d for d in DEVICES if d[2] not in set(taken)] or list(DEVICES)
+    cc, mk = market(country)
+    mv = market_values(cc, timezone)
+    catalogue = DEVICE_SETS[mk["devices"]]
+    avail = [d for d in catalogue if d[2] not in set(taken)] or list(catalogue)
     name, manu, model, dev, cpu, res, dpi, api, rel = rng.choice(avail)
     build = _pick(rng, app_builds())
     device_settings = {
@@ -232,12 +467,12 @@ def mint(label: str, *, rng=None, chrome=None, taken=()) -> dict:
     return {
         "uuids": new_uuids(rng),
         "device_settings": device_settings,
-        "user_agent": app_user_agent(device_settings, MARKET["locale"]),
-        "country": MARKET["country"],
-        "country_code": MARKET["country_code"],
-        "locale": MARKET["locale"],
-        "timezone_offset": MARKET["timezone_offset"],
-        "timezone_name": MARKET["timezone_name"],
+        "user_agent": app_user_agent(device_settings, mv["locale"]),
+        "country": mv["country"],
+        "country_code": mv["country_code"],
+        "locale": mv["locale"],
+        "timezone_offset": mv["timezone_offset"],
+        "timezone_name": mv["timezone_name"],
         # Ours, not instagrapi's: carried in the device file, read by
         # engine_ig._browser_session and ig.InteractiveLogin.
         "web_user_agent": WEB_UA.format(major=major),
@@ -246,8 +481,9 @@ def mint(label: str, *, rng=None, chrome=None, taken=()) -> dict:
             "label": label,
             "name": name,
             "chrome_major": major,
-            "web_locale": MARKET["web_locale"],
-            "accept_language": MARKET["accept_language"],
+            "market": cc,
+            "web_locale": mv["web_locale"],
+            "accept_language": mv["accept_language"],
             "screen": {"width": w, "height": h, "scale": round(scale, 3),
                        "css_width": round(w / scale), "css_height": round(h / scale)},
         },
@@ -276,6 +512,37 @@ def is_legacy(device: dict) -> bool:
             or device.get("country") == "US")
 
 
+def country_of(device: dict) -> str:
+    """The ISO-2 country this phone says it is in ('' for no device)."""
+    return str((device or {}).get("country") or "").strip().upper()
+
+
+def country_name(device: dict) -> str:
+    """'France' for a phone minted for France; the bare code for a country
+    with no row (a seed from somewhere this table has never heard of)."""
+    cc = country_of(device)
+    return (MARKETS.get(cc) or {}).get("name") or cc
+
+
+def expected_country(device: dict) -> str:
+    """The country this account's proxy exit SHOULD be in: its own phone's.
+    No device yet -> the default market."""
+    return country_of(device) or DEFAULT_COUNTRY
+
+
+def live_offset(device: dict, now=None) -> int | None:
+    """The phone's UTC offset RIGHT NOW, from its time zone name.
+
+    The device file stores the offset of the day it was minted. India never
+    changes its clocks, so that number was always right; Paris and New York
+    change twice a year, and a phone that keeps summer time into November is
+    an hour out from the IP it speaks through. The zone is the identity, the
+    offset is derived from it — like the Chrome major, not an identifier.
+    None when the device names no zone (a legacy seed): leave it alone."""
+    tz = (device or {}).get("timezone_name") or ""
+    return utc_offset(tz, now) if tz else None
+
+
 def describe(device: dict) -> str:
     """One line for the dashboard: what phone this account is."""
     if not device:
@@ -283,7 +550,8 @@ def describe(device: dict) -> str:
     ds = device.get("device_settings") or {}
     ident = device.get("identity") or {}
     name = ident.get("name") or f"{ds.get('manufacturer', '?')} {ds.get('model', '?')}"
-    bits = [name, f"Android {ds.get('android_release', '?')}",
+    bits = [name] + ([country_name(device)] if country_name(device) else []) + [
+            f"Android {ds.get('android_release', '?')}",
             f"Instagram {ds.get('app_version', '?')}",
             device.get("locale") or "?",
             device.get("timezone_name") or f"UTC{device.get('timezone_offset', 0) / 3600:+.1f}"]
@@ -302,6 +570,7 @@ def summary(device: dict) -> dict:
         "android": ds.get("android_release") or "",
         "app_version": ds.get("app_version") or "",
         "locale": device.get("locale") or "", "country": device.get("country") or "",
+        "country_name": country_name(device),
         "timezone": device.get("timezone_name") or "",
         "chrome_major": ident.get("chrome_major") or "",
         "legacy": is_legacy(device),

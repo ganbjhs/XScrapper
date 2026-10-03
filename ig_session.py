@@ -149,6 +149,7 @@ def save_device(settings: dict, label: str, root: Path | str = ".",
 
 
 def ensure_device(label: str, root: Path | str = ".", *, username: str = "",
+                  country: str | None = None, timezone: str = "",
                   log=lambda m: None) -> dict:
     """
     Return the fingerprint for `label`, minting one if this is the first time.
@@ -178,7 +179,17 @@ def ensure_device(label: str, root: Path | str = ".", *, username: str = "",
     # Nothing to adopt: mint a NEW, COHERENT phone (ig_identity), never the
     # library default. The default was the bug: every account this project
     # ever ran was the same US-locale Pixel 8 Pro (CHECKPOINT 2026-09-04).
-    device = ig_identity.mint(label, taken=taken_models(root))
+    # `country` matters ONLY here, the first mint: a phone that exists is
+    # never moved by this function. A country with no row in
+    # ig_identity.MARKETS falls back to the default market and says so — a
+    # first sign-in must not be stranded by a geo database's guess.
+    if country and not ig_identity.known_market(country):
+        log(f"[ig] '{label}': no phones are catalogued for {country} — minting "
+            f"for {ig_identity.DEFAULT_COUNTRY} instead. Add {country} to "
+            f"ig_identity.MARKETS, then use 'New phone' on the card.")
+        country = None
+    device = ig_identity.mint(label, taken=taken_models(root), country=country,
+                              timezone=timezone)
     dev = save_device(device, label, root, log=log)
     log(f"[ig] '{label}' is now {ig_identity.describe(dev)}")
     return dev
@@ -202,6 +213,7 @@ def taken_models(root: Path | str = ".") -> set:
 
 
 def reseed(label: str, root: Path | str = ".", *, why: str = "",
+           country: str | None = None, timezone: str = "",
            log=lambda m: None) -> dict:
     """
     Replace the device for `label` with a freshly minted one, ONLY ever as
@@ -214,9 +226,21 @@ def reseed(label: str, root: Path | str = ".", *, why: str = "",
     Legit reasons: the seed is the legacy library default (ig_identity
     .is_legacy) — a fresh login is being paid for anyway, so the new phone
     costs nothing extra; or the operator asked for a new handset.
+
+    `country` (2026-10-03) is the market the NEW phone lives in. Left out, a
+    phone this project minted keeps its own country — an account moved to
+    France stays in France through a later reseed — and a legacy library seed
+    (which says "US" only because the library does) gets the default market.
+    An unknown country raises ig_identity.UnknownMarket BEFORE anything is
+    touched: the old phone is still in force.
     """
     path = device_path(label, root)
     old = load_device(label, root)
+    if country is None and old.get("identity") \
+            and ig_identity.known_market(old.get("country")):
+        country = old.get("country")
+        timezone = timezone or old.get("timezone_name") or ""
+    ig_identity.market(country)        # refuse an unknown country up front
     if path.exists():
         bak = path.with_name(path.name + ".bak-" + _now().replace(":", ""))
         try:
@@ -224,7 +248,8 @@ def reseed(label: str, root: Path | str = ".", *, why: str = "",
             log(f"[ig] '{label}': previous device kept at {bak.name}")
         except OSError:
             path.unlink(missing_ok=True)
-    device = ig_identity.mint(label, taken=taken_models(root))
+    device = ig_identity.mint(label, taken=taken_models(root), country=country,
+                              timezone=timezone)
     dev = save_device(device, label, root, log=log)
     log(f"[ig] '{label}' reseeded{(' — ' + why) if why else ''}: was "
         f"{ig_identity.describe(old) if old else 'nothing'}; now "
@@ -265,6 +290,13 @@ def _splice_device(settings: dict, device: dict) -> dict:
     for k, v in (device or {}).items():
         if v is not None:
             out[k] = v
+    # The UTC offset follows the phone's ZONE, today (ig_identity.live_offset):
+    # the seed's own number is the offset on the day it was minted, which is
+    # right forever in India and wrong twice a year in Paris or New York. The
+    # seed file is not rewritten — the zone is the identity, this is derived.
+    live = ig_identity.live_offset(device or {})
+    if live is not None:
+        out["timezone_offset"] = live
     return out
 
 
@@ -499,12 +531,77 @@ def sample_exit(username: str, root: Path | str = ".", *,
     if not proxy:
         return None
     try:
-        chk = proxy_check(proxy, expect_country=ig_identity.MARKET["country"])
+        chk = proxy_check(proxy, expect_country=account_country(username, root))
     except Exception as e:
         log(f"[ig] @{username}: exit sample failed ({type(e).__name__}) — not a "
             f"collection failure, the pass decides on its own requests")
         return None
     return chk if chk.get("exit_ip") else None
+
+
+def account_device(username: str, root: Path | str = ".") -> dict:
+    """The device seed of the label this username signs in under ({} if the
+    account has no sidecar or no seed)."""
+    meta = (_read_sidecar(sidecar_path(username, root)).get("meta") or {})
+    return load_device(meta.get("label") or "ig_a", root)
+
+
+def account_country(username: str, root: Path | str = ".") -> str:
+    """The country this account's exit should be in: its own phone's."""
+    return ig_identity.expected_country(account_device(username, root))
+
+
+def account_tz_offset(username: str, root: Path | str = ".",
+                      default: int = 19800) -> int:
+    """Seconds east of UTC on THIS account's phone, now — for the waking-hours
+    window. `default` when the account has no minted phone or its seed names
+    no zone (legacy)."""
+    off = ig_identity.live_offset(account_device(username, root))
+    return default if off is None else off
+
+
+def exit_market(proxy: str, *, check=None) -> tuple:
+    """(country, zone) of a proxy's exit, for minting a FIRST phone where the
+    exit is. ('', '') when there is no proxy, the exit does not answer, or the
+    geo lookup has nothing — the caller then mints the default market.
+    BLOCKING; call it from a thread or at a sign-in, never in a pass."""
+    if not proxy:
+        return "", ""
+    try:
+        chk = (check or proxy_check)(proxy)
+    except Exception:
+        return "", ""
+    cc = (chk.get("country") or "").upper()
+    if not cc:
+        return "", ""
+    tz = ""
+    if ig_identity.known_market(cc) and len(ig_identity.MARKETS[cc]["zones"]) > 1:
+        tz = geo_timezone(chk.get("exit_ip") or "")
+    return cc, tz
+
+
+GEO_TZ_URL = "https://ipapi.co/{ip}/timezone/"
+
+
+def geo_timezone(ip: str, *, timeout: int = 8, get=None) -> str:
+    """The IANA zone a geo database puts an IP in, or '' — best effort, used
+    only to choose among a multi-zone market's zones at mint time (a US exit:
+    New York or Los Angeles?). A wrong or missing answer costs nothing:
+    ig_identity.pick_zone falls back to the market's first zone."""
+    ip = (ip or "").strip()
+    if not ip:
+        return ""
+    try:
+        if get is None:
+            import requests
+            r = requests.get(GEO_TZ_URL.format(ip=ip), timeout=timeout,
+                             headers={"User-Agent": "curl/8.4.0"})
+        else:
+            r = get(GEO_TZ_URL.format(ip=ip), None, timeout)
+        tz = (r.text or "").strip()
+        return tz if "/" in tz and len(tz) < 64 and " " not in tz else ""
+    except Exception:
+        return ""
 
 
 def exit_summary(username: str, root: Path | str = ".") -> dict:

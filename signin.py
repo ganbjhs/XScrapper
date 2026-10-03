@@ -361,13 +361,20 @@ def _needs_browser(exc) -> bool:
             or "trusted device" in t)
 
 
-def _check_exit(proxy: str, o: Outcome, log) -> dict | None:
+def _check_exit(proxy: str, o: Outcome, log, *, label: str = "", root=".") -> dict | None:
     """Prove the exit before spending a login through it. A dead or
     intercepting exit is a `proxy` refusal with the exact reason; a
-    country mismatch is said, not refused (geo databases are approximate)."""
+    country mismatch is said, not refused (geo databases are approximate).
+
+    The country the exit is compared against is THIS account's phone's
+    (ig_identity markets, 2026-10-03), not one country for the whole server.
+    An account with no phone yet is not compared at all: its first phone is
+    about to be minted FOR the exit's country (_phone_for_exit)."""
     import ig_identity
     import ig_session
-    chk = ig_session.proxy_check(proxy, expect_country=ig_identity.MARKET["country"])
+    dev = ig_session.load_device(label, root) if label else {}
+    chk = ig_session.proxy_check(
+        proxy, expect_country=ig_identity.country_of(dev) if dev else "")
     if not chk["ok"]:
         from engine_ig import NETWORK_ADVICE
         o.detail = (f"This account's proxy exit is not usable: {chk['detail']}. "
@@ -379,6 +386,25 @@ def _check_exit(proxy: str, o: Outcome, log) -> dict | None:
     if chk.get("warn"):
         log(f"warning: {chk['warn']}")
     return chk
+
+
+def _phone_for_exit(label: str, root, chk, log, *, username: str = "") -> None:
+    """A label with NO phone yet gets its first one minted for the country its
+    proxy exits in, so a new account added on a French exit is a phone in
+    France from its first request. A label that already has a phone is never
+    touched here — moving an existing account is the operator's 'New phone'."""
+    import ig_identity
+    import ig_session
+    if ig_session.load_device(label, root):
+        return
+    cc = ((chk or {}).get("country") or "").upper()
+    if not cc:
+        return                      # no geo answer: ensure_device mints the default
+    tz = ""
+    if ig_identity.known_market(cc) and len(ig_identity.MARKETS[cc]["zones"]) > 1:
+        tz = ig_session.geo_timezone((chk or {}).get("exit_ip") or "")
+    ig_session.ensure_device(label, root, username=username, country=cc,
+                             timezone=tz, log=log)
 
 
 def _fresh_phone_if_legacy(label: str, root, log) -> None:
@@ -447,9 +473,10 @@ def ig_password(login: str, password: str, *, totp_secret: str = "",
     from instagrapi.exceptions import (ChallengeRequired, ClientError,
                                        TwoFactorRequired)
 
-    chk = _check_exit(proxy, o, log)
+    chk = _check_exit(proxy, o, log, label=label, root=root)
     if chk is None:
         return o
+    _phone_for_exit(label, root, chk, log, username=login)
     _fresh_phone_if_legacy(label, root, log)
 
     log(f"signing in as @{login} through {_redact(proxy)}")
@@ -547,9 +574,10 @@ def ig_cookie(blob: str, *, proxy: str = "", label: str = "ig_a", root=".",
     import ig_session
     from instagrapi.exceptions import ClientError
 
-    chk = _check_exit(proxy, o, log)
+    chk = _check_exit(proxy, o, log, label=label, root=root)
     if chk is None:
         return o
+    _phone_for_exit(label, root, chk, log)
     _fresh_phone_if_legacy(label, root, log)
 
     # Through new_client so the cookie is adopted BY THE ACCOUNT'S PINNED
@@ -721,8 +749,9 @@ def ig_browser_adopt(cookies: dict, *, proxy: str = "", label: str = "ig_a",
 
     chk = None
     try:
-        chk = ig_session.proxy_check(proxy, expect_country=ig_identity.MARKET["country"]) \
-            if proxy else None
+        chk = ig_session.proxy_check(
+            proxy, expect_country=ig_identity.expected_country(
+                ig_session.load_device(label, root))) if proxy else None
     except Exception:
         chk = None
     return _ig_persist(cl, username, label=label, proxy=proxy, root=root,

@@ -372,8 +372,15 @@ class InteractiveLogin:
         default) seed is replaced here, because this IS a sign-in."""
         import ig_identity
         import ig_session
+        # A label with no phone yet gets its FIRST one where its proxy exits
+        # (ig_identity markets, 2026-10-03). An existing phone is not moved.
+        cc = tz = ""
+        if not ig_session.load_device(self.ig_label, self.root):
+            cc, tz = ig_session.exit_market(
+                getattr(self.acct, "proxy_or_none", None) or "")
         dev = ig_session.ensure_device(self.ig_label, self.root,
-                                       username=self.acct.username, log=log)
+                                       username=self.acct.username,
+                                       country=cc or None, timezone=tz, log=log)
         if ig_identity.is_legacy(dev):
             dev = ig_session.reseed(self.ig_label, self.root,
                                     why="legacy default phone; the browser "
@@ -401,7 +408,7 @@ class InteractiveLogin:
             await cdp.send("Emulation.setUserAgentOverride", {
                 "userAgent": ig_identity.playwright_kwargs(self.device)["user_agent"],
                 "acceptLanguage": (self.device.get("identity") or {}).get(
-                    "accept_language", "en-IN,en;q=0.9"),
+                    "accept_language", ig_identity.MARKET["accept_language"]),
                 "platform": "Linux armv8l",
                 "userAgentMetadata": ig_identity.cdp_user_agent_metadata(self.device),
             })

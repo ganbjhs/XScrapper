@@ -4961,6 +4961,142 @@ def test_ig_identity(tmp):
     ok(o1 == ig_identity.stable_offset("sanaakhtar221") and -1.5 <= o1 <= 1.5 and o1 != o2,
        f"same handle -> same shift ({o1:+.2f}h), different handles differ ({o2:+.2f}h)")
 
+    print()
+    print("== markets: a phone lives where its proxy exits (2026-10-03) ==")
+    from unittest import mock as _m
+    # Until now the market was one constant, India, for the whole server. Two
+    # accounts were moved to French static exits on 2026-10-02 — an Indian
+    # handset on IST, speaking from Paris — and one was challenged the next
+    # day. These checks hold the per-account market to its promises.
+    ok(ig_identity.validate_markets() == [],
+       "the market and phone tables are complete: " + str(ig_identity.validate_markets()))
+    ok(ig_identity.MARKET["country"] == "IN" and ig_identity.MARKET["locale"] == "en_IN"
+       and ig_identity.MARKET["timezone_offset"] == 19800
+       and ig_identity.mint("dflt", rng=_r.Random(1), chrome="140")["country"] == "IN",
+       "no country asked for -> India, exactly as before markets existed")
+    for cc, loc, tzname in (("FR", "en_GB", "Europe/Paris"), ("DE", "en_GB", "Europe/Berlin"),
+                            ("GB", "en_GB", "Europe/London"), ("US", "en_US", "America/New_York")):
+        m = ig_identity.mint("m_" + cc, rng=_r.Random(11), chrome="140", country=cc)
+        mk = ig_identity.MARKETS[cc]
+        models = {row[2] for row in ig_identity.DEVICE_SETS[mk["devices"]]}
+        ok(m["country"] == cc and m["locale"] == loc and m["timezone_name"] == tzname
+           and m["country_code"] == mk["country_code"]
+           and m["device_settings"]["model"] in models
+           and f"; {loc}; " in m["user_agent"]
+           and m["identity"]["market"] == cc
+           and m["identity"]["accept_language"] == mk["accept_language"]
+           and m["timezone_offset"] == ig_identity.utc_offset(tzname)
+           and not ig_identity.is_legacy(m),
+           f"{cc}: phone, language, dialling code, zone and catalogue are all {mk['name']}'s "
+           f"({ig_identity.describe(m)})")
+        ok(mk["name"] in ig_identity.describe(m)
+           and ig_identity.summary(m)["country_name"] == mk["name"]
+           and ig_identity.summary(m)["country"] == cc,
+           f"{cc}: the card names the country in words")
+        pwk = ig_identity.playwright_kwargs(m)
+        ok(pwk["timezone_id"] == tzname and pwk["locale"] == mk["web_locale"]
+           and ig_identity.web_headers(m)["Accept-Language"] == mk["accept_language"],
+           f"{cc}: the sign-in window and web calls are in the same country")
+    ok(all(mk["locale"].startswith("en_") for mk in ig_identity.MARKETS.values()),
+       "every market's phone speaks English (rate limits and challenges are "
+       "recognised by their English wording)")
+    us = ig_identity.mint("u", rng=_r.Random(2), chrome="140", country="us",
+                          timezone="America/Chicago")
+    ok(us["timezone_name"] == "America/Chicago" and us["country"] == "US",
+       "a multi-zone country takes the zone it is given (and the code is case-blind)")
+    ok(ig_identity.mint("u", rng=_r.Random(2), chrome="140", country="FR",
+                        timezone="America/Chicago")["timezone_name"] == "Europe/Paris",
+       "a zone that is not that country's is ignored, not obeyed")
+    try:
+        ig_identity.mint("j", country="JP")
+        ok(False, "an uncatalogued country must be refused")
+    except ig_identity.UnknownMarket as e:
+        ok("JP" in str(e) and "MARKETS" in str(e),
+           "an uncatalogued country is REFUSED with the fix named, never minted as India")
+    # daylight saving: the offset follows the zone, on the day
+    paris = {"timezone_name": "Europe/Paris", "timezone_offset": 7200}
+    jan, jul = 1767268800, 1782907200          # 2026-01-01 12:00Z, 2026-07-01 12:00Z
+    ok(ig_identity.live_offset(paris, jan) == 3600 and ig_identity.live_offset(paris, jul) == 7200,
+       "Paris is +1h in January and +2h in July, whatever the seed recorded")
+    ok(ig_identity.live_offset({"timezone_name": "Asia/Kolkata"}, jan) == 19800
+       and ig_identity.live_offset({"timezone_name": "Asia/Kolkata"}, jul) == 19800,
+       "India does not move")
+    ok(ig_identity.live_offset({"timezone_offset": -14400}) is None,
+       "a legacy seed with no zone name is left alone")
+    ok(ig_identity.expected_country(us) == "US" and ig_identity.expected_country({}) == "IN",
+       "an exit is compared against the account's OWN phone's country")
+    pub = ig_identity.markets_public()
+    ok(pub[0]["country"] == "IN" and {m["country"] for m in pub} == set(ig_identity.MARKETS)
+       and all(m["phones"] > 0 and m["zones"] and "devices" not in m for m in pub),
+       "the picker lists every market, default first, without device internals")
+
+    print()
+    print("== markets through ig_session: one account moves, the others do not ==")
+    root2 = root / "mk"
+    (root2 / "profiles").mkdir(parents=True, exist_ok=True)
+    india = ig_session.ensure_device("pool_1", root2)
+    before = (root2 / "profiles" / "ig_device_pool_1.json").read_bytes()
+    fr = ig_session.ensure_device("pool_2", root2, country="FR")
+    ok(india["country"] == "IN" and fr["country"] == "FR"
+       and fr["device_settings"]["model"] != india["device_settings"]["model"],
+       "a new label can be minted in France beside one in India")
+    lines2 = []
+    odd = ig_session.ensure_device("pool_3", root2, country="JP", log=lines2.append)
+    ok(odd["country"] == "IN" and any("JP" in l and "MARKETS" in l for l in lines2),
+       "a FIRST sign-in on an uncatalogued exit still gets a phone (India) and says why")
+    moved = ig_session.reseed("pool_2", root2, why="t", country="US", timezone="America/Denver")
+    ok(moved["country"] == "US" and moved["timezone_name"] == "America/Denver"
+       and moved["uuids"] != fr["uuids"],
+       "New phone with a country moves THAT account")
+    again = ig_session.reseed("pool_2", root2, why="t")
+    ok(again["country"] == "US" and again["timezone_name"] == "America/Denver",
+       "a later reseed with no country keeps the account where it lives")
+    ok((root2 / "profiles" / "ig_device_pool_1.json").read_bytes() == before,
+       "and the other account's device file is byte-for-byte untouched")
+    try:
+        ig_session.reseed("pool_2", root2, why="t", country="ZZ")
+        ok(False, "reseed must refuse an unknown country")
+    except ig_identity.UnknownMarket:
+        ok(ig_session.load_device("pool_2", root2)["uuids"] == again["uuids"],
+           "a refused country leaves the phone in force exactly as it was")
+    legacy_file = root2 / "profiles" / "ig_device_pool_9.json"
+    legacy_file.write_text(json.dumps({"label": "pool_9", "device": legacy}))
+    ok(ig_session.reseed("pool_9", root2, why="legacy")["country"] == "IN",
+       "a legacy library seed (which says US only because the library does) "
+       "is replaced by the default market, not by an American phone")
+    cl2 = ig_session.new_client("pool_2", root=root2)
+    ok(cl2.get_settings()["timezone_offset"] == ig_identity.utc_offset("America/Denver")
+       and cl2.get_settings()["country"] == "US" and cl2.get_settings()["locale"] == "en_US",
+       "the client is built with TODAY's offset for the phone's zone")
+    (root2 / "profiles" / "ig_someone.json").write_text(
+        json.dumps({"meta": {"username": "someone", "label": "pool_2"}, "settings": {}}))
+    ok(ig_session.account_country("someone", root2) == "US"
+       and ig_session.account_country("nobody", root2) == "IN"
+       and ig_session.account_tz_offset("someone", root2) == ig_identity.utc_offset("America/Denver")
+       and ig_session.account_tz_offset("nobody", root2, default=19800) == 19800,
+       "the collector reads each account's country and clock from its own phone")
+    seen_expect = []
+    with _m.patch.object(ig_session, "exit_due", return_value=True), \
+         _m.patch.object(ig_session, "proxy_check",
+                         side_effect=lambda proxy, **kw: seen_expect.append(kw.get("expect_country"))
+                         or {"exit_ip": "1.2.3.4", "country": "US", "ok": True}):
+        (root2 / "profiles" / "ig_someone.json").write_text(
+            json.dumps({"meta": {"username": "someone", "label": "pool_2", "proxy": "http://p"},
+                        "settings": {}}))
+        ig_session.sample_exit("someone", root2)
+    ok(seen_expect == ["US"], "the exit sample expects the account's own country: " + str(seen_expect))
+
+    class _R:
+        def __init__(self, t): self.text = t
+    ok(ig_session.geo_timezone("1.2.3.4", get=lambda u, p, t: _R("America/Chicago\n")) == "America/Chicago"
+       and ig_session.geo_timezone("1.2.3.4", get=lambda u, p, t: _R("<html>rate limited</html>")) == ""
+       and ig_session.geo_timezone("") == "",
+       "the zone lookup returns a zone or nothing, never an error page")
+    ok(ig_session.exit_market("http://p", check=lambda p: {"country": "fr", "exit_ip": "9.9.9.9"}) == ("FR", "")
+       and ig_session.exit_market("") == ("", "")
+       and ig_session.exit_market("http://p", check=lambda p: {"country": ""}) == ("", ""),
+       "a first phone is minted for the exit's country when the exit says one")
+
 
 def test_ig_writeback(tmp):
     """A pass writes back what it LEARNED, and is fenced from what it must not

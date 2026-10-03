@@ -19,6 +19,57 @@ must respect belongs in the rulebook, not here.
 
 ---
 
+## 2026-10-03 — Instagram phones get a country: one market per account
+
+**Why.** The market (language, country, dialling code, time zone, phone list)
+was ONE constant in `ig_identity` — India — because every proxy exit was
+Indian. Static exits were then bought in France and the US (Webshare sells no
+Indian static residential) and two accounts were moved onto them on 10-02: an
+Indian handset on IST, speaking from Paris. `@sanaakhtar221` was challenged
+the next day. Indian static exits are next month's purchase, so until then a
+phone has to be able to live where its IP lives.
+
+**What changed.**
+
+- `ig_identity.MARKETS` — one row per country (IN, FR, DE, GB, US), each
+  naming its phone list (`DEVICE_SETS`: india / intl / us), language, dialling
+  code and time zone(s). `mint(..., country=, timezone=)`. No country = India,
+  exactly as before. An unknown country raises `UnknownMarket`; it is never
+  quietly minted as India.
+- **Adding a country is one row in `MARKETS`.** The picker, the proxy check
+  and the collector's clock all read the table. `validate_markets()` runs in
+  the tests and fails a half-typed row.
+- Every market's phone speaks **English** (`en_GB` in Europe, `en_US`):
+  instagrapi and this project recognise a rate limit or a challenge by its
+  English wording, and a French-language phone would make those unreadable.
+- **Existing phones are not touched.** A device file holds its own copy of
+  every value; only an operator "New phone" (or a label's very first sign-in)
+  mints. The test asserts another account's device file is byte-identical.
+- Dashboard: **New phone** opens a country picker, preset to the country the
+  account's proxy exits in, with a warning when the two disagree. The card's
+  phone line names the country, and a `country` row appears when phone and
+  proxy disagree. `GET /api/ig/markets` (dashboard-only) feeds the picker;
+  `POST /api/ig/reseed` takes optional `country` / `timezone`.
+- A label's FIRST phone is minted for the country its proxy exits in
+  (`signin._phone_for_exit`, `ig.InteractiveLogin._phone`), so a new account
+  added on a French exit is a phone in France from its first request.
+- The proxy check compares the exit with the account's OWN phone's country
+  (`ig_session.account_country`), not with India for everyone.
+- The UTC offset now follows the phone's zone on the day
+  (`ig_identity.live_offset`, applied in `ig_session._splice_device`), so
+  Paris and New York change with daylight saving. India is unaffected.
+- Waking hours follow each phone's own clock (`collect_ig`), unless
+  `IG_TZ_OFFSET_S` is set, which still overrides for every account.
+
+**Not verified.** The France/US phone rows (model numbers, device codenames,
+chipsets, screen density) were written from memory, not read off real
+handsets or captured traffic. They pass the structural checks only.
+
+**Still true.** A new phone costs a sign-in and Instagram sees the swap. A
+phone in France that follows only Rajasthan politics is consistent, not
+natural. When Indian static exits arrive, each moved account needs "New
+phone → India" and another sign-in.
+
 ## 2026-10-02 — The Activity Log becomes an audit trail; Live Feed gets a top bar
 
 **Asked for.** The operator wanted the Activity Log to show, second by second,
