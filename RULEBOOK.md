@@ -1388,6 +1388,16 @@ in France and the US while still presenting an Indian handset on IST, and
 - **Do not move one account by editing the default.** `DEFAULT_COUNTRY` moves
   every future mint; it is not a way to relocate an account.
 
+### The Accounts page reads accounts without a project (2026-10-03)
+
+`/api/ig/status` is project-scoped and, with no project, answers HTTP 200 with
+the accounts AND `error: "no project selected"`. The
+frontend's `request()` treats any `error` as a failure, so the Accounts page —
+which has no project — threw the accounts away: every Instagram card said
+"never signed in on this server" and had no phone row, no Bench, no New phone.
+Accounts are global. The Accounts page asks with `softError`
+(`api.igAccountsLive`); do not point it back at the project-scoped helper.
+
 ### Instagram is the STRICT platform — treat every rule here as non-negotiable
 
 Instagram's bot detection watches rhythm, volume, IP and device as much as any

@@ -1060,7 +1060,11 @@ export default function Accounts({ onMenu }) {
   const pool = useApi(() => api.pool(), [], { every: 30_000 });
   const liveX = useApi(() => api.status(), [], { every: 30_000 });
   // Same 30 s refresh as the others. Loaded once, the Instagram session rows
-  const liveIg = useApi(() => api.igStatus(), [], { every: 30_000 });
+  // Not api.igStatus(): with no project it answers 200 + "no project
+  // selected", which request() threw away along with the accounts — so every
+  // Instagram card read "never signed in" and lost its phone row, Bench and
+  // New phone (since the project scoping, 77442c8; found 2026-10-03).
+  const liveIg = useApi(() => api.igAccountsLive(), [], { every: 30_000 });
   const liveFb = useApi(() => api.fbStatus(), [], { every: 30_000 });
   const conds = useApi(() => api.deciderConditions(), [], { every: 30_000 });
   const [adding, setAdding] = useState(null);   // null | {} | {platform,label,login}

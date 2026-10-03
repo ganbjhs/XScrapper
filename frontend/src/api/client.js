@@ -11,7 +11,10 @@ const doneWord = (path) => {
 };
 
 async function request(path, opts = {}) {
-  const { quiet = false, ...init } = opts;
+  // softError: a 200 whose body carries BOTH data and an `error` note is data
+  // (e.g. /api/ig/status with no project: the accounts are there, the sources
+  // are not). Only the Accounts page asks for this.
+  const { quiet = false, softError = false, ...init } = opts;
   const mutating = init.method && init.method !== "GET";
   let rep;
   try {
@@ -36,7 +39,8 @@ async function request(path, opts = {}) {
     throw new Error(`HTTP ${rep.status}: not JSON`);
   }
   // Validation problems come back as {error} with HTTP 200 — same shape as transport errors.
-  const err = !rep.ok ? (data.error || `HTTP ${rep.status}`) : (data && typeof data === "object" && data.error);
+  const err = !rep.ok ? (data.error || `HTTP ${rep.status}`)
+    : (!softError && data && typeof data === "object" && data.error);
   if (err) {
     if (mutating && !quiet) toast.err(String(err));
     throw new Error(err);
@@ -89,6 +93,9 @@ export const api = {
   // Instagram is project-scoped like Facebook: pass the selected project or the
   igStatus: (project) => request(`/api/ig/status${qs({ project })}`),
   igDiag: () => request("/api/ig/diag"),
+  // Instagram's ACCOUNTS are global; the status endpoint is project-scoped and
+  // answers "no project selected" beside the accounts.
+  igAccountsLive: () => request("/api/ig/status", { softError: true }),
   igAccount: (username, active) =>
     request("/api/ig/account", { method: "POST", body: { username, active } }),
   // country/timezone are optional: left out, the server uses the country the
