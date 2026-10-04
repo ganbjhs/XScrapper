@@ -400,6 +400,10 @@ class InteractiveLogin:
             # installed when the seed was minted.
             dev = ig_session.refresh_browser_version(self.ig_label, self.root,
                                                      log=log) or dev
+            # The session this window earns is adopted by the APP client on
+            # this phone; an out-of-date app build would be refused there.
+            dev = ig_session.refresh_app_version(self.ig_label, self.root,
+                                                 log=log) or dev
         self.device = dev
         kw = ig_identity.playwright_kwargs(dev)
         self.viewport = dict(kw["viewport"])

@@ -1424,6 +1424,23 @@ Accounts are global. The Accounts page asks with `softError`
 - Timestamps sent to the browser carry a `Z`. A bare UTC string is read as
   local time and was showing a checkpoint as 5h30m older than it was.
 
+### A phone that must log in runs the NEWEST Instagram app (2026-10-04)
+
+Minting drew the app build by weight (60% newest, 40% one of two older ones)
+so accounts would differ. Instagram refuses a LOGIN from an old build —
+"Your version of Instagram is out of date. Please upgrade your app to log in"
+— so `@youssefnasser168` and `@saieemanjrekar.fc`, both minted on 385.0.0.47.74,
+could not sign in at all. A session already signed in on an old build keeps
+working; it is the login that is refused.
+
+- `ig_identity.mint` always uses `newest_build()`. Do not bring the weighted
+  draw back for "variety".
+- A seed on an older build is updated IN PLACE at its next sign-in
+  (`ig_session.refresh_app_version`): same handset, same ids, newer app — an
+  app update, not a new phone. Never during a collection pass.
+- When instagrapi is upgraded and ships a newer build, every account moves to
+  it at its next sign-in, by itself.
+
 ### Instagram is the STRICT platform — treat every rule here as non-negotiable
 
 Instagram's bot detection watches rhythm, volume, IP and device as much as any

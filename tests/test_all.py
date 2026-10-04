@@ -4899,8 +4899,34 @@ def test_ig_identity(tmp):
     a = ig_identity.mint("a", rng=rng, chrome="140")["uuids"]
     b = ig_identity.mint("b", rng=rng, chrome="140")["uuids"]
     ok(a != b and len(set(a.values())) == len(a), "uuids never repeat across mints")
-    ok(len(set(ig_identity.mint("z", rng=_r.Random(i), chrome="140")["device_settings"]["app_version"]
-               for i in range(60))) > 1, "app builds vary across accounts")
+    newest = ig_identity.newest_build()
+    ok(all(ig_identity._ver(newest["app_version"]) >= ig_identity._ver(b["app_version"])
+           for _, b in ig_identity.app_builds()),
+       f"newest_build() is the highest version instagrapi ships ({newest['app_version']})")
+    ok({ig_identity.mint("z", rng=_r.Random(i), chrome="140", country=cc)["device_settings"]["app_version"]
+        for i in range(40) for cc in ("IN", "FR", "US")} == {newest["app_version"]},
+       "every new phone runs the NEWEST app — Instagram refuses a login from an "
+       "old build (\"Your version of Instagram is out of date\", 2026-10-04)")
+    old_b = min((b for _, b in ig_identity.app_builds()), key=lambda b: ig_identity._ver(b["app_version"]))
+    stale = ig_identity.mint("old", rng=_r.Random(5), chrome="140", country="FR")
+    stale["device_settings"].update(old_b)
+    stale["user_agent"] = ig_identity.app_user_agent(stale["device_settings"], stale["locale"])
+    up = ig_identity.refresh_app_build(stale)
+    if old_b["app_version"] != newest["app_version"]:
+        ok(up and up["device_settings"]["app_version"] == newest["app_version"]
+           and up["device_settings"]["version_code"] == newest["version_code"]
+           and up["device_settings"]["bloks_versioning_id"] == newest["bloks_versioning_id"]
+           and f"Instagram {newest['app_version']} " in up["user_agent"]
+           and up["user_agent"].endswith(f"; {newest['version_code']})"),
+           "a seed on an old build is brought to the newest one, user-agent included")
+        ok(up["uuids"] == stale["uuids"]
+           and up["device_settings"]["model"] == stale["device_settings"]["model"]
+           and up["country"] == stale["country"] and up["identity"] == stale["identity"]
+           and stale["device_settings"]["app_version"] == old_b["app_version"],
+           "the handset, its ids and its country do not move (and the input is not mutated)")
+    ok(ig_identity.refresh_app_build(ig_identity.mint("cur", chrome="140")) is None
+       and ig_identity.refresh_app_build({}) is None,
+       "a current seed, or no seed, is left alone")
 
     print()
     print("== the legacy seed is recognised, and describe() says so ==")
@@ -4953,6 +4979,23 @@ def test_ig_identity(tmp):
     ok(ig_session.load_device("ig_p", root)["uuids"] == new["uuids"], "the new seed is the one in force")
     ok(ig_session.ensure_device("ig_p", root)["uuids"] == new["uuids"],
        "ensure_device never reseeds by itself (a collection pass cannot change a phone)")
+    # the app build is refreshed at a sign-in, in place
+    pth = ig_session.device_path("ig_p", root)
+    raw = json.loads(pth.read_text())
+    oldest = min((b for _, b in ig_identity.app_builds()), key=lambda b: ig_identity._ver(b["app_version"]))
+    raw["device"]["device_settings"].update(oldest)
+    pth.write_text(json.dumps(raw))
+    lines_b = []
+    got = ig_session.refresh_app_version("ig_p", root, log=lines_b.append)
+    ok(got["device_settings"]["app_version"] == ig_identity.newest_build()["app_version"]
+       and got["uuids"] == new["uuids"]
+       and ig_session.load_device("ig_p", root)["device_settings"]["app_version"]
+           == ig_identity.newest_build()["app_version"],
+       "a sign-in updates an out-of-date app build in the device file; the phone stays")
+    ok(not any(p.name.count(".bak-") > 1 for p in (root / "profiles").iterdir())
+       and (oldest["app_version"] == ig_identity.newest_build()["app_version"]
+            or any("UNCHANGED" in l for l in lines_b)),
+       "and says so, without a reseed")
     _ = old_model
 
     print()

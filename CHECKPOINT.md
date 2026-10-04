@@ -19,6 +19,22 @@ must respect belongs in the rulebook, not here.
 
 ---
 
+## 2026-10-04 — New phones could not log in: the app build was out of date
+
+Background sign-in for `@youssefnasser168` (France phone, minted 10-03) was
+refused: "Your version of Instagram is out of date. Please upgrade your app to
+log in." Its seed carried app build 385.0.0.47.74 — `mint` drew builds by
+weight, and 40% of draws were an old one. Saiee drew the same build. Shoaib
+drew 428.0.0.47.67 and signed in.
+
+Now: `mint` always uses the newest build instagrapi ships, and a sign-in
+updates an older seed's build in place (`refresh_app_version`) — the handset
+and its ids do not change. See RULEBOOK §6.
+
+Separately observed, NOT fixed by this: the streamed sign-in browser gets
+HTTP 429 from instagram.com on two different French static proxies with a
+fresh (cookieless) profile. Cause not established.
+
 ## 2026-10-03 (II) — Clear session; the card shows where an account leaves from NOW
 
 **Why.** After "New phone" the sign-in window showed Instagram's "something

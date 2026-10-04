@@ -284,6 +284,33 @@ def refresh_browser_version(label: str, root: Path | str = ".", *, chrome=None,
     return fresh
 
 
+def refresh_app_version(label: str, root: Path | str = ".", *,
+                        log=lambda m: None) -> dict:
+    """Update the seed's Instagram APP BUILD in place to the newest one — no
+    reseed, no .bak, the handset unchanged (ig_identity.refresh_app_build).
+
+    Called at a SIGN-IN only. Instagram refuses a login from an old build
+    ("Your version of Instagram is out of date"), and a seed minted before
+    2026-10-04 has a 4-in-10 chance of carrying one. A session already signed
+    in on an old build is left alone until its next sign-in. Returns the seed
+    now in force."""
+    dev = load_device(label, root)
+    fresh = ig_identity.refresh_app_build(dev)
+    if not fresh:
+        return dev
+    path = device_path(label, root)
+    data = _read_sidecar(path) or {"label": label, "created": _now()}
+    data["device"] = fresh
+    data["app_refreshed"] = _now()
+    _write_sidecar(path, data)
+    was = (dev.get("device_settings") or {}).get("app_version") or "?"
+    log(f"[ig] '{label}': Instagram app {was} -> "
+        f"{fresh['device_settings']['app_version']}. The handset is UNCHANGED — "
+        f"Instagram refuses a login from an out-of-date app, and a phone's app "
+        f"updating itself is what phones do.")
+    return fresh
+
+
 def _splice_device(settings: dict, device: dict) -> dict:
     """Lay the seed over a settings dict. The seed wins; nulls in it do not."""
     out = dict(settings or {})

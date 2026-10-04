@@ -426,6 +426,10 @@ def _fresh_phone_if_legacy(label: str, root, log) -> None:
     # Chromium 151 render is the same kind of incoherence as a US Pixel on an
     # Indian exit, and unlike the handset it costs nothing to correct.
     ig_session.refresh_browser_version(label, root, log=log)
+    # And the APP build: Instagram refuses a login from an out-of-date app
+    # ("Your version of Instagram is out of date"), so a seed carrying an old
+    # build is brought to the newest one here — same handset, updated app.
+    ig_session.refresh_app_version(label, root, log=log)
 
 
 # ---------------------------------------------------------------------------

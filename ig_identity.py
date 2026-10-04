@@ -326,6 +326,9 @@ def validate_markets() -> list:
 # How likely each app build is: people mostly run the latest, a tail lags.
 # Keyed by app_version; must exist in instagrapi's APP_SETTINGS or it is
 # ignored (see app_builds()).
+# NOT USED FOR MINTING since 2026-10-04: Instagram refuses a login from an old
+# build, so a new phone always gets newest_build(). Kept because app_builds()
+# is also how the list of shipped builds is read.
 BUILD_WEIGHTS = {"428.0.0.47.67": 60, "385.0.0.47.74": 25, "364.0.0.35.86": 15}
 
 # Chrome's REDUCED mobile user-agent (Chrome ≥ 110 freezes the Android
@@ -358,6 +361,48 @@ def app_builds() -> list:
         w = BUILD_WEIGHTS.get(ver, 5)
         out.append((w, {k: row[k] for k in ("app_version", "version_code",
                                             "bloks_versioning_id")}))
+    return out
+
+
+def _ver(v: str) -> tuple:
+    return tuple(int(x) for x in re.findall(r"\d+", str(v or "")))
+
+
+def newest_build() -> dict:
+    """The NEWEST app build instagrapi ships — the only one a sign-in may use.
+
+    WHY (2026-10-04). Minting used to draw a build by BUILD_WEIGHTS so that
+    accounts differed: 60% the newest, 40% one of two older ones. Instagram
+    refuses a LOGIN from an old build outright — "Your version of Instagram is
+    out of date. Please upgrade your app to log in." — so four in ten new
+    phones could never sign in (@youssefnasser168 and @saieemanjrekar.fc both
+    drew 385.0.0.47.74 on 2026-10-03). An existing session on an old build
+    keeps working; it is the login that is refused. Variety across accounts
+    was never worth a phone that cannot log in, and a real phone's app is
+    current anyway."""
+    return max((b for _, b in app_builds()), key=lambda b: _ver(b["app_version"]))
+
+
+def refresh_app_build(device: dict) -> dict | None:
+    """Bring an EXISTING seed's Instagram app up to newest_build(), touching
+    nothing that identifies the handset — the app updating itself on the same
+    phone, which is what real phones do every couple of weeks.
+
+    `uuids`, the model and the rest of `device_settings` are the identity and
+    do not move. Only app_version / version_code / bloks_versioning_id change,
+    and `user_agent` is re-formatted from them (it embeds the version).
+    Returns a NEW device dict when the build moved, None when it is already
+    current or the seed is a legacy one (that wants a reseed)."""
+    if not device or not device.get("identity"):
+        return None
+    ds = dict(device.get("device_settings") or {})
+    new = newest_build()
+    if _ver(ds.get("app_version")) >= _ver(new["app_version"]):
+        return None
+    ds.update(new)
+    out = dict(device)
+    out["device_settings"] = ds
+    out["user_agent"] = app_user_agent(ds, device.get("locale") or MARKET["locale"])
     return out
 
 
@@ -454,7 +499,7 @@ def mint(label: str, *, rng=None, chrome=None, taken=(), country=None,
     catalogue = DEVICE_SETS[mk["devices"]]
     avail = [d for d in catalogue if d[2] not in set(taken)] or list(catalogue)
     name, manu, model, dev, cpu, res, dpi, api, rel = rng.choice(avail)
-    build = _pick(rng, app_builds())
+    build = dict(newest_build())      # the only build that can LOG IN
     device_settings = {
         "android_version": api, "android_release": rel, "dpi": dpi,
         "resolution": res, "manufacturer": manu, "device": dev,
