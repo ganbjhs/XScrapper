@@ -19,6 +19,56 @@ must respect belongs in the rulebook, not here.
 
 ---
 
+## 2026-10-07 — Sign-in failures are recorded, compared across accounts, and measurable
+
+**Why.** All six Instagram accounts were failing to sign in and the tool could
+not say why. The browser window showed "403" in the picture; the activity log
+held `POST /api/login/start -> 200`. The background login reported urllib3's
+"too many 429 error responses" — after instagrapi's transport had re-sent the
+login three more times. Each explanation tried after that (the France range,
+headless, the phone's country) was an assumption, and the operator had to
+notice by hand that most accounts shared one problem.
+
+**What changed.**
+
+- `ig_evidence.py` (new) — `record()` keeps every sign-in attempt, per door
+  (browser window / background login / pasted session), success or failure:
+  HTTP status, who answered, exit address, the browser really launched, the
+  phone. One row in `activity.db:signin_attempts`, one line in the activity
+  log filed under the account. `diagnose()` compares the rows ACROSS accounts
+  and prints what the failures share and what they do not; with no success to
+  compare against it says "cannot be told apart", it does not pick.
+- The sign-in window writes down every answer its main document gets
+  (`ig.watch_navigation`, `InteractiveLogin.evidence`) and which browser was
+  really launched (`auth._launch` -> `ctx._launched`, `ig.launched_as`).
+- Background login is ONE request (`engine_ig._no_retries` around `cl.login`)
+  and Instagram's own answer is kept (`ig_evidence.wire`: status, path,
+  Retry-After, message).
+- **Probe** (`POST /api/ig/probe`, Accounts -> Diagnosis -> Run probe): the
+  login page through one account's proxy as four clients — curl, HTTP with the
+  phone's headers, the browser dressed as the phone, the browser as itself —
+  no cookies, throwaway profile. Which client is refused is the verdict.
+- `GET /api/ig/diagnosis` (dashboard-only) + a Diagnosis panel on Accounts and
+  Activity Log.
+- Sign-in window: real Google Chrome when installed, a real window on Xvfb
+  instead of headless, driven by patchright with Playwright as the fallback
+  (`deploy/browser.sh`; `BROWSER_HEADFUL=0`, `IG_BROWSER_ENGINE=playwright`
+  put either back). `chrome_major()` reads the installed Chrome first.
+
+**Verified.** `tests/test_all.py` passes, incl. new `test_ig_evidence`. In a
+Linux container, against a local server answering a bare 403 and then a login
+form: the real launch path (Chrome on Xvfb, patchright and Playwright)
+recorded status 403 / Retry-After / the Meta header, and status 200 + form.
+
+**Not verified.** Anything against Instagram — nothing here has run on the
+server. In particular it is NOT established that the real-window change
+removes the 403: a status on the first page load is decided before any page
+script runs, so it cannot come from the JS-visible automation tells that
+change addresses. Known beforehand: the proxy check (python-requests, curl
+UA) gets 200 from instagram.com on the same addresses where the browser gets
+403/429. The probe is what separates "address" from "browser" from "anything
+presenting as Chrome"; run it before changing proxies, phones or browsers.
+
 ## 2026-10-04 — New phones could not log in: the app build was out of date
 
 Background sign-in for `@youssefnasser168` (France phone, minted 10-03) was

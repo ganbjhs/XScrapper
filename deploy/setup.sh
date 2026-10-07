@@ -188,6 +188,8 @@ with sync_playwright() as p:
         copy accounts.db + profiles/ up instead."
   fi
 fi
+# Real Google Chrome + a virtual screen for the Instagram sign-in window.
+[ "$SKIP_BROWSER" = "1" ] || bash "$APP_DIR/deploy/browser.sh"
 # Recorded in .env so every entry point finds it, not just the service.
 if ! grep -q '^PLAYWRIGHT_BROWSERS_PATH=' "$APP_DIR/.env" 2>/dev/null; then
   printf 'PLAYWRIGHT_BROWSERS_PATH=%s\n' /opt/ms-playwright >> "$APP_DIR/.env"

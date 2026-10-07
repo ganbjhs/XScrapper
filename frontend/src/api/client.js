@@ -109,6 +109,11 @@ export const api = {
   // Ask, now, where this account's proxy exits. Quiet: the card shows the answer.
   igExitCheck: (username) =>
     request("/api/ig/exit", { method: "POST", body: { username }, quiet: true }),
+  // What the accounts' sign-in failures have in common (ig_evidence.diagnose).
+  igDiagnosis: () => request("/api/ig/diagnosis", { quiet: true }),
+  // Measure which client Instagram refuses through this account's proxy.
+  igProbe: (account_id) =>
+    request("/api/ig/probe", { method: "POST", body: { account_id }, quiet: true }),
   igSource: (body) => request("/api/ig/source", { method: "POST", body }),
   igFetch: (project, list_id) => request("/api/ig/fetch", { method: "POST", body: { project, list_id } }),
   // Named Instagram lists (2026-09-29): create / rename / pause / resume / delete.

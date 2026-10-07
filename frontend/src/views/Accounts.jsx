@@ -4,6 +4,7 @@ import { Link, useSearchParams } from "react-router-dom";
 import { api, fmtAgo, useApi } from "../api/client.js";
 import { PageHead } from "../App.jsx";
 import { Empty, ErrorState, Loading, Modal } from "../components/ui.jsx";
+import Diagnosis from "../components/Diagnosis.jsx";
 
 const PLATS = [["x", "X"], ["ig", "Instagram"], ["fb", "Facebook"]];
 const BADGE = { x: "platform-x", ig: "platform-ig", fb: "platform-fb" };
@@ -596,55 +597,102 @@ function SignInModal({ a, onDone, onClose }) {
 
 
 // Session state — ALWAYS rendered, on every card
-function SessionRow({ a, live }) {
-  // No live record at all: the account exists in the pool and nowhere else.
-  if (!live) {
-    return (
-      <div className="kv"><span>session</span>
-        <b className="st-warn">
-          never signed in on this server
-          <span style={{ color: "var(--ink-3)", fontWeight: 400 }}>
-            {" · use Login now"}
-          </span>
-        </b>
-      </div>
-    );
-  }
+// ONE WORD per row on the card (2026-10-07, the operator's rule: the card
+// answers "is it fine?", the detail answers "what is wrong?"). Every word that
+// is not fine is a button; it opens AccountDetail, which holds the sentences.
+function sessionWord(live) {
+  if (!live) return ["never", "warn"];
+  if (live.checkpoint_at) return ["checkpoint", "crit"];
+  if (/cleared|new phone/i.test(live.error || "")) return ["needs login", "warn"];
+  if (live.active) return ["ok", "good"];
+  return ["not working", "crit"];
+}
 
-  // Instagram parks a checkpoint tombstone next to the session. It outranks
-  // active/inactive: the session may still half-work while a human is required.
-  if (live.checkpoint_at) {
-    return (
-      <div className="kv"><span>session</span>
-        <b className="st-crit">
-          checkpoint — Instagram wants a human ({fmtAgo(
-            /Z$|[+-]\d\d:?\d\d$/.test(live.checkpoint_at) ? live.checkpoint_at : live.checkpoint_at + "Z")})
-        </b>
-      </div>
-    );
-  }
-
-  const bits = [];
-  if (live.requests != null) bits.push(`${live.requests} requests`);
-  if (live.last_used) bits.push(`last used ${fmtAgo(live.last_used)}`);
-
+function Word({ text, tone, onClick }) {
+  if (tone === "good" || !onClick) return <b className={tone ? `st-${tone}` : ""}>{text}</b>;
   return (
-    <>
-      <div className="kv"><span>session</span>
-        <b className={live.active ? "st-good" : "st-crit"}>
-          {live.active ? "signed in · collecting" : "signed in once · not working now"}
-          {bits.length ? (
-            <span style={{ color: "var(--ink-3)", fontWeight: 400 }}>
-              {` · ${bits.join(" · ")}`}
-            </span>
-          ) : null}
-        </b>
-      </div>
-      {live.error && (
-        <div className="kv"><span>session error</span>
-          <b className="st-crit">{live.error}</b></div>
+    <button className={`chip as-btn ${tone}`} onClick={onClick} title="Show what is wrong">
+      {text}<span className="chev">›</span>
+    </button>
+  );
+}
+
+// Everything the card no longer says: the sentences, the addresses, the last
+// sign-in attempts with what Instagram answered, and this account's own log.
+function AccountDetail({ a, live, problems, onClose }) {
+  const isIg = a.platform === "ig";
+  const names = [live?.username || a.login, a.label].filter(Boolean).join(",");
+  const diag = useApi(() => (isIg ? api.igDiagnosis() : Promise.resolve(null)), [a.account_id]);
+  const logs = useApi(() => api.activityLogs({ account: names, limit: 80 }), [names]);
+  const tries = diag.data?.accounts?.[(live?.username || a.login || "").toLowerCase()] || [];
+  const shared = (diag.data?.findings || []).filter(
+    (f) => (f.accounts || []).includes((live?.username || a.login || "").toLowerCase()));
+  const en = live?.exit_now;
+  const H = ({ children }) => (
+    <div style={{ fontSize: 11, letterSpacing: ".06em", textTransform: "uppercase",
+                  color: "var(--ink-3)", margin: "14px 0 4px" }}>{children}</div>
+  );
+  return (
+    <Modal title={a.label} sub={`@${a.login} · ${a.platform.toUpperCase()}`} onClose={onClose} wide>
+      <H>What is wrong</H>
+      {problems.length === 0 && <div className="kv"><span>status</span><b className="st-good">nothing</b></div>}
+      {problems.map((p, i) => (
+        <div className="kv" key={i}><span>{p.label}</span><b className={`st-${p.tone || "warn"}`}>{p.text}</b></div>
+      ))}
+      {shared.map((f, i) => (
+        <div className="kv" key={`s${i}`}><span style={{ whiteSpace: "nowrap" }}>{f.level === "measured" ? "measured" : "shared"}</span>
+          <b style={{ fontWeight: 500 }}>{f.title}</b></div>
+      ))}
+
+      {isIg && live && (
+        <>
+          <H>Phone and address</H>
+          <div className="kv"><span>phone</span><b style={{ fontWeight: 500 }}>{live.identity?.text || "none yet"}</b></div>
+          <div className="kv"><span>fetching via</span><b style={{ fontWeight: 500 }}>
+            {en?.ip ? `${en.ip}${en.country ? ` (${en.country})` : ""}${en.at ? ` · checked ${fmtAgo(en.at)}` : ""}`
+              : en?.proxy_host ? `proxy ${en.proxy_host} — not checked since it changed` : "no proxy on file"}</b></div>
+          {live.exit?.exit_ip && (
+            <div className="kv"><span>signed in via</span><b style={{ fontWeight: 400, color: "var(--ink-3)" }}>
+              {`${live.exit.exit_ip}${live.exit.country ? ` (${live.exit.country})` : ""}`}
+              {live.exit.checked ? ` · ${String(live.exit.checked).slice(0, 10)}` : ""}
+              {en?.ip && en.ip !== live.exit.exit_ip ? " · a previous proxy" : ""}</b></div>
+          )}
+        </>
       )}
-    </>
+
+      {isIg && (
+        <>
+          <H>Last sign-in attempts</H>
+          {tries.length === 0 && <div className="kv"><span>none recorded yet</span><b /></div>}
+          {tries.map((t, i) => (
+            <div className="kv" key={i}>
+              <span style={{ whiteSpace: "nowrap" }}>{t.door}{t.stage && t.stage !== "login" ? ` (${t.stage})` : ""} · {fmtAgo(new Date(t.ts_ms).toISOString())}</span>
+              <b className={t.ok ? "st-good" : "st-crit"} style={{ fontWeight: 500 }}>
+                {t.ok ? "ok" : [t.http_status ? `HTTP ${t.http_status}` : t.why,
+                                t.answered_by && `by ${t.answered_by}`,
+                                t.exit_ip && `via ${t.exit_ip}${t.country ? ` (${t.country})` : ""}`,
+                                t.browser, t.detail].filter(Boolean).join(" · ")}
+              </b>
+            </div>
+          ))}
+        </>
+      )}
+
+      <H>This account's log</H>
+      <div style={{ maxHeight: 260, overflowY: "auto", border: "1px solid var(--ring)", borderRadius: 8,
+                    padding: "6px 10px", fontSize: 12, lineHeight: 1.65, fontFamily: "var(--mono, ui-monospace, monospace)" }}>
+        {logs.loading && "…"}
+        {!logs.loading && (logs.data?.events || []).length === 0 && "no lines for this account"}
+        {(logs.data?.events || []).map((e) => (
+          <div key={e.id} className={e.level === "error" ? "st-crit" : e.level === "warn" ? "st-warn" : e.level === "ok" ? "st-good" : ""}>
+            <span style={{ color: "var(--ink-3)" }}>
+              {new Date(e.ts_ms).toLocaleString([], { day: "2-digit", month: "short", hour: "2-digit", minute: "2-digit" })}
+            </span>{"  "}{String(e.message).trim()}
+          </div>
+        ))}
+      </div>
+      <div className="row"><button className="btn" onClick={onClose}>Close</button></div>
+    </Modal>
   );
 }
 
@@ -704,6 +752,20 @@ function AccountCard({ a, live, onChanged }) {
   const exitCc = exitCountry(live);
   const en = live?.exit_now;
   const countryClash = !!(phoneCc && exitCc && phoneCc !== exitCc);
+  const [sw, st] = sessionWord(live);
+  const openDetail = () => setModal("detail");
+  // Every reason this card is not fine, as sentences — shown in the detail only.
+  const problems = [];
+  if (!live) problems.push({ label: "session", text: "never signed in on this server" });
+  else if (live.checkpoint_at) problems.push({ label: "session", tone: "crit",
+    text: `checkpoint — ${a.platform === "ig" ? "Instagram" : "the platform"} wants a human` });
+  else if (!live.active && !live.error) problems.push({ label: "session", tone: "crit", text: "signed in once, not working now" });
+  if (live?.error) problems.push({ label: "session error", tone: "crit", text: live.error });
+  if (a.health && a.health !== live?.error) problems.push({ label: "health", tone: "crit", text: a.health });
+  if (!a.has_proxy) problems.push({ label: "proxy", tone: "crit", text: "no proxy — requests would leave from the server's own address" });
+  if (countryClash) problems.push({ label: "country",
+    text: `phone is in ${live.identity.country_name || phoneCc}, proxy exits in ${exitCc} — New phone to match, or move the proxy` });
+  if (live?.identity?.legacy) problems.push({ label: "phone", text: "legacy default phone — the next sign-in mints a real one" });
 
   return (
     <div className="panel">
@@ -715,66 +777,26 @@ function AccountCard({ a, live, onChanged }) {
         <span className={`badge ${BADGE[a.platform]}`}>{BADGE_TXT[a.platform]}</span>
         <span className={`chip ${s.chip}`}>{s.text}</span>
         <span className="right">
-          {a.has_proxy ? "proxied" : "no proxy"} · {a.has_totp ? "TOTP" : "no 2FA"} · {a.backup_codes_left} codes
+          <button className="btn btn-ghost btn-sm" onClick={openDetail}>Details</button>
         </span>
       </div>
 
       <div className="kv"><span>login</span><b>{a.login}</b></div>
-      <div className="kv"><span>proxy / IP</span><b>{a.proxy_id || "none (server IP)"}</b></div>
-      <SessionRow a={a} live={live} />
+      <div className="kv"><span>session</span><Word text={sw} tone={st} onClick={openDetail} /></div>
       {isIg && live && (
-        <>
-          <div className="kv"><span>phone</span>
-            <b className={live.identity?.legacy ? "st-warn" : ""} style={{ fontWeight: live.identity ? 500 : 400 }}>
-              {live.identity ? live.identity.text : "no phone minted yet — the first sign-in mints one"}
-            </b>
-          </div>
-          {countryClash && (
-            <div className="kv"><span>country</span>
-              <b className="st-warn">
-                {`phone is in ${live.identity.country_name || phoneCc}, proxy exits in ${exitCc} — use New phone to match, or move the proxy`}
-              </b>
-            </div>
-          )}
-          <div className="kv"><span>collecting</span>
-            <b className={live.active && !live.checkpoint_at ? "st-good" : "st-warn"}>
-              {live.active ? `yes · owns ${live.owns ?? 0} source(s)` : "benched"}
-            </b>
-          </div>
-          {/* TWO addresses, named for what they are. "fetching via" is where
-              requests leave from now; "signed in via" is where the session was
-              created, which after a proxy change is the OLD proxy's address. */}
-          {en && (
-            <div className="kv"><span>fetching via</span>
-              <b style={{ fontWeight: 500 }} className={en.ip ? "" : "st-warn"}>
-                {en.ip
-                  ? `${en.ip}${en.country ? ` (${en.country})` : " (country unknown)"}`
-                  : en.proxy_host
-                    ? `proxy ${en.proxy_host} — exit not checked since the proxy changed`
-                    : "no proxy on file"}
-                {en.ip && en.at ? (
-                  <span style={{ color: "var(--ink-3)", fontWeight: 400 }}>
-                    {` · checked ${fmtAgo(en.at)}`}
-                  </span>
-                ) : null}
-              </b>
-            </div>
-          )}
-          {live.exit?.exit_ip ? (
-            <div className="kv"><span>signed in via</span>
-              <b style={{ fontWeight: 400, color: "var(--ink-3)" }}>
-                {`${live.exit.exit_ip}${live.exit.country ? ` (${live.exit.country})` : ""}`}
-                {live.exit.checked ? ` · ${String(live.exit.checked).slice(0, 10)}` : ""}
-                {en && en.ip && en.ip !== live.exit.exit_ip ? " · a previous proxy" : ""}
-                {en && !en.ip && en.source === "" && en.proxy_host ? " · a previous proxy" : ""}
-              </b>
-            </div>
-          ) : null}
-        </>
+        <div className="kv"><span>collecting</span>
+          <b className={live.active && !live.checkpoint_at ? "st-good" : ""}>
+            {live.active ? `yes · ${live.owns ?? 0}` : "benched"}</b></div>
       )}
+      <div className="kv"><span>proxy</span>
+        {!a.has_proxy ? <Word text="none" tone="crit" onClick={openDetail} />
+          : countryClash ? <Word text="mismatch" tone="warn" onClick={openDetail} />
+          : <b>{isIg && en?.country ? en.country : (a.proxy_id || "set")}</b>}
+      </div>
+      <div className="kv"><span>health</span>
+        <Word text={problems.length ? "not ok" : "ok"} tone={problems.length ? "crit" : "good"} onClick={openDetail} /></div>
       <div className="kv"><span>last success</span>
         <b>{a.last_success_at ? fmtAgo(a.last_success_at) : "never"}</b></div>
-      {a.health && <div className="kv"><span>health</span><b className="st-warn">{a.health}</b></div>}
       {msg && <div className="kv"><span>note</span><b>{msg}</b></div>}
 
       <div className="cactions">
@@ -795,6 +817,7 @@ function AccountCard({ a, live, onChanged }) {
         <button onClick={remove} style={{ color: "var(--critical)" }}>Remove</button>
       </div>
 
+      {modal === "detail" && <AccountDetail a={a} live={live} problems={problems} onClose={() => setModal(null)} />}
       {modal === "signin" && <SignInModal a={a} onDone={onChanged} onClose={() => setModal(null)} />}
       {modal === "edit" && <EditModal a={a} onDone={onChanged} onClose={() => setModal(null)} />}
       {modal === "codes" && <CodesModal a={a} onDone={onChanged} onClose={() => setModal(null)} />}
@@ -1228,6 +1251,8 @@ export default function Accounts({ onMenu }) {
       <FixPanel conds={conds.data} focusId={focusId} accounts={accounts}
                 telegram={!!conds.data?.telegram}
                 onAdopt={(initial) => setAdding(initial)} onChanged={reload} />
+
+      <Diagnosis accounts={accounts} />
 
       {(() => {
         // One glance across all three platforms before the per-platform detail.

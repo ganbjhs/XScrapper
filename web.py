@@ -2110,7 +2110,9 @@ def _activity_logs_json(q):
         limit = 300
     platform = (q.get("platform") or "").strip().lower() or None
     level = (q.get("level") or "").strip().lower() or None
+    # ?account=<login>[,<label>] — one account's lines (additive, optional).
     events = activity_log.recent(limit=limit, platform=platform, level=level,
+                                 account=(q.get("account") or "").strip() or None,
                                  db=str(_CFG.root / "activity.db"))
     return {"count": len(events), "events": events}
 
@@ -4997,6 +4999,150 @@ def _pool_after_capture(account_id: int, ok: bool, detail: str) -> None:
             pass
 
 
+def _ig_note_attempt(username, door, ok, *, stage="login", why="",
+                     http_status=0, answered="", exit_ip="", country="",
+                     browser="", detail="", extra=None, ig_label=""):
+    """Write one Instagram sign-in attempt into the evidence table and the
+    activity log (ig_evidence.record), filling in what the caller does not
+    know: where the account leaves from and which phone it is. Never raises."""
+    try:
+        import ig_evidence
+        import ig_identity
+        import ig_session
+        username = str(username or "").strip().lstrip("@")
+        if not exit_ip:
+            try:
+                en = ig_session.exit_now(username, _CFG.root) or {}
+                exit_ip, country = en.get("ip") or "", country or en.get("country") or ""
+            except Exception:
+                pass
+        phone = ""
+        try:
+            dev = ig_session.load_device(ig_label, _CFG.root) if ig_label else None
+            if dev:
+                sm = ig_identity.summary(dev)
+                phone = " · ".join(b for b in (
+                    sm.get("name"), sm.get("country_name"),
+                    f"app {sm['app_version']}" if sm.get("app_version") else "") if b)
+        except Exception:
+            pass
+        return ig_evidence.record(
+            username, door, ok, stage=stage, why=why, http_status=http_status,
+            answered=answered, exit_ip=exit_ip, country=country, browser=browser,
+            phone=phone, detail=detail, extra=extra,
+            db=str(_CFG.root / "activity.db"))
+    except Exception as e:
+        print(f"[evidence] not recorded: {type(e).__name__}: {e}", flush=True)
+        return None
+
+
+def _ig_diagnosis(q=None):
+    """What the Instagram accounts' sign-in failures and open conditions have
+    in common (ig_evidence.diagnose). Dashboard-only."""
+    import decider
+    import ig_evidence
+    adb = str(_CFG.root / "activity.db")
+    try:
+        conds = decider.open_conditions("instagram", db=adb)
+    except Exception:
+        conds = []
+    collecting = []
+    try:
+        collecting = [a["username"] for a in (_ig_status({}).get("accounts") or [])
+                      if a.get("owns")]
+    except Exception:
+        pass
+    out = ig_evidence.diagnose(conditions=conds, collecting=collecting, db=adb)
+    out["probe"] = {"running": bool(_PROBE["thread"] and _PROBE["thread"].is_alive()),
+                    "username": _PROBE["username"], "lines": list(_PROBE["lines"]),
+                    "result": _PROBE["result"]}
+    return out
+
+
+# One probe at a time: each browser variant is a ~1 GB Chrome.
+_PROBE = {"thread": None, "username": "", "lines": [], "result": None, "started": 0}
+
+
+def _ig_probe_start(body):
+    """Operator: MEASURE what Instagram refuses on this account's address —
+    the login page asked by plain HTTP, by HTTP carrying the phone's headers,
+    by the browser dressed as the phone and by the browser as itself. No
+    cookies and no account are used; four logged-out page loads in all."""
+    import ig_evidence
+    import ig_session
+    aid = body.get("account_id")
+    if aid in (None, ""):
+        return {"error": "account_id is required"}
+    if _PROBE["thread"] is not None and _PROBE["thread"].is_alive():
+        return {"error": f"A probe is already running for @{_PROBE['username']}."}
+    if _LOGIN["session"] is not None:
+        return {"error": "A sign-in window is open. Close it first — the probe "
+                         "needs the browser."}
+    try:
+        acct, row = _pool_account_cfg(aid)
+    except Exception as e:
+        return {"error": str(e)}
+    if acct.platform != "instagram":
+        return {"error": "The probe is for Instagram accounts."}
+    if not acct.proxy:
+        return {"error": "This account has no usable proxy on file; Instagram "
+                         "must never see the server's own address."}
+    username = acct.username or row.login
+    ig_label = getattr(acct, "ig_label", "") or _ig_label_for(row.login, row.account_id)
+    device = ig_session.load_device(ig_label, _CFG.root)
+    with_browser = body.get("browser", True) is not False
+    lines = []
+
+    def log(m):
+        lines.append(str(m).strip())
+        print(f"[probe:{username}] {m}", flush=True)
+
+    def st(c):
+        return (f"HTTP {c['status']}" if c.get("status")
+                else (c.get("error") or "no answer").splitlines()[0])
+
+    def work():
+        clients = []
+        try:
+            log(f"asking for the login page through @{username}'s proxy")
+            for c in ig_evidence.probe_http(acct.proxy, device):
+                clients.append(c)
+                log(f"{c['client']}: {st(c)}")
+            if with_browser:
+                import ig
+                for dev in ([device] if device else []) + [None]:
+                    c = _run(ig.probe_window(acct, dev, _CFG.root, log=lambda m: None),
+                             timeout=150)
+                    c["error"] = (c.get("error") or "").splitlines()[0] if c.get("error") else ""
+                    clients.append(c)
+                    log(f"{c['client']}: {st(c)}"
+                        + (" — login form shown" if c.get("form") else "")
+                        + (f" [{c['browser']}]" if c.get("browser") else ""))
+        except Exception as e:
+            log(f"the probe stopped: {type(e).__name__}: {e}")
+        why, sentence = ig_evidence.probe_verdict(clients) if clients else (
+            "proxy", "The probe produced no measurements.")
+        log(f"VERDICT — {ig_evidence.PROBE_TITLES.get(why, why)}")
+        browser = next((c.get("browser") for c in clients if c.get("browser")), "")
+        _ig_note_attempt(username, "probe", why == "open", stage="verdict",
+                         why=why, browser=browser, detail=sentence,
+                         extra={"clients": [{k: c.get(k) for k in
+                                             ("client", "kind", "variant", "status",
+                                              "error", "form", "ms", "location")}
+                                            for c in clients]},
+                         ig_label=ig_label)
+        _PROBE["result"] = {"username": username, "why": why,
+                            "title": ig_evidence.PROBE_TITLES.get(why, why),
+                            "detail": sentence, "clients": clients,
+                            "at": time.time()}
+
+    _PROBE.update(username=username, lines=lines, result=None, started=time.time())
+    t = threading.Thread(target=work, name=f"probe-{username}", daemon=True)
+    _PROBE["thread"] = t
+    t.start()
+    return {"ok": True, "username": username}
+
+
 def _login_start(label="", account_id=None):
     """
     Open the streamed sign-in window for ONE account.
@@ -5093,6 +5239,30 @@ def _login_start(label="", account_id=None):
             return {"error": f"Could not open a browser: {type(e).__name__}: {e}",
                     "trace": trace}
         took = time.time() - started
+
+        # What did the window MEET? Instagram's answer to the first page is
+        # written into the activity log under the account, and into the trace
+        # the panel shows — a 403 is no longer something only the picture knows.
+        if acct.platform == "instagram" and hasattr(sess, "evidence"):
+            try:
+                ev = _run(sess.evidence(), timeout=20)
+                _ig_note_attempt(
+                    acct.username or label, "browser", ev["ok"], stage="open",
+                    why=ev["why"], http_status=ev["http_status"],
+                    answered=ev["answered"], exit_ip=ev["exit_ip"],
+                    browser=ev["browser"], detail=ev["detail"], extra=ev["extra"],
+                    ig_label=getattr(acct, "ig_label", "") or acct.label)
+                if not ev["ok"]:
+                    import ig_evidence
+                    line = (ig_evidence.WHY_TEXT.get(ev["why"], ev["why"])
+                            + (f" — answered by {ev['answered']}" if ev["answered"] else "")
+                            + (f" — {ev['detail']}" if ev["detail"] else ""))
+                    trace.append("NOT a login form: " + line)
+                    if not getattr(sess, "error", ""):
+                        sess.error = line
+            except Exception as e:
+                print(f"[signin:{label}] evidence skipped: {type(e).__name__}: {e}",
+                      flush=True)
 
         _LOGIN["session"] = sess
         _LOGIN["label"] = label
@@ -5212,6 +5382,20 @@ def _login_capture():
                 print(f"[signin:{label}] {line}", flush=True)
             active, detail = o.ok, ("" if o.ok else o.detail)
             username = o.identity or harvest.username
+            try:
+                import ig_evidence
+                _ig_note_attempt(
+                    cfg.username or username, "browser", o.ok, stage="adopt",
+                    why=ig_evidence.why_from_outcome(o, o.wire),
+                    http_status=(o.wire or {}).get("status", 0),
+                    exit_ip=(o.exit or {}).get("exit_ip", "") or getattr(s, "exit_ip", ""),
+                    country=(o.exit or {}).get("country", ""),
+                    browser=getattr(s, "browser", ""),
+                    detail=("signed in in the window; session adopted by the app "
+                            "client" if o.ok else o.detail),
+                    ig_label=getattr(cfg, "ig_label", "") or cfg.label)
+            except Exception:
+                pass
             if not o.ok:
                 # Keep what the browser held so the operator can see the row;
                 # not active, with the reason on it.
@@ -5387,12 +5571,34 @@ def _signin_start(body):
             # The card is the thing the operator reads. Stamp it either way.
             _pool_after_capture(aid, o.ok, o.detail)
             try:
-                import activity_log
-                activity_log.log_event(
-                    {"ig": "instagram", "fb": "facebook"}.get(plat, "x"),
-                    f"[signin] {label}: "
-                    + ("signed in as @" + o.identity if o.ok else "FAILED — " + o.detail),
-                    db=str(_CFG.root / "activity.db"))
+                if plat == "ig":
+                    # The full record: status, who answered, address, phone.
+                    import ig_evidence
+                    w = getattr(o, "wire", None) or {}
+                    x = getattr(o, "exit", None) or {}
+                    _ig_note_attempt(
+                        login, "background" if mode == "auto" else "cookie", o.ok,
+                        why=ig_evidence.why_from_outcome(o, w),
+                        http_status=w.get("status", 0),
+                        answered="instagram" if w.get("status") else "",
+                        exit_ip=x.get("exit_ip", ""), country=x.get("country", ""),
+                        detail=("signed in as @" + o.identity if o.ok else
+                                "; ".join(b for b in (
+                                    (f'Instagram said: "{w["message"]}"'
+                                     if w.get("message") else ""),
+                                    (f"on {w['path']}" if w.get("path") else ""),
+                                    (f"Retry-After {w['retry_after']}"
+                                     if w.get("retry_after") else ""),
+                                    o.detail[:240]) if b)),
+                        extra={"wire": w}, ig_label=ig_label)
+                else:
+                    import activity_log
+                    activity_log.log_event(
+                        {"fb": "facebook"}.get(plat, "x"),
+                        f"[signin] {label}: "
+                        + ("signed in as @" + o.identity if o.ok
+                           else "FAILED — " + o.detail),
+                        db=str(_CFG.root / "activity.db"))
             except Exception:
                 pass
             if o.ok and plat == "ig":
@@ -7802,6 +8008,8 @@ class Handler(BaseHTTPRequestHandler):
                 return self._send(200, _ig_status(q))
             if u.path == "/api/ig/diag":
                 return self._send(200, _ig_diag())
+            if u.path == "/api/ig/diagnosis":
+                return self._send(200, _ig_diagnosis(q))
             if u.path == "/api/ig/markets":
                 import ig_identity
                 return self._send(200, {"markets": ig_identity.markets_public(),
@@ -7878,6 +8086,8 @@ class Handler(BaseHTTPRequestHandler):
                 return self._send(200, _ig_session_clear(body))
             if u.path == "/api/ig/exit":
                 return self._send(200, _ig_exit_check(body))
+            if u.path == "/api/ig/probe":
+                return self._send(200, _ig_probe_start(body))
             if u.path == "/api/ig/account":
                 return self._send(200, _ig_account_post(body))
             if u.path == "/api/projects":

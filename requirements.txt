@@ -24,6 +24,9 @@ instagrapi==2.18.12
 
 python-dotenv>=1.0
 playwright>=1.49
+# Playwright without the automation tells; drives Instagram's sign-in window
+# (ig.py falls back to plain playwright if this is missing or will not start).
+patchright>=1.49
 
 
 pyotp>=2.9

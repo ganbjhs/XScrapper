@@ -45,6 +45,9 @@ flushes to disk.
 import asyncio
 import json
 import os
+import shutil
+import subprocess
+import sys
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -412,8 +415,73 @@ def _proxy_kwargs(url: str) -> dict:
     return out
 
 
-async def _launch(pw, acct, headless: bool, log, extra: dict | None = None):
+# One Xvfb per process, started the first time a window asks for it and left
+# running: a second sign-in reuses it, and it dies with the service.
+_XVFB = {"proc": None, "display": ""}
+
+
+def virtual_display(log=print, env=None) -> str:
+    """A display a REAL (non-headless) browser window can open on, or "".
+
+    WHY (2026-10-07). The Instagram sign-in window was headless Chromium, and
+    Instagram answered it 403 before the login form — through the France
+    proxies AND through the US one that the app client was collecting on, so
+    the address was not the reason. Headless is a different rendering path
+    with its own tells; a real window on a virtual screen is the same binary
+    a person runs. Nothing is shown anywhere: Xvfb is a screen in memory, and
+    the dashboard still gets its picture from page.screenshot().
+
+    Order: BROWSER_HEADFUL=0 turns this off → an existing $DISPLAY is used →
+    Xvfb is started on the first free :99..:119. No Xvfb, not Linux, or it
+    will not start: "" and the caller stays headless, saying so."""
+    env = os.environ if env is None else env
+    if (env.get("BROWSER_HEADFUL") or "").strip() == "0":
+        return ""
+    if not sys.platform.startswith("linux"):
+        return ""
+    if env.get("DISPLAY"):
+        return env["DISPLAY"]
+    proc = _XVFB["proc"]
+    if proc is not None and proc.poll() is None:
+        return _XVFB["display"]
+    exe = shutil.which("Xvfb")
+    if not exe:
+        log("  no Xvfb on this machine — the window stays headless "
+            "(deploy/setup.sh installs it)")
+        return ""
+    for n in range(99, 120):
+        sock = f"/tmp/.X11-unix/X{n}"
+        if os.path.exists(sock) or os.path.exists(f"/tmp/.X{n}-lock"):
+            continue
+        try:
+            proc = subprocess.Popen(
+                [exe, f":{n}", "-screen", "0", "1920x1080x24", "-nolisten", "tcp"],
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        except Exception as e:
+            log(f"  Xvfb did not start ({type(e).__name__})")
+            return ""
+        for _ in range(40):
+            if proc.poll() is not None or os.path.exists(sock):
+                break
+            time.sleep(0.1)
+        if proc.poll() is None and os.path.exists(sock):
+            _XVFB.update(proc=proc, display=f":{n}")
+            return f":{n}"
+        try:
+            proc.kill()
+        except Exception:
+            pass
+    log("  Xvfb would not come up on :99..:119 — the window stays headless")
+    return ""
+
+
+async def _launch(pw, acct, headless: bool, log, extra: dict | None = None,
+                  display: bool = False):
     """Launch the persistent context, preferring real Chrome over bundled Chromium.
+
+    `display=True` (Instagram's window) asks for a real window on a virtual
+    screen instead of headless whenever the machine can give one — see
+    virtual_display(). A machine that cannot stays headless, as before.
 
     `extra` is merged over the launch kwargs LAST — it is how ig.py makes the
     window BE the account's phone (user_agent, viewport, device_scale_factor,
@@ -422,6 +490,11 @@ async def _launch(pw, acct, headless: bool, log, extra: dict | None = None):
     profile_dir = Path(acct.profile_path)
     profile_dir.mkdir(parents=True, exist_ok=True)
     clear_stale_locks(profile_dir, log)
+
+    screen = virtual_display(log) if (headless and display) else ""
+    server = headless          # no human at this machine, whatever the mode
+    if screen:
+        headless = False
 
     args = [
         "--disable-blink-features=AutomationControlled",
@@ -441,7 +514,7 @@ async def _launch(pw, acct, headless: bool, log, extra: dict | None = None):
         "--force-webrtc-ip-handling-policy=disable_non_proxied_udp",
         "--webrtc-ip-handling-policy=disable_non_proxied_udp",
     ]
-    if headless:
+    if server:
         # Chrome puts its shared-memory files in /dev/shm, which is 64 MB on a
         # default container or a systemd unit with PrivateTmp. Loading x.com
         # overruns that and the tab dies with no useful message.
@@ -456,7 +529,10 @@ async def _launch(pw, acct, headless: bool, log, extra: dict | None = None):
         timezone_id=acct.timezone,
     )
 
-    if headless:
+    if screen:
+        kwargs["env"] = {**os.environ, "DISPLAY": screen}
+        args += ["--window-position=0,0", "--window-size=1440,1000"]
+    if server:
         # X's layout is responsive, and the left nav — which is where the
         # profile link and account switcher live — is hidden below ~1000px.
         # Letting headless Chrome pick its own (narrow) window size makes the
@@ -495,6 +571,8 @@ async def _launch(pw, acct, headless: bool, log, extra: dict | None = None):
     nosandbox = [*args, "--no-sandbox"]
     attempts = (
         ("Google Chrome", dict(kwargs, channel="chrome")),
+        ("Google Chrome without its sandbox",
+         dict(kwargs, channel="chrome", args=nosandbox)),
         ("bundled Chromium", dict(kwargs, channel="chromium")),
         ("bundled Chromium without its sandbox",
          dict(kwargs, channel="chromium", args=nosandbox)),
@@ -508,8 +586,18 @@ async def _launch(pw, acct, headless: bool, log, extra: dict | None = None):
     for i, (what, kw) in enumerate(attempts):
         try:
             ctx = await pw.chromium.launch_persistent_context(**kw)
-            if i:
-                log(f"  using {what}")
+            if i or display:
+                mode = (f"a real window on virtual display {screen}" if screen
+                        else "headless" if headless else "a real window")
+                log(f"  using {what} — {mode}")
+            # Kept on the context so the sign-in evidence can say what was
+            # REALLY launched (ig_evidence), not what was asked for.
+            try:
+                ctx._launched = {"browser": what,
+                                 "mode": ("window on a virtual display" if screen
+                                          else "headless" if headless else "window")}
+            except Exception:
+                pass
             return ctx
         except Exception as e:
             last = e

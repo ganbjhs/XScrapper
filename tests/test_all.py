@@ -5141,6 +5141,184 @@ def test_ig_identity(tmp):
        "a first phone is minted for the exit's country when the exit says one")
 
 
+def test_ig_evidence(tmp):
+    """2026-10-07: six accounts could not sign in and the log held nothing
+    that said why — the window's 403 was only in the picture, the background
+    login's 429 arrived as urllib3's "too many 429 error responses". Every
+    attempt is now a row, and the rows are compared ACROSS accounts."""
+    import ig_evidence as ev, activity_log
+    from unittest import mock as _m
+    root = pathlib.Path(tmp)
+    db = str(root / "activity.db")
+    t0 = 1_800_000_000_000
+
+    print("== who answered, and why ==")
+    ok(ev.answered_by("https://www.instagram.com/", 403) == "instagram",
+       "an HTTP status on an https URL can only be the site's (the proxy carries a tunnel)")
+    ok(ev.answered_by("https://www.instagram.com/", 0,
+                      "net::ERR_TUNNEL_CONNECTION_FAILED") == "proxy",
+       "a refused tunnel is the proxy")
+    ok(ev.answered_by("https://www.instagram.com/", 0, "net::ERR_TIMED_OUT") == "network",
+       "a failure with no status and no proxy word is the network")
+    ok(ev.why_from_status(403) == "http_403" and ev.why_from_status(429) == "http_429"
+       and ev.why_from_status(200) == "ok", "statuses map onto the vocabulary")
+
+    class RetryError(Exception): pass
+    class PleaseWaitFewMinutes(Exception): pass
+    class ChallengeRequired(Exception): pass
+    ok(ev.why_from_exception(RetryError("Max retries exceeded (Caused by ResponseError("
+                                        "'too many 429 error responses'))")) == "http_429",
+       "urllib3's 'too many 429' is read as a 429, not as 'unknown'")
+    ok(ev.why_from_exception(PleaseWaitFewMinutes("x")) == "http_429", "PleaseWaitFewMinutes -> 429")
+    ok(ev.why_from_exception(ChallengeRequired("x")) == "challenge", "ChallengeRequired -> challenge")
+    ok(ev.why_from_exception(Exception("Your version of Instagram is out of date")) == "app_out_of_date",
+       "the out-of-date app message is recognised")
+    o = _m.Mock(ok=False, needs="paste",
+                detail="Login failed: RetryError: HTTPSConnectionPool(...) too many 429 error responses")
+    ok(ev.why_from_outcome(o) == "http_429", "an Outcome's detail is read the same way")
+    o2 = _m.Mock(ok=False, needs="paste", detail="Instagram did not accept the login, without saying why.")
+    ok(ev.why_from_outcome(o2, {"status": 403}) == "http_403",
+       "with no words to go on, the status Instagram sent decides")
+
+    print("== the app client's last answer, without secrets ==")
+    resp = _m.Mock(status_code=429, url="https://i.instagram.com/api/v1/accounts/login/?x=1",
+                   headers={"Retry-After": "300", "x-fb-debug": "z", "Set-Cookie": "sessionid=SECRET"})
+    cl = _m.Mock(last_response=resp, last_json={"message": "Please wait a few minutes", "status": "fail"})
+    w = ev.wire(cl)
+    ok(w["status"] == 429 and w["path"] == "/api/v1/accounts/login/" and w["retry_after"] == "300",
+       "status, path and Retry-After are kept")
+    ok(w["message"].startswith("Please wait") and "SECRET" not in json.dumps(w),
+       "Instagram's message is kept; no cookie is")
+
+    print("== an attempt is a row AND a line under the account ==")
+    r = ev.record("@HanaMalik146", "browser", False, stage="open", why="http_403",
+                  http_status=403, answered="instagram", exit_ip="31.98.5.60", country="fr",
+                  browser="bundled Chromium · HeadlessChrome/151 · headless · playwright",
+                  phone="Galaxy A34 · France", detail='page says: "HTTP ERROR 403"',
+                  db=db, now_ms=t0)
+    ok(r["account"] == "hanamalik146" and r["country"] == "FR", "the account and country are normalised")
+    line = activity_log.recent(5, platform="instagram", db=db)[0]
+    ok(line["account"] == "hanamalik146" and line["level"] == "error",
+       "the activity log line is filed under the account, as an error")
+    ok("HTTP 403" in line["message"] and "31.98.5.60 (FR)" in line["message"]
+       and "answered by instagram" in line["message"] and "HeadlessChrome/151" in line["message"],
+       "the line says the status, who answered, the address and the browser")
+
+    print("== one account's log ==")
+    activity_log.log_event("instagram", "  @hanamalik146 visits someone (most overdue of 84)", db=db)
+    activity_log.log_event("instagram", "[signin] Hana Malik: FAILED - old style line", db=db)
+    activity_log.log_event("instagram", "  @actresses_society rests for 58m", db=db)
+    mine = activity_log.recent(50, db=db, account="hanamalik146,Hana Malik")
+    ok(len(mine) == 3 and all("actresses" not in e["message"] for e in mine),
+       "filed under the account, or naming its handle or its label: all three, and no one else's")
+    ok(len(activity_log.recent(50, db=db, account="hana_alik146")) == 0,
+       "an underscore in a name is a character, not a wildcard")
+    ok(len(activity_log.recent(50, db=db)) == 4, "no account = everything, as before")
+
+    print("== several accounts, several addresses, one browser: a shared cause ==")
+    ev.record("youssefnasser168", "browser", False, stage="open", why="http_403", http_status=403,
+              answered="instagram", exit_ip="31.98.5.141", country="FR",
+              browser="bundled Chromium · HeadlessChrome/151 · headless · playwright", db=db, now_ms=t0 + 1)
+    ev.record("shoaibakhtar4915", "browser", False, stage="open", why="http_403", http_status=403,
+              answered="instagram", exit_ip="23.230.174.154", country="US",
+              browser="bundled Chromium · HeadlessChrome/151 · headless · playwright", db=db, now_ms=t0 + 2)
+    d = ev.diagnose(db=db, now_ms=t0 + 60_000)
+    f = [x for x in d["findings"] if x["door"] == "browser"][0]
+    ok(f["level"] == "shared" and len(f["accounts"]) == 3, "three accounts are grouped into one finding")
+    ok(f["suspect"] == "shared" and "2 different address ranges" in f["detail"]
+       and "2 countries" in f["detail"] and "HeadlessChrome/151" in f["detail"],
+       "it says: not one account, not one address — and names the browser they share")
+    ok(len(d["accounts"]["hanamalik146"]) == 1 and d["accounts"]["hanamalik146"][0]["http_status"] == 403,
+       "each account's latest word per door is listed")
+
+    print("== a success on another range points at the address ==")
+    db2 = str(root / "a2.db")
+    for i, (a, ip) in enumerate((("a1", "31.98.5.60"), ("a2", "31.98.24.25"))):
+        ev.record(a, "background", False, why="http_429", http_status=429, exit_ip=ip,
+                  country="FR", db=db2, now_ms=t0 + i)
+    ev.record("a3", "background", True, exit_ip="23.230.174.154", country="US", db=db2, now_ms=t0 + 5)
+    f = ev.diagnose(db=db2, now_ms=t0 + 60_000)["findings"][0]
+    ok(f["suspect"] == "address" and "@a3" in f["detail"] and "31.98.x.x" in f["detail"],
+       "failures on one range + a success on another = the address range")
+
+    print("== a success on the SAME range points at the accounts ==")
+    db3 = str(root / "a3.db")
+    for i, a in enumerate(("b1", "b2")):
+        ev.record(a, "background", False, why="challenge", exit_ip=f"31.98.5.{i+1}", db=db3, now_ms=t0 + i)
+    ev.record("b3", "background", True, exit_ip="31.98.9.9", db=db3, now_ms=t0 + 5)
+    f = ev.diagnose(db=db3, now_ms=t0 + 60_000)["findings"][0]
+    ok(f["suspect"] == "account", "same door, same range, one works: the accounts differ")
+
+    print("== one range, no success: it says it cannot tell ==")
+    db4 = str(root / "a4.db")
+    for i, a in enumerate(("c1", "c2")):
+        ev.record(a, "background", False, why="http_429", exit_ip=f"31.98.5.{i+1}", db=db4, now_ms=t0 + i)
+    f = ev.diagnose(db=db4, now_ms=t0 + 60_000)["findings"][0]
+    ok(f["suspect"] == "undetermined" and "cannot be told apart" in f["detail"]
+       and "probe" in f["detail"], "no guess: undetermined, and it asks for a probe")
+
+    print("== a later success replaces an account's failure ==")
+    ev.record("c1", "background", True, exit_ip="31.98.5.1", db=db4, now_ms=t0 + 10)
+    d = ev.diagnose(db=db4, now_ms=t0 + 60_000)
+    ok(all("c1" not in x["accounts"] for x in d["findings"]),
+       "the latest attempt per door is what counts")
+    ok(d["findings"][0]["level"] == "single" and "@c1" in d["findings"][0]["detail"],
+       "the one still failing is compared with the one that got through")
+
+    print("== the collectors' conditions are compared too ==")
+    conds = [{"account": "hanamalik146", "kind": "rate_limited"},
+             {"account": "actresses_society", "kind": "rate_limited"},
+             {"account": "sanaakhtar221", "kind": "checkpoint"}]
+    d = ev.diagnose(rows=[], conditions=conds,
+                    collecting=["hanamalik146", "actresses_society"], now_ms=t0)
+    f = [x for x in d["findings"] if x["door"] == "collector"]
+    ok(len(f) == 1 and f[0]["why"] == "rate_limited" and "every account that is collecting" in f[0]["detail"],
+       "rate_limited on every collecting account is said in so many words")
+
+    print("== the probe: which client is refused names the cause ==")
+    def get_factory(by_ua):
+        def get(url, headers, proxies, timeout):
+            ok_ = "curl" in headers.get("User-Agent", "")
+            return _m.Mock(status_code=by_ua["curl" if ok_ else "phone"], headers={})
+        return get
+    import ig_identity
+    dev = ig_identity.mint("probe-test", country="FR")
+    rows = ev.probe_http("http://u:p@1.2.3.4:1", dev, get=get_factory({"curl": 200, "phone": 200}))
+    ok([c["status"] for c in rows] == [200, 200] and len(rows) == 2, "two plain-HTTP clients are asked")
+    br = lambda variant, status: {"client": variant, "kind": "browser", "variant": variant, "status": status}
+    ok(ev.probe_verdict(rows + [br("phone", 403), br("plain", 403)])[0] == "browser",
+       "HTTP fine, browser refused -> the browser")
+    ok(ev.probe_verdict(rows + [br("phone", 403), br("plain", 200)])[0] == "disguise",
+       "browser fine as itself, refused as the phone -> the disguise")
+    ok(ev.probe_verdict(rows + [br("phone", 200), br("plain", 200)])[0] == "open",
+       "everything answers -> the page is reachable")
+    r403 = ev.probe_http("http://u:p@1.2.3.4:1", dev, get=get_factory({"curl": 403, "phone": 403}))
+    ok(ev.probe_verdict(r403 + [br("phone", 403), br("plain", 403)])[0] == "address",
+       "even curl refused -> the address")
+    rmix = ev.probe_http("http://u:p@1.2.3.4:1", dev, get=get_factory({"curl": 200, "phone": 403}))
+    v = ev.probe_verdict(rmix + [br("phone", 403), br("plain", 403)])
+    ok(v[0] == "claims_chrome" and "not what it objects to" in v[1],
+       "curl fine, anything presenting as Chrome refused -> not the browser build")
+    def boom(url, headers, proxies, timeout):
+        raise ConnectionError("ProxyError: Tunnel connection failed: 407")
+    rdead = ev.probe_http("http://u:p@1.2.3.4:1", dev, get=boom)
+    ok(ev.probe_verdict(rdead)[0] == "proxy" and rdead[0]["why"] == "proxy_refused",
+       "no answer at all -> the proxy")
+
+    print("== a probe verdict outranks the inference ==")
+    ev.record("hanamalik146", "probe", False, stage="verdict", why="browser", detail="measured",
+              extra={"clients": [{"client": "plain HTTP (curl)", "status": 200},
+                                 {"client": "the browser dressed as the phone", "status": 403}]},
+              db=db, now_ms=t0 + 30_000)
+    d = ev.diagnose(db=db, now_ms=t0 + 60_000)
+    ok(d["findings"][0]["level"] == "measured" and "refuses the browser" in d["findings"][0]["title"]
+       and d["findings"][0]["evidence"] == ["plain HTTP (curl): HTTP 200",
+                                            "the browser dressed as the phone: HTTP 403"],
+       "the measurement is listed first, with what each client got")
+    ok(all(x["door"] != "probe" for rows_ in d["accounts"].values() for x in rows_),
+       "a probe is not counted as a sign-in attempt")
+
+
 def test_ig_clear_and_exit(tmp):
     """Two things the operator hit on 2026-10-03.
 
@@ -7807,6 +7985,7 @@ def main():
         test_ig_identity(fresh("igid"))
         section("instagram: clear a session; where an account leaves from now")
         test_ig_clear_and_exit(fresh("igclear"))
+        test_ig_evidence(fresh("igevidence"))
         section("instagram write-back (the claim advances; the handset cannot)")
         test_ig_writeback(fresh("igwb"))
         section("instagram sign-in from the server (code relay, exit check, browser door)")

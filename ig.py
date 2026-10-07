@@ -342,6 +342,167 @@ async def cookies_dict(ctx) -> dict:
 # the sign-in window
 # ==========================================================================
 
+def watch_navigation(page, sink: list) -> None:
+    """Write down every answer the MAIN document gets, and every main-document
+    request that failed without one. This is the evidence a sign-in window
+    used to throw away: the operator saw "403" in the picture and the log held
+    nothing (2026-10-07). Headers are reduced to the few that say who answered
+    and how long to wait. Never raises."""
+    def on_response(resp):
+        try:
+            req = resp.request
+            if not req.is_navigation_request() or resp.frame != page.main_frame:
+                return
+            h = resp.headers or {}
+            sink.append({
+                "url": resp.url.split("?")[0][:160], "status": resp.status,
+                "retry_after": h.get("retry-after", ""),
+                "server": h.get("server", ""),
+                "meta": sorted(k for k in h if k.startswith(("x-fb-", "x-ig-",
+                                                             "x-stack")))[:6],
+                "location": (h.get("location", "") or "").split("?")[0][:120]})
+        except Exception:
+            pass
+
+    def on_failed(req):
+        try:
+            if not req.is_navigation_request() or req.frame != page.main_frame:
+                return
+            sink.append({"url": req.url.split("?")[0][:160], "status": 0,
+                         "failure": str(req.failure or "")[:160]})
+        except Exception:
+            pass
+
+    try:
+        page.on("response", on_response)
+        page.on("requestfailed", on_failed)
+    except Exception:
+        pass
+
+
+async def launched_as(ctx, page, engine_name: str = "") -> str:
+    """One phrase for the browser that is really running: the build Chrome
+    itself reports, how the window was opened, and what drives it."""
+    info = getattr(ctx, "_launched", None) or {}
+    product = ""
+    try:
+        cdp = await ctx.new_cdp_session(page)
+        v = await cdp.send("Browser.getVersion")
+        product = str(v.get("product") or "")
+        await cdp.detach()
+    except Exception:
+        pass
+    bits = [info.get("browser") or "browser", product, info.get("mode") or "",
+            engine_name]
+    return " · ".join(b for b in bits if b)
+
+
+async def probe_window(acct, device: dict | None, root, log=lambda m: None,
+                       timeout_ms: int = 40000) -> dict:
+    """Open the login page ONCE in a throwaway profile through this account's
+    proxy and report what answered. `device` given = dressed as that phone,
+    exactly as the sign-in window is; None = the browser as itself. No cookies,
+    no account, nothing typed; the profile is deleted afterwards."""
+    import shutil
+    import tempfile
+    import types
+    import ig_identity
+    variant = "phone" if device else "plain"
+    row = {"client": ("the browser dressed as the phone" if device
+                      else "the browser as itself (desktop)"),
+           "kind": "browser", "variant": variant, "status": 0, "error": "",
+           "form": False, "nav": [], "browser": ""}
+    prof = Path(tempfile.mkdtemp(prefix="_probe_", dir=str(Path(root) / "profiles")))
+    shim = types.SimpleNamespace(
+        profile_path=str(prof), proxy_or_none=getattr(acct, "proxy_or_none", None),
+        locale=getattr(acct, "locale", "en-US"),
+        timezone=getattr(acct, "timezone", "UTC"))
+    extra = ig_identity.playwright_kwargs(device) if device else None
+    pw = ctx = None
+    t0 = time.time()
+    try:
+        last = None
+        for engine_name, starter in _browser_engines():
+            try:
+                pw = await starter().start()
+                ctx = await auth._launch(pw, shim, True, log, extra=extra,
+                                         display=True)
+                break
+            except Exception as e:
+                last = e
+                try:
+                    if pw:
+                        await pw.stop()
+                except Exception:
+                    pass
+                pw = ctx = None
+        if ctx is None:
+            raise last
+        page = ctx.pages[0] if ctx.pages else await ctx.new_page()
+        if device:
+            try:
+                cdp = await ctx.new_cdp_session(page)
+                await cdp.send("Emulation.setUserAgentOverride", {
+                    "userAgent": extra["user_agent"],
+                    "platform": "Linux armv8l",
+                    "userAgentMetadata": ig_identity.cdp_user_agent_metadata(device)})
+            except Exception:
+                pass
+        row["browser"] = await launched_as(ctx, page, engine_name)
+        watch_navigation(page, row["nav"])
+        try:
+            await page.goto(LOGIN_URL, wait_until="domcontentloaded",
+                            timeout=timeout_ms)
+            try:
+                await page.wait_for_selector(
+                    'input[name="username"], input[name="password"]',
+                    timeout=12000, state="visible")
+                row["form"] = True
+            except Exception:
+                pass
+        except Exception as e:
+            row["error"] = f"{type(e).__name__}: {str(e)[:140]}"
+        docs = [n for n in row["nav"] if n.get("status")]
+        if docs:
+            row["status"] = docs[-1]["status"]
+        elif row["nav"]:
+            row["error"] = row["nav"][-1].get("failure") or row["error"]
+        try:
+            row["title"] = (await page.title())[:80]
+        except Exception:
+            pass
+    except Exception as e:
+        row["error"] = row["error"] or f"{type(e).__name__}: {str(e)[:140]}"
+    finally:
+        for closer in (lambda: ctx.close() if ctx else None,
+                       lambda: pw.stop() if pw else None):
+            try:
+                r = closer()
+                if r is not None:
+                    await r
+            except Exception:
+                pass
+        shutil.rmtree(prof, ignore_errors=True)
+    row["ms"] = int((time.time() - t0) * 1000)
+    return row
+
+
+def _browser_engines():
+    """(name, async_playwright) pairs to try, best disguise first.
+    IG_BROWSER_ENGINE=playwright skips Patchright."""
+    import os
+    out = []
+    if (os.environ.get("IG_BROWSER_ENGINE") or "").strip().lower() != "playwright":
+        try:
+            from patchright.async_api import async_playwright as _pr
+            out.append(("patchright", _pr))
+        except Exception:
+            pass
+    from playwright.async_api import async_playwright as _pw
+    out.append(("playwright", _pw))
+    return out
+
+
 class InteractiveLogin:
     """
     A real Instagram, running on the server, driven from the dashboard.
@@ -366,6 +527,10 @@ class InteractiveLogin:
         self.viewport = dict(LOGIN_VIEWPORT)
         self.device = {}
         self.exit_ip = ""       # proved by _prove_exit when the window opens
+        self.nav = []           # every answer the main document got (watch_navigation)
+        self.engine = ""        # patchright | playwright
+        self.browser = ""       # what was really launched (launched_as)
+        self.form = False       # did the login form appear
         self.ig_label = getattr(acct, "ig_label", "") or acct.label
 
     @property
@@ -482,15 +647,38 @@ class InteractiveLogin:
                 f"as intended (not the server's address)")
 
     async def start(self, log=lambda m: None):
-        from playwright.async_api import async_playwright
-
         extra = self._phone(log)
-        self.pw = await async_playwright().start()
-        self.ctx = await auth._launch(self.pw, self.acct, True, log, extra=extra)
+        # Patchright is Playwright with the automation tells removed (it does
+        # not turn on the CDP Runtime domain a page can detect). Same API, so
+        # it is tried first and plain Playwright is the fallback — a sign-in
+        # window that opens beats one that hides better and does not open.
+        last = None
+        for engine_name, starter in _browser_engines():
+            try:
+                self.pw = await starter().start()
+                self.ctx = await auth._launch(self.pw, self.acct, True, log,
+                                              extra=extra, display=True)
+                log(f"  driven by {engine_name}")
+                self.engine = engine_name
+                break
+            except Exception as e:
+                last = e
+                log(f"  {engine_name} could not open the window "
+                    f"({type(e).__name__})")
+                try:
+                    if self.pw:
+                        await self.pw.stop()
+                except Exception:
+                    pass
+                self.pw = self.ctx = None
+        if self.ctx is None:
+            raise last
         self.page = self.ctx.pages[0] if self.ctx.pages else await self.ctx.new_page()
         await self._client_hints(log)
         await self.page.set_viewport_size(self.viewport)
+        self.browser = await launched_as(self.ctx, self.page, self.engine)
         await self._prove_exit(log)
+        watch_navigation(self.page, self.nav)   # from here on: Instagram's answers
         try:
             await self.page.goto(HOME_URL, wait_until="domcontentloaded", timeout=45000)
             await self.page.wait_for_timeout(2000)
@@ -510,6 +698,7 @@ class InteractiveLogin:
                     await self.page.wait_for_selector(
                         'input[name="username"], input[name="password"]',
                         timeout=20000, state="visible")
+                    self.form = True
                 except Exception:
                     self.error = ("Instagram loaded but never showed a login "
                                   "form. It may be blocking this server's "
@@ -517,6 +706,50 @@ class InteractiveLogin:
             except Exception as e:
                 self.error = f"{type(e).__name__}: {e}"
         return self
+
+    async def evidence(self) -> dict:
+        """What this window met when it opened, for ig_evidence.record():
+        the last answer the main document got, who gave it, and what the page
+        said. A refusal that arrives as a bare status (Chrome then paints its
+        own "HTTP ERROR 403" page) is named here in words."""
+        import ig_evidence
+        docs = [n for n in self.nav if n.get("status")]
+        failed = [n for n in self.nav if n.get("failure")]
+        status = docs[-1]["status"] if docs else 0
+        failure = failed[-1]["failure"] if (failed and not docs) else ""
+        url = (docs[-1]["url"] if docs else (failed[-1]["url"] if failed else ""))
+        title = text = ""
+        try:
+            title = (await self.page.title())[:80]
+            text = (await self.page.evaluate(
+                "() => document.body ? document.body.innerText : ''") or "")
+            text = " ".join(text.split())[:160]
+        except Exception:
+            pass
+        signed_in = self.state == LOGGED_IN
+        ok = bool(signed_in or self.form)
+        if ok:
+            why = "ok"
+        elif status >= 400:
+            why = ig_evidence.why_from_status(status)
+        elif failure:
+            why = ("proxy_refused"
+                   if ig_evidence.answered_by(url, 0, failure) == "proxy"
+                   else "network")
+        else:
+            why = "no_form"
+        said = "already signed in" if signed_in else \
+               "login form shown" if self.form else \
+               (f'page says: "{text or title}"' if (text or title) else
+                "an empty page" if status else "")
+        return {"ok": ok, "why": why, "http_status": status,
+                "answered": ig_evidence.answered_by(url, status, failure),
+                "exit_ip": self.exit_ip, "browser": self.browser,
+                "detail": "; ".join(b for b in (
+                    said, failure,
+                    (f"Retry-After {docs[-1]['retry_after']}"
+                     if docs and docs[-1].get("retry_after") else "")) if b),
+                "extra": {"nav": self.nav[-8:], "title": title, "url": url}}
 
     def _alive(self):
         if self.page is None:

@@ -409,12 +409,28 @@ def refresh_app_build(device: dict) -> dict | None:
 def chrome_major(env=os.environ) -> str:
     """The Chrome major this machine's browser really is.
 
-    Order: IG_WEB_CHROME_MAJOR (an explicit operator pin) → Playwright's
-    Chromium `--version` → FALLBACK_CHROME_MAJOR. Cached into the device
+    Order: IG_WEB_CHROME_MAJOR (an explicit operator pin) → installed Google
+    Chrome `--version` → Playwright's Chromium → FALLBACK_CHROME_MAJOR. Cached into the device
     file at mint time, so this runs once per account, not per request."""
     pinned = (env.get("IG_WEB_CHROME_MAJOR") or "").strip()
     if pinned.isdigit():
         return pinned
+    # auth._launch tries Google Chrome before the bundled Chromium, so when
+    # Chrome is installed IT is the browser the window will be, and the UA
+    # must announce its major, not Playwright's.
+    import shutil
+    for exe in (shutil.which("google-chrome-stable"), shutil.which("google-chrome"),
+                "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"):
+        if not exe or not os.path.exists(exe):
+            continue
+        try:
+            out = subprocess.run([exe, "--version"], capture_output=True,
+                                 text=True, timeout=15).stdout
+            m = re.search(r"(\d{2,3})\.\d+\.\d+\.\d+", out or "")
+            if m:
+                return m.group(1)
+        except Exception:
+            pass
     # In a child process, on purpose: the sync Playwright API refuses to run
     # inside an asyncio loop, and the streamed sign-in window mints the
     # identity from exactly such a loop (web.py runs it on _LOOP).

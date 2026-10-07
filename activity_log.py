@@ -116,8 +116,13 @@ def logger(platform, account=None, echo=print, db=None):
     return _log
 
 
-def recent(limit=200, platform=None, level=None, db=None):
-    """Newest events first, optionally filtered by platform and/or level."""
+def recent(limit=200, platform=None, level=None, db=None, account=None):
+    """Newest events first, optionally filtered by platform and/or level.
+
+    `account` narrows to ONE account's lines: a name or several separated by
+    commas (login, @handle, card label). A line matches when it is filed under
+    one of them or names one in its text — most collector lines predate the
+    account column and carry the handle only in the message."""
     try:
         con = _con(db)
     except Exception:
@@ -128,6 +133,16 @@ def recent(limit=200, platform=None, level=None, db=None):
         where.append("platform = ?"); params.append(platform)
     if level:
         where.append("level = ?"); params.append(level)
+    names = [n.strip().lstrip("@") for n in str(account or "").split(",")]
+    names = [n for n in names if len(n) >= 3][:4]
+    if names:
+        ors = []
+        for n in names:
+            ors.append("LOWER(account) = ?"); params.append(n.lower())
+            ors.append("message LIKE ? ESCAPE '\\'")
+            params.append("%" + n.replace("\\", "\\\\").replace("%", "\\%")
+                          .replace("_", "\\_") + "%")
+        where.append("(" + " OR ".join(ors) + ")")
     try:
         rows = con.execute(
             "SELECT * FROM events "

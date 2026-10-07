@@ -111,6 +111,9 @@ class Outcome:
     detail: str = ""            # plain words, shown to the operator verbatim
     needs: str = ""             # "" | "paste" | "totp" | "proxy"
     lines: list = field(default_factory=list)   # the running log
+    # Evidence for ig_evidence.record — never shown raw, never holds a secret:
+    wire: dict = field(default_factory=dict)    # Instagram's last answer
+    exit: dict = field(default_factory=dict)    # the proxy check of this attempt
 
     def as_json(self) -> dict:
         return {"ok": self.ok, "identity": self.identity, "detail": self.detail,
@@ -480,6 +483,7 @@ def ig_password(login: str, password: str, *, totp_secret: str = "",
     chk = _check_exit(proxy, o, log, label=label, root=root)
     if chk is None:
         return o
+    o.exit = dict(chk)
     _phone_for_exit(label, root, chk, log, username=login)
     _fresh_phone_if_legacy(label, root, log)
 
@@ -502,7 +506,24 @@ def ig_password(login: str, password: str, *, totp_secret: str = "",
             log(f"could not generate a 2FA code: {type(e).__name__}: {e}")
 
     try:
-        ok = cl.login(login, password, verification_code=code)
+        # ONE knock. instagrapi's transport re-sends a refused request three
+        # times; on a login that turns "429, wait" into four logins in six
+        # seconds and reports it as urllib3's "too many 429 error responses"
+        # instead of what Instagram said (2026-10-07). Retries off, and
+        # whatever Instagram answered is kept for the record.
+        import engine_ig
+        import ig_evidence
+        try:
+            with engine_ig._no_retries(cl):
+                ok = cl.login(login, password, verification_code=code)
+        finally:
+            o.wire = ig_evidence.wire(cl)
+            if o.wire.get("status", 0) >= 400:
+                log(f"Instagram's answer: HTTP {o.wire['status']}"
+                    + (f" on {o.wire['path']}" if o.wire.get("path") else "")
+                    + (f" — \"{o.wire['message']}\"" if o.wire.get("message") else "")
+                    + (f" — Retry-After {o.wire['retry_after']}"
+                       if o.wire.get("retry_after") else ""))
     except TwoFactorRequired:
         o.detail = ("Instagram asked for a two-factor code and none is on file. "
                     "Add the account's TOTP secret on the card (Edit -> TOTP "
@@ -581,6 +602,7 @@ def ig_cookie(blob: str, *, proxy: str = "", label: str = "ig_a", root=".",
     chk = _check_exit(proxy, o, log, label=label, root=root)
     if chk is None:
         return o
+    o.exit = dict(chk)
     _phone_for_exit(label, root, chk, log)
     _fresh_phone_if_legacy(label, root, log)
 

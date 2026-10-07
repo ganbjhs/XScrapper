@@ -2105,6 +2105,23 @@ before changing the engine; nearly every "obvious" idea has been tried.)
   `containers=`** — the real DOM shape to retune the extractor against. That is
   the diagnostic path; use it before guessing.
 
+### A sign-in that fails says what answered — and the tool compares accounts (2026-10-07)
+
+- **Every Instagram sign-in attempt is recorded** (`ig_evidence.record`), on
+  every door, success or failure: HTTP status, who answered, exit address,
+  the browser really launched, the phone. A new sign-in path that does not
+  call it is a bug. No cookie, password or proxy credential goes in.
+- **A cause is measured or it is called undetermined.** `ig_evidence.diagnose`
+  names a suspect only when the attempts separate it (a success on another
+  address range, a success on the same range); otherwise it says so and asks
+  for a probe. Do not change proxies, phones or the browser on a theory —
+  run the probe (Accounts -> Diagnosis) first and read which client is refused.
+- **A login is one request.** `cl.login` runs inside `engine_ig._no_retries`;
+  the transport's three re-sends turned one refused login into four.
+- **An HTTP status on an https URL is the site's.** The proxy carries a
+  tunnel; when it refuses, the client sees a failed connection
+  (`ERR_TUNNEL_CONNECTION_FAILED`, `ProxyError`), never a 403 page.
+
 ## 7. Change rules
 
 - **Update this rulebook in the same commit as the change** (§0). The

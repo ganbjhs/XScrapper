@@ -3,6 +3,7 @@ import React, { useMemo, useRef, useState } from "react";
 import { api, fmtAgo, fmtLag, useApi } from "../api/client.js";
 import { PageHead } from "../App.jsx";
 import { Empty, ErrorState, HeadSearch, Loading, Pill } from "../components/ui.jsx";
+import Diagnosis from "../components/Diagnosis.jsx";
 
 const STOP = {
   watermark: ["✓ caught up", "st-good"],
@@ -205,6 +206,7 @@ function Timeline({ q, setQ, live }) {
 
         {data && all.length > 0 && (
           <aside>
+            <Diagnosis compact />
             <div className="panel">
               <div className="phead"><h3>Threat watch</h3><span className="right">{span}</span></div>
               {suspects.length === 0 && (

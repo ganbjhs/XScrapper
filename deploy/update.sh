@@ -56,6 +56,13 @@ if changed '^requirements\.txt$'; then
   ok "pip install done"
 fi
 
+# Real Chrome + Xvfb for the sign-in window. Skips whatever is already there.
+if changed '^deploy/browser\.sh$' || ! command -v Xvfb >/dev/null 2>&1 \
+   || ! command -v google-chrome >/dev/null 2>&1; then
+  say "browser"
+  bash "$APP_DIR/deploy/browser.sh"
+fi
+
 if changed '^deploy/xscraper-.*\.service$'; then
   say "systemd units (deploy/*.service changed)"
   # The web unit carries the port setup.sh chose; keep it rather than picking a new one.
