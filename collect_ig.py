@@ -1204,6 +1204,15 @@ def main() -> int:
                     nap = min(until) + random.uniform(5, 60)
                     await asyncio.sleep(max(30, min(1800, nap)))
                     continue
+                if not owners:
+                    # No account can collect (all benched, cleared, resting or
+                    # checkpointed). Wait and look again; the loop must outlive
+                    # this. Until 2026-10-08 it reached max() over nothing
+                    # below, crashed, and after five restarts systemd gave up:
+                    # the service stayed "failed" for a day and a half, so the
+                    # accounts signed in afterwards collected nothing.
+                    await asyncio.sleep(300 + random.uniform(0, 60))
+                    continue
                 # A VISIT, not a pass: every phone in hand reads its ONE most
                 # overdue source (not seen within the dashboard cadence), and
                 # the loop comes back after a human gap — a trickle across
@@ -1225,8 +1234,8 @@ def main() -> int:
                 # the other phones. The decider's wait is a floor, never a
                 # ceiling, so the human rhythm still applies.
                 budget = ig_human.daily_budget()
-                planned = max(ig_human.planned_seconds(a, started, tz_offset_s=off)
-                              for a, off in in_hand.items())
+                planned = max((ig_human.planned_seconds(a, started, tz_offset_s=off)
+                               for a, off in in_hand.items()), default=0)
                 wait = max(ig_human.visit_gap(budget, planned), dec.platform_wait_s())
                 wait -= (time.time() - started)
                 await asyncio.sleep(max(5, wait))

@@ -2139,6 +2139,11 @@ before changing the engine; nearly every "obvious" idea has been tried.)
   tunnel; when it refuses, the client sees a failed connection
   (`ERR_TUNNEL_CONNECTION_FAILED`, `ProxyError`), never a 403 page.
 
+- **The Instagram loop never exits because nobody can collect (2026-10-08).**
+  Zero healthy accounts is a state to wait out, not an error: the service
+  sleeps and looks again. A crash there turned into systemd giving up and a
+  collector that stayed dead after the accounts came back.
+
 - **One Instagram account asks for at most 120 requests a day by default
   (2026-10-08).** When accounts drop out, the rest do NOT absorb their load
   beyond that: Shoaib did, and was disabled. Raise coverage by adding

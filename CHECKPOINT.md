@@ -19,6 +19,15 @@ must respect belongs in the rulebook, not here.
 
 ---
 
+## 2026-10-08 — The Instagram loop crashed when no account could collect
+
+**Why.** `journalctl -u xscraper-ig`: from 2026-10-07 07:46 UTC every start
+died in `collect_ig.loop` on `max()` over an empty iterable (no account in
+hand), five times, and systemd stopped restarting it. The service stayed
+`failed`, so accounts signed in on 10-08 collected nothing until it was
+started by hand. **What changed.** With no owners the loop sleeps ~5 min and
+looks again; `planned` takes `default=0`. **Verified.** py_compile + suite.
+
 ## 2026-10-08 — Instagram daily budget per account 300 -> 120
 
 **Why.** @shoaibakhtar4915 took over every source when the others fell out
