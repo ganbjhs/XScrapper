@@ -1,3 +1,8 @@
+- **instagrapi is pinned at 3.0.20 (2026-10-08).** Instagram refused the
+  2.18.12 login flow as "out of date" whatever the app build; 3.0.x logs in
+  through the CAA flow. When a login says "out of date", check PyPI for a newer
+  instagrapi before touching phones or proxies.
+
 # Rulebook
 
 The rules every change must respect. Each one was paid for in a bug, a ban, or

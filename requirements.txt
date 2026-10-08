@@ -20,7 +20,14 @@ twscrape==0.20.0
 # reports. NOTE: it is a private-API client, not an official API — it can break
 # when Instagram shifts, exactly as snscrape did, and cannot make an account
 # ban-proof. Proxy + stable device + gentle interval is mitigation, not immunity.
-instagrapi==2.18.12
+# 2.18.12 -> 3.0.20 (2026-10-08): Instagram now answers a login on the old
+# accounts/login/ flow with HTTP 400 "Your version of Instagram is out of
+# date" (seen on @hanamalik146 with app 428.0.0.47.67 through a clean US
+# address). 3.0.x logs in through the current Android CAA flow, ships app
+# 449.0.0.52.84, and sends requests over curl_cffi (a Chrome-like TLS
+# handshake instead of python-requests'). Every method engine_ig.check()
+# asserts still exists; the full offline suite passes on it.
+instagrapi==3.0.20
 
 python-dotenv>=1.0
 playwright>=1.49

@@ -19,6 +19,30 @@ must respect belongs in the rulebook, not here.
 
 ---
 
+## 2026-10-08 — instagrapi 2.18.12 -> 3.0.20: the old login flow is refused
+
+**Why.** Probes (ig_evidence) showed all six France static addresses refused by
+Instagram for every client, even curl (HTTP 429), while the US address was
+open. @hanamalik146 was moved to a new US address (12.12.121.235, probe:
+open, login form shown) with a US phone, and its one background login got
+HTTP 400 on `/api/v1/accounts/login/`: "Your version of Instagram is out of
+date" — on app 428.0.0.47.67, the newest build 2.18.12 ships. instagrapi
+3.0.x (3.0.20, 2026-10-04) logs in through the current Android "CAA" flow,
+ships app 449.0.0.52.84 and uses curl_cffi for transport.
+
+Also recorded: @shoaibakhtar4915 is permanently disabled ("We disabled your
+account", 2026-10-07, no review possible) — seen in its own browser window.
+
+**What changed.** The pin, `engine_ig.PINNED_VERSION`. `ig_identity.newest_build()`
+reads instagrapi's table, so new phones mint 449 and a sign-in moves an
+existing seed's app build up (`refresh_app_version`), handset unchanged.
+
+**Verified.** `engine_ig.check()` all OK on 3.0.20; full offline suite passes;
+`_no_retries` attributes still exist.
+
+**Not verified.** A real login on 3.0.20. One background sign-in on Hana after
+deploy is the test; its evidence row will say what Instagram answered.
+
 ## 2026-10-08 — The X watcher's delivery loop re-searched a day of tweets every 2 s
 
 **Why.** The VPS ran at 55-65% CPU for a day; Hostinger capped it at ~20%

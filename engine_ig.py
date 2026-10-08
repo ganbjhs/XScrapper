@@ -48,7 +48,7 @@ from datetime import datetime, timezone
 # instagrapi is synchronous (requests under the hood). Every call it makes is
 # wrapped in asyncio.to_thread below so the single-loop server that runs the
 # collector is never blocked while a page is in flight.
-PINNED_VERSION = "2.18.12"
+PINNED_VERSION = "3.0.20"
 
 # Instagram's public web app id — the same constant ig.py already sends. Not a
 # secret; instagrapi sets its own, this is only documented here for parity.
