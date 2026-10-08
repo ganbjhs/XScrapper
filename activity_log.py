@@ -71,8 +71,14 @@ def _con(db=None):
     return con
 
 
+# A count of zero is not a failure. "profile pictures: 1 cached, 0 failed"
+# was painted red because it contains the word "failed" (2026-10-08).
+_ZERO_COUNT_RE = re.compile(r"\b0 (?:failed|failures?|errors?|rejected)\b", re.I)
+
+
 def classify(message: str) -> str:
     """Level from the message text the collectors already write."""
+    message = _ZERO_COUNT_RE.sub("", message)
     if _ERROR_RE.search(message):
         return "error"
     if _WARN_RE.search(message):

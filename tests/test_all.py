@@ -5300,6 +5300,13 @@ def test_ig_evidence(tmp):
        and "answered by instagram" in line["message"] and "HeadlessChrome/151" in line["message"],
        "the line says the status, who answered, the address and the browser")
 
+    print("== a zero count is not a failure ==")
+    ok(activity_log.classify("profile pictures: 1 cached, 0 failed, 1 tried") != "error",
+       "'0 failed' is not an error (it was painted red)")
+    ok(activity_log.classify("profile pictures: 0 cached, 2 failed, 2 tried") == "error",
+       "'2 failed' still is")
+    ok(activity_log.classify("Login failed: RetryError") == "error", "a real failure still is")
+
     print("== one account's log ==")
     activity_log.log_event("instagram", "  @hanamalik146 visits someone (most overdue of 84)", db=db)
     activity_log.log_event("instagram", "[signin] Hana Malik: FAILED - old style line", db=db)
