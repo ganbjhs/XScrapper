@@ -47,7 +47,11 @@ printf '%s\n' "$CHANGED" | sed 's/^/   /'
 changed() { printf '%s\n' "$CHANGED" | grep -qE "$1"; }
 
 say "ownership"
-chown -R "$APP_USER:$APP_USER" "$APP_DIR"
+# SQLite's -wal/-shm files come and go while the services run; one vanishing
+# between chown's listing and its change made `set -e` stop the whole update
+# here, before the restart (2026-10-08). A missing file needs no owner.
+chown -R "$APP_USER:$APP_USER" "$APP_DIR" 2>/dev/null \
+  || chown -R "$APP_USER:$APP_USER" "$APP_DIR" 2>&1 | grep -v 'No such file or directory' || true
 ok "$APP_DIR is $APP_USER"
 
 if changed '^requirements\.txt$'; then
