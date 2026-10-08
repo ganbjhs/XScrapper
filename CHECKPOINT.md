@@ -19,6 +19,32 @@ must respect belongs in the rulebook, not here.
 
 ---
 
+## 2026-10-08 — The X watcher's delivery loop re-searched a day of tweets every 2 s
+
+**Why.** The VPS ran at 55-65% CPU for a day; Hostinger capped it at ~20%
+(night of 10-07) and the dashboard then took 45-82 s per request, Watch Tower's
+`/api/tweets` included. `ps`: `main.py watch --all` at ~70% CPU. `py-spy dump`
+8 times: 8 of 8 in `store.tweets_after` under `webhook.pump`. The table holds
+1,047,414 tweets. A target filtered to a project or streams finds its next rows
+with a correlated EXISTS per row from its delivery cursor; the cursor moves
+only on a match, so a target with no new match re-checked every tweet
+collected since, every `IDLE_POLL_S` (2 s).
+
+**What changed.** `webhook.pump` keeps an in-memory "searched up to" mark per
+target: set from `store.delivery_high_water()` (taken before the search) when
+a search comes back short of a full batch; the next search starts there. The
+delivery cursor and what is delivered are unchanged; a cursor moved back
+(replay) discards the mark; a restart costs one full search. Also:
+`/api/ig/diagnosis` is cached 60 s (it took up to 66 s under the cap).
+
+**Verified.** `test_webhook_search_watermark` (searches start at the mark, the
+cursor does not move, a failed delivery is retried not skipped, a rewind
+replays, marks are per target); full suite passes.
+
+**Not verified.** The CPU drop on the server. After deploy: `top` / `py-spy
+dump` on the watcher, then remove the Hostinger limitation only once CPU stays
+under the cap.
+
 ## 2026-10-07 — Sign-in failures are recorded, compared across accounts, and measurable
 
 **Why.** All six Instagram accounts were failing to sign in and the tool could

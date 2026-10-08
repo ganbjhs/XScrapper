@@ -5026,6 +5026,7 @@ def _ig_note_attempt(username, door, ok, *, stage="login", why="",
                     f"app {sm['app_version']}" if sm.get("app_version") else "") if b)
         except Exception:
             pass
+        _TTL_CACHE.pop(("ig-diagnosis",), None)   # the next read shows this attempt
         return ig_evidence.record(
             username, door, ok, stage=stage, why=why, http_status=http_status,
             answered=answered, exit_ip=exit_ip, country=country, browser=browser,
@@ -5038,7 +5039,23 @@ def _ig_note_attempt(username, door, ok, *, stage="login", why="",
 
 def _ig_diagnosis(q=None):
     """What the Instagram accounts' sign-in failures and open conditions have
-    in common (ig_evidence.diagnose). Dashboard-only."""
+    in common (ig_evidence.diagnose). Dashboard-only.
+
+    Cached for DIAG_TTL_S (2026-10-08): two pages poll this every 30 s and one
+    answer took 66 s on a CPU-capped box. A sign-in or a probe writes its row
+    and the next minute shows it; the probe's own progress is never cached."""
+    core = _ttl_cached(("ig-diagnosis",), DIAG_TTL_S, _ig_diagnosis_uncached)
+    out = dict(core)
+    out["probe"] = {"running": bool(_PROBE["thread"] and _PROBE["thread"].is_alive()),
+                    "username": _PROBE["username"], "lines": list(_PROBE["lines"]),
+                    "result": _PROBE["result"]}
+    return out
+
+
+DIAG_TTL_S = 60
+
+
+def _ig_diagnosis_uncached():
     import decider
     import ig_evidence
     adb = str(_CFG.root / "activity.db")
@@ -5052,11 +5069,7 @@ def _ig_diagnosis(q=None):
                       if a.get("owns")]
     except Exception:
         pass
-    out = ig_evidence.diagnose(conditions=conds, collecting=collecting, db=adb)
-    out["probe"] = {"running": bool(_PROBE["thread"] and _PROBE["thread"].is_alive()),
-                    "username": _PROBE["username"], "lines": list(_PROBE["lines"]),
-                    "result": _PROBE["result"]}
-    return out
+    return ig_evidence.diagnose(conditions=conds, collecting=collecting, db=adb)
 
 
 # One probe at a time: each browser variant is a ~1 GB Chrome.

@@ -4048,6 +4048,15 @@ class Store:
         ).fetchall()
         return [dict(r) for r in rows]
 
+    async def delivery_high_water(self) -> tuple:
+        """(collected_ms, tweet_id) of the newest stored row — the far end of
+        what tweets_after() could return right now. One step down the
+        ix_tweets_delivery index; see webhook.pump for why it is asked."""
+        row = self.db.execute(
+            "SELECT collected_ms, tweet_id FROM tweets "
+            "ORDER BY collected_ms DESC, tweet_id DESC LIMIT 1").fetchone()
+        return (int(row[0] or 0), int(row[1] or 0)) if row else (0, 0)
+
     async def stream_labels_for(self, tweet_id: int) -> list:
         return [r["label"] for r in self.db.execute(
             "SELECT s.label FROM tweet_hits h JOIN streams s USING(stream_id) "

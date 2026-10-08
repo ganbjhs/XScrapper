@@ -5141,6 +5141,103 @@ def test_ig_identity(tmp):
        "a first phone is minted for the exit's country when the exit says one")
 
 
+def test_webhook_search_watermark():
+    """2026-10-08: the X watcher sat at 55-65% CPU for a day and Hostinger
+    capped the box. py-spy: 8 of 8 samples in store.tweets_after, under
+    webhook.pump. A target filtered to a project re-searched every tweet since
+    its (stuck) cursor every 2 s. pump now remembers how far it has searched
+    with nothing matching — without moving the delivery cursor."""
+    import types
+    import webhook as wh
+
+    class FakeStore:
+        def __init__(self, rows):
+            self.rows, self.calls = rows, []
+            self.cur = {"last_ms": 0, "last_tweet_id": 0, "sent": 0, "failures": 0,
+                        "next_attempt_ms": 0}
+
+        async def webhook_cursor(self, label):
+            return dict(self.cur)
+
+        async def webhook_advance(self, label, ms, tid, sent):
+            self.cur.update(last_ms=ms, last_tweet_id=tid, failures=0, next_attempt_ms=0)
+
+        async def webhook_failed(self, label, err, nxt):
+            self.cur.update(failures=self.cur["failures"] + 1, next_attempt_ms=0)
+
+        async def delivery_high_water(self):
+            r = self.rows[-1]
+            return (r["collected_ms"], r["tweet_id"])
+
+        async def tweets_after(self, ms, tid, limit, labels=None, project_id=None):
+            self.calls.append((ms, tid))
+            out = [r for r in self.rows if (r["collected_ms"], r["tweet_id"]) > (ms, tid)
+                   and r["match"]]
+            return out[:limit]
+
+    def row(i, match=False):
+        return {"collected_ms": i, "tweet_id": i, "match": match, "is_retweet": 0,
+                "is_reply": 0, "like_count": 0, "created_ms": 0}
+
+    sent_batches = []
+    state = {"fail": False}
+
+    async def fake_deliver(client, hook, store, rows):
+        if state["fail"]:
+            return False, "down"
+        sent_batches.append([r["tweet_id"] for r in rows])
+        return True, ""
+
+    real = wh.deliver_batch
+    wh.deliver_batch = fake_deliver
+    try:
+        hook = types.SimpleNamespace(label="p3", batch_size=20, streams=None, project_id=3)
+        st = FakeStore([row(i) for i in range(1, 1001)] + [row(1001, True)])
+
+        async def run():
+            await wh.pump(hook, st, None, log=lambda m: None)
+
+        asyncio.run(run())
+        ok(sent_batches == [[1001]] and st.cur["last_tweet_id"] == 1001,
+           "the one match is delivered and the cursor moves to it")
+        st.rows += [row(i) for i in range(1002, 3000)]           # a day of non-matches
+        st.calls.clear()
+        asyncio.run(run())
+        ok(st.calls == [(1001, 1001)], "first search after them starts at the cursor")
+        st.calls.clear()
+        asyncio.run(run()); asyncio.run(run())
+        ok(st.calls == [(2999, 2999), (2999, 2999)],
+           "nothing new: the next searches start where the last one ended, not at the cursor")
+        ok(st.cur["last_tweet_id"] == 1001, "the delivery cursor itself did not move")
+
+        st.rows += [row(3000), row(3001, True)]
+        st.calls.clear(); sent_batches.clear()
+        state["fail"] = True
+        asyncio.run(run())
+        ok(st.calls == [(2999, 2999)] and st.cur["last_tweet_id"] == 1001,
+           "a match after the watermark is found; the receiver fails; the cursor stays")
+        state["fail"] = False
+        st.calls.clear()
+        asyncio.run(run())
+        ok(sent_batches == [[3001]], "the failed tweet is retried and delivered, not skipped")
+
+        # An operator rewinds the cursor (replay): the watermark must not hide
+        # the replayed range.
+        st.cur.update(last_ms=0, last_tweet_id=0)
+        st.calls.clear(); sent_batches.clear()
+        asyncio.run(run())
+        ok(st.calls[0] == (0, 0) and sent_batches[0][:2] == [1001, 3001],
+           "a cursor moved BACK discards the watermark and replays from the cursor")
+
+        # A different target on the same store keeps its own watermark.
+        other = types.SimpleNamespace(label="all", batch_size=20, streams=None, project_id=None)
+        st2 = FakeStore([row(1, True)])
+        asyncio.run(wh.pump(other, st2, None, log=lambda m: None))
+        ok(st2.calls[0] == (0, 0), "a watermark is per target and per store")
+    finally:
+        wh.deliver_batch = real
+
+
 def test_ig_evidence(tmp):
     """2026-10-07: six accounts could not sign in and the log held nothing
     that said why — the window's 403 was only in the picture, the background
@@ -7986,6 +8083,7 @@ def main():
         section("instagram: clear a session; where an account leaves from now")
         test_ig_clear_and_exit(fresh("igclear"))
         test_ig_evidence(fresh("igevidence"))
+        test_webhook_search_watermark()
         section("instagram write-back (the claim advances; the handset cannot)")
         test_ig_writeback(fresh("igwb"))
         section("instagram sign-in from the server (code relay, exit check, browser door)")
