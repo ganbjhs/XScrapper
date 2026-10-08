@@ -3986,6 +3986,20 @@ class Store:
             "  next_attempt_ms = 0, last_error = NULL, last_ok_ms = excluded.last_ok_ms",
             (label, last_ms, last_tweet_id, sent, now))
 
+    async def webhook_skip_to(self, label: str, last_ms: int, last_tweet_id: int) -> None:
+        """Move a target's cursor FORWARD past rows that were searched and did
+        not match it (webhook.pump). Never backwards, never counts as a
+        delivery: sent, failures and last_ok_ms are untouched."""
+        self.db.execute(
+            "INSERT INTO webhook_state(label, last_ms, last_tweet_id, sent, failures, "
+            "                          next_attempt_ms) VALUES(?,?,?,0,0,0) "
+            "ON CONFLICT(label) DO UPDATE SET "
+            "  last_ms = excluded.last_ms, last_tweet_id = excluded.last_tweet_id "
+            "WHERE excluded.last_ms > webhook_state.last_ms OR "
+            "  (excluded.last_ms = webhook_state.last_ms AND "
+            "   excluded.last_tweet_id > webhook_state.last_tweet_id)",
+            (label, int(last_ms), int(last_tweet_id)))
+
     async def webhook_failed(self, label: str, error: str, next_attempt_ms: int) -> None:
         """Record a failure WITHOUT moving the cursor, so nothing is skipped."""
         self.db.execute(

@@ -356,30 +356,24 @@ def backoff_ms(failures: int) -> int:
     return int(min(BACKOFF_BASE_S * (2 ** max(0, failures - 1)), BACKOFF_MAX_S) * 1000)
 
 
-# How far each target has already been SEARCHED, in memory only.
+# A search that comes back short of a full batch has proved that nothing up to
+# the newest stored row matches this target. The cursor moves there.
 #
 # WHY (2026-10-08). A target filtered to one project or a few streams finds
 # its next tweets with a correlated EXISTS per row, walking forward from its
-# delivery cursor. The cursor moves only when something matches, so a target
-# whose project had no new match sat on an old cursor and, every IDLE_POLL_S
-# (2 s), re-checked every tweet collected since — the backlog of a 1,047,414-row
-# table, growing all day. py-spy caught the watcher in tweets_after 8 times out
-# of 8; the box ran at 55-65% CPU for a day and Hostinger capped it at 20%.
+# delivery cursor. The cursor used to move only when something matched, so a
+# target whose project had no new match sat on an old cursor and, every
+# IDLE_POLL_S (2 s), re-checked every tweet collected since — the backlog of a
+# 1,047,414-row table, growing all day. py-spy caught the watcher in
+# tweets_after 8 times out of 8; the box ran at 55-65% CPU for a day and its
+# host capped it at 20%. The dashboard's Delivery page counted the same
+# backlog ("behind") on every refresh.
 #
-# The fix keeps a second, cheaper watermark: "nothing matches up to here",
-# set only when a search came back short of a full batch, and taken BEFORE
-# that search so a row collected during it is still searched next time. The
-# delivery cursor is untouched — what is delivered, and when it is
-# acknowledged, is exactly as before. The watermark is discarded if the
-# cursor ever moves BACK (a rewind or replay), and it does not survive a
-# restart, which merely costs one full search.
-_SEARCHED: dict = {}
-
-
-def _searched_key(store, hook):
-    return (id(store), hook.label)
-
-
+# The skip uses the high-water mark taken BEFORE the search, so a row stored
+# during it is searched next time; it only ever moves the cursor forward and
+# is not a delivery (store.webhook_skip_to). What is delivered is unchanged:
+# a skipped row is one that did not match the target when it was searched —
+# exactly what an up-to-date target already does with every new row.
 async def pump(hook, store, client, log=print, once: bool = False) -> int:
     """
     Deliver everything outstanding for one endpoint.
@@ -395,23 +389,17 @@ async def pump(hook, store, client, log=print, once: bool = False) -> int:
             return sent
 
         at = (int(cur["last_ms"] or 0), int(cur["last_tweet_id"] or 0))
-        key = _searched_key(store, hook)
-        seen = _SEARCHED.get(key)
-        if seen and at < seen[0]:
-            _SEARCHED.pop(key, None)                    # cursor moved back: forget
-            seen = None
-        start = max(at, seen[1]) if seen else at
         try:
             hi = await store.delivery_high_water()
         except Exception:
             hi = None
         rows = await store.tweets_after(
-            start[0], start[1], hook.batch_size,
+            at[0], at[1], hook.batch_size,
             labels=hook.streams or None,
             project_id=getattr(hook, "project_id", None))
         if not rows:
-            if hi:
-                _SEARCHED[key] = (at, hi)
+            if hi and hi > at:
+                await store.webhook_skip_to(hook.label, hi[0], hi[1])
             return sent
 
         # Filtering happens AFTER the cursor read, never inside the query.
@@ -448,10 +436,11 @@ async def pump(hook, store, client, log=print, once: bool = False) -> int:
             log(f"[webhook:{hook.label}] recovered after {cur['failures']} failure(s)")
         log(f"[webhook:{hook.label}] delivered {len(rows)} tweet(s)")
 
-        if len(rows_all) < hook.batch_size and hi:
+        if len(rows_all) < hook.batch_size and hi and \
+                hi > (int(last["collected_ms"]), int(last["tweet_id"])):
             # Delivered, and the search ran out before a full batch: nothing
-            # else matched up to `hi`. Recorded against the NEW cursor.
-            _SEARCHED[key] = ((int(last["collected_ms"]), int(last["tweet_id"])), hi)
+            # else matched up to `hi`.
+            await store.webhook_skip_to(hook.label, hi[0], hi[1])
         if once or len(rows_all) < hook.batch_size:
             return sent
 

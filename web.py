@@ -2055,13 +2055,19 @@ def _delivery_json(q=None, mask: bool = False):
                 params.append(t["project_id"])
             behind = 0
             if cur["last_ms"] or cur["sent"]:
+                # Counted at most BEHIND_CAP ahead: this ran on every refresh
+                # of the Delivery page and walked the whole backlog behind a
+                # stale cursor (2026-10-08). `behind_capped` says when the
+                # number is a floor. Additive.
                 behind = con.execute(
-                    f"SELECT COUNT(*) c FROM tweets t WHERE {' AND '.join(where)}",
-                    params).fetchone()["c"]
+                    f"SELECT COUNT(*) c FROM (SELECT 1 FROM tweets t "
+                    f"WHERE {' AND '.join(where)} LIMIT ?)",
+                    [*params, BEHIND_CAP + 1]).fetchone()["c"]
 
             out["targets"].append({
                 **t, "sent": cur["sent"], "failures": cur["failures"],
-                "behind": behind, "last_ok_ms": cur["last_ok_ms"],
+                "behind": min(behind, BEHIND_CAP),
+                "behind_capped": behind > BEHIND_CAP, "last_ok_ms": cur["last_ok_ms"],
                 "last_error": cur["last_error"],
                 "started": bool(cur["last_ms"] or cur["sent"]),
             })
@@ -4999,6 +5005,9 @@ def _pool_after_capture(account_id: int, ok: bool, detail: str) -> None:
             pass
 
 
+BEHIND_CAP = 5000   # Delivery page: "behind" is counted at most this far
+
+
 def _ig_note_attempt(username, door, ok, *, stage="login", why="",
                      http_status=0, answered="", exit_ip="", country="",
                      browser="", detail="", extra=None, ig_label=""):
@@ -7711,8 +7720,21 @@ class Handler(BaseHTTPRequestHandler):
             self.wfile.flush()
             while True:
                 if _CFG.db_results.exists():
+                    hi = None
                     try:
                         with _connect() as con:
+                            # Same as webhook.pump (2026-10-08): a project-scoped
+                            # feed with no new match kept its cursor at the time
+                            # the page opened and re-checked everything since,
+                            # every 1.5 s, for as long as the tab stayed open.
+                            # Taken BEFORE the read; a short read proves nothing
+                            # up to it matches, so the cursor moves there.
+                            if project:
+                                h = con.execute(
+                                    "SELECT collected_ms, tweet_id FROM tweets "
+                                    "ORDER BY collected_ms DESC, tweet_id DESC "
+                                    "LIMIT 1").fetchone()
+                                hi = (int(h[0]), int(h[1])) if h else None
                             rows = _live_rows(con, last_ms, last_id, project)
                     except sqlite3.Error:
                         rows = []
@@ -7721,6 +7743,8 @@ class Handler(BaseHTTPRequestHandler):
                         last_id = int(r["tweet_id"])
                         body = json.dumps(r, ensure_ascii=False)
                         self.wfile.write(f"event: post\ndata: {body}\n\n".encode())
+                    if hi and len(rows) < 50 and hi > (last_ms, last_id):
+                        last_ms, last_id = hi
                     if rows:
                         quiet = 0
                         self.wfile.flush()

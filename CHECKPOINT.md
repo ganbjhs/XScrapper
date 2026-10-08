@@ -30,16 +30,25 @@ with a correlated EXISTS per row from its delivery cursor; the cursor moves
 only on a match, so a target with no new match re-checked every tweet
 collected since, every `IDLE_POLL_S` (2 s).
 
-**What changed.** `webhook.pump` keeps an in-memory "searched up to" mark per
-target: set from `store.delivery_high_water()` (taken before the search) when
-a search comes back short of a full batch; the next search starts there. The
-delivery cursor and what is delivered are unchanged; a cursor moved back
-(replay) discards the mark; a restart costs one full search. Also:
+**What changed.** First (6096f14) an in-memory "searched up to" mark in
+`webhook.pump`. After deploy the watcher fell from ~90% to ~9%, and py-spy on
+the WEB process found the same pattern three more times: the Delivery page's
+"behind" count, the live feed's SSE loop (project-scoped, every 1.5 s from the
+moment the tab opened), and the metrics strip. So (second commit): a search
+that returns short of a full batch moves the cursor FORWARD to the high-water
+mark taken before it — persisted for webhook targets
+(`store.webhook_skip_to`, not a delivery), local for the SSE loop — and
+"behind" is counted at most `BEHIND_CAP` (5,000; `behind_capped`, additive).
 `/api/ig/diagnosis` is cached 60 s (it took up to 66 s under the cap).
 
-**Verified.** `test_webhook_search_watermark` (searches start at the mark, the
-cursor does not move, a failed delivery is retried not skipped, a rewind
-replays, marks are per target); full suite passes.
+The box is 1 core shared by five apps (SERVER_INFO); load average was 20-29
+with 70-84% steal under the cap.
+
+**Verified.** `test_webhook_search_watermark` (the backlog is read once, a
+failed delivery is retried not skipped, a rewind replays, full batches drain
+before any skip); `webhook_skip_to` checked against SQLite (forward only,
+`sent`/`last_ok_ms` untouched); full suite passes. Watcher CPU after the
+first commit: ~90% -> ~9% (top on the server).
 
 **Not verified.** The CPU drop on the server. After deploy: `top` / `py-spy
 dump` on the watcher, then remove the Hostinger limitation only once CPU stays

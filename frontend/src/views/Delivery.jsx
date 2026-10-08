@@ -461,7 +461,7 @@ function TargetPanel({ t, reload }) {
         <>
           <div className="kv"><span>Cursor behind</span>
             <b className={t.behind ? "st-warn" : "st-good"}>
-              {t.behind ? `${fmtN(t.behind)} posts` : "✓ 0 — in sync"}</b></div>
+              {t.behind ? `${fmtN(t.behind)}${t.behind_capped ? "+" : ""} posts` : "✓ 0 — in sync"}</b></div>
           <div className="kv"><span>Delivered (lifetime)</span><b>{fmtN(t.sent)}</b></div>
           <div className="kv"><span>Last success</span>
             <b>{t.last_ok_ms ? fmtAgo(t.last_ok_ms) : "never"}</b></div>

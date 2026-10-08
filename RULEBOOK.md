@@ -1003,17 +1003,20 @@ session got opened on a live account (§6, "never signed in twice").
   that is not rebuilt does not ship. `cd frontend && npm run build`, and check
   that `dist/index.html` names the assets that are actually in `dist/assets`.
 
-### A delivery loop never re-searches what it already searched (2026-10-08)
+### A poll never re-searches what it already searched (2026-10-08)
 
-- `webhook.pump` runs every `IDLE_POLL_S` (2 s) per target. Any per-poll query
-  whose cost grows with the backlog behind a cursor is a CPU leak that grows
-  all day: a project-filtered target re-checked ~1M tweets every 2 s and the
-  VPS was capped by its host. The in-memory search mark (`_SEARCHED`) is what
-  keeps each poll proportional to what is NEW; do not remove it, and give any
-  new filtered query the same treatment.
-- The mark never moves the delivery cursor and is discarded when the cursor
-  moves back. What is delivered, and when it is acknowledged, is decided by
-  the cursor alone.
+- Anything that polls (webhook.pump every 2 s, the live feed's SSE loop every
+  1.5 s, a page that auto-refreshes) must cost what is NEW, never the backlog
+  behind a cursor. A project-filtered delivery target re-checked ~1M tweets
+  every 2 s because its cursor only moved on a match; the VPS (1 core, five
+  apps) was capped by its host.
+- The pattern: take the high-water mark (newest `collected_ms, tweet_id`)
+  BEFORE the search; a search that returns less than a full batch proves
+  nothing up to that mark matches, so the cursor moves there.
+  `store.webhook_skip_to` only moves forward and is not a delivery (`sent`,
+  `last_ok_ms` untouched); a cursor an operator moves back replays from there.
+- A count over a backlog (the Delivery page's "behind") is capped
+  (`BEHIND_CAP`), never a full scan per request.
 - A CPU question is answered with `py-spy dump --pid <pid>` (several samples),
   not by reading code and guessing.
 
