@@ -1,13 +1,3 @@
-- **One Instagram account asks for at most 120 requests a day by default
-  (2026-10-08).** When accounts drop out, the rest do NOT absorb their load
-  beyond that: Shoaib did, and was disabled. Raise coverage by adding
-  accounts, never by raising one account's budget.
-
-- **instagrapi is pinned at 3.0.20 (2026-10-08).** Instagram refused the
-  2.18.12 login flow as "out of date" whatever the app build; 3.0.x logs in
-  through the CAA flow. When a login says "out of date", check PyPI for a newer
-  instagrapi before touching phones or proxies.
-
 # Rulebook
 
 The rules every change must respect. Each one was paid for in a bug, a ban, or
@@ -2148,6 +2138,16 @@ before changing the engine; nearly every "obvious" idea has been tried.)
 - **An HTTP status on an https URL is the site's.** The proxy carries a
   tunnel; when it refuses, the client sees a failed connection
   (`ERR_TUNNEL_CONNECTION_FAILED`, `ProxyError`), never a 403 page.
+
+- **One Instagram account asks for at most 120 requests a day by default
+  (2026-10-08).** When accounts drop out, the rest do NOT absorb their load
+  beyond that: Shoaib did, and was disabled. Raise coverage by adding
+  accounts, never by raising one account's budget.
+
+- **instagrapi is pinned at 3.0.20 (2026-10-08).** Instagram refused the
+  2.18.12 login flow as "out of date" whatever the app build; 3.0.x logs in
+  through the CAA flow. When a login says "out of date", check PyPI for a newer
+  instagrapi before touching phones or proxies.
 
 ## 7. Change rules
 
