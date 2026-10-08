@@ -81,7 +81,11 @@ LONG_BREAK_MAX = _envf("IG_LONG_BREAK_MAX", 900.0)   # 15 min
 
 # Daily request ceiling per account once warm, and the warm-up ramp for a
 # freshly-onboarded account (age in days -> fraction of the full budget).
-DAILY_BUDGET = _envi("IG_DAILY_BUDGET", 300)
+# 300 -> 120 (2026-10-08): @shoaibakhtar4915 carried every source alone
+# (42 -> 71 -> 107 visits a day), was checkpointed on 10-07 and disabled the
+# same day. A day's coverage now grows by adding accounts, not by asking more
+# of one. IG_DAILY_BUDGET in .env still overrides.
+DAILY_BUDGET = _envi("IG_DAILY_BUDGET", 120)
 WARMUP_DAYS = _envi("IG_WARMUP_DAYS", 7)
 WARMUP_FLOOR = _envf("IG_WARMUP_FLOOR", 0.15)        # day 0 gets 15% of budget
 

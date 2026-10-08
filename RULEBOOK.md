@@ -1,3 +1,8 @@
+- **One Instagram account asks for at most 120 requests a day by default
+  (2026-10-08).** When accounts drop out, the rest do NOT absorb their load
+  beyond that: Shoaib did, and was disabled. Raise coverage by adding
+  accounts, never by raising one account's budget.
+
 - **instagrapi is pinned at 3.0.20 (2026-10-08).** Instagram refused the
   2.18.12 login flow as "out of date" whatever the app build; 3.0.x logs in
   through the CAA flow. When a login says "out of date", check PyPI for a newer

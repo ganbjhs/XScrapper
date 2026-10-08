@@ -19,6 +19,15 @@ must respect belongs in the rulebook, not here.
 
 ---
 
+## 2026-10-08 — Instagram daily budget per account 300 -> 120
+
+**Why.** @shoaibakhtar4915 took over every source when the others fell out
+(42 -> 71 -> 107 visits/day), was checkpointed on 10-07 and permanently
+disabled the same day. Three accounts collect again (Hana, Daksh, Sana on US
+addresses). **What changed.** `ig_human.DAILY_BUDGET` default 120;
+`IG_DAILY_BUDGET` in `.env` still overrides. A handle may now wait more than
+a day for its visit when accounts are few; coverage grows by adding accounts.
+
 ## 2026-10-08 — instagrapi 2.18.12 -> 3.0.20: the old login flow is refused
 
 **Why.** Probes (ig_evidence) showed all six France static addresses refused by
