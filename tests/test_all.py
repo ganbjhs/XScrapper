@@ -1943,9 +1943,9 @@ def test_ig_linked_handles(tmp):
         lb = {l["list_id"]: l for l in st.lists(2)}[B]
         ok(lb["sources"] == 2 and lb["enabled"] == 2 and lb["posts"] == 3,
            f"list B counts the link ({lb['sources']}, {lb['enabled']}, {lb['posts']})")
-        ok(st.add_source("h1", "user", "h1", project_id=2, list_id=B).get("already") is None
+        ok(st.add_source("h1", "user", "h1", project_id=2, list_id=B).get("already")
            and st.db.execute("SELECT COUNT(*) FROM ig_list_members").fetchone()[0] == 1,
-           "re-adding is idempotent")
+           "re-adding is a skip")
         ok(st.add_source("h1", "user", "h1", project_id=2).get("already"),
            "re-typing it with no list is a no-op")
         st.upsert_posts([rec(5, "h1")], "h1")
@@ -1956,6 +1956,34 @@ def test_ig_linked_handles(tmp):
         r = st.add_source("Handle Two", "user", "H2", project_id=2, list_id=B)
         ok(r.get("linked") and r["label"] == "h2", f"label 'Handle Two' resolves to h2's row ({r})")
         ok(st.db.execute("SELECT COUNT(*) FROM sources").fetchone()[0] == 4, "still no second row")
+
+        print()
+        print("== pasting the WHOLE list again: present ones skipped, new ones added ==")
+        st.add_source("own", "user", "own", account="ig_pin", project_id=2, list_id=B)
+        st.set_enabled("h1", False, list_id=B)
+        C = st.create_list(2, "Second")["list_id"]
+        res = {lab: st.add_source(lab, "user", h, project_id=2, list_id=C)
+               for lab, h in (("own", "own"), ("h1", "h1"), ("Handle Two", "h2"),
+                              ("fresh", "fresh"))}
+        ok(res["own"].get("already") and res["own"]["list_id"] == B,
+           f"'own' (home in list B) is skipped and says where it is ({res['own']})")
+        ok(res["h1"].get("already") and res["Handle Two"].get("already"),
+           "linked handles are skipped too (also under another label)")
+        ok(not res["fresh"].get("already")
+           and st.db.execute("SELECT list_id FROM sources WHERE label='fresh'").fetchone()[0] == C,
+           "only the new handle is added")
+        ok(st.db.execute("SELECT account FROM sources WHERE label='own'").fetchone()[0] == "ig_pin",
+           "the skip did not clear a human pin")
+        ok(st.db.execute("SELECT enabled FROM ig_list_members WHERE label='h1'").fetchone()[0] == 0,
+           "…nor resume a link paused here")
+        ok(st.db.execute("SELECT COUNT(*) FROM sources").fetchone()[0] == 5
+           and st.db.execute("SELECT COUNT(*) FROM ig_list_members").fetchone()[0] == 2,
+           "DB: one row per handle, no extra links")
+        st.add_source("own", "user", "own", project_id=2)
+        ok(st.db.execute("SELECT account FROM sources WHERE label='own'").fetchone()[0] == "ig_pin",
+           "a CLI-style re-add with no pin keeps the pin")
+        st.set_enabled("h1", True, list_id=B)
+        st.remove_source("fresh", list_id=C)
 
         print()
         print("== each project's rules ==")

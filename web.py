@@ -7002,6 +7002,9 @@ def _ig_source_post(body):
                                   str(body.get("platform_id") or ""), project_id=pid,
                                   list_id=_int_or(body.get("list_id"), 0),
                                   move=bool(body.get("move")))
+                if isinstance(r, dict) and r.get("already"):
+                    return {"ok": True, "already": True, "label": r["label"],
+                            "list": r.get("list") or ""}
                 if isinstance(r, dict) and r.get("linked"):
                     return {"ok": True, "linked": True, "label": r["label"],
                             "home_project_id": r["home_project_id"],
@@ -7060,13 +7063,16 @@ def _ig_lists_post(body):
             items = [x.strip().lstrip("@#") for x in
                      str(body.get("handles") or "").replace(",", " ").split()]
             typ = (body.get("type") or "user").lower()
-            added, elsewhere = 0, []
+            added, elsewhere, skipped = 0, [], []
             for it in items:
                 if not it:
                     continue
                 try:
-                    st.add_source(it, typ, it, project_id=pid, list_id=made["list_id"])
-                    added += 1
+                    r = st.add_source(it, typ, it, project_id=pid, list_id=made["list_id"])
+                    if isinstance(r, dict) and r.get("already"):
+                        skipped.append(it)
+                    else:
+                        added += 1
                 except store_ig.SourceElsewhere as e:
                     # Already collected for another project: left there (not
                     # moved), and named so the operator can share that list.
@@ -7074,6 +7080,8 @@ def _ig_lists_post(body):
                 except ValueError as e:
                     return {**made, "warning": str(e), "added": added}
             out = {**made, "added": added}
+            if skipped:
+                out["skipped"] = skipped
             if elsewhere:
                 out["elsewhere"] = elsewhere
                 out["warning"] = (f"{len(elsewhere)} handle(s) are already collected for "

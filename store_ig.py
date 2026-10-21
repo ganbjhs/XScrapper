@@ -509,7 +509,6 @@ class Store:
         # project ADDED from another project (shared): the source then
         # belongs to the list's owner — one row, collected once, seen by all.
         lid = int(list_id or 0)
-        explicit_list = bool(lid)
         pid = int(project_id or 0)
         cur = self.db.execute(
             "SELECT project_id, list_id FROM sources WHERE label = ?",
@@ -544,23 +543,40 @@ class Store:
                 owner = pid
         else:
             owner = 0
-        # The handle already lives in ANOTHER list — another project's, or
-        # (when a list was named) another list of this one. Moving the row
+        # RE-ADD = SKIP (2026-10-21). One handle appears once per project:
+        # if this project already sees it — in any list it uses, home or
+        # linked — pasting it again changes NOTHING (no pin cleared, no
+        # paused link resumed, no second copy in another list). Only a
+        # re-add that really changes the handle (another value or type, or
+        # a new pin) falls through to the update below.
+        if cur and pid and not move:
+            row = self.db.execute("SELECT * FROM sources WHERE label = ?", (label,)).fetchone()
+            here = self.db.execute(
+                "SELECT l.list_id, l.name FROM ig_lists l "
+                "JOIN ig_list_projects lp ON lp.list_id = l.list_id AND lp.project_id = ? "
+                "WHERE l.list_id = ? OR l.list_id IN "
+                "(SELECT list_id FROM ig_list_members WHERE label = ?) "
+                "ORDER BY l.list_id != ?, l.list_id LIMIT 1",
+                (pid, int(row["list_id"] or 0), label, int(row["list_id"] or 0))).fetchone()
+            same = (row["type"] == type_
+                    and (not value or str(row["value"] or "").lower() == value.lower())
+                    and (not account or row["account"] == account))
+            if here and same:
+                return {"ok": True, "already": True, "label": label,
+                        "list_id": int(here["list_id"]), "list": here["name"]}
+        # The handle already lives in ANOTHER project's list. Moving the row
         # would silently stop it there, and refusing (SourceElsewhere, until
         # 2026-10-13) left the operator no way to take ONE handle without
         # sharing the whole list. So it is LINKED into this list: one row,
         # collected once, shown here under this list's rules. An explicit
         # move=True is still the operator saying "move it".
         if (cur and int(cur["project_id"] or 0) and owner and not move
-                and (int(cur["project_id"]) != owner
-                     or (explicit_list and int(cur["list_id"] or 0) != lid))):
+                and int(cur["project_id"]) != owner):
             target = lid or self.default_list(owner)
-            if int(cur["list_id"] or 0) == target:
+            if int(cur["list_id"] or 0) == target or not self.db.execute(
+                    "INSERT OR IGNORE INTO ig_list_members(list_id, label, enabled, added_at) "
+                    "VALUES(?,?,1,?)", (target, label, _now())).rowcount:
                 return {"ok": True, "already": True, "label": label}
-            self.db.execute(
-                "INSERT INTO ig_list_members(list_id, label, enabled, added_at) "
-                "VALUES(?,?,1,?) ON CONFLICT(list_id, label) DO UPDATE SET enabled = 1",
-                (target, label, _now()))
             self.db.commit()
             return {"ok": True, "linked": True, "label": label, "list_id": target,
                     "home_project_id": int(cur["project_id"]),
@@ -572,7 +588,10 @@ class Store:
             "INSERT INTO sources(label,type,value,platform_id,project_id,account,"
             "enabled,created_at,list_id) VALUES(?,?,?,?,?,?,1,?,?) "
             "ON CONFLICT(label) DO UPDATE SET "
-            "type=excluded.type, value=excluded.value, account=excluded.account, "
+            "type=excluded.type, value=excluded.value, "
+            # A re-add that names no pin keeps the one a human set.
+            "account = CASE WHEN excluded.account != '' THEN excluded.account "
+            "  ELSE sources.account END, "
             "platform_id = CASE "
             "  WHEN excluded.platform_id != '' THEN excluded.platform_id "
             "  WHEN sources.value = excluded.value THEN sources.platform_id "

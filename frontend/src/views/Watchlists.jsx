@@ -1679,17 +1679,26 @@ function IgDetail({ pid, data, reload, gotoSettings, onBack, list }) {
   const addBulk = async () => {
     setBusyAdd(true); setMsg(""); setElsewhere([]); setLinkedNote("");
     try {
-      const errs = [], found = [], linked = [];
+      const errs = [], found = [], linked = [], skipped = [];
+      let added = 0;
       for (const u of adding.split(/[\s,]+/).filter(Boolean)) {
         const name = u.replace(/^[@#]/, "");
         const r = await api.igSource({ action: "add", label: name, type: "user", value: name, project: pid,
                                        list_id: list?.list_id || 0 });
         if (r && r.elsewhere) found.push(r.elsewhere);
         else if (r && r.error) errs.push(`@${name}: ${r.error}`);
+        else if (r && r.already) skipped.push(`@${name}${r.list && r.list !== list?.name ? ` (in “${r.list}”)` : ""}`);
         else if (r && r.linked) linked.push(`@${name}${r.home_project ? ` (${r.home_project})` : ""}`);
+        else if (r && r.ok) added += 1;
       }
       setElsewhere(found);
-      if (linked.length) setLinkedNote(`linked from another project — collected once: ${linked.join(", ")}`);
+      // One line for the whole paste: what was new, what was already here
+      // (skipped — nothing changed), what was linked from another project.
+      const parts = [];
+      if (added) parts.push(`${added} added`);
+      if (skipped.length) parts.push(`${skipped.length} skipped — already in this project: ${skipped.join(", ")}`);
+      if (linked.length) parts.push(`${linked.length} linked from another project (collected once): ${linked.join(", ")}`);
+      if (parts.length) setLinkedNote(parts.join(" · "));
       if (errs.length) setMsg(errs.join("\n"));
       setAdding(""); reload();
     } catch (e) { setMsg(String(e.message || e)); }
