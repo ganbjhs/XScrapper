@@ -2389,18 +2389,30 @@ class Store:
         removes = [h for h in removes if h]
 
         now = _iso_ms(int(time.time() * 1000))
+        # RE-ADD = SKIP (2026-10-21): count the rows really inserted /
+        # deleted. A paste of members the list already has changes nothing
+        # — and is not recompiled, because compiling sets every chunk
+        # stream back to paused = 0 (a chunk the operator paused would
+        # silently resume) and used to report the pasted count as "added".
+        added = removed = 0
         for h in adds:
-            self.db.execute(
+            added += self.db.execute(
                 "INSERT OR IGNORE INTO watchlist_members(watchlist_id, handle, added_at) "
-                "VALUES(?,?,?)", (int(watchlist_id), h, now))
+                "VALUES(?,?,?)", (int(watchlist_id), h, now)).rowcount
         for h in removes:
-            self.db.execute(
+            removed += self.db.execute(
                 "DELETE FROM watchlist_members WHERE watchlist_id = ? AND handle = ?",
-                (int(watchlist_id), h))
-
+                (int(watchlist_id), h)).rowcount
+        out = {"watchlist_id": int(watchlist_id), "added": added, "removed": removed,
+               "existing": len(set(adds)) - added}
+        if not added and not removed:
+            self.db.commit()
+            out["streams"] = [r["label"] for r in self.db.execute(
+                "SELECT label FROM streams WHERE label LIKE ? AND watched = 1 "
+                "ORDER BY label", (f"wl:{int(watchlist_id)}:%",))]
+            return out
         compiled = await self.compile_watchlist(int(watchlist_id))
-        return {"watchlist_id": int(watchlist_id),
-                "added": len(adds), "removed": len(removes), **compiled}
+        return {**out, **compiled}
 
     async def compile_watchlist(self, watchlist_id: int) -> dict:
         """

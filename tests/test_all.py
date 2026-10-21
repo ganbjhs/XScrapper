@@ -2792,6 +2792,15 @@ def test_shared_watchlists(tmp):
         await st.set_watchlist_members(wid, add=["alpha", "beta"])
         sid = st.db.execute("SELECT stream_id FROM streams WHERE label = ?",
                             (f"wl:{wid}:0",)).fetchone()["stream_id"]
+        # Re-add = skip (2026-10-21): pasting members the list has changes
+        # nothing — counts are honest and a paused chunk stays paused.
+        st.db.execute("UPDATE streams SET paused = 1 WHERE stream_id = ?", (sid,))
+        out["readd"] = await st.set_watchlist_members(wid, add=["alpha", "@Beta"])
+        out["readd_paused"] = st.db.execute(
+            "SELECT paused FROM streams WHERE stream_id = ?", (sid,)).fetchone()["paused"]
+        out["readd_mix"] = await st.set_watchlist_members(wid, add=["alpha", "gamma"])
+        await st.set_watchlist_members(wid, remove=["gamma"])
+        st.db.execute("UPDATE streams SET paused = 0 WHERE stream_id = ?", (sid,))
         # A tweet the list collected before anyone shared it.
         st.db.execute(
             "INSERT INTO tweets(tweet_id, source, created_ms, collected_at, collected_ms, "
@@ -2856,6 +2865,12 @@ def test_shared_watchlists(tmp):
 
     r = asyncio.run(run())
     a, b, c, wid = r["a"], r["b"], r["c"], r["wid"]
+    ok(r["readd"]["added"] == 0 and r["readd"]["existing"] == 2
+       and r["readd"]["streams"] == [f"wl:{wid}:0"],
+       f"re-adding members the list has is a skip, honestly counted ({r['readd']})")
+    ok(r["readd_paused"] == 1, "…and does not resume a chunk the operator paused")
+    ok(r["readd_mix"]["added"] == 1 and r["readd_mix"]["existing"] == 1,
+       f"a mixed paste adds only the new handle ({r['readd_mix']})")
     lib = {w["watchlist_id"]: w for w in r["lib_before"]}
     ok(wid in lib and lib[wid]["owner_project"] == "A" and not lib[wid]["attached"]
        and lib[wid]["members"] == 2 and lib[wid]["tweets"] == 1,
