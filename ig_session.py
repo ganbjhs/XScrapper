@@ -944,19 +944,34 @@ def refresh(username: str, *, proxy: str = "", store_path: str = "ig_accounts.db
     # for every expiry, which is the exact cost this module exists to remove.
     pw_env = meta.get("password_env") or f"IG_PASSWORD_{label.upper()}"
     password = _password(pw_env)
+    pw_from, totp = pw_env, ""
+    if not password:
+        # The password typed on the dashboard's account card (2026-10-21).
+        # It lives ENCRYPTED in pool.db, and until now nothing here read it:
+        # relogin looked only at .env, so every account added through the
+        # dashboard — password and all — still "had no password" when its
+        # session died, and needed a human every time.
+        password, totp = _pool_password(username, root)
+        pw_from = "the password saved on the account card"
     if not (allow_relogin and password):
         raise RuntimeError(
             f"@{username}'s saved session is no longer valid and there is no "
-            f"password in .env to refresh it automatically. Either set {pw_env} "
-            f"in .env and re-run `python3 ig_login.py {username}`, or import a fresh "
-            f"cookie with `python3 ig_import.py \"<sessionid>\"`.")
+            f"password to refresh it automatically — none on the account card "
+            f"(Accounts & Sessions -> Edit -> password) and none in .env as "
+            f"{pw_env}. Add it on the card, or sign in again with a fresh cookie.")
 
     cl = new_client(label, proxy=use_proxy, settings=data.get("settings", {}),
                     username=username, root=root, log=log)
     cl.challenge_code_handler = _make_challenge_handler(log)
-    log(f"[ig] relogging in @{username} from {pw_env} …")
+    log(f"[ig] relogging in @{username} from {pw_from} …")
+    code = ""
+    if totp:
+        try:
+            code = cl.totp_generate_code(totp)
+        except Exception as e:
+            log(f"[ig] could not generate a 2FA code: {type(e).__name__}: {e}")
     try:
-        cl.login(username, password, relogin=True)
+        cl.login(username, password, relogin=True, verification_code=code)
     except ChallengeRequired as e:
         # NOT a bug, and NOT something to retry. Instagram is holding a
         # checkpoint that only the official app or web flow can clear, and
@@ -1155,6 +1170,41 @@ def _note_checkpoint(username: str, root, *, log=lambda m: None) -> None:
         path.write_text(json.dumps(data, indent=2))
     except (OSError, ValueError) as e:
         log(f"[ig] could not record the checkpoint in {path}: {type(e).__name__}")
+
+
+def _pool_password(username: str, root=".") -> tuple:
+    """(password, totp_secret) for an Instagram account from the dashboard's
+    account pool (pool.db, encrypted with ACCOUNTS_SECRET_KEY), matched by
+    login. ("", "") when there is no such account, no key, or no password —
+    never raises: a missing fallback must not mask the real error."""
+    try:
+        try:
+            from dotenv import load_dotenv
+            load_dotenv()
+        except Exception:
+            pass
+        from store_accounts import AccountStore
+        path = Path(root) / os.getenv("ACCOUNTS_DB", "pool.db")
+        if not path.exists():
+            return "", ""
+        want = str(username or "").strip().lstrip("@").lower()
+        with AccountStore(str(path)) as st:
+            for a in st.list("ig"):
+                if str(a.login or "").strip().lstrip("@").lower() != want:
+                    continue
+                pw = st.get_password(a.account_id) or ""
+                if not pw:
+                    continue
+                totp = ""
+                try:
+                    enc = st._row(a.account_id)["enc_totp"]
+                    totp = st._cipher.decrypt(enc) if enc else ""
+                except Exception:
+                    totp = ""
+                return pw, totp
+    except Exception:
+        pass
+    return "", ""
 
 
 def _password(env_name: str) -> str:

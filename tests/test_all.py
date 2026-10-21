@@ -1903,6 +1903,42 @@ def test_ig_lists(tmp):
 
 
 
+def test_ig_relogin_uses_card_password(tmp):
+    """
+    2026-10-21: the password typed on the dashboard's account card lives
+    ENCRYPTED in pool.db, but auto-relogin read only .env — so a dashboard-
+    added account "had no password" whenever its session died. _pool_password
+    is the fallback: matched by login, decrypted with ACCOUNTS_SECRET_KEY,
+    never raising.
+    """
+    import os, ig_session
+    from store_accounts import AccountStore
+    root = str(tmp)
+    saved = os.environ.get("ACCOUNTS_SECRET_KEY")
+    os.environ["ACCOUNTS_SECRET_KEY"] = "test-key"
+    try:
+        with AccountStore(os.path.join(root, "pool.db")) as st:
+            st.add("ig", "pool_18", "PriyaMalik6562", password="s3cret", totp_secret="JBSWY3DPEHPK3PXP")
+            st.add("ig", "pool_19", "nopass")
+            st.add("x", "x1", "hanamalik146", password="x-side")
+        pw, totp = ig_session._pool_password("@priyamalik6562", root)
+        ok(pw == "s3cret" and totp == "JBSWY3DPEHPK3PXP",
+           "the card's password (and TOTP) is found by login, case-insensitively")
+        ok(ig_session._pool_password("nopass", root) == ("", ""), "an account with no password gives nothing")
+        ok(ig_session._pool_password("hanamalik146", root) == ("", ""),
+           "an X account with the same login is never used for Instagram")
+        os.environ["ACCOUNTS_SECRET_KEY"] = "wrong"
+        ok(ig_session._pool_password("priyamalik6562", root) == ("", ""),
+           "a wrong key gives nothing instead of raising")
+        ok(ig_session._pool_password("anyone", os.path.join(root, "missing")) == ("", ""),
+           "no pool.db gives nothing")
+    finally:
+        if saved is None:
+            os.environ.pop("ACCOUNTS_SECRET_KEY", None)
+        else:
+            os.environ["ACCOUNTS_SECRET_KEY"] = saved
+
+
 def test_ig_linked_handles(tmp):
     """
     Linked Instagram handles (2026-10-13). Taking ONE handle that another
@@ -8270,6 +8306,7 @@ def main():
         test_ig_lists(fresh("ig_lists"))
         test_ig_shared_lists(fresh("ig_shared_lists"))
         test_ig_linked_handles(fresh("ig_linked_handles"))
+        test_ig_relogin_uses_card_password(fresh("ig_relogin_card_pw"))
         test_identity(fresh("identity"))
         test_ig_avatars(fresh("ig_avatars"))
 
