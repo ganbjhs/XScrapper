@@ -199,6 +199,27 @@ CREATE TABLE IF NOT EXISTS ig_list_projects (
   PRIMARY KEY (list_id, project_id)
 );
 CREATE INDEX IF NOT EXISTS ix_ig_list_projects_project ON ig_list_projects(project_id);
+
+-- Linked handles (2026-10-13). Sharing a WHOLE list is too coarse: the
+-- operator wanted two handles of another project's 50, not all 50, and the
+-- add was refused (SourceElsewhere). A link puts ONE handle into a list
+-- that is not its home: the source keeps its single row (label is still
+-- the primary key, so it is collected ONCE, by one account, with one
+-- watermark), and every project using the link's list sees it and its
+-- posts, under THAT list's rules — the list's pause and the link's own
+-- pause decide whether the link asks for collection; Remove removes the
+-- link only. The collector reads a source while ANY of its memberships
+-- (home or link) is live, so pausing it in one project never stops it in
+-- another. Rollback = drop the table (the links vanish, the home rows and
+-- every post stay).
+CREATE TABLE IF NOT EXISTS ig_list_members (
+  list_id     INTEGER NOT NULL,
+  label       TEXT NOT NULL,
+  enabled     INTEGER NOT NULL DEFAULT 1,
+  added_at    INTEGER NOT NULL,
+  PRIMARY KEY (list_id, label)
+);
+CREATE INDEX IF NOT EXISTS ix_ig_list_members_label ON ig_list_members(label);
 """
 
 
@@ -222,6 +243,22 @@ class SourceElsewhere(ValueError):
             f"that list with this project, or move the handle here explicitly.")
 
 
+# The labels LINKED into the lists project P uses (see ig_list_members).
+_LINKED = ("SELECT m_.label FROM ig_list_members m_ "
+           "JOIN ig_list_projects lpm_ ON lpm_.list_id = m_.list_id "
+           "WHERE lpm_.project_id = ?")
+
+
+def _has_links(db, pid):
+    try:
+        return bool(db.execute(
+            "SELECT 1 FROM ig_list_members m JOIN ig_list_projects lp "
+            "ON lp.list_id = m.list_id WHERE lp.project_id = ? LIMIT 1",
+            (int(pid),)).fetchone())
+    except sqlite3.OperationalError:
+        return False
+
+
 def post_scope(db, project_id, alias="posts"):
     """(sql, args): the posts that belong to project P — its own, plus the
     owner's posts from the handles of every Instagram list P has added from
@@ -240,13 +277,23 @@ def post_scope(db, project_id, alias="posts"):
             "WHERE lp.project_id = ? AND l.project_id != ? LIMIT 1", (pid, pid)).fetchone()
     except sqlite3.OperationalError:
         shared = None
-    if not shared:
+    linked = _has_links(db, pid)
+    if not shared and not linked:
         return f"{a}.project_id = ?", [pid]
-    return (f"({a}.project_id = ? OR ({a}.project_id, {a}.source_label) IN ("
-            f"SELECT l_.project_id, s_.label FROM ig_list_projects lp_ "
-            f"JOIN ig_lists l_ ON l_.list_id = lp_.list_id "
-            f"JOIN sources s_ ON s_.list_id = l_.list_id "
-            f"WHERE lp_.project_id = ? AND l_.project_id != ?))", [pid, pid, pid])
+    sql, args = f"{a}.project_id = ?", [pid]
+    if shared:
+        sql += (f" OR ({a}.project_id, {a}.source_label) IN ("
+                f"SELECT l_.project_id, s_.label FROM ig_list_projects lp_ "
+                f"JOIN ig_lists l_ ON l_.list_id = lp_.list_id "
+                f"JOIN sources s_ ON s_.list_id = l_.list_id "
+                f"WHERE lp_.project_id = ? AND l_.project_id != ?)")
+        args += [pid, pid]
+    if linked:
+        # A linked handle's posts are the handle's posts, whoever collected
+        # them: posts are one row per media (pk), so this never duplicates.
+        sql += f" OR {a}.source_label IN ({_LINKED})"
+        args += [pid]
+    return f"({sql})", args
 
 
 def source_scope(db, project_id, alias="sources"):
@@ -257,8 +304,12 @@ def source_scope(db, project_id, alias="sources"):
         db.execute("SELECT 1 FROM ig_list_projects LIMIT 1").fetchone()
     except sqlite3.OperationalError:
         return f"{alias}.project_id = ?", [pid]
+    if not _has_links(db, pid):
+        return (f"({alias}.project_id = ? OR {alias}.list_id IN "
+                f"(SELECT list_id FROM ig_list_projects WHERE project_id = ?))", [pid, pid])
     return (f"({alias}.project_id = ? OR {alias}.list_id IN "
-            f"(SELECT list_id FROM ig_list_projects WHERE project_id = ?))", [pid, pid])
+            f"(SELECT list_id FROM ig_list_projects WHERE project_id = ?) "
+            f"OR {alias}.label IN ({_LINKED}))", [pid, pid, pid])
 
 
 @dataclass
@@ -393,6 +444,12 @@ class Store:
             "SELECT list_id, project_id, created_at FROM ig_lists")
         self.db.execute(
             "DELETE FROM ig_list_projects WHERE list_id NOT IN (SELECT list_id FROM ig_lists)")
+        # Links whose list or source is gone, or that point at the source's
+        # own home list, mean nothing; drop them (idempotent).
+        self.db.execute(
+            "DELETE FROM ig_list_members WHERE list_id NOT IN (SELECT list_id FROM ig_lists) "
+            "OR label NOT IN (SELECT label FROM sources) "
+            "OR (list_id, label) IN (SELECT list_id, label FROM sources)")
         self.db.commit()
 
     def close(self):
@@ -452,10 +509,21 @@ class Store:
         # project ADDED from another project (shared): the source then
         # belongs to the list's owner — one row, collected once, seen by all.
         lid = int(list_id or 0)
+        explicit_list = bool(lid)
         pid = int(project_id or 0)
         cur = self.db.execute(
             "SELECT project_id, list_id FROM sources WHERE label = ?",
             (label,)).fetchone()
+        if not cur and type_ == "user" and value:
+            # The same handle under another label (e.g. a person's name
+            # typed in one project, the bare handle in another) is the SAME
+            # Instagram account: reuse its row instead of collecting it twice.
+            alt = self.db.execute(
+                "SELECT label, project_id, list_id FROM sources "
+                "WHERE type = 'user' AND lower(value) = lower(?) ORDER BY created_at LIMIT 1",
+                (value,)).fetchone()
+            if alt:
+                label, cur = alt["label"], alt
         if lid:
             l = self.list_row(lid)
             if not l:
@@ -468,19 +536,35 @@ class Store:
                                            or self.list_used_by(cur["list_id"], pid)):
                 # Already here (its own list, or a list this project added).
                 lid, owner = int(cur["list_id"]), int(cur["project_id"])
+            elif cur and not move and self.db.execute(
+                    _LINKED + " AND m_.label = ? LIMIT 1", (pid, label)).fetchone():
+                # Already here through a link: nothing to do.
+                return {"ok": True, "already": True, "label": label}
             else:
                 owner = pid
         else:
             owner = 0
-        # The handle lives in ANOTHER project: refuse rather than move it
-        # out from under that project (it would silently stop collecting
-        # there). An explicit move=True is the operator saying "move it".
-        if (cur and int(cur["project_id"] or 0) and owner
-                and int(cur["project_id"]) != owner and not move):
-            cl = self.list_row(cur["list_id"]) if cur["list_id"] else None
-            raise SourceElsewhere(label, value, int(cur["project_id"]),
-                                  int(cur["list_id"] or 0),
-                                  (cl or {}).get("name") or "Instagram sources")
+        # The handle already lives in ANOTHER list — another project's, or
+        # (when a list was named) another list of this one. Moving the row
+        # would silently stop it there, and refusing (SourceElsewhere, until
+        # 2026-10-13) left the operator no way to take ONE handle without
+        # sharing the whole list. So it is LINKED into this list: one row,
+        # collected once, shown here under this list's rules. An explicit
+        # move=True is still the operator saying "move it".
+        if (cur and int(cur["project_id"] or 0) and owner and not move
+                and (int(cur["project_id"]) != owner
+                     or (explicit_list and int(cur["list_id"] or 0) != lid))):
+            target = lid or self.default_list(owner)
+            if int(cur["list_id"] or 0) == target:
+                return {"ok": True, "already": True, "label": label}
+            self.db.execute(
+                "INSERT INTO ig_list_members(list_id, label, enabled, added_at) "
+                "VALUES(?,?,1,?) ON CONFLICT(list_id, label) DO UPDATE SET enabled = 1",
+                (target, label, _now()))
+            self.db.commit()
+            return {"ok": True, "linked": True, "label": label, "list_id": target,
+                    "home_project_id": int(cur["project_id"]),
+                    "home_list_id": int(cur["list_id"] or 0)}
         if owner and not lid:
             lid = self.default_list(owner)
         project_id = owner
@@ -500,7 +584,76 @@ class Store:
             "list_id = CASE WHEN excluded.list_id != 0 "
             "  THEN excluded.list_id ELSE sources.list_id END",
             (label, type_, value, platform_id, int(project_id or 0), account, _now(), lid))
+        # A move into a list where the handle was linked: the link is now
+        # its home, so the link row would only be a duplicate.
+        self.db.execute("DELETE FROM ig_list_members WHERE label = ? AND list_id = "
+                        "(SELECT list_id FROM sources WHERE label = ?)", (label, label))
         self.db.commit()
+        return {"ok": True, "label": label}
+
+    # -- linked handles (ig_list_members) — see the schema comment ----------
+
+    def linked_rows(self, project_id) -> list:
+        """[{list_id, label, enabled}] — every handle linked into a list the
+        project uses."""
+        return [dict(r) for r in self.db.execute(
+            "SELECT m.list_id, m.label, m.enabled FROM ig_list_members m "
+            "JOIN ig_list_projects lp ON lp.list_id = m.list_id "
+            "WHERE lp.project_id = ? ORDER BY m.list_id, m.label", (int(project_id),))]
+
+    def _handover(self, label, list_id) -> int:
+        """Make the link (list_id, label) the source's home: the row, its
+        pause state and the posts collected under the old owner go to the
+        list's owner, and the link row goes. Returns the new owner. Used
+        when the home is removed (Remove, project delete) while another
+        project still links the handle — that project must not lose it."""
+        l = self.list_row(list_id)
+        m = self.db.execute("SELECT enabled FROM ig_list_members WHERE list_id = ? AND label = ?",
+                            (int(list_id), label)).fetchone()
+        old = self.project_for(label)
+        new = int(l["project_id"])
+        self.db.execute("UPDATE sources SET project_id = ?, list_id = ?, enabled = ? "
+                        "WHERE label = ?", (new, int(list_id), int(m["enabled"]) if m else 1, label))
+        if old and old != new:
+            self.db.execute("UPDATE posts SET project_id = ? WHERE source_label = ? "
+                            "AND project_id = ?", (new, label, old))
+        self.db.execute("DELETE FROM ig_list_members WHERE list_id = ? AND label = ?",
+                        (int(list_id), label))
+        return new
+
+    def _next_link(self, label, exclude_owner=None):
+        """The oldest link of a handle (optionally skipping lists owned by
+        `exclude_owner`) — who inherits it when its home goes."""
+        q = ("SELECT m.list_id FROM ig_list_members m JOIN ig_lists l ON l.list_id = m.list_id "
+             "WHERE m.label = ?")
+        args = [label]
+        if exclude_owner is not None:
+            q += " AND l.project_id != ?"; args.append(int(exclude_owner))
+        r = self.db.execute(q + " ORDER BY m.added_at, m.list_id LIMIT 1", args).fetchone()
+        return int(r["list_id"]) if r else None
+
+    def remove_source(self, label, list_id=0) -> dict:
+        """Remove a handle from ONE list. A link goes alone. A home row with
+        links elsewhere is handed to the oldest link (the other project
+        keeps collecting it); with none, the source row is deleted. Posts
+        are never deleted here."""
+        lid = int(list_id or 0)
+        if lid and self.db.execute(
+                "DELETE FROM ig_list_members WHERE list_id = ? AND label = ?",
+                (lid, label)).rowcount:
+            self.db.commit()
+            return {"ok": True, "unlinked": True}
+        if not self.db.execute("SELECT 1 FROM sources WHERE label = ?", (label,)).fetchone():
+            return {"error": f"no source {label!r}"}
+        nxt = self._next_link(label)
+        if nxt:
+            to = self._handover(label, nxt)
+            self.db.commit()
+            return {"ok": True, "handed_to": to, "list_id": nxt}
+        self.db.execute("DELETE FROM sources WHERE label = ?", (label,))
+        self.db.execute("DELETE FROM ig_list_members WHERE label = ?", (label,))
+        self.db.commit()
+        return {"ok": True, "removed": True}
 
     # ------------------------------------------------------------------
     # named lists (ig_lists) — see the schema comment
@@ -550,12 +703,19 @@ class Store:
     def source_scope(self, project_id, alias="sources"):
         return source_scope(self.db, project_id, alias)
 
+    # Linked handles count in the list they are linked into (sources,
+    # enabled and posts), the same as the list's own.
     _LIST_COUNTS = (
-        "  (SELECT COUNT(*) FROM sources s WHERE s.list_id = l.list_id) AS sources, "
-        "  (SELECT COUNT(*) FROM sources s WHERE s.list_id = l.list_id "
-        "     AND s.enabled = 1) AS enabled, "
-        "  (SELECT COUNT(*) FROM posts p JOIN sources s ON s.label = p.source_label "
-        "     WHERE s.list_id = l.list_id AND p.project_id = l.project_id) AS posts ")
+        "  ((SELECT COUNT(*) FROM sources s WHERE s.list_id = l.list_id) "
+        "   + (SELECT COUNT(*) FROM ig_list_members m WHERE m.list_id = l.list_id)) AS sources, "
+        "  ((SELECT COUNT(*) FROM sources s WHERE s.list_id = l.list_id "
+        "     AND s.enabled = 1) "
+        "   + (SELECT COUNT(*) FROM ig_list_members m WHERE m.list_id = l.list_id "
+        "     AND m.enabled = 1)) AS enabled, "
+        "  ((SELECT COUNT(*) FROM posts p JOIN sources s ON s.label = p.source_label "
+        "     WHERE s.list_id = l.list_id AND p.project_id = l.project_id) "
+        "   + (SELECT COUNT(*) FROM posts p WHERE p.source_label IN "
+        "     (SELECT m.label FROM ig_list_members m WHERE m.list_id = l.list_id))) AS posts ")
 
     def _list_dict(self, row, project_id=None) -> dict:
         d = dict(row)
@@ -701,6 +861,17 @@ class Store:
                             (lid,)).fetchone()["c"]
         moved = removed = 0
         if delete_sources:
+            # A handle another list links is handed to that list instead of
+            # being deleted out from under it.
+            for r in self.db.execute("SELECT label FROM sources WHERE list_id = ?",
+                                     (lid,)).fetchall():
+                nxt = self._next_link(r["label"])
+                while nxt == lid:
+                    self.db.execute("DELETE FROM ig_list_members WHERE list_id = ? AND label = ?",
+                                    (lid, r["label"]))
+                    nxt = self._next_link(r["label"])
+                if nxt:
+                    self._handover(r["label"], nxt); moved += 1
             removed = self.db.execute("DELETE FROM sources WHERE list_id = ?",
                                       (lid,)).rowcount
         elif n:
@@ -714,6 +885,7 @@ class Store:
             moved = self.db.execute(
                 "UPDATE sources SET list_id = ? WHERE list_id = ?",
                 (int(others["list_id"]), lid)).rowcount
+        self.db.execute("DELETE FROM ig_list_members WHERE list_id = ?", (lid,))
         self.db.execute("DELETE FROM ig_lists WHERE list_id = ?", (lid,))
         self.db.execute("DELETE FROM ig_list_projects WHERE list_id = ?", (lid,))
         self.db.commit()
@@ -742,6 +914,22 @@ class Store:
         for l, _ in moves:
             kept_labels += [r["label"] for r in self.db.execute(
                 "SELECT label FROM sources WHERE list_id = ?", (l["list_id"],))]
+        # Handles this project owns that ANOTHER project links: they go to
+        # the oldest such link, with their posts, instead of being deleted.
+        moving_lists = {l["list_id"] for l, _ in moves}
+        handovers = []
+        for r in self.db.execute(
+                "SELECT label FROM sources WHERE project_id = ?", (pid,)).fetchall():
+            if r["label"] in kept_labels:
+                continue
+            m = self.db.execute(
+                "SELECT m.list_id FROM ig_list_members m JOIN ig_lists l ON l.list_id = m.list_id "
+                "WHERE m.label = ? AND (l.project_id != ? OR m.list_id IN (%s)) "
+                "ORDER BY m.added_at, m.list_id LIMIT 1" % (",".join("?" * len(moving_lists)) or "NULL"),
+                (r["label"], pid, *moving_lists)).fetchone()
+            if m:
+                handovers.append((r["label"], int(m["list_id"])))
+                kept_labels.append(r["label"])
         marks = ",".join("?" * len(kept_labels)) or "''"
         n_src = self.db.execute(
             f"SELECT COUNT(*) FROM sources WHERE project_id = ? AND label NOT IN ({marks})",
@@ -753,6 +941,7 @@ class Store:
         out = {"sources": n_src, "posts": n_posts,
                "lists_transferred": [{"list_id": l["list_id"], "name": l["name"],
                                       "to_project": to} for l, to in moves]}
+        out["sources_handed_over"] = [lab for lab, _ in handovers]
         if not apply:
             return out
         for l, to in moves:
@@ -773,6 +962,8 @@ class Store:
                     f"AND source_label IN ({m})", (to, pid, *labels))
             out["lists_transferred"][[x["list_id"] for x in out["lists_transferred"]]
                                      .index(l["list_id"])]["name"] = name
+        for lab, mlid in handovers:
+            self._handover(lab, mlid)
         self.db.execute("DELETE FROM ig_list_projects WHERE project_id = ?", (pid,))
         self.db.execute("DELETE FROM posts WHERE project_id = ?", (pid,))
         self.db.execute("DELETE FROM sources WHERE project_id = ?", (pid,))
@@ -781,6 +972,7 @@ class Store:
         self.db.execute("DELETE FROM ig_lists WHERE project_id = ?", (pid,))
         for lid in gone:
             self.db.execute("DELETE FROM ig_list_projects WHERE list_id = ?", (lid,))
+            self.db.execute("DELETE FROM ig_list_members WHERE list_id = ?", (lid,))
         self.db.commit()
         return out
 
@@ -796,6 +988,8 @@ class Store:
         if int(r["project_id"]) != int(l["project_id"]):
             return {"error": "a source can only move between lists of its own project"}
         self.db.execute("UPDATE sources SET list_id = ? WHERE label = ?",
+                        (int(list_id), label))
+        self.db.execute("DELETE FROM ig_list_members WHERE list_id = ? AND label = ?",
                         (int(list_id), label))
         self.db.commit()
         return {"ok": True}
@@ -849,7 +1043,14 @@ class Store:
                     "SELECT * FROM sources WHERE type='user' AND platform_id='' "
                     "AND value != '' ORDER BY label")]
 
-    def set_enabled(self, label, enabled: bool) -> None:
+    def set_enabled(self, label, enabled: bool, list_id=0) -> None:
+        """Pause/resume a handle IN ONE LIST: a link pauses only itself
+        (the home project keeps collecting); otherwise the home row."""
+        if list_id and self.db.execute(
+                "UPDATE ig_list_members SET enabled=? WHERE list_id=? AND label=?",
+                (int(enabled), int(list_id), label)).rowcount:
+            self.db.commit()
+            return
         self.db.execute("UPDATE sources SET enabled=? WHERE label=?",
                         (int(enabled), label))
         self.db.commit()
@@ -862,8 +1063,13 @@ class Store:
         if only_enabled:
             # Enabled AND not in a paused list: this is the collector's
             # worklist, so a list's Pause is honoured here and nowhere else.
-            where.append("s.enabled=1")
-            where.append("COALESCE(l.paused, 0) = 0")
+            # A linked handle (ig_list_members) is collected while ANY of
+            # its memberships is live: one project's pause never stops it
+            # for another, and it is still one row, read once.
+            where.append(
+                "((s.enabled=1 AND COALESCE(l.paused, 0) = 0) OR EXISTS ("
+                "SELECT 1 FROM ig_list_members m JOIN ig_lists ml ON ml.list_id = m.list_id "
+                "WHERE m.label = s.label AND m.enabled = 1 AND ml.paused = 0))")
         if project_id is not None:
             sq, sa = self.source_scope(project_id, "s")
             where.append(sq); args += sa
@@ -1227,7 +1433,8 @@ class Store:
             pw = " WHERE " + sq
         total = c(f"SELECT COUNT(*) n FROM posts{pw}", pa).fetchone()["n"]
         newest = c(f"SELECT MAX(taken_at) t FROM posts{pw}", pa).fetchone()["t"]
-        sw, sa = "enabled=1", []
+        sw, sa = ("(enabled=1 OR label IN "
+                  "(SELECT label FROM ig_list_members WHERE enabled=1))"), []
         if project_id is not None:
             sq, sa = self.source_scope(project_id)
             sw += " AND " + sq

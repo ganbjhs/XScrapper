@@ -857,6 +857,14 @@ def _ig_pseudo_streams() -> list:
             users = {}
             for r in st.db.execute("SELECT list_id, project_id FROM ig_list_projects"):
                 users.setdefault(int(r["list_id"]), set()).add(int(r["project_id"]))
+            # Linked handles (2026-10-13): a live link puts the handle under
+            # every project using the list it is linked into.
+            linked = {}
+            for r in st.db.execute(
+                    "SELECT m.label, m.list_id FROM ig_list_members m "
+                    "JOIN ig_lists l ON l.list_id = m.list_id "
+                    "WHERE m.enabled = 1 AND l.paused = 0"):
+                linked.setdefault(r["label"], set()).update(users.get(int(r["list_id"]), set()))
             srcs = {}
             # The author's picture and real name ride along from the profile
             # cache (filled by collected posts — never a lookup), so a
@@ -869,13 +877,16 @@ def _ig_pseudo_streams() -> list:
                   else "pr.avatar_url")
             for r in st.db.execute(
                     f"SELECT s.label, s.type, s.value, s.platform_id, s.project_id, s.account, "
-                    f"       s.assigned_account, s.list_id, {av} AS avatar_url, {fn} AS full_name "
+                    f"       s.assigned_account, s.list_id, s.enabled, {av} AS avatar_url, {fn} AS full_name "
                     f"FROM sources s LEFT JOIN profiles pr ON "
                     f"  (s.platform_id != '' AND pr.user_pk = CAST(s.platform_id AS INTEGER)) "
                     f"  OR (s.platform_id = '' AND lower(pr.handle) = lower(s.value)) "
-                    f"WHERE s.enabled = 1 AND s.project_id > 0 "
+                    f"WHERE (s.enabled = 1 OR s.label IN (SELECT label FROM ig_list_members "
+                    f"  WHERE enabled = 1)) AND s.project_id > 0 "
                     f"ORDER BY s.project_id, s.label"):
-                for _p in sorted({int(r["project_id"])} | users.get(int(r["list_id"] or 0), set())):
+                home = (({int(r["project_id"])} | users.get(int(r["list_id"] or 0), set()))
+                        if r["enabled"] else set())
+                for _p in sorted(home | linked.get(r["label"], set())):
                   srcs.setdefault(_p, []).append({
                     "handle": r["value"], "label": r["label"], "type": r["type"],
                     "user_id": r["platform_id"] or None,
@@ -6302,6 +6313,26 @@ def _ig_status(q=None):
                     f"  OR (s.platform_id = '' AND lower(pr.handle) = lower(s.value)) "
                     f"WHERE {st.source_scope(pid, 's')[0]} ORDER BY s.label",
                     st.source_scope(pid, 's')[1])]
+                # Linked handles (2026-10-13): one row per (list, handle),
+                # under the list it is linked into, with the LINK's pause
+                # state; the home row shows only where this project uses
+                # the home list. Additive keys: linked, home_project_id.
+                links = st.linked_rows(pid)
+                if links:
+                    mine = {int(l["list_id"]) for l in st.lists(pid)}
+                    base = {r["label"]: r for r in out["sources"]}
+                    rows = [r for r in out["sources"] if int(r.get("list_id") or 0) in mine]
+                    names = _project_names()
+                    for m in links:
+                        b = base.get(m["label"])
+                        if not b:
+                            continue
+                        rows.append({**b, "list_id": int(m["list_id"]),
+                                     "enabled": int(m["enabled"]), "linked": True,
+                                     "home_project_id": int(b["project_id"]),
+                                     "home_project": names.get(int(b["project_id"])) or ""})
+                    rows.sort(key=lambda r: r["label"])
+                    out["sources"] = rows
                 for row in out["sources"]:
                     row["collector"] = row.get("account") or row.get("assigned_account") or ""
                     # Our held copy of the Instagram picture, else nothing —
@@ -6866,17 +6897,23 @@ def _ig_fetch(body):
         try:
             with store_ig.Store(rp) as st:
                 _sq, _sa = st.source_scope(pid)
-                srcs = [r for r in st.db.execute(
+                srcs = [dict(r) for r in st.db.execute(
                     f"SELECT label, list_id FROM sources WHERE enabled = 1 AND {_sq}", _sa)]
+                # Linked handles count where they are linked, with the
+                # link's own pause (2026-10-13).
+                _links = st.linked_rows(pid)
+                if _links:
+                    _mine = {int(l["list_id"]) for l in st.lists(pid)}
+                    srcs = [r for r in srcs if int(r["list_id"] or 0) in _mine]
+                    srcs += [{"label": m["label"], "list_id": m["list_id"]}
+                             for m in _links if m["enabled"]]
                 if lid:
                     l = st.list_row(lid)
                     if not l:
                         return {"error": f"no Instagram list {lid}"}
                     if l["paused"]:
                         return {"error": f"{l['name']!r} is paused — resume it first"}
-                    if not st.db.execute(
-                            "SELECT 1 FROM sources WHERE enabled = 1 AND list_id = ?",
-                            (lid,)).fetchone():
+                    if not any(int(r["list_id"] or 0) == lid for r in srcs):
                         return {"error": f"{l['name']!r} has no live source to fetch"}
         except Exception as e:
             return {"error": f"{type(e).__name__}: {e}"}
@@ -6958,10 +6995,17 @@ def _ig_source_post(body):
                 # value is still accepted and routed to platform_id by
                 # store_ig.add_source, so old callers keep working. `list_id`
                 # picks the named list; absent, the project's default list.
-                st.add_source(label, typ, value, str(body.get("account") or ""),
-                              str(body.get("platform_id") or ""), project_id=pid,
-                              list_id=_int_or(body.get("list_id"), 0),
-                              move=bool(body.get("move")))
+                # A handle already collected for another list/project is
+                # LINKED here (2026-10-13): one row, collected once, shown
+                # in both, following this list's pause/remove.
+                r = st.add_source(label, typ, value, str(body.get("account") or ""),
+                                  str(body.get("platform_id") or ""), project_id=pid,
+                                  list_id=_int_or(body.get("list_id"), 0),
+                                  move=bool(body.get("move")))
+                if isinstance(r, dict) and r.get("linked"):
+                    return {"ok": True, "linked": True, "label": r["label"],
+                            "home_project_id": r["home_project_id"],
+                            "home_project": _project_names().get(r["home_project_id"]) or ""}
             except store_ig.SourceElsewhere as e:
                 return _ig_elsewhere(e)
             except ValueError as e:
@@ -6974,10 +7018,14 @@ def _ig_source_post(body):
                 return {"error": "platform_id must be the numeric Instagram id"}
             st.set_platform_id(label, pk)
         elif action == "remove":
-            st.db.execute("DELETE FROM sources WHERE label = ?", (label,))
-            st.db.commit()
+            # From ONE list: a link goes alone; a home row that other lists
+            # link is handed to them instead of being deleted.
+            r = st.remove_source(label, _int_or(body.get("list_id"), 0))
+            if "error" in r:
+                return r
         elif action == "enable":
-            st.set_enabled(label, bool(body.get("enabled")))
+            st.set_enabled(label, bool(body.get("enabled")),
+                           _int_or(body.get("list_id"), 0))
         elif action == "move":
             r = st.set_list(label, _int_or(body.get("list_id"), 0))
             if "error" in r:

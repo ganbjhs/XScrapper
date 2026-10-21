@@ -1903,6 +1903,102 @@ def test_ig_lists(tmp):
 
 
 
+def test_ig_linked_handles(tmp):
+    """
+    Linked Instagram handles (2026-10-13). Taking ONE handle that another
+    project already collects used to be refused (SourceElsewhere) — the
+    only way was to share the whole list. Now the handle is LINKED into
+    this project's list: still one source row (collected once, by one
+    account), shown in both projects with its posts, and under each list's
+    own rules — pause and remove act on the link only.
+    """
+    import store_ig
+    import pathlib as _pl
+    rp = _pl.Path(str(tmp)) / "ig_results.db"
+    rec = lambda pk, u: {"pk": pk, "code": f"c{pk}", "taken_at": 1000 + pk,
+                         "username": u, "user_pk": 50 + pk % 7, "caption": f"p{pk}",
+                         "media_type": 1}
+    with store_ig.Store(str(rp)) as st:
+        A = st.create_list(1, "Big")["list_id"]
+        for h in ("h1", "h2", "h3"):
+            st.add_source(h, "user", h, project_id=1, list_id=A)
+        B = st.create_list(2, "Mine")["list_id"]
+        st.add_source("own", "user", "own", project_id=2, list_id=B)
+        st.upsert_posts([rec(1, "h1"), rec(2, "h1")], "h1")
+        st.upsert_posts([rec(3, "h2")], "h2")
+        st.upsert_posts([rec(4, "own")], "own")
+
+        print("== add one handle of another project: linked, not refused ==")
+        r = st.add_source("h1", "user", "h1", project_id=2, list_id=B)
+        ok(r.get("linked") and r["home_project_id"] == 1, f"h1 is linked into B ({r})")
+        ok(tuple(st.db.execute("SELECT project_id, list_id FROM sources WHERE label='h1'").fetchone())
+           == (1, A), "…its one row stays home in project 1")
+        ok(st.db.execute("SELECT COUNT(*) FROM sources").fetchone()[0] == 4, "no second row")
+        ok(sorted(s.label for s in st.sources(only_enabled=True)) == ["h1", "h2", "h3", "own"],
+           "the collector reads h1 ONCE")
+        ok(st.count(project_id=2) == 3 and st.count(project_id=1) == 3,
+           "project 2 sees h1's posts (incl. history) plus its own; 1 unchanged")
+        ok(sorted(x.label for x in st.sources(only_enabled=False, project_id=2)) == ["h1", "own"],
+           "project 2's sources: its own + the link, not the rest of 'Big'")
+        lb = {l["list_id"]: l for l in st.lists(2)}[B]
+        ok(lb["sources"] == 2 and lb["enabled"] == 2 and lb["posts"] == 3,
+           f"list B counts the link ({lb['sources']}, {lb['enabled']}, {lb['posts']})")
+        ok(st.add_source("h1", "user", "h1", project_id=2, list_id=B).get("already") is None
+           and st.db.execute("SELECT COUNT(*) FROM ig_list_members").fetchone()[0] == 1,
+           "re-adding is idempotent")
+        ok(st.add_source("h1", "user", "h1", project_id=2).get("already"),
+           "re-typing it with no list is a no-op")
+        st.upsert_posts([rec(5, "h1")], "h1")
+        ok(st.count(project_id=2) == 4 and st.count(project_id=1) == 4, "new posts show in both")
+
+        print()
+        print("== the same handle under another label is the same source ==")
+        r = st.add_source("Handle Two", "user", "H2", project_id=2, list_id=B)
+        ok(r.get("linked") and r["label"] == "h2", f"label 'Handle Two' resolves to h2's row ({r})")
+        ok(st.db.execute("SELECT COUNT(*) FROM sources").fetchone()[0] == 4, "still no second row")
+
+        print()
+        print("== each project's rules ==")
+        st.set_list_paused(A, True)
+        ok(sorted(s.label for s in st.sources(only_enabled=True)) == ["h1", "h2", "own"],
+           "home list paused: h1/h2 still collected for project 2's live list, h3 stops")
+        st.set_enabled("h1", False, list_id=B)
+        ok("h1" not in [s.label for s in st.sources(only_enabled=True)],
+           "link paused too: nobody wants h1, it stops")
+        ok(st.db.execute("SELECT enabled FROM sources WHERE label='h1'").fetchone()[0] == 1,
+           "…and the home row's own switch was not touched")
+        st.set_list_paused(A, False)
+        ok("h1" in [s.label for s in st.sources(only_enabled=True)],
+           "pausing in project 2 never stops it for project 1")
+        st.set_enabled("h1", True, list_id=B)
+
+        print()
+        print("== remove ==")
+        r = st.remove_source("h2", list_id=B)
+        ok(r.get("unlinked") and st.db.execute("SELECT 1 FROM sources WHERE label='h2'").fetchone(),
+           "removing the link leaves project 1's h2 alone")
+        r = st.remove_source("h1", list_id=A)
+        ok(r.get("handed_to") == 2, f"removing h1's HOME hands it to the linking project ({r})")
+        ok(tuple(st.db.execute("SELECT project_id, list_id FROM sources WHERE label='h1'").fetchone())
+           == (2, B) and not st.linked_rows(2), "…now it lives in B, no link left")
+        ok(st.count(project_id=2) == 4 and st.count(project_id=1) == 1,
+           "its posts went with it (project 1 keeps only h2)")
+        r = st.remove_source("h3", list_id=A)
+        ok(r.get("removed") and not st.db.execute("SELECT 1 FROM sources WHERE label='h3'").fetchone(),
+           "a handle nobody links is deleted as before")
+
+        print()
+        print("== deleting a project hands its linked handles over ==")
+        st.add_source("h2", "user", "h2", project_id=2, list_id=B)
+        plan = st.delete_project(1)
+        ok(plan["sources_handed_over"] == ["h2"] and plan["sources"] == 0,
+           f"the plan names h2 as handed over, nothing deleted ({plan})")
+        st.delete_project(1, apply=True)
+        ok(tuple(st.db.execute("SELECT project_id, list_id FROM sources WHERE label='h2'").fetchone())
+           == (2, B) and st.count(project_id=2) == 5, "h2 and its post now belong to project 2")
+        ok(st.db.execute("SELECT COUNT(*) FROM ig_list_members").fetchone()[0] == 0, "no stale links")
+
+
 def test_ig_shared_lists(tmp):
     """
     Shared Instagram lists (2026-09-30), the Instagram twin of X's shared
@@ -1922,20 +2018,11 @@ def test_ig_shared_lists(tmp):
                          "username": u, "user_pk": 50 + pk % 7, "caption": f"p{pk}",
                          "media_type": 1}
     with store_ig.Store(str(rp)) as st:
-        print("== a handle already in another project is refused, not moved ==")
+        print("== setup: two projects ==")
         L = st.create_list(7, "Leaders")["list_id"]
         st.add_source("a1", "user", "a1", project_id=7, list_id=L)
         st.add_source("a2", "user", "a2", project_id=7, list_id=L)
         st.add_source("b1", "user", "b1", project_id=8)
-        try:
-            st.add_source("a1", "user", "a1", project_id=8); err = None
-        except store_ig.SourceElsewhere as e:
-            err = e
-        ok(err is not None and err.project_id == 7 and err.list_id == L,
-           "adding a1 to project 8 raises SourceElsewhere naming project 7's list")
-        ok(isinstance(err, ValueError), "…a ValueError, so old callers report it as an error")
-        r = st.db.execute("SELECT project_id, list_id FROM sources WHERE label='a1'").fetchone()
-        ok((r["project_id"], r["list_id"]) == (7, L), "…and a1 stays where it was")
         ok(st.post_scope(8) == ("posts.project_id = ?", [8]),
            "a project that added nothing keeps the plain indexed clause")
 
@@ -2056,12 +2143,32 @@ def test_ig_shared_lists(tmp):
            "the dashboard library lists every Instagram list with its owner")
         r = web._ig_source_post({"action": "add", "project": 9, "label": "a1",
                                  "type": "user", "value": "a1"})
-        ok("error" in r and r.get("elsewhere", {}).get("project_id") == 8,
-           f"the dashboard answers a cross-project add with where it lives ({r.get('elsewhere')})")
+        ok(r.get("linked") and r.get("home_project_id") == 8,
+           f"the dashboard LINKS a handle another project collects (2026-10-13) ({r})")
+        ps = {s["project_id"]: s for s in web._ig_pseudo_streams()}
+        ok(sorted(m["label"] for m in ps[9]["sources"]) == ["a1", "n1"]
+           and ps[9]["tweets"] == 1 + 2,
+           f"ig:9:0 now lists the linked handle and counts its posts ({ps.get(9)})")
+        ok(sorted(m["label"] for m in ps[8]["sources"]) == ["a1", "b1", "c1"] and ps[8]["tweets"] == 4,
+           "the home project's stream is unchanged")
+        stt = web._ig_status({"project": "9"})
+        rows = [x for x in stt.get("sources", []) if x["label"] == "a1"]
+        ok(len(rows) == 1 and rows[0].get("linked") and rows[0]["list_id"] == M
+           and rows[0]["home_project_id"] == 8,
+           f"the panel shows a1 once, in list Nine, marked linked ({rows})")
+        web._ig_source_post({"action": "enable", "project": 9, "label": "a1",
+                             "list_id": M, "enabled": False})
+        with store_ig.Store(str(rp)) as st:
+            ok(st.db.execute("SELECT enabled FROM sources WHERE label='a1'").fetchone()[0] == 1,
+               "Pause on the linked row pauses only the link")
+        web._ig_source_post({"action": "remove", "project": 9, "label": "a1", "list_id": M})
+        with store_ig.Store(str(rp)) as st:
+            ok(st.db.execute("SELECT project_id FROM sources WHERE label='a1'").fetchone()[0] == 8
+               and not st.linked_rows(9), "Remove on the linked row removes only the link")
         r = web._ig_lists_post({"action": "create", "project": 9, "name": "Mix",
                                 "handles": "a1 z1"})
-        ok(r.get("added") == 1 and len(r.get("elsewhere") or []) == 1 and "warning" in r,
-           "a create with handles adds the free ones and names the ones left elsewhere")
+        ok(r.get("added") == 2 and not r.get("elsewhere"),
+           f"a create with handles adds the free ones and links the taken ones ({r})")
     finally:
         web._CFG = saved
 
@@ -8119,6 +8226,7 @@ def main():
         test_shared_watchlists(fresh("shared_wl"))
         test_ig_lists(fresh("ig_lists"))
         test_ig_shared_lists(fresh("ig_shared_lists"))
+        test_ig_linked_handles(fresh("ig_linked_handles"))
         test_identity(fresh("identity"))
         test_ig_avatars(fresh("ig_avatars"))
 

@@ -1639,7 +1639,10 @@ function IgDetail({ pid, data, reload, gotoSettings, onBack, list }) {
   // Handles the last add found in another project's list: offered as
   // "add that list here" (shared, collected once) or an explicit move.
   const [elsewhere, setElsewhere] = useState([]);
-  useEffect(() => { setElsewhere([]); }, [list?.list_id]);
+  // Handles the last add LINKED here from another project (collected once,
+  // shown in both) — a short note, not an error.
+  const [linkedNote, setLinkedNote] = useState("");
+  useEffect(() => { setElsewhere([]); setLinkedNote(""); }, [list?.list_id]);
   const listPaused = !!list?.paused;
   const toggleList = async () => {
     setBusyList(true); setMsg("");
@@ -1674,17 +1677,19 @@ function IgDetail({ pid, data, reload, gotoSettings, onBack, list }) {
   // Facebook-style inline add: paste one or many usernames, added as user
   // sources (label = username; the engine resolves it to the pk at collect time).
   const addBulk = async () => {
-    setBusyAdd(true); setMsg(""); setElsewhere([]);
+    setBusyAdd(true); setMsg(""); setElsewhere([]); setLinkedNote("");
     try {
-      const errs = [], found = [];
+      const errs = [], found = [], linked = [];
       for (const u of adding.split(/[\s,]+/).filter(Boolean)) {
         const name = u.replace(/^[@#]/, "");
         const r = await api.igSource({ action: "add", label: name, type: "user", value: name, project: pid,
                                        list_id: list?.list_id || 0 });
         if (r && r.elsewhere) found.push(r.elsewhere);
         else if (r && r.error) errs.push(`@${name}: ${r.error}`);
+        else if (r && r.linked) linked.push(`@${name}${r.home_project ? ` (${r.home_project})` : ""}`);
       }
       setElsewhere(found);
+      if (linked.length) setLinkedNote(`linked from another project — collected once: ${linked.join(", ")}`);
       if (errs.length) setMsg(errs.join("\n"));
       setAdding(""); reload();
     } catch (e) { setMsg(String(e.message || e)); }
@@ -1791,24 +1796,27 @@ function IgDetail({ pid, data, reload, gotoSettings, onBack, list }) {
           <div className="muted" style={{ padding: "12px 0" }}>no match for “{search}”</div>
         )}
         {sources.map((s) => (
-          <div className="wl-row" key={s.label} style={{ opacity: s.enabled ? 1 : 0.55 }}>
+          <div className="wl-row" key={`${s.list_id}:${s.label}`} style={{ opacity: s.enabled ? 1 : 0.55 }}>
             <IgPfp src={s.avatar} name={s.display_name || s.value || s.label} />
             <div className="who">
-              <b>{s.display_name || s.label}{!s.enabled && " (paused)"}</b>
+              <b>{s.display_name || s.label}{!s.enabled && (s.linked ? " (paused here)" : " (paused)")}</b>
               <small>
                 {s.display_name ? `@${s.value || s.label}` : s.type}{!s.display_name && s.value && s.value !== s.label ? ` · ${s.value}` : ""}
                 {s.type !== "user" ? ` · ${s.type}` : ""}
                 {s.account ? ` · pinned to @${s.account}` : (s.collector ? ` · via @${s.collector}` : " · not yet assigned")}
                 {s.platform_id ? "" : " · id pending"}
+                {s.linked ? ` · linked from ${s.home_project || `project #${s.home_project_id}`}` : ""}
               </small>
             </div>
             <div className="right" style={{ display: "flex", gap: 6, alignItems: "center" }}>
               <button className="btn btn-ghost btn-sm"
-                      onClick={() => act({ action: "enable", label: s.label, enabled: !s.enabled })}>
+                      title={s.linked ? "Pause/resume this handle in this list only — the other project is not affected" : undefined}
+                      onClick={() => act({ action: "enable", label: s.label, enabled: !s.enabled, list_id: s.list_id })}>
                 {s.enabled ? "Pause" : "Resume"}
               </button>
               <button className="btn btn-ghost btn-sm"
-                      onClick={() => act({ action: "remove", label: s.label })}>
+                      title={s.linked ? "Remove from this list only — the other project keeps it" : undefined}
+                      onClick={() => act({ action: "remove", label: s.label, list_id: s.list_id })}>
                 Remove
               </button>
             </div>
@@ -1851,6 +1859,7 @@ function IgDetail({ pid, data, reload, gotoSettings, onBack, list }) {
           ))}
         </div>
       )}
+      {linkedNote && <div style={{ color: "var(--ink-3)", fontSize: 12.5, marginTop: 6 }}>{linkedNote}</div>}
       {msg && <div style={{ color: "var(--critical)", fontSize: 12.5, whiteSpace: "pre-wrap" }}>{msg}</div>}
     </div>
   );
