@@ -449,6 +449,11 @@ def _decide_exc(dec, acct, group, e, *, fallback, log=print, src=None):
                         "failover_to": new, "note": note})
 
 
+# Instagram lets a profile pin up to three posts; they lead the first page of
+# its feed whatever their age (see collect_source).
+PINNED_SLOTS = 3
+
+
 async def collect_source(engine, store, source, *, page_size=12, max_pages=2, log=print) -> int:
     """One pass over a source: collect posts newer than the watermark, save them.
 
@@ -470,7 +475,9 @@ async def collect_source(engine, store, source, *, page_size=12, max_pages=2, lo
     seen_author = None
 
     first_page = True
+    pages_read = 0
     async for page in engine.pages_for(source, page_size=page_size, max_pages=max_pages):
+        pages_read += 1
         # Human rhythm BETWEEN pages of the same source: a person scrolls, then
         # pauses, before loading more — not a steady machine tick. The first
         # page of a source loads immediately (you just opened it).
@@ -484,13 +491,25 @@ async def collect_source(engine, store, source, *, page_size=12, max_pages=2, lo
                 if rec.get("user_pk") and (rec.get("author_avatar") or rec.get("author_name")):
                     seen_author = rec
                     break
-        for pk in page.result_ids:
-            if wm and pk <= wm:          # reached known ground
-                stop = True
-                break
+        # Every post on the page is kept; upsert_posts is INSERT OR IGNORE, so
+        # a post already stored costs nothing and changes nothing. The
+        # watermark decides only whether to load ANOTHER page.
+        #
+        # Why not "stop at the first known post" (the rule until 2026-11-04):
+        # a profile's feed opens with its PINNED posts (up to three), and a
+        # pinned post is usually old. The loop met it first, read "known
+        # ground", stopped with new=0 — and the watermark still jumped to the
+        # newest pk on the page, so the posts it never saved counted as seen.
+        # Every handle with a pinned post froze after its cold start
+        # (@_samvad_news_: 16 posts, nothing for 45 days, visited daily).
+        for i, pk in enumerate(page.result_ids):
             rec = page.entries_by_id.get(pk)
             if rec:
                 collected.append(rec)
+            # Known ground is a known post BELOW the pinned slots; the first
+            # PINNED_SLOTS of the first page can be old and prove nothing.
+            if wm and pk <= wm and not (pages_read == 1 and i < PINNED_SLOTS):
+                stop = True
         if stop:
             break
 

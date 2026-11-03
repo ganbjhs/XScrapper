@@ -1365,6 +1365,22 @@ streamed login is dead; the phone-shaped one (above) is the third door.
 - `/api/handover` is dashboard-only: it is in no API-key allowlist. Recording
   is observational — it must never change a response or fail a request.
 
+### Pinned posts lead a profile's feed — they are not "known ground" (2026-11-04)
+
+- An Instagram profile feed opens with up to three PINNED posts, whatever
+  their age. `collect_source` used to stop at the first post at or below the
+  watermark: the old pinned post. It saved nothing (new=0), yet still moved
+  the watermark to the newest pk on the page, so the new posts it never
+  stored counted as seen. Every handle with a pinned post froze after its
+  cold start (@_samvad_news_: visited daily, nothing for 45 days).
+- So: every post on a fetched page is kept (`upsert_posts` is INSERT OR
+  IGNORE — a known post costs nothing), and the watermark decides only
+  whether to load another page. Known ground = a known post BELOW the first
+  `PINNED_SLOTS` (3) of the first page.
+- A handle reading new=0 on every visit while it is visibly posting is this
+  class of bug, not "no new posts" — check the stored posts for one old post
+  among recent ones (the pinned one).
+
 ### A quarantined Instagram account is not used, and its sources move (2026-10-02)
 
 - `collect_ig.collectors()` benches an account whose POOL status is

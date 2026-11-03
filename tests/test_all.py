@@ -8216,6 +8216,68 @@ def test_watchlist_depth_controls(tmp):
        "along with whether the cadence is pinned, and the depth setting")
 
 
+def test_ig_pinned_posts_do_not_freeze_a_source(tmp):
+    """
+    2026-11-04: a profile's feed opens with its PINNED posts (up to three),
+    whatever their age. collect_source used to stop at the first post at or
+    below the watermark — the old pinned one — so it saved nothing, yet moved
+    the watermark to the newest pk on the page: the new posts counted as seen
+    without ever being stored. @_samvad_news_ (pinned post from 11 Aug among
+    17-19 Sept posts) froze for 45 days while being visited daily.
+    Pins: new posts behind a pinned old one are saved; posts the old loop
+    skipped (above the old watermark, never stored) come back; a known post
+    below the pinned slots still ends the walk (no needless second page).
+    """
+    import asyncio, collect_ig, engine_ig, store_ig
+    import pathlib as _pl
+    rp = _pl.Path(str(tmp)) / "ig_results.db"
+    st = store_ig.Store(str(rp))
+    st.open()
+    st.add_source("samvad", "user", "_samvad_news_", platform_id="52", project_id=17)
+    src = [s for s in st.sources(only_enabled=False) if s.label == "samvad"][0]
+
+    def rec(pk, t):
+        return {"pk": pk, "code": f"c{pk}", "taken_at": t, "username": "_samvad_news_",
+                "user_pk": 52, "caption": f"p{pk}", "media_type": 2}
+
+    class Eng:
+        def __init__(self, pages):
+            self.pages, self.asked = pages, 0
+        async def pages_for(self, source, **kw):
+            for n, ids in enumerate(self.pages, 1):
+                self.asked += 1
+                pg = engine_ig.IGPage(page_no=n, received_ts=0)
+                for pk in ids:
+                    pg.result_ids.append(pk)
+                    pg.entries_by_id[pk] = rec(pk, pk)
+                yield pg
+
+    async def go(pages):
+        e = Eng(pages)
+        n = await collect_ig.collect_source(e, st, src, log=lambda *a: None)
+        return n, e.asked
+    _gap = collect_ig.ig_human.request_gap
+    collect_ig.ig_human.request_gap = lambda: 0
+
+    print("== Instagram: pinned posts ==")
+    # Cold start: pinned old post 100 first, then the feed 300..290.
+    n, _ = asyncio.run(go([[100, 300, 299, 298], [297, 296]]))
+    ok(n == 6 and st.watermark("samvad") == 300, f"cold start stores everything ({n})")
+    # Next visit: the pinned post still leads; three new posts sit behind it.
+    n, asked = asyncio.run(go([[100, 303, 302, 301, 300, 299], [298, 297]]))
+    ok(n == 3, f"new posts behind an old pinned post are saved ({n})")
+    ok(asked == 1, f"a known post below the pinned slots ends the walk ({asked} pages)")
+    ok(st.watermark("samvad") == 303, "watermark moves to the newest post")
+    # The old loop's damage: watermark already ahead of posts never stored.
+    st.set_watermark("samvad", 310)
+    n, _ = asyncio.run(go([[100, 310, 309, 308, 303], [302]]))
+    ok(n == 3, f"posts the old loop skipped come back on the next visit ({n})")
+    n, _ = asyncio.run(go([[100, 310, 309]]))
+    ok(n == 0, "a visit with nothing new is still new=0")
+    collect_ig.ig_human.request_gap = _gap
+    st.close()
+
+
 def test_search_archive(tmp):
     """
     /api/search (2026-11-04): the Search page reads EVERY platform's archive
@@ -8365,6 +8427,7 @@ def main():
         test_ig_avatar(fresh("igav"))
         test_ig_as_stream(fresh("igstream"))
         test_search_archive(fresh("search"))
+        test_ig_pinned_posts_do_not_freeze_a_source(fresh("igpinned"))
         section("instagram rhythm (phone-time sessions, one visit at a time)")
         test_ig_rhythm(fresh("igrhythm"))
         section("instagram: a stop decision stands; shared stores are WAL")
