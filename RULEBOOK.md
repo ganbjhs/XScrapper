@@ -1003,6 +1003,22 @@ session got opened on a live account (§6, "never signed in twice").
   that is not rebuilt does not ship. `cd frontend && npm run build`, and check
   that `dist/index.html` names the assets that are actually in `dist/assets`.
 
+### The Search page searches the archive of EVERY platform (2026-11-04)
+
+- The dashboard's Search reads the databases, never a platform: results.db
+  (X), ig_results.db (Instagram), fb_results.db (Facebook), one filter set,
+  merged newest-posted first (`GET /api/search`, `web._search_archive`). It
+  used to ask /api/tweets only, so an Instagram username found nothing.
+- A filter means the same thing on every platform. One that cannot apply
+  (no retweets on IG/FB) excludes nothing there; it never hides a platform.
+- A handle is literal text: `_` and `%` are escaped in LIKE, so
+  `_samvad_news_` never matches `xsamvadxnewsx`.
+- Instagram scope is `post_scope` (shared and linked lists count); "All
+  projects" means every assigned post (`project_id != 0`).
+- One platform failing is a zero plus an `errors` entry, never a blank page.
+- It is additive and cookie-only (in no API-key set). /api/tweets, which
+  Watch-Tower reads, is not changed by it.
+
 ### A poll never re-searches what it already searched (2026-10-08)
 
 - Anything that polls (webhook.pump every 2 s, the live feed's SSE loop every

@@ -833,6 +833,239 @@ def _query_ig_as_stream(p):
     return out
 
 
+# ---------------------------------------------------------------------------
+# /api/search — the dashboard's Search page, across EVERY platform (2026-11-04).
+#
+# The Search page used to call /api/tweets, which is X only: an Instagram
+# username typed into it found nothing even though its posts sat in
+# ig_results.db. This reads the archive the platforms were collected into —
+# results.db (X), ig_results.db (Instagram), fb_results.db (Facebook) — with
+# ONE set of filters, and merges the hits newest-posted first. Nothing here
+# touches a platform; it is the database only.
+#
+# Additive and cookie-only: it is in none of the API-key path sets, and
+# /api/tweets — Watch-Tower's endpoint — is not changed by it.
+#
+# Paging across three databases: each is asked for its newest offset+limit
+# matches, the union is sorted, and the page is sliced out of it. Exact, and
+# cheap for the depths a person pages to; capped so a deep page cannot ask
+# a database for an unbounded scan.
+SEARCH_MAX_DEPTH = 5000
+
+
+def _like_escape(v: str) -> str:
+    """A handle like `_samvad_news_` is literal text, not LIKE wildcards."""
+    return (str(v).replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_"))
+
+
+def _search_author(v) -> str:
+    """'@handle', 'handle', or a pasted profile URL -> 'handle'."""
+    a = str(v or "").strip()
+    m = re.search(r"(?:x|twitter|instagram|facebook)\.com/([^/?#]+)", a, re.I)
+    if m:
+        a = m.group(1)
+    return a.lstrip("@").strip().strip("/")
+
+
+def _search_x(p, pid, depth):
+    if not _CFG.db_results.exists():
+        return 0, []
+    q = {"limit": depth, "offset": 0}
+    for k in ("q", "min_likes", "has_media", "no_retweets", "from_date", "to_date", "since"):
+        if p.get(k):
+            q[k] = p[k]
+    if p.get("author"):
+        q["author"] = _search_author(p["author"])
+    if pid:
+        q["project"] = pid
+    # _query_tweets caps a page at 500; walk it for deeper pages.
+    rows, total, off = [], 0, 0
+    while off < depth:
+        q["limit"], q["offset"] = min(500, depth - off), off
+        r = _query_tweets(q)
+        total = r.get("total", 0)
+        rows += r.get("rows", [])
+        if len(r.get("rows", [])) < q["limit"]:
+            break
+        off += q["limit"]
+    for r in rows:
+        r["platform"] = "x"
+    return total, rows
+
+
+def _search_ig(p, pid, depth):
+    rp = _CFG.root / "ig_results.db"
+    if not rp.exists():
+        return 0, []
+    import store_ig
+    with store_ig.Store(rp) as st:
+        if pid:
+            sq, sa = st.post_scope(pid, "p")
+            where, params = [sq], list(sa)
+        else:
+            # All projects: every post that belongs to one (0 = unassigned,
+            # which no read ever returns).
+            where, params = ["p.project_id != 0"], []
+        if p.get("q"):
+            where.append("(p.caption LIKE ? ESCAPE '\\' OR p.username LIKE ? ESCAPE '\\' "
+                         " OR pp.full_name LIKE ? ESCAPE '\\')")
+            params += [f"%{_like_escape(p['q'])}%"] * 3
+        if p.get("author"):
+            where.append("p.username LIKE ? ESCAPE '\\'")
+            params.append(_like_escape(_search_author(p["author"])) + "%")
+        if p.get("min_likes"):
+            where.append("p.like_count >= ?")
+            params.append(int(p["min_likes"]))
+        if p.get("has_media"):
+            where.append("(COALESCE(p.thumbnail_url, '') != '' OR COALESCE(p.video_url, '') != '')")
+        if p.get("from_date"):
+            ms = _day_ms(p["from_date"])
+            if ms is not None:
+                where.append("p.taken_at >= ?"); params.append(ms // 1000)
+        if p.get("to_date"):
+            ms = _day_ms(p["to_date"])
+            if ms is not None:
+                where.append("p.taken_at < ?"); params.append((ms + 86_400_000) // 1000)
+        if p.get("since"):
+            ms = store_mod.parse_window(p["since"])
+            if ms:
+                where.append("p.taken_at >= ?"); params.append(int(ms / 1000))
+        # no_retweets: Instagram has no retweets — every post is the
+        # author's own, so the filter excludes nothing here.
+        cond = " AND ".join(where)
+        frm = "FROM posts p LEFT JOIN profiles pp ON pp.user_pk = p.user_pk"
+        total = st.db.execute(f"SELECT COUNT(*) c {frm} WHERE {cond}",
+                              params).fetchone()["c"]
+        rows = st.db.execute(
+            f"SELECT p.*, COALESCE(pp.avatar_local, pp.avatar_url, p.author_avatar) AS _avatar, "
+            f"       pp.full_name AS _full_name {frm} WHERE {cond} "
+            f"ORDER BY p.taken_at DESC, p.pk DESC LIMIT ?",
+            [*params, depth]).fetchall()
+    out = []
+    for r in rows:
+        d = dict(r)
+        d["author_avatar"] = store_ig.public_media_url(d.pop("_avatar")) or None
+        # Instagram's OWN name for the account, never another platform's.
+        d["author_name"] = d.pop("_full_name") or None
+        f = store_ig.to_feed(d)
+        f["platform"] = "instagram"
+        f["created_ms"] = int(d.get("taken_at") or 0) * 1000
+        f["collected_ms"] = int(d.get("collected_at") or 0) * 1000
+        f["_project_id"] = d.get("project_id")
+        out.append(f)
+    if pid:
+        _stamp_labels(out, pid, "instagram")
+    for f in out:
+        f.pop("_project_id", None)
+    return total, out
+
+
+def _search_fb(p, pid, depth):
+    rp = _CFG.root / "fb_results.db"
+    if not rp.exists():
+        return 0, []
+    import store_fb
+    where, params = [], []
+    if pid:
+        where.append("p.project_id = ?"); params.append(pid)
+    if p.get("q"):
+        where.append("(p.text LIKE ? ESCAPE '\\' OR p.page LIKE ? ESCAPE '\\' "
+                     " OR p.author_name LIKE ? ESCAPE '\\')")
+        params += [f"%{_like_escape(p['q'])}%"] * 3
+    if p.get("author"):
+        where.append("p.page LIKE ? ESCAPE '\\'")
+        params.append(_like_escape(_search_author(p["author"])) + "%")
+    if p.get("min_likes"):
+        where.append("p.like_count >= ?")
+        params.append(int(p["min_likes"]))
+    if p.get("has_media"):
+        where.append("COALESCE(p.media_json, '') NOT IN ('', '[]')")
+    t = "COALESCE(p.created_ms, p.collected_ms)"
+    if p.get("from_date"):
+        ms = _day_ms(p["from_date"])
+        if ms is not None:
+            where.append(f"{t} >= ?"); params.append(ms)
+    if p.get("to_date"):
+        ms = _day_ms(p["to_date"])
+        if ms is not None:
+            where.append(f"{t} < ?"); params.append(ms + 86_400_000)
+    if p.get("since"):
+        ms = store_mod.parse_window(p["since"])
+        if ms:
+            where.append(f"{t} >= ?"); params.append(int(ms))
+    cond = ("WHERE " + " AND ".join(where)) if where else ""
+    with store_fb.Store(rp) as st:
+        total = st.db.execute(f"SELECT COUNT(*) c FROM posts p {cond}",
+                              params).fetchone()["c"]
+        rows = st.db.execute(
+            "SELECT p.*, COALESCE(p.author_avatar, pp.avatar_url) AS _av "
+            "FROM posts p LEFT JOIN page_profiles pp ON pp.handle = LOWER(p.page) "
+            f"{cond} ORDER BY {t} DESC, p.post_id DESC LIMIT ?",
+            [*params, depth]).fetchall()
+    out = []
+    for r in rows:
+        d = dict(r)
+        d["author_avatar"] = d.pop("_av")
+        f = store_fb.to_feed(d)
+        f["created_ms"] = int(d.get("created_ms") or d.get("collected_ms") or 0)
+        out.append(f)
+    if pid:
+        _stamp_labels(out, pid, "facebook")
+    return total, out
+
+
+def _search_archive(p):
+    """
+    GET /api/search — the collected archive of every platform, one filter set.
+
+      q          free text (post text, handle, display name)
+      author     a handle — '@x', 'x', or a profile URL; prefix match
+      min_likes  has_media  no_retweets (X only — the others have none)
+      project    scope to one project (omit for all projects)
+      limit / offset
+
+    -> {total, totals: {x, instagram, facebook}, rows: [shared post shape,
+        each with `platform`], errors?: {platform: message}}
+    One platform failing (a locked or missing database) never blanks the
+    others: its count is 0 and the reason is in `errors`.
+    """
+    pid = _project_or_none(p)
+    try:
+        limit = max(1, min(int(p.get("limit") or 25), 100))
+    except (TypeError, ValueError):
+        limit = 25
+    try:
+        offset = max(0, int(p.get("offset") or 0))
+    except (TypeError, ValueError):
+        offset = 0
+    depth = min(offset + limit, SEARCH_MAX_DEPTH)
+    totals, rows, errors = {}, [], {}
+    for name, fn in (("x", _search_x), ("instagram", _search_ig), ("facebook", _search_fb)):
+        try:
+            n, r = fn(p, pid, depth)
+        except Exception as e:      # one platform down is not the page down
+            n, r = 0, []
+            errors[name] = f"{type(e).__name__}: {e}"[:200]
+        totals[name] = n
+        rows += r
+
+    def posted(r):
+        ms = r.get("created_ms")
+        if ms:
+            return int(ms)
+        try:
+            return int(datetime.datetime.fromisoformat(
+                str(r.get("created_at") or "").replace("Z", "+00:00")).timestamp() * 1000)
+        except (TypeError, ValueError):
+            return 0
+    rows.sort(key=lambda r: (posted(r), str(r.get("tweet_id") or "")), reverse=True)
+    out = {"total": sum(totals.values()), "totals": totals,
+           "rows": rows[offset:offset + limit]}
+    if errors:
+        out["errors"] = errors
+    return out
+
+
 def _ig_pseudo_streams() -> list:
     """
     One entry per project that has enabled Instagram sources — what
@@ -8031,6 +8264,10 @@ class Handler(BaseHTTPRequestHandler):
                     raise
                 self._note_pull(u.path, q, body, 200)
                 return self._send(200, body)
+            if u.path == "/api/search":
+                # The dashboard's Search page: X + Instagram + Facebook from
+                # the databases, one filter set. Cookie-only (no API-key set).
+                return self._send(200, _search_archive(q))
             if u.path == "/api/projects":
                 return self._send(200, _projects_json())
             if u.path == "/api/watchlists":

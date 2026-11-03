@@ -1,5 +1,6 @@
 // Search the archive — everything already collected, filtered locally.
-// Nothing here spends X rate-limit budget.
+// Every platform (X, Instagram, Facebook) from the databases, one set of
+// filters; nothing here touches a platform or spends rate-limit budget.
 import React, { useState } from "react";
 import { api, fmtN, useApi } from "../api/client.js";
 import { PageHead, useProject } from "../App.jsx";
@@ -19,7 +20,7 @@ export default function Search({ onMenu }) {
   const results = useApi(
     () =>
       params
-        ? api.tweets({ ...params, limit, offset: page * limit })
+        ? api.search({ ...params, limit, offset: page * limit })
         : Promise.resolve(null),
     [params, page],
   );
@@ -50,7 +51,7 @@ export default function Search({ onMenu }) {
         <input placeholder='Text, e.g. "flood relief"' value={form.q} onChange={f("q")}
                style={{ flex: 2, minWidth: 180 }}
                onKeyDown={(e) => e.key === "Enter" && run()} />
-        <input placeholder="@author" value={form.author} onChange={f("author")}
+        <input placeholder="@username" value={form.author} onChange={f("author")}
                style={{ width: 140 }} onKeyDown={(e) => e.key === "Enter" && run()} />
         <input placeholder="min likes" inputMode="numeric" value={form.min_likes}
                onChange={f("min_likes")} style={{ width: 100 }} />
@@ -69,8 +70,8 @@ export default function Search({ onMenu }) {
 
       {!params && (
         <Empty title="Search everything you have collected">
-          Filters combine — text, author, media, likes — and stay inside your own
-          database.
+          X, Instagram and Facebook together. Filters combine — text, username,
+          media, likes — and stay inside your own database.
         </Empty>
       )}
       {results.loading && params && !results.data && <Loading label="Searching…" />}
@@ -79,6 +80,14 @@ export default function Search({ onMenu }) {
         <>
           <div className="feed-head">
             <h2>{fmtN(total)} result{total === 1 ? "" : "s"}</h2>
+            {total > 0 && (
+              <span className="muted" style={{ marginLeft: 8 }}>
+                {[["x", "X"], ["instagram", "Instagram"], ["facebook", "Facebook"]]
+                  .filter(([k]) => results.data.totals?.[k])
+                  .map(([k, n]) => `${n} ${fmtN(results.data.totals[k])}`)
+                  .join(" · ")}
+              </span>
+            )}
             {pages > 1 && (
               <span className="right">
                 <button className="btn btn-ghost btn-sm" disabled={page === 0}
@@ -93,7 +102,8 @@ export default function Search({ onMenu }) {
             <Empty title="Nothing matches">Loosen a filter and try again.</Empty>
           )}
           {results.data.rows.map((t) => (
-            <PostCard key={t.tweet_id} t={{ ...t, platform: "x" }} onPin={setPinTarget} />
+            <PostCard key={`${t.platform}:${t.tweet_id}`} t={{ ...t, platform: t.platform || "x" }}
+                      onPin={setPinTarget} />
           ))}
           {pinTarget && pid && (
             <CollectionPicker t={pinTarget} pid={pid} onClose={() => setPinTarget(null)} />

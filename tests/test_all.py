@@ -8216,6 +8216,104 @@ def test_watchlist_depth_controls(tmp):
        "along with whether the cadence is pinned, and the depth setting")
 
 
+def test_search_archive(tmp):
+    """
+    /api/search (2026-11-04): the Search page reads EVERY platform's archive
+    with one filter set. An Instagram username typed into it used to find
+    nothing, because the page only ever asked /api/tweets (X). Pins: an IG
+    handle finds its IG posts; a handle with underscores is literal text, not
+    LIKE wildcards; text/likes/media filters apply on every platform; X, IG
+    and FB merge newest-posted first with per-platform totals; project scope
+    holds; offset pages the merged list; a missing database is just zero.
+    """
+    import asyncio, store_ig, store_fb, web
+    import store as store_mod
+    import pathlib as _pl
+    root = _pl.Path(str(tmp))
+    with store_ig.Store(str(root / "ig_results.db")) as st:
+        st.add_source("Samvad", "user", "_samvad_news_", platform_id="11", project_id=7)
+        st.add_source("decoy", "user", "xsamvadxnewsx", platform_id="12", project_id=7)
+        st.add_source("other", "user", "_samvad_news_other", platform_id="13", project_id=9)
+        st.upsert_posts([{"pk": 500 + i, "code": f"s{i}", "taken_at": 3000 + i * 100,
+                          "username": "_samvad_news_", "user_pk": 11,
+                          "caption": f"flood relief {i}" if i % 2 == 0 else f"rally {i}",
+                          "media_type": 1, "like_count": i * 10,
+                          "thumbnail_url": f"https://cdn/{i}.jpg" if i else ""}
+                         for i in range(4)], "Samvad", project_id=7)
+        st.upsert_posts([{"pk": 600, "taken_at": 3050, "username": "xsamvadxnewsx",
+                          "user_pk": 12, "caption": "decoy"}], "decoy", project_id=7)
+        st.upsert_posts([{"pk": 700, "taken_at": 3060, "username": "_samvad_news_other",
+                          "user_pk": 13, "caption": "flood relief elsewhere"}],
+                        "other", project_id=9)
+    with store_fb.Store(str(root / "fb_results.db")) as st:
+        st.upsert({"post_id": "fb1", "page": "samvadnews", "created_ms": 3250 * 1000,
+                   "collected_ms": 3260 * 1000, "text": "flood relief camp",
+                   "like_count": 40, "project_id": 7})
+        st.db.commit()
+
+    db = str(root / "results.db")
+    async def seed():
+        st = store_mod.Store(db, False)
+        await st.open()
+        a = (await st.create_project("A"))["project_id"]
+        wl = await st.create_watchlist(a, "L")
+        await st.set_watchlist_members(wl["watchlist_id"], add=["samvad_x"])
+        sid = st.db.execute("SELECT stream_id FROM streams WHERE label = ?",
+                            (f"wl:{wl['watchlist_id']}:0",)).fetchone()["stream_id"]
+        st.db.execute(
+            "INSERT INTO tweets(tweet_id, source, created_ms, collected_at, collected_ms, "
+            "last_seen_at, lag_ms, author_username, text, like_count, is_retweet, media_urls) "
+            "VALUES(2001, 'result', ?, 'x', 1, 'x', 0, 'samvad_x', 'flood relief x', 99, 0, '[]')",
+            (3150 * 1000,))
+        st.db.execute("INSERT INTO tweet_hits(stream_id, tweet_id, first_seen_ms) VALUES(?, 2001, 1)", (sid,))
+        st.db.commit()
+        await st.close()
+        return a
+    xpid = asyncio.run(seed())
+
+    class Cfg:
+        pass
+    Cfg.root = root
+    Cfg.db_results = _pl.Path(db)
+    saved = web._CFG
+    web._CFG = Cfg()
+    try:
+        print("== /api/search ==")
+        r = web._search_archive({"author": "_samvad_news_", "project": "7"})
+        ok(r["totals"]["instagram"] == 4 and all(x["platform"] == "instagram" for x in r["rows"]),
+           f"an Instagram username finds its Instagram posts ({r['totals']})")
+        ok("xsamvadxnewsx" not in [x["author_username"] for x in r["rows"]],
+           "underscores in a handle are literal, not LIKE wildcards")
+        ok([x["tweet_id"] for x in r["rows"]] == ["503", "502", "501", "500"],
+           "newest posted first")
+        r = web._search_archive({"author": "https://www.instagram.com/_samvad_news_/", "project": 7})
+        ok(r["totals"]["instagram"] == 4, "a pasted profile URL works as the author")
+        r = web._search_archive({"author": "@_samvad_news_"})
+        ok(r["totals"]["instagram"] == 5, f"all projects: every project's matches ({r['totals']})")
+        r = web._search_archive({"q": "flood relief", "project": 7})
+        ok(r["totals"] == {"x": 0, "instagram": 2, "facebook": 1},
+           f"text filter across platforms, project-scoped ({r['totals']})")
+        r = web._search_archive({"q": "flood relief"})
+        ok(r["totals"] == {"x": 1, "instagram": 3, "facebook": 1}, f"all projects ({r['totals']})")
+        ok([x["platform"] for x in r["rows"]][:3] == ["facebook", "instagram", "x"],
+           f"platforms merged by posted time ({[(x['platform'], x['tweet_id']) for x in r['rows']]})")
+        r = web._search_archive({"q": "flood relief", "min_likes": "20"})
+        ok(r["totals"] == {"x": 1, "instagram": 1, "facebook": 1}, f"min likes on every platform ({r['totals']})")
+        r = web._search_archive({"author": "_samvad_news_", "project": 7, "has_media": "1"})
+        ok(r["totals"]["instagram"] == 3, "has media")
+        r = web._search_archive({"author": "_samvad_news_", "project": 7, "no_retweets": "1"})
+        ok(r["totals"]["instagram"] == 4, "no retweets excludes nothing on Instagram")
+        r = web._search_archive({"q": "flood relief", "limit": 2, "offset": 2})
+        ok(len(r["rows"]) == 2 and r["total"] == 5, "offset pages the merged list")
+        r = web._search_archive({"q": "flood relief", "project": xpid})
+        ok(r["totals"]["x"] == 1, "X still project-scoped through its streams")
+        (root / "fb_results.db").unlink()
+        r = web._search_archive({"q": "flood relief"})
+        ok(r["totals"]["facebook"] == 0 and "errors" not in r, "a missing database is just zero")
+    finally:
+        web._CFG = saved
+
+
 def main():
     root = HERE / ".tmp"
     cwd = os.getcwd()
@@ -8266,6 +8364,7 @@ def main():
         section("instagram profile pictures (from the post's own user object, never a fetch)")
         test_ig_avatar(fresh("igav"))
         test_ig_as_stream(fresh("igstream"))
+        test_search_archive(fresh("search"))
         section("instagram rhythm (phone-time sessions, one visit at a time)")
         test_ig_rhythm(fresh("igrhythm"))
         section("instagram: a stop decision stands; shared stores are WAL")
