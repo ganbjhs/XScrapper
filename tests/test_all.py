@@ -1337,6 +1337,110 @@ def test_lists():
 
 
 # ==========================================================================
+# X: a handle search hides is read from its profile (2026-11-04)
+# ==========================================================================
+
+def test_x_search_dark_profile_fallback():
+    print()
+    print("== X: search shows nothing for one handle -> its profile timeline ==")
+    from fixtures import _entry, mk_tweet, mk_user
+    import engine as E
+
+    user = mk_user(77, "modinama2029")
+    new1, new2, thread_id = id_at(-60_000), id_at(-120_000), id_at(-90_000)
+    pinned = id_at(-40 * 86_400_000)          # an old pinned post
+    profile = {"data": {"user": {"result": {"timeline": {"timeline": {"instructions": [
+        {"type": "TimelinePinEntry", "entry": _entry(pinned, mk_tweet(pinned, 77, "pinned"), user)},
+        {"type": "TimelineAddEntries", "entries": [
+            _entry(new1, mk_tweet(new1, 77, "newest"), user),
+            {"entryId": "profile-conversation-1", "content": {"items": [
+                {"entryId": f"profile-conversation-1-tweet-{thread_id}",
+                 "item": {"itemContent": {"tweet_results": {"result": {
+                     **mk_tweet(thread_id, 77, "thread"),
+                     "core": {"user_results": {"result": user}}}}}}}]}},
+            _entry(new2, mk_tweet(new2, 77, "older"), user),
+            {"entryId": "cursor-bottom-0", "content": {"value": "C2", "cursorType": "Bottom"}},
+        ]}]}}}}}}
+
+    calls = []
+
+    class U:
+        id = 77
+
+    class FakeAPI:
+        def __init__(self, search_hits):
+            self.search_hits = search_hits
+
+        async def search_raw(self, q, **kw):
+            calls.append(("search", q))
+            if self.search_hits:
+                yield FakeResponse(search_payload(cursor=None, include_traps=False))
+
+        async def user_by_login(self, login):
+            calls.append(("lookup", login))
+            return U()
+
+        async def user_tweets_raw(self, uid, **kw):
+            calls.append(("profile", uid))
+            yield FakeResponse(profile)
+
+    async def collect(eng, query):
+        class S:
+            list_id = ""
+        S.query = query
+        pages = []
+        async with aclosing(eng.pages_for(S(), tab="Latest", page_size=20, max_pages=3)) as g:
+            async for pg in g:
+                pages.append(pg)
+        return pages
+
+    ok(E.single_from_handle("(from:ModiNama2029)") == "ModiNama2029", "(from:x) is one handle")
+    ok(E.single_from_handle("(from:a OR from:b)") is None, "two handles are left to search")
+    ok(E.single_from_handle("from:a min_faves:5") is None, "a query with operators is left to search")
+
+    eng = E.Engine(FakeAPI(search_hits=False))
+    pages = asyncio.run(collect(eng, "(from:ModiNama2029)"))
+    ids = pages[0].result_ids if pages else []
+    ok(len(pages) == 1 and [c[0] for c in calls] == ["search", "lookup", "profile"],
+       f"empty search falls back to the profile ({calls})")
+    ok(ids == [new1, thread_id, new2],
+       f"profile results are newest-first, thread item included ({ids})")
+    ok(pinned not in ids, "the old pinned post is NOT a result (it would freeze the watermark)")
+    ok(all(i in pages[0].tweets for i in ids), "every profile result parsed into a Tweet")
+
+    calls.clear()
+    asyncio.run(collect(eng, "(from:ModiNama2029)"))
+    ok([c[0] for c in calls] == ["profile"],
+       f"next poll goes straight to the profile, id cached ({calls})")
+
+    eng._search_dark["modinama2029"] = 0      # recheck window over
+    calls.clear()
+    asyncio.run(collect(eng, "(from:ModiNama2029)"))
+    ok([c[0] for c in calls] == ["search", "profile"], f"search is re-tried after the window ({calls})")
+
+    calls.clear()
+    eng2 = E.Engine(FakeAPI(search_hits=True))
+    pages = asyncio.run(collect(eng2, "(from:ModiNama2029)"))
+    ok([c[0] for c in calls] == ["search"] and pages,
+       f"a handle search still shows never touches the profile ({calls})")
+
+    calls.clear()
+    eng3 = E.Engine(FakeAPI(search_hits=False))
+    asyncio.run(collect(eng3, "(from:a OR from:b)"))
+    ok([c[0] for c in calls] == ["search"], "a multi-handle stream never falls back")
+
+    calls.clear()
+    async def resumed():
+        class S:
+            query, list_id = "(from:ModiNama2029)", ""
+        async with aclosing(eng3.pages_for(S(), tab="Latest", cursor="X")) as g:
+            async for _ in g:
+                pass
+    asyncio.run(resumed())
+    ok([c[0] for c in calls] == ["search"], "a resumed (cursor) walk stays on search")
+
+
+# ==========================================================================
 # account status flags
 # ==========================================================================
 
@@ -8396,6 +8500,7 @@ def main():
         test_snowflake()
         test_normalize()
         test_config()
+        test_x_search_dark_profile_fallback()
         test_lists()
         test_account_flags()
         test_auth()

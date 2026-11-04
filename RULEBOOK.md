@@ -1381,6 +1381,28 @@ streamed login is dead; the phone-shaped one (above) is the third door.
   class of bug, not "no new posts" — check the stored posts for one old post
   among recent ones (the pinned one).
 
+### An X handle that search hides is read from its profile (2026-11-04)
+
+- X can drop a live account from search: @ModiNama2029 kept posting, but
+  `from:modinama2029` on x.com said "No results". An empty search makes
+  twscrape yield ZERO pages, which the collector records as
+  `no_account_or_abort`, so Viral Content (project 3) went silent for two
+  days while every account card read healthy.
+- So: a single-handle stream (`(from:x)` and nothing else) whose search
+  comes back empty falls back to that handle's profile timeline (UserTweets,
+  its own rate-limit queue) in `Engine.pages_for`. Once the profile has
+  worked, search is skipped for that handle for `SEARCH_DARK_RECHECK_S` (6h)
+  and then tried again, so the stream goes back to search when X lifts it.
+  Each fallback writes a warn line to the Activity Log.
+- The profile's pinned post (TimelinePinEntry) is never a result, for the
+  same reason as the Instagram rule above: it would be the page minimum and
+  stop every poll at the watermark.
+- Multi-handle queries, queries with extra operators and resumed (cursor)
+  walks stay on search. A hidden member of a multi-handle watchlist is
+  still silently lost; that is open.
+- One stream reading `no_account_or_abort` while the others collect is this
+  class of problem, not a dry pool. Check the handle's search on x.com.
+
 ### A quarantined Instagram account is not used, and its sources move (2026-10-02)
 
 - `collect_ig.collectors()` benches an account whose POOL status is

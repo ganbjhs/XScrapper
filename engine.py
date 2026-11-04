@@ -380,6 +380,17 @@ _ENTRY_RE = re.compile(r"^tweet-(\d+)$")
 # lookup is the fallback if X reshapes the response.
 _TIMELINE_PATH = ("data", "search_by_raw_query", "search_timeline", "timeline", "instructions")
 
+# Where UserTweets (a profile's own timeline) puts it. Used only when a
+# single-handle search comes back empty -- see Engine._search_or_profile.
+_USER_TIMELINE_PATHS = (
+    ("data", "user", "result", "timeline", "timeline", "instructions"),
+    ("data", "user", "result", "timeline_v2", "timeline", "instructions"),
+)
+
+# A self-thread on a profile arrives as a module whose items are
+# "profile-conversation-<n>-tweet-<id>"; each item is one tweet of the thread.
+_MODULE_ITEM_RE = re.compile(r"-tweet-(\d+)$")
+
 
 @dataclass
 class Page:
@@ -435,14 +446,51 @@ class Page:
 # response parsing
 # --------------------------------------------------------------------------
 
+def _walk(obj, path):
+    node = obj
+    for key in path:
+        if not isinstance(node, dict):
+            return None
+        node = node.get(key)
+    return node
+
+
+def _user_timeline_entries(instructions: list) -> list[dict]:
+    """
+    A profile timeline's entries in server order, WITHOUT the pinned post.
+
+    The pinned post (TimelinePinEntry) sits above everything and is usually
+    old. Kept, it would be the page minimum on every poll and stop the walk at
+    the watermark before reaching anything new -- the same freeze Instagram
+    had with pinned posts (2026-11-04). It is skipped here; if it was ever new
+    it was collected then.
+    """
+    entries: list[dict] = []
+    for ins in instructions:
+        if not isinstance(ins, dict) or ins.get("type") != "TimelineAddEntries":
+            continue
+        for entry in ins.get("entries") or []:
+            if not isinstance(entry, dict):
+                continue
+            items = (entry.get("content") or {}).get("items")
+            if isinstance(items, list):
+                for it in items:
+                    m = _MODULE_ITEM_RE.search(str((it or {}).get("entryId") or ""))
+                    if m:
+                        entries.append({**it, "entryId": f"tweet-{m.group(1)}"})
+            else:
+                entries.append(entry)
+    return entries
+
+
 def _timeline_entries(obj: dict) -> list[dict]:
     """Timeline entries in server order."""
-    node = obj
-    for key in _TIMELINE_PATH:
-        if not isinstance(node, dict):
-            node = None
-            break
-        node = node.get(key)
+    node = _walk(obj, _TIMELINE_PATH)
+    if not isinstance(node, list):
+        for path in _USER_TIMELINE_PATHS:
+            user_node = _walk(obj, path)
+            if isinstance(user_node, list):
+                return _user_timeline_entries(user_node)
 
     entries: list[dict] = []
     if isinstance(node, list):
@@ -579,11 +627,43 @@ def parse_detail(rep, tweet_id: int) -> Detail:
 # engine
 # --------------------------------------------------------------------------
 
+# How long a handle that search hides goes straight to its profile before
+# search is tried again.
+SEARCH_DARK_RECHECK_S = 6 * 3600
+
+# "(from:handle)" / "from:@handle" and nothing else. A query with more in it
+# (other handles, operators) is left to search alone.
+_FROM_ONE_RE = re.compile(r"^\(?\s*from:@?([A-Za-z0-9_]{1,15})\s*\)?$", re.I)
+
+
+def single_from_handle(query: str) -> str | None:
+    m = _FROM_ONE_RE.match((query or "").strip())
+    return m.group(1) if m else None
+
+
+def _note_x(message: str, level: str | None = None) -> None:
+    """journalctl + the dashboard's Activity Log. Never raises."""
+    try:
+        print(message, flush=True)
+    except Exception:
+        pass
+    try:
+        import activity_log
+        activity_log.log_event("x", message, level=level)
+    except Exception:
+        pass
+
+
 class Engine:
     """Thin wrapper over twscrape's API. Swap this to change the transport."""
 
     def __init__(self, api):
         self.api = api
+        # handle (lower) -> X user id, for the profile fallback.
+        self._uids: dict[str, int] = {}
+        # handle (lower) -> epoch seconds until which search is assumed to
+        # show nothing for it, so polls go straight to the profile.
+        self._search_dark: dict[str, float] = {}
 
     async def search_pages(
         self,
@@ -700,6 +780,87 @@ class Engine:
                           note="no account available (pool empty, locked, or request aborted)")
         return parse_detail(rep, tid)
 
+    async def user_pages(
+        self,
+        user_id: int | str,
+        *,
+        page_size: int = 20,
+        max_pages: int = 0,
+        limit: int = -1,
+        cursor: str | None = None,
+    ):
+        """
+        Yield Page objects for one account's own profile timeline (UserTweets).
+
+        Same Page shape as search_pages/list_pages, on its own rate-limit
+        queue ("UserTweets"). The pinned post is dropped by the parser.
+        As with search_pages, the caller MUST wrap this in aclosing.
+        """
+        kv = {"count": page_size}
+        if cursor:
+            kv["cursor"] = cursor
+        page_no = 0
+        async with aclosing(
+            self.api.user_tweets_raw(int(user_id), limit=limit, kv=kv)
+        ) as gen:
+            async for rep in gen:
+                page_no += 1
+                yield parse_page(rep, page_no)
+                if max_pages and page_no >= max_pages:
+                    return
+
+    async def _user_id(self, handle: str) -> int | None:
+        key = handle.lower()
+        if key not in self._uids:
+            user = await self.api.user_by_login(handle)
+            if user is None or not getattr(user, "id", None):
+                return None
+            self._uids[key] = int(user.id)
+        return self._uids[key]
+
+    async def _search_or_profile(self, query: str, handle: str, **kw):
+        """
+        Search first; if X search shows NOTHING for this one handle, read the
+        handle's profile timeline instead.
+
+        Why (2026-11-04): @ModiNama2029 kept posting, but X stopped returning
+        it in search -- even `from:modinama2029` on x.com said "No results".
+        A search with no results makes twscrape yield zero pages, which the
+        collector records as no_account_or_abort, so the project went silent
+        for two days while every account looked healthy. A profile timeline
+        is not affected by search visibility.
+
+        Once the profile has worked, search is skipped for that handle for
+        SEARCH_DARK_RECHECK_S and then tried again, so the stream returns to
+        plain search by itself when X lifts it. If the pool is genuinely dry
+        the fallback gets nothing either and the poll still reads as starved.
+        """
+        key = handle.lower()
+        tab = kw.pop("tab", "Latest")
+        skip_search = self._search_dark.get(key, 0) > time.time()
+        if not skip_search:
+            got = 0
+            async with aclosing(self.search_pages(query, tab=tab, **kw)) as gen:
+                async for page in gen:
+                    got += 1
+                    yield page
+            if got:
+                self._search_dark.pop(key, None)
+                return
+        uid = await self._user_id(handle)
+        if uid is None:
+            return
+        got = 0
+        async with aclosing(self.user_pages(uid, **kw)) as gen:
+            async for page in gen:
+                got += 1
+                yield page
+        if got and not skip_search:
+            self._search_dark[key] = time.time() + SEARCH_DARK_RECHECK_S
+            _note_x(f"[{handle}] X search shows nothing for @{handle} -- "
+                    f"reading its profile timeline instead (search re-checked "
+                    f"every {SEARCH_DARK_RECHECK_S // 3600}h)", level="warn")
+
     def pages_for(self, stream, **kw):
         """
         Dispatch a stream to the right generator.
@@ -711,6 +872,12 @@ class Engine:
         if getattr(stream, "list_id", None):
             kw.pop("tab", None)          # a list timeline has no product tab
             return self.list_pages(stream.list_id, **kw)
+        # A one-handle search ("from:x") falls back to that handle's profile
+        # when search hides it. Not for a resumed walk: a search cursor means
+        # nothing to a profile timeline.
+        handle = single_from_handle(getattr(stream, "query", "") or "")
+        if handle and not kw.get("cursor"):
+            return self._search_or_profile(stream.query, handle, **kw)
         return self.search_pages(stream.query, **kw)
 
     async def search(self, query: str, limit: int = 50, tab: str = "Latest") -> list[Tweet]:
