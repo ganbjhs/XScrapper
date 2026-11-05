@@ -700,6 +700,9 @@ function AccountDetail({ a, live, problems, onClose }) {
 // A managed (pool) account card — full controls
 
 function AccountCard({ a, live, onChanged }) {
+  // live === undefined → that platform's live sessions have not arrived yet
+  // (first open). Say "…" instead of reading the gap as "never" / "not ok".
+  const pending = live === undefined;
   const [msg, setMsg] = useState("");
   const [modal, setModal] = useState(null);
   const s = STATUS[a.status] || STATUS.backup;
@@ -752,16 +755,17 @@ function AccountCard({ a, live, onChanged }) {
   const exitCc = exitCountry(live);
   const en = live?.exit_now;
   const countryClash = !!(phoneCc && exitCc && phoneCc !== exitCc);
-  const [sw, st] = sessionWord(live);
+  const [sw, st] = pending ? ["…", ""] : sessionWord(live);
   const openDetail = () => setModal("detail");
   // Every reason this card is not fine, as sentences — shown in the detail only.
   const problems = [];
-  if (!live) problems.push({ label: "session", text: "never signed in on this server" });
+  if (pending) { /* nothing known yet */ }
+  else if (!live) problems.push({ label: "session", text: "never signed in on this server" });
   else if (live.checkpoint_at) problems.push({ label: "session", tone: "crit",
     text: `checkpoint — ${a.platform === "ig" ? "Instagram" : "the platform"} wants a human` });
   else if (!live.active && !live.error) problems.push({ label: "session", tone: "crit", text: "signed in once, not working now" });
-  if (live?.error) problems.push({ label: "session error", tone: "crit", text: live.error });
-  if (a.health && a.health !== live?.error) problems.push({ label: "health", tone: "crit", text: a.health });
+  if (!pending && live?.error) problems.push({ label: "session error", tone: "crit", text: live.error });
+  if (!pending && a.health && a.health !== live?.error) problems.push({ label: "health", tone: "crit", text: a.health });
   if (!a.has_proxy) problems.push({ label: "proxy", tone: "crit", text: "no proxy — requests would leave from the server's own address" });
   if (countryClash) problems.push({ label: "country",
     text: `phone is in ${live.identity.country_name || phoneCc}, proxy exits in ${exitCc} — New phone to match, or move the proxy` });
@@ -782,7 +786,8 @@ function AccountCard({ a, live, onChanged }) {
       </div>
 
       <div className="kv"><span>login</span><b>{a.login}</b></div>
-      <div className="kv"><span>session</span><Word text={sw} tone={st} onClick={openDetail} /></div>
+      <div className="kv"><span>session</span>
+        {pending ? <b>…</b> : <Word text={sw} tone={st} onClick={openDetail} />}</div>
       {isIg && live && (
         <div className="kv"><span>collecting</span>
           <b className={live.active && !live.checkpoint_at ? "st-good" : ""}>
@@ -794,7 +799,8 @@ function AccountCard({ a, live, onChanged }) {
           : <b>{isIg && en?.country ? en.country : (a.proxy_id || "set")}</b>}
       </div>
       <div className="kv"><span>health</span>
-        <Word text={problems.length ? "not ok" : "ok"} tone={problems.length ? "crit" : "good"} onClick={openDetail} /></div>
+        {pending ? <b>…</b>
+          : <Word text={problems.length ? "not ok" : "ok"} tone={problems.length ? "crit" : "good"} onClick={openDetail} />}</div>
       <div className="kv"><span>last success</span>
         <b>{a.last_success_at ? fmtAgo(a.last_success_at) : "never"}</b></div>
       {msg && <div className="kv"><span>note</span><b>{msg}</b></div>}
@@ -1196,9 +1202,15 @@ export default function Accounts({ onMenu }) {
       : p === "ig" ? (liveIg.data?.accounts || [])
       : p === "fb" ? fbLive() : [];
 
+  // A platform's live list counts as known once its first answer (or error)
+  // is in. Before that, liveFor() returns undefined so cards show "…".
+  const liveSrc = (p) => (p === "x" ? liveX : p === "ig" ? liveIg : p === "fb" ? liveFb : null);
+  const livePending = (p) => { const s = liveSrc(p); return !!s && s.loading && !s.data && !s.error; };
+
   // Match a managed account to its live session.
   const norm = (v) => String(v || "").trim().toLowerCase().replace(/^@/, "");
   const liveFor = (a) => {
+    if (livePending(a.platform)) return undefined;
     const label = norm(a.label), login = norm(a.login);
     const rows = liveList(a.platform);
     return rows.find((r) => login && norm(r.username) === login)
@@ -1288,7 +1300,7 @@ export default function Accounts({ onMenu }) {
                 a human is said underneath, in words, only when it is true. */}
             <div className="stat">
               <div className="k">Signed-in sessions</div>
-              <div className="v">{liveOn}</div>
+              <div className="v">{PLATS.some(([p]) => livePending(p)) ? "…" : liveOn}</div>
               <div className={`d ${attention ? "st-warn" : ""}`}>
                 {attention
                   ? `live right now · ${attention} account${attention === 1 ? "" : "s"} need a login`

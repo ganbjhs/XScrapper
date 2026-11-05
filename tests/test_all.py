@@ -8384,40 +8384,60 @@ def test_ig_pinned_posts_do_not_freeze_a_source(tmp):
 
 def test_search_archive(tmp):
     """
-    /api/search (2026-11-04): the Search page reads EVERY platform's archive
-    with one filter set. An Instagram username typed into it used to find
-    nothing, because the page only ever asked /api/tweets (X). Pins: an IG
-    handle finds its IG posts; a handle with underscores is literal text, not
-    LIKE wildcards; text/likes/media filters apply on every platform; X, IG
-    and FB merge newest-posted first with per-platform totals; project scope
-    holds; offset pages the merged list; a missing database is just zero.
+    /api/search (deep search, 2026-11-05). Pins: FTS drives (no LIKE); the
+    IG / FB indexes are created once and kept by triggers (insert, text
+    update, delete — and a metric update leaves the index alone); the boxes;
+    the precise check (#bihar is not #biharelection nor the word bihar,
+    from:/mentioning are exact handles, Hindi is whole words — also on X,
+    whose index splits Devanagari); IST day ranges (X via the snowflake id);
+    platform-only filters only when that platform is chosen; a filter a
+    platform cannot answer leaves the platform out with a reason; scope is
+    closed by default; keyset paging walks every match once; the caps and
+    the deadline return partial instead of hanging; CSV export; and the
+    endpoint is in no API-key path set.
     """
-    import asyncio, store_ig, store_fb, web
+    import asyncio, datetime, store_ig, store_fb, web
+    import search as S
     import store as store_mod
     import pathlib as _pl
     root = _pl.Path(str(tmp))
+    IST = S.IST
+
+    def ist_ms(y, m, d, hh=12, mm=0):
+        return int(datetime.datetime(y, m, d, hh, mm, tzinfo=IST).timestamp() * 1000)
+
+    def snow(ms, n=0):
+        return ((ms - S.X_EPOCH_MS) << 22) + n
+
+    # ---------------- Instagram
     with store_ig.Store(str(root / "ig_results.db")) as st:
         st.add_source("Samvad", "user", "_samvad_news_", platform_id="11", project_id=7)
         st.add_source("decoy", "user", "xsamvadxnewsx", platform_id="12", project_id=7)
         st.add_source("other", "user", "_samvad_news_other", platform_id="13", project_id=9)
-        st.upsert_posts([{"pk": 500 + i, "code": f"s{i}", "taken_at": 3000 + i * 100,
-                          "username": "_samvad_news_", "user_pk": 11,
-                          "caption": f"flood relief {i}" if i % 2 == 0 else f"rally {i}",
-                          "media_type": 1, "like_count": i * 10,
-                          "thumbnail_url": f"https://cdn/{i}.jpg" if i else ""}
+        base = ist_ms(2026, 11, 1) // 1000
+        caps = ["flood relief #bihar", "rally #biharelection", "बिहार चुनाव राहुल",
+                "flood relief camp at patna @CMOfficeBihar"]
+        st.upsert_posts([{"pk": 500 + i, "code": f"s{i}", "taken_at": base + i * 3600,
+                          "username": "_samvad_news_", "user_pk": 11, "caption": caps[i],
+                          "media_type": [1, 2, 8, 2][i], "product_type": "clips" if i == 3 else "",
+                          "like_count": i * 10, "play_count": 100 if i in (1, 3) else None,
+                          "thumbnail_url": f"https://cdn/{i}.jpg"}
                          for i in range(4)], "Samvad", project_id=7)
-        st.upsert_posts([{"pk": 600, "taken_at": 3050, "username": "xsamvadxnewsx",
-                          "user_pk": 12, "caption": "decoy"}], "decoy", project_id=7)
-        st.upsert_posts([{"pk": 700, "taken_at": 3060, "username": "_samvad_news_other",
+        st.upsert_posts([{"pk": 600, "taken_at": base + 50, "username": "xsamvadxnewsx",
+                          "user_pk": 12, "caption": "flood relief decoy"}], "decoy", project_id=7)
+        st.upsert_posts([{"pk": 700, "taken_at": base + 60, "username": "_samvad_news_other",
                           "user_pk": 13, "caption": "flood relief elsewhere"}],
                         "other", project_id=9)
+    # ---------------- Facebook
     with store_fb.Store(str(root / "fb_results.db")) as st:
-        st.upsert({"post_id": "fb1", "page": "samvadnews", "created_ms": 3250 * 1000,
-                   "collected_ms": 3260 * 1000, "text": "flood relief camp",
-                   "like_count": 40, "project_id": 7})
+        st.upsert({"post_id": "fb1", "page": "samvadnews", "created_ms": ist_ms(2026, 11, 2),
+                   "collected_ms": ist_ms(2026, 11, 2), "text": "flood relief camp #Bihar",
+                   "like_count": 40, "share_count": 7, "project_id": 7})
         st.db.commit()
-
+    # ---------------- X
     db = str(root / "results.db")
+    x_ms = ist_ms(2026, 11, 3, 0, 10)        # 00:10 IST on the 3rd = the 2nd in UTC
+
     async def seed():
         st = store_mod.Store(db, False)
         await st.open()
@@ -8426,12 +8446,23 @@ def test_search_archive(tmp):
         await st.set_watchlist_members(wl["watchlist_id"], add=["samvad_x"])
         sid = st.db.execute("SELECT stream_id FROM streams WHERE label = ?",
                             (f"wl:{wl['watchlist_id']}:0",)).fetchone()["stream_id"]
-        st.db.execute(
-            "INSERT INTO tweets(tweet_id, source, created_ms, collected_at, collected_ms, "
-            "last_seen_at, lag_ms, author_username, text, like_count, is_retweet, media_urls) "
-            "VALUES(2001, 'result', ?, 'x', 1, 'x', 0, 'samvad_x', 'flood relief x', 99, 0, '[]')",
-            (3150 * 1000,))
-        st.db.execute("INSERT INTO tweet_hits(stream_id, tweet_id, first_seen_ms) VALUES(?, 2001, 1)", (sid,))
+        rows = [
+            (snow(x_ms, 1), "flood relief x #bihar", '["bihar"]', '[]', 99, 0, 0, 0, "en", None),
+            (snow(x_ms, 2), "राहुल गांधी बिहार में", '[]', '[]', 5, 0, 1, 0, "hi", None),
+            (snow(x_ms, 3), "बहार आई", '[]', '[]', 5, 0, 0, 0, "hi", None),
+            (snow(x_ms, 4), "RT @PMOIndia: flood relief", '[]', '["PMOIndia"]', 1, 1, 0, 0, "en", None),
+            (snow(x_ms, 5), "verified flood relief", '[]', '[]', 1, 0, 0, 0, "en",
+             '{"user": {"blue": true}}'),
+        ]
+        for tid, text, tags, ments, likes, rt, rp, qt, lang, raw in rows:
+            st.db.execute(
+                "INSERT INTO tweets(tweet_id, source, created_ms, collected_at, collected_ms, "
+                "last_seen_at, lag_ms, author_username, text, hashtags, mentions, like_count, "
+                "is_retweet, is_reply, is_quote, lang, media_urls, urls, raw_json) "
+                "VALUES(?, 'result', ?, 'x', 1, 'x', 0, 'samvad_x', ?, ?, ?, ?, ?, ?, ?, ?, '[]', '[]', ?)",
+                (tid, x_ms, text, tags, ments, likes, rt, rp, qt, lang, raw))
+            st.db.execute("INSERT INTO tweet_hits(stream_id, tweet_id, first_seen_ms) "
+                          "VALUES(?, ?, 1)", (sid, tid))
         st.db.commit()
         await st.close()
         return a
@@ -8441,43 +8472,192 @@ def test_search_archive(tmp):
         pass
     Cfg.root = root
     Cfg.db_results = _pl.Path(db)
-    saved = web._CFG
+    saved, saved_ready = web._CFG, dict(S._FTS_READY)
     web._CFG = Cfg()
+    S._FTS_READY.clear()
+
+    def srch(**p):
+        return web._search_archive({k: str(v) for k, v in p.items()})
+
+    def ids(r):
+        return [(x["platform"], x["tweet_id"]) for x in r["rows"]]
+
     try:
-        print("== /api/search ==")
-        r = web._search_archive({"author": "_samvad_news_", "project": "7"})
-        ok(r["totals"]["instagram"] == 4 and all(x["platform"] == "instagram" for x in r["rows"]),
-           f"an Instagram username finds its Instagram posts ({r['totals']})")
-        ok("xsamvadxnewsx" not in [x["author_username"] for x in r["rows"]],
-           "underscores in a handle are literal, not LIKE wildcards")
-        ok([x["tweet_id"] for x in r["rows"]] == ["503", "502", "501", "500"],
-           "newest posted first")
-        r = web._search_archive({"author": "https://www.instagram.com/_samvad_news_/", "project": 7})
-        ok(r["totals"]["instagram"] == 4, "a pasted profile URL works as the author")
-        r = web._search_archive({"author": "@_samvad_news_"})
-        ok(r["totals"]["instagram"] == 5, f"all projects: every project's matches ({r['totals']})")
-        r = web._search_archive({"q": "flood relief", "project": 7})
-        ok(r["totals"] == {"x": 0, "instagram": 2, "facebook": 1},
-           f"text filter across platforms, project-scoped ({r['totals']})")
-        r = web._search_archive({"q": "flood relief"})
-        ok(r["totals"] == {"x": 1, "instagram": 3, "facebook": 1}, f"all projects ({r['totals']})")
-        ok([x["platform"] for x in r["rows"]][:3] == ["facebook", "instagram", "x"],
-           f"platforms merged by posted time ({[(x['platform'], x['tweet_id']) for x in r['rows']]})")
-        r = web._search_archive({"q": "flood relief", "min_likes": "20"})
-        ok(r["totals"] == {"x": 1, "instagram": 1, "facebook": 1}, f"min likes on every platform ({r['totals']})")
-        r = web._search_archive({"author": "_samvad_news_", "project": 7, "has_media": "1"})
-        ok(r["totals"]["instagram"] == 3, "has media")
-        r = web._search_archive({"author": "_samvad_news_", "project": 7, "no_retweets": "1"})
-        ok(r["totals"]["instagram"] == 4, "no retweets excludes nothing on Instagram")
-        r = web._search_archive({"q": "flood relief", "limit": 2, "offset": 2})
-        ok(len(r["rows"]) == 2 and r["total"] == 5, "offset pages the merged list")
-        r = web._search_archive({"q": "flood relief", "project": xpid})
-        ok(r["totals"]["x"] == 1, "X still project-scoped through its streams")
+        print("== /api/search (deep search) ==")
+        # Closed by default.
+        try:
+            web._search_archive({"all": "flood"})
+            ok(False, "no project and no scope=all is refused")
+        except S.BadRequest:
+            ok(True, "no project and no scope=all is refused (400)")
+        ok("/api/search" not in web.API_KEY_PATHS, "/api/search is in no API-key path set")
+
+        r = srch(all="flood relief", scope="all")
+        ok(r["counts"]["instagram"]["n"] == 4 and r["counts"]["facebook"]["n"] == 1
+           and r["counts"]["x"]["n"] == 3,
+           f"all of these words, every platform, all projects ({r['counts']})")
+        ok([x["platform"] for x in r["rows"]][0] == "x",
+           f"merged newest-posted first ({ids(r)})")
+
+        # The indexes exist, with triggers, and stay current.
+        import sqlite3
+        con = sqlite3.connect(str(root / "ig_results.db"))
+        trig = {n: s for n, s in con.execute(
+            "SELECT name, sql FROM sqlite_master WHERE type='trigger' AND name LIKE 'ig_posts_fts%'")}
+        ok(set(trig) == {"ig_posts_fts_ai", "ig_posts_fts_ad", "ig_posts_fts_au"}
+           and "WHEN" in trig["ig_posts_fts_au"], "Instagram index kept by triggers; updates gated by WHEN")
+        con.execute("UPDATE posts SET like_count = 999 WHERE pk = 500")
+        con.execute("UPDATE posts SET caption = 'cyclone warning' WHERE pk = 502")
+        con.execute("INSERT INTO posts(pk, taken_at, username, caption, collected_at, project_id) "
+                    "VALUES(800, ?, '_samvad_news_', 'cyclone again', 1, 7)", (base + 9000,))
+        con.execute("INSERT INTO posts(pk, taken_at, username, caption, collected_at, project_id) "
+                    "VALUES(801, ?, '_samvad_news_', 'राहुल गांधी पटना में', 1, 7)", (base + 9500,))
+        con.execute("DELETE FROM posts WHERE pk = 600")
+        con.commit()
+        con.close()
+        r = srch(all="cyclone", project=7, platform="instagram")
+        ok(sorted(x["tweet_id"] for x in r["rows"]) == ["502", "800"],
+           f"index follows an insert and a caption edit ({ids(r)})")
+        r = srch(all="decoy", scope="all", platform="instagram")
+        ok(r["rows"] == [], "index follows a delete")
+        con = sqlite3.connect(str(root / "fb_results.db"))
+        fbsql = con.execute("SELECT sql FROM sqlite_master WHERE name='fb_posts_fts'").fetchone()[0]
+        ok("post_id UNINDEXED" in fbsql, "Facebook index keyed by post_id, its own copy")
+        con.execute("UPDATE posts SET text = 'flood relief camp #Bihar day two' WHERE post_id='fb1'")
+        con.commit()
+        con.close()
+        r = srch(phrase="day two", project=7, platform="facebook")
+        ok(ids(r) == [("facebook", "fb1")], "Facebook index follows a text edit")
+
+        # Precise checks.
+        r = srch(tags="#bihar", scope="all")
+        got = set(ids(r))
+        ok(("instagram", "500") in got and ("instagram", "501") not in got
+           and ("facebook", "fb1") in got and ("x", str(snow(x_ms, 1))) in got
+           and ("x", str(snow(x_ms, 2))) not in got,
+           f"#bihar: not #biharelection, not the word बिहार; case-insensitive ({sorted(got)})")
+        r = srch(**{"from": "_samvad_news_", "scope": "all", "platform": "instagram"})
+        ok(all(x["author_username"] == "_samvad_news_" for x in r["rows"]) and len(r["rows"]) == 6,
+           "from: is the exact handle (no prefix, no other account)")
+        r = srch(**{"from": "https://www.instagram.com/_samvad_news_/", "project": 7,
+                    "platform": "instagram"})
+        ok(len(r["rows"]) == 6, "a pasted profile URL works in From")
+        r = srch(mention="cmofficebihar", scope="all")
+        ok(ids(r) == [("instagram", "503")], "mentioning: exact handle, case-insensitive")
+        r = srch(mention="pmoindia", scope="all", platform="x")
+        ok(ids(r) == [("x", str(snow(x_ms, 4)))], "mentioning on X uses the stored mentions")
+        r = srch(all="बिहार", scope="all", platform="x")
+        ok(ids(r) == [("x", str(snow(x_ms, 2)))],
+           f"Hindi on X: बिहार, not बहार (index splits it, precise check fixes it) ({ids(r)})")
+        r = srch(all="राहु", scope="all")
+        ok(r["rows"] == [], "Hindi: राहु does not match राहुल")
+        r = srch(all="राहुल", scope="all", platform="instagram")
+        ok(ids(r) == [("instagram", "801")], f"Hindi on Instagram: whole words ({ids(r)})")
+        r = srch(phrase="राहुल गांधी", scope="all")
+        ok(set(ids(r)) == {("instagram", "801"), ("x", str(snow(x_ms, 2)))},
+           "Hindi exact phrase on X and Instagram")
+        r = srch(any="cyclone warning, patna", project=7, platform="instagram")
+        ok(sorted(x["tweet_id"] for x in r["rows"]) == ["502", "503"],
+           "any of these: a multi-word item stays a phrase")
+        r = srch(any="warning cyclone", project=7, platform="instagram")
+        ok(r["rows"] == [], "…so its words in another order do not match")
+        r = srch(all="flood", none="camp, RT", scope="all")
+        ok(("facebook", "fb1") not in set(ids(r)) and ("x", str(snow(x_ms, 4))) not in set(ids(r)),
+           "none of these")
+
+        # Filters.
+        r = srch(all="flood relief", scope="all", min_likes=20)
+        ok(set(ids(r)) == {("x", str(snow(x_ms, 1))), ("instagram", "500"), ("instagram", "503"),
+                           ("facebook", "fb1")},
+           f"min likes on every platform ({ids(r)})")
+        r = srch(all="flood", scope="all", min_views=50)
+        ok("facebook" not in r["counts"] and any("Facebook" in n for n in r["notes"]),
+           f"Facebook has no views: left out, with the reason ({r['notes']})")
+        r = srch(all="flood", scope="all", no_reposts=1)
+        ok(("x", str(snow(x_ms, 4))) not in set(ids(r)), "hide reposts")
+        r = srch(scope="all", platform="x", lang="hi")
+        ok(len(r["rows"]) == 2, "X-only: language (no text box needed)")
+        r = srch(scope="all", lang="hi", all="flood")
+        ok(len([1 for x in r["rows"] if x["platform"] == "x"]) == 3 and r["notes"],
+           "an X-only filter is ignored under All, and the response says so")
+        r = srch(scope="all", platform="x", verified=1)
+        ok(ids(r) == [("x", str(snow(x_ms, 5)))], "X-only: verified, from the stored raw tweet")
+        r = srch(scope="all", platform="x", x_types="reply")
+        ok(ids(r) == [("x", str(snow(x_ms, 2)))], "X-only: post types")
+        r = srch(project=7, platform="instagram", ig_types="reel")
+        ok(ids(r) == [("instagram", "503")], "Instagram-only: reel")
+        r = srch(project=7, platform="instagram", ig_types="photo,album")
+        ok(sorted(x["tweet_id"] for x in r["rows"]) == ["500", "502"], "Instagram-only: photo + album")
+        r = srch(project=7, platform="facebook", min_shares=5)
+        ok(ids(r) == [("facebook", "fb1")], "Facebook-only: min shares")
+
+        # IST days. 00:10 IST on the 3rd is the 2nd in UTC — it is the 3rd here.
+        r = srch(scope="all", platform="x", from_date="2026-11-03", to_date="2026-11-03")
+        ok(len(r["rows"]) == 5, "X: an IST day, as a snowflake id range")
+        r = srch(scope="all", platform="x", to_date="2026-11-02")
+        ok(r["rows"] == [], "…and the day before it holds none of them")
+        r = srch(scope="all", platform="facebook", from_date="2026-11-02", to_date="2026-11-02")
+        ok(len(r["rows"]) == 1, "Facebook: an IST day")
+
+        # Scope.
+        r = srch(all="flood relief", project=7)
+        ok(r["counts"]["instagram"]["n"] == 2 and r["counts"].get("x", {}).get("n", 0) == 0,
+           f"project-scoped ({r['counts']})")
+        r = srch(all="flood relief", project=xpid, platform="x")
+        ok(len(r["rows"]) == 3, "X project-scoped through its streams")
+
+        # Keyset paging: every match once, in order.
+        seen, cur, pages = [], None, 0
+        while True:
+            p = {"all": "flood", "scope": "all"}
+            if cur:
+                p["cursor"] = cur
+            pr = S.run(p, scope="all", paths=web._search_paths(),
+                       post_scope=store_ig.post_scope, want=2)
+            seen += [(m["platform"], m["id"]) for m in pr["refs"]]
+            pages += 1
+            cur = pr["cursor"]
+            if not cur or pages > 20:
+                break
+        full = S.run({"all": "flood"}, scope="all", paths=web._search_paths(),
+                     post_scope=store_ig.post_scope, want=50)
+        ok(seen == [(m["platform"], m["id"]) for m in full["refs"]] and len(seen) == len(set(seen)),
+           f"keyset paging walks every match once, in order ({pages} pages)")
+        r = srch(all="flood", scope="all", sort="oldest")
+        ok([x["tweet_id"] for x in r["rows"]][-1] == str(snow(x_ms, 5)), "oldest first")
+
+        # Caps and deadline.
+        mc = S.MAX_COUNT
+        S.MAX_COUNT = 2
+        try:
+            r = srch(all="flood", scope="all", platform="x")
+            ok(r["counts"]["x"] == {"n": 2, "plus": True}, f"count capped, shown as 'N+' ({r['counts']})")
+        finally:
+            S.MAX_COUNT = mc
+        r = S.run({"all": "flood"}, scope="all", paths=web._search_paths(),
+                  post_scope=store_ig.post_scope, deadline_s=-1)
+        ok(r["partial"] is True and "errors" not in r, "a hit deadline returns partial, not an error")
+
+        csv_text = web._search_csv({"all": "flood", "scope": "all"})
+        lines = csv_text.strip().splitlines()
+        ok(lines[0].startswith("platform,posted_ist") and len(lines) == 1 + full_len(full),
+           f"CSV export walks the cursor ({len(lines) - 1} rows)")
+        try:
+            web._search_archive({"all": "x", "scope": "all", "from_date": "3-11-2026"})
+            ok(False, "a bad date is refused")
+        except S.BadRequest:
+            ok(True, "a bad date is a 400, not a silent empty page")
         (root / "fb_results.db").unlink()
-        r = web._search_archive({"q": "flood relief"})
-        ok(r["totals"]["facebook"] == 0 and "errors" not in r, "a missing database is just zero")
+        r = srch(all="flood relief", scope="all")
+        ok("facebook" not in r["counts"] and "errors" not in r, "a missing database is just absent")
     finally:
         web._CFG = saved
+        S._FTS_READY.clear()
+        S._FTS_READY.update(saved_ready)
+
+
+def full_len(r):
+    return len(r["refs"])
 
 
 def main():

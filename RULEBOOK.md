@@ -1003,21 +1003,77 @@ session got opened on a live account (§6, "never signed in twice").
   that is not rebuilt does not ship. `cd frontend && npm run build`, and check
   that `dist/index.html` names the assets that are actually in `dist/assets`.
 
-### The Search page searches the archive of EVERY platform (2026-11-04)
+### The Search page is a deep search over EVERY platform's archive (2026-11-05)
 
-- The dashboard's Search reads the databases, never a platform: results.db
-  (X), ig_results.db (Instagram), fb_results.db (Facebook), one filter set,
-  merged newest-posted first (`GET /api/search`, `web._search_archive`). It
-  used to ask /api/tweets only, so an Instagram username found nothing.
-- A filter means the same thing on every platform. One that cannot apply
-  (no retweets on IG/FB) excludes nothing there; it never hides a platform.
-- A handle is literal text: `_` and `%` are escaped in LIKE, so
-  `_samvad_news_` never matches `xsamvadxnewsx`.
-- Instagram scope is `post_scope` (shared and linked lists count); "All
-  projects" means every assigned post (`project_id != 0`).
-- One platform failing is a zero plus an `errors` entry, never a blank page.
-- It is additive and cookie-only (in no API-key set). /api/tweets, which
-  Watch-Tower reads, is not changed by it.
+Replaces the 2026-11-04 LIKE version. Code: `search.py` (the work),
+`web._search_archive` / `_search_csv` (scope, hydration, logging).
+
+- **The archive only, never a platform.** results.db (X), ig_results.db
+  (Instagram), fb_results.db (Facebook). No budget is spent. No YouTube: this
+  tool does not collect it.
+- **Never `LIKE '%word%'`.** X uses `tweets_fts` (store.py). Instagram uses
+  `ig_posts_fts` (external content on `posts(pk)`). Facebook uses
+  `fb_posts_fts`, which keeps its own copy of the text keyed by
+  `post_id UNINDEXED`, because a VACUUM can renumber the hidden rowid of a
+  TEXT-keyed table.
+- **The IG/FB indexes are created by the first search** (`search.ensure_fts`:
+  index + triggers + backfill in one transaction). After that, TRIGGERS inside
+  each database keep them current, so the collectors' code is untouched. The
+  update triggers fire only when the text or author changes, so a metric update
+  never rewrites the index. A database whose index cannot be made is searched
+  without it, still under the caps.
+- **FTS drives.** The query is `FROM fts CROSS JOIN posts`, ordered by the index
+  rowid, with a keyset cursor on that rowid. On X the rowid is the snowflake
+  `tweet_id`, so an IST day range becomes `rowid BETWEEN` on
+  `(ms − 1288834974657) << 22` and the index only walks those days. Facebook's
+  index rowid is not time order: its candidates (within the caps) are sorted by
+  posted time in Python and paged on `(ms, post_id)`.
+- **Hard caps on every request:** 50 per page; at most 5,000 matches counted per
+  platform (shown "5,000+"); at most 20,000 rows looked at; a 1.5 s deadline per
+  platform via `set_progress_handler`. When the deadline hits, the request
+  returns what it found with `partial=true`. A count that hit a cap carries
+  `plus`. Only the 50 rows on the page are hydrated into full posts.
+- **FTS is fuzzy, so every candidate gets a precise check:**
+  - `#bihar` does not match `#biharelection` or the plain word "bihar".
+  - From and Mentioning compare the handle exactly, case-insensitive.
+  - Words and phrases are whole-token sequences.
+  - On X, Mentioning finds candidates through the text (the `@handle` that X
+    keeps in it) and confirms them against the stored mentions.
+- **Hindi / Devanagari.** The IG/FB indexes use
+  `unicode61 categories 'L* N* Co M*'`, so a vowel sign stays part of its word.
+  X's `tweets_fts` predates this and uses plain unicode61, which splits
+  Devanagari at every vowel sign (बिहार → ब ह र). It is deliberately NOT rebuilt:
+  its matches are a superset, and the precise check (which tokenizes Hindi
+  correctly) removes the false ones. Results are correct. A common Hindi word on
+  X just looks at more rows. "None of these" is pushed into FTS only for ASCII
+  items, so FTS never drops a row that is fine. Rebuilding `tweets_fts` with the
+  new tokenizer is open, and needs a measured one-off on the server.
+- **Boxes, not syntax.** Comma-separated: all of these words (commas and spaces
+  split), exact phrase, any of these (a multi-word item stays a phrase), none of
+  these, hashtags (any of), from these accounts, mentioning.
+- **Platform-wise filters.**
+  - **All** shows only what every platform can answer: likes, comments, views,
+    media, hide reposts/replies, dates.
+  - **One platform** adds its own filters, applied only then:
+    - X: post types, language, verified (`user.blue` from the stored raw
+      tweet), min followers, min reposts, has link.
+    - Instagram: photo / video / reel / album.
+    - Facebook: min shares.
+    Sent under All, they are ignored and `notes` says so.
+  - **A platform that cannot answer a filter is left out, with the reason in
+    `notes`.** Facebook has no view counts, so it is left out of min views. A
+    value is never guessed.
+- **Dates are whole IST days**, both ends inclusive. A malformed date is a 400,
+  not a silent empty page.
+- **Closed by default.** No project and no explicit `scope=all` → 400.
+  Instagram scope is `post_scope`; "All projects" means every assigned post.
+- **Dashboard-only.** `/api/search` is in none of the API-key path sets. It
+  never changes `/api/tweets`, `/api/ig/posts`, `/api/fb/posts` (Watch-Tower
+  reads those).
+- **No saved searches.** Export CSV walks the cursor, at most 5,000 rows.
+- **Activity Log:** only slow (> 1.5 s), partial or failed searches, with which
+  boxes were used, never the values typed (§5).
+- **One platform failing** is an `errors` entry, never a blank page.
 
 ### A poll never re-searches what it already searched (2026-10-08)
 

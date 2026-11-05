@@ -91,6 +91,7 @@ export const api = {
   tweets: (p) => request(`/api/tweets${qs(p)}`),
   // The Search page: X + Instagram + Facebook archives, one filter set.
   search: (p) => request(`/api/search${qs(p)}`),
+  searchCsvUrl: (p) => `/api/search${qs({ ...p, format: "csv" })}`,
   igPosts: (p) => request(`/api/ig/posts${qs(p)}`),
   // Instagram is project-scoped like Facebook: pass the selected project or the
   igStatus: (project) => request(`/api/ig/status${qs({ project })}`),

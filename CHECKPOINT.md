@@ -19,6 +19,57 @@ must respect belongs in the rulebook, not here.
 
 ---
 
+## 2026-11-05 — Search became a deep search (FTS, boxes, platform-wise, capped)
+
+**Why.** The 2026-11-04 `/api/search` used `LIKE '%q%'` on every platform: a
+full scan on one vCPU, one free-text box, offset paging that re-read everything
+above the page. Tilak wanted Collector2's deep search here, minus the features
+this tool lacks (no YouTube).
+
+**What changed.**
+- New `search.py`: FTS-driven candidates under hard caps (50 per page, 5,000
+  counted, 20,000 looked at, 1.5 s per platform), a precise check, keyset
+  cursors, and a merge by posted time.
+- IG and FB indexes are created on first use and kept by triggers (collectors
+  untouched).
+- `web._search_archive` now only scopes (closed by default), hydrates the page,
+  and logs slow/partial/failed searches. Added Export CSV.
+- Search.jsx: All / X / Instagram / Facebook tabs, seven boxes, and each
+  platform's own filters.
+- Not touched: the Live Feed, `/api/tweets`, `/api/ig/posts`, `/api/fb/posts`,
+  and every API-key set.
+
+**Verified.**
+- `test_search_archive` was rewritten: 47 checks covering triggers on insert,
+  edit and delete, #tag precision, exact handles, Hindi on X and IG, IST days
+  through the snowflake, platform-only filters, the Facebook views reason,
+  closed scope, keyset paging (every match once), caps, the deadline, and CSV.
+  Full suite passes.
+- Timed on synthetic archives (1M tweets, 200k IG posts, 50k FB posts; one CPU
+  core):
+  - X: common word 90–170 ms, rare word 2 ms, one IST day 19–39 ms, page 2
+    under 15 ms.
+  - All three platforms: under 600 ms worst case.
+  - IG/FB one-time index build: 0.8 s / 0.4 s.
+- EXPLAIN shows `SCAN f VIRTUAL TABLE INDEX …:M3><` (match + rowid range, no
+  temp sort) with primary-key joins.
+- The page was checked in Chromium (desktop + phone, no console errors).
+
+**Open.**
+- Not yet timed on a copy of the REAL results.db (none reachable from the
+  session).
+- X `tweets_fts` still splits Devanagari. Results are correct via the precise
+  check; a rebuild with the new tokenizer is a measured one-off for later.
+- Facebook sorts its candidates in Python (its index rowid is not time order).
+  Past 5,000 matches the order is newest-collected first within that set
+  (flagged with "+").
+
+## 2026-11-05 — Accounts page no longer shows "never / not ok" on first load
+
+**Why.** Pool accounts load before the live-session lists; the gap was read as
+"no session". **What changed.** Until that platform's live list arrives, the
+cards and the Signed-in tile show "…". **Verified.** Build clean.
+
 ## 2026-10-08 — The Instagram loop crashed when no account could collect
 
 **Why.** `journalctl -u xscraper-ig`: from 2026-10-07 07:46 UTC every start
