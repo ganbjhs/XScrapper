@@ -215,6 +215,12 @@ export default function PostCard({ t, onPin, onUnpin, terms, cats, onLabel }) {
           <Pfp t={t} name={name} />
           <b>{name}</b>
           <span className="handle">@{t.author_username}</span>
+          {/* Instagram collab: the other handles the post is credited to. */}
+          {Array.isArray(t.coauthors) && t.coauthors.length > 0 && (
+            <span className="handle coauth" title="Collab post — also on these profiles">
+              with {t.coauthors.map((h) => "@" + h).join(", ")}
+            </span>
+          )}
           {(() => {
             const P = { instagram: ["ig", "IG"], facebook: ["fb", "f"] }[t.platform] || ["x", "𝕏"];
             return <span className={`badge platform-${P[0]}`}>{P[1]}</span>;

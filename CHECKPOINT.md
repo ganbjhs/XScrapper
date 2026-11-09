@@ -19,6 +19,42 @@ must respect belongs in the rulebook, not here.
 
 ---
 
+## 2026-11-09 — Instagram collab posts: co-authors stored, searchable, shown
+
+**Why.** `@mandaleshwarin` (project 17) showed nothing after 15 Aug although
+his profile grid had newer reels. They are collab posts published by
+`@goldenhindnews` with him as co-author: Instagram puts them in both grids but
+returns them only from the author's media feed, and the collector kept only
+`user.username`. A handle that only co-signs looked dead.
+
+**What changed.**
+- `engine_ig.record()` keeps `coauthor_producers` (pk, handle, picture, name)
+  off the same media row — same request, nothing extra fetched (RULEBOOK §6).
+- `store_ig.posts.coauthors TEXT` (JSON list of lowercase handles, NULL when
+  none; `_migrate` adds the column). One row per post, still under its primary
+  author — no duplicate rows. A re-sighting fills a NULL (hole), never
+  overwrites. Co-authors' own name/picture go to the `profiles` cache.
+- `to_feed` / `to_api` gain `coauthors` (additive; `/api/tweets` and
+  `/api/ig/posts` keep their shape — handover updated). `_post_filter(username=)`
+  and `/api/ig/posts?author=` match a co-author too.
+- `search.py`: `ig_posts_fts` indexes `coauthors`; "From" uses FTS5's
+  `{username coauthors} : h` and the precise check accepts either. An index
+  built before the column (2026-11-05 shape) is dropped and rebuilt once by
+  `ensure_fts` (same one-off cost as the first build).
+- `PostCard.jsx`: "with @handle" beside the author on collab posts.
+
+**Verified.** `test_search_archive` +7 checks (store shape, profile cache,
+index rebuild, from: co-author and from: author both find the one row, to_api
+additive). Full suite green. Not verified against Instagram live: whether
+`coauthor_producers` is populated in `user_medias_paginated_v1` responses on
+instagrapi 3.0.20 (the field exists in its extractor); watch the first visit of
+`goldenhindnews` after deploy — the reel of 11 Sep should gain `coauthors`.
+
+**Open.** No raw JSON is kept, so posts collected before this have no
+coauthors until they are seen again (a full re-walk of a source would do it).
+
+---
+
 ## 2026-11-05 — Search became a deep search (FTS, boxes, platform-wise, capped)
 
 **Why.** The 2026-11-04 `/api/search` used `LIKE '%q%'` on every platform: a

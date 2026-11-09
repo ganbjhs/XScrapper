@@ -2101,6 +2101,23 @@ before changing the engine; nearly every "obvious" idea has been tried.)
   X match was the ONLY path. No profile lookup was added and none may be:
   `users/<pk>/info` is on the most throttled endpoints Instagram has, and
   the media row already says everything a picture needs.
+- **Instagram collab posts: ONE row under the primary author, the other
+  handles in `posts.coauthors`; a co-author NEVER becomes a second row.**
+  Instagram credits a collab post to its author and to every
+  `coauthor_producers` UserShort, shows it in both grids, but returns it
+  only from the author's media feed. Until 2026-11-09 the collector kept
+  only `user.username`, so a watched handle that only co-signs
+  (@mandaleshwarin via @goldenhindnews, project 17) looked silent for
+  months. `engine_ig.record` keeps the co-authors off the same media row
+  (same request, nothing fetched); the store writes them as a JSON list of
+  lowercase handles (NULL when none, filled on a later sighting, never
+  overwritten); `coauthors` is an ADDITIVE key on `to_feed` / `to_api`;
+  every "from / author" filter (`search.py` via FTS5 `{username coauthors}`,
+  `_post_filter`, `/api/ig/posts?author=`) accepts either. Duplicating the
+  row per handle is forbidden: `pk` is the dedupe key Watch Tower relies on,
+  and the one-copy rule (§3, 2026-10-21) applies to posts as much as to
+  sources. The co-authors' own picture and name go to the `profiles` cache
+  by the rule above — same UserShort, same free source.
 - **The collector only READS the account. It never changes account settings** —
   no enabling 2FA, no answering verification flows, no profile edits, nothing
   under Settings. Anything Facebook asks that is not "show me the feed" is a

@@ -23,6 +23,32 @@ import urllib.parse
 import time
 from dataclasses import dataclass
 from pathlib import Path
+import json as _json
+
+
+def coauthors_json(items) -> str | None:
+    """The stored form of a post's co-authors: a JSON list of lowercase
+    handles, or None when there are none (never '[]' — NULL is the hole a
+    later sighting may fill). Accepts engine_ig.record()'s dicts or bare
+    strings; the primary author is not among them by construction."""
+    out = []
+    for c in items or []:
+        h = (c.get("username") if isinstance(c, dict) else c) or ""
+        h = str(h).strip().lstrip("@").lower()
+        if h and h not in out:
+            out.append(h)
+    return _json.dumps(out) if out else None
+
+
+def coauthor_list(stored) -> list:
+    """The handles back out of the stored column ([] for NULL / junk)."""
+    if not stored:
+        return []
+    try:
+        v = _json.loads(stored)
+    except (TypeError, ValueError):
+        return []
+    return [str(x) for x in v] if isinstance(v, list) else []
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS posts (
@@ -43,6 +69,12 @@ CREATE TABLE IF NOT EXISTS posts (
   author_avatar TEXT,                     -- the author's profile picture URL, as
                                           -- the media row carried it (NULL when
                                           -- the sighting had none — never '')
+  coauthors     TEXT,                     -- JSON list of the OTHER handles a
+                                          -- collab post is credited to (IG's
+                                          -- coauthor_producers), NULL when none.
+                                          -- The post stays ONE row under its
+                                          -- primary author; this is how a
+                                          -- co-tagged handle still finds it.
   source_label  TEXT,                     -- which source surfaced it
   project_id    INTEGER NOT NULL DEFAULT 0, -- WHOSE post: copied from the source
                                           -- that collected it. 0 = unassigned,
@@ -410,6 +442,8 @@ class Store:
                 "ALTER TABLE posts ADD COLUMN project_id INTEGER NOT NULL DEFAULT 0")
         if "author_avatar" not in havep:
             self.db.execute("ALTER TABLE posts ADD COLUMN author_avatar TEXT")
+        if "coauthors" not in havep:
+            self.db.execute("ALTER TABLE posts ADD COLUMN coauthors TEXT")
         havepr = {r["name"] for r in self.db.execute("PRAGMA table_info(profiles)")}
         if "full_name" not in havepr:
             self.db.execute("ALTER TABLE profiles ADD COLUMN full_name TEXT")
@@ -1229,27 +1263,42 @@ class Store:
             # value to COALESCE and to the fill-a-hole test below, and a blank
             # that counts as "known" is a hole nothing can ever fill.
             avatar = str(r.get("author_avatar") or "").strip() or None
+            coauth = coauthors_json(r.get("coauthors"))
             cur = self.db.execute(
                 "INSERT OR IGNORE INTO posts(pk,code,url,taken_at,username,user_pk,"
                 "caption,media_type,product_type,like_count,comment_count,play_count,"
-                "video_url,thumbnail_url,author_avatar,source_label,project_id,"
-                "collected_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                "video_url,thumbnail_url,author_avatar,coauthors,source_label,project_id,"
+                "collected_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                 (pk, r.get("code"), r.get("url"), r.get("taken_at"),
                  r.get("username"), r.get("user_pk"), r.get("caption"),
                  r.get("media_type"), r.get("product_type"), r.get("like_count"),
                  r.get("comment_count"), r.get("play_count"), r.get("video_url"),
-                 r.get("thumbnail_url"), avatar, source_label, project_id, now))
+                 r.get("thumbnail_url"), avatar, coauth, source_label, project_id, now))
             if cur.rowcount:
                 new += 1
-            elif avatar:
+            else:
                 # A post seen again FILLS A HOLE and never overwrites (RULEBOOK
                 # §6): the stored picture came from a sighting that could read
                 # one, and the cache below — not the row — is where freshness
                 # lives. Still not a new post, so the count is untouched.
-                self.db.execute(
-                    "UPDATE posts SET author_avatar = ? WHERE pk = ? "
-                    "AND (author_avatar IS NULL OR author_avatar = '')",
-                    (avatar, pk))
+                if avatar:
+                    self.db.execute(
+                        "UPDATE posts SET author_avatar = ? WHERE pk = ? "
+                        "AND (author_avatar IS NULL OR author_avatar = '')",
+                        (avatar, pk))
+                if coauth:
+                    # Rows collected before 2026-11-09 have no coauthors; a
+                    # later sighting of the same collab post fills them in.
+                    self.db.execute(
+                        "UPDATE posts SET coauthors = ? WHERE pk = ? AND coauthors IS NULL",
+                        (coauth, pk))
+            # The co-authors' own pictures and names ride on the same media
+            # row (UserShort each), so the cache learns them for free too.
+            for c in (r.get("coauthors") or []):
+                if isinstance(c, dict):
+                    self.set_profile(c.get("pk"), c.get("username"),
+                                     str(c.get("avatar") or "").strip() or None, now,
+                                     full_name=c.get("name"))
             if avatar or r.get("author_name"):
                 self.set_profile(r.get("user_pk"), r.get("username"), avatar, now,
                                  full_name=r.get("author_name"))
@@ -1418,7 +1467,10 @@ class Store:
         if source:
             where.append("source_label = ?"); args.append(source)
         if username:
-            where.append("username = ?"); args.append(username.lstrip("@"))
+            # Primary author OR co-author of a collab post (coauthors is a JSON
+            # list of handles, so the quoted form is an exact-handle match).
+            where.append("(username = ? OR coauthors LIKE ?)")
+            args += [username.lstrip("@"), '%"' + username.lstrip("@") + '"%']
         if before_pk:
             where.append("pk < ?"); args.append(int(before_pk))
         return where, args
@@ -1546,6 +1598,8 @@ def to_feed(row: dict) -> dict:
         "retweet_count": None,
         "view_count": row.get("play_count"),
         "source": row.get("source_label"),
+        # Additive (2026-11-09): the other handles a collab post is credited to.
+        "coauthors": coauthor_list(row.get("coauthors")),
     }
 
 
@@ -1582,6 +1636,9 @@ def to_api(row: dict) -> dict:
         # along; the row simply never carried one until 2026-09-04, so the
         # dashboard's read-time X match was the only picture a post could get.
         "author_avatar": row.get("author_avatar") or None,
+        # Additive (2026-11-09): collab co-authors' handles, [] when none.
+        # Watch Tower may ignore it; nothing above changed shape.
+        "coauthors": coauthor_list(row.get("coauthors")),
     }
 
 

@@ -138,6 +138,7 @@ Response:
       "metrics": {"likes": 15230, "comments": 412, "views": 98000},
       "source": "Narendra Modi",
       "author_avatar": "https://…",
+      "coauthors": [],
       "label": null,
       "label_source": null,
       "label_ms": null
@@ -201,6 +202,7 @@ Always check for an `error` key; do not rely on HTTP status alone.
 | author_display_name | `author.username` (no better value exists) |
 | author_id | `author.id` |
 | author_avatar | `author_avatar` |
+| (new, additive, 2026-11-09) | `coauthors` — the OTHER handles a collab post is credited to (Instagram's `coauthor_producers`), `[]` when none. The post is one object under `author`; a watched handle that only co-signs posts shows up here. Safe to ignore. |
 | like_count | `metrics.likes` |
 | reply_count | `metrics.comments` |
 | view_count | `metrics.views` (null for photos) |

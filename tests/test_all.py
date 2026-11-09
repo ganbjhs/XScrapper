@@ -8428,6 +8428,23 @@ def test_search_archive(tmp):
         st.upsert_posts([{"pk": 700, "taken_at": base + 60, "username": "_samvad_news_other",
                           "user_pk": 13, "caption": "flood relief elsewhere"}],
                         "other", project_id=9)
+        # A collab post (2026-11-09): posted by goldenhindnews, co-authored by
+        # the watched handle. One row, under its primary author.
+        st.add_source("Mandaleshwar", "user", "mandaleshwarin", platform_id="14", project_id=7)
+        st.upsert_posts([{"pk": 900, "taken_at": base + 70, "username": "goldenhindnews",
+                          "user_pk": 15, "caption": "pravasi rajasthani samman",
+                          "coauthors": [{"pk": 14, "username": "MandaleshwarIN",
+                                         "avatar": "https://cdn/m.jpg", "name": "Mandaleshwar Singh"}]}],
+                        "Mandaleshwar", project_id=7)
+        # An index built BEFORE the coauthors column existed (the 2026-11-05 shape).
+        st.db.executescript("""
+CREATE VIRTUAL TABLE ig_posts_fts USING fts5(caption, username, content='posts', content_rowid='pk');
+CREATE TRIGGER ig_posts_fts_ai AFTER INSERT ON posts BEGIN
+  INSERT INTO ig_posts_fts(rowid, caption, username) VALUES (new.pk, new.caption, new.username);
+END;
+INSERT INTO ig_posts_fts(ig_posts_fts) VALUES('rebuild');
+""")
+        st.db.commit()
     # ---------------- Facebook
     with store_fb.Store(str(root / "fb_results.db")) as st:
         st.upsert({"post_id": "fb1", "page": "samvadnews", "created_ms": ist_ms(2026, 11, 2),
@@ -8544,6 +8561,29 @@ def test_search_archive(tmp):
         ok(len(r["rows"]) == 6, "a pasted profile URL works in From")
         r = srch(mention="cmofficebihar", scope="all")
         ok(ids(r) == [("instagram", "503")], "mentioning: exact handle, case-insensitive")
+
+        # Collab posts: a co-author's handle finds the post; the row stays one.
+        con = sqlite3.connect(str(root / "ig_results.db"))
+        ftsql = con.execute("SELECT sql FROM sqlite_master WHERE name='ig_posts_fts'").fetchone()[0]
+        ok("coauthors" in ftsql, "an Instagram index from before coauthors is rebuilt once")
+        ok(con.execute("SELECT coauthors FROM posts WHERE pk = 900").fetchone()[0]
+           == '["mandaleshwarin"]', "coauthors stored as a JSON list of lowercase handles")
+        ok(con.execute("SELECT handle, full_name FROM profiles WHERE user_pk = 14").fetchone()
+           == ("MandaleshwarIN", "Mandaleshwar Singh"),
+           "a co-author's own name and picture reach the profile cache")
+        con.close()
+        r = srch(**{"from": "mandaleshwarin", "project": 7, "platform": "instagram"})
+        ok(ids(r) == [("instagram", "900")]
+           and r["rows"][0]["author_username"] == "goldenhindnews"
+           and r["rows"][0]["coauthors"] == ["mandaleshwarin"],
+           f"from: a co-author finds the collab post, still credited to its author ({ids(r)})")
+        r = srch(**{"from": "goldenhindnews", "project": 7, "platform": "instagram"})
+        ok(ids(r) == [("instagram", "900")], "from: the primary author still finds it")
+        r = srch(all="pravasi", project=7, platform="instagram")
+        ok(len(r["rows"]) == 1, "a collab post is one row, not one per handle")
+        ok(store_ig.to_api({"pk": 1, "coauthors": None})["coauthors"] == []
+           and store_ig.to_api({"pk": 1, "coauthors": '["a","b"]'})["coauthors"] == ["a", "b"],
+           "to_api carries coauthors additively ([] when none)")
         r = srch(mention="pmoindia", scope="all", platform="x")
         ok(ids(r) == [("x", str(snow(x_ms, 4)))], "mentioning on X uses the stored mentions")
         r = srch(all="बिहार", scope="all", platform="x")

@@ -44,6 +44,8 @@ import sqlite3
 import threading
 import time
 
+import store_ig
+
 PAGE = 50
 MAX_COUNT = 5000          # matches counted / sorted per platform; shown "5,000+"
 MAX_SCAN = 20000          # candidate rows looked at per platform per request
@@ -267,10 +269,13 @@ def _ascii(raw):
     return raw.isascii()
 
 
-def text_ok(spec, text, tags, mentions, handle) -> bool:
-    """The precise check on one candidate row."""
-    if spec["from"] and (handle or "").lower() not in spec["from"]:
-        return False
+def text_ok(spec, text, tags, mentions, handle, coauthors=()) -> bool:
+    """The precise check on one candidate row. `coauthors`: the other handles
+    a collab post is credited to (Instagram) — "from" accepts any of them."""
+    if spec["from"]:
+        who = {(handle or "").lower()} | {str(c or "").lower() for c in coauthors}
+        if not (who & set(spec["from"])):
+            return False
     if spec["tags"] and not (set(tags) & set(spec["tags"])):
         return False
     if spec["mention"] and not (set(mentions) & set(spec["mention"])):
@@ -299,21 +304,30 @@ def _ge(v, n):
 _FTS_LOCK = threading.Lock()
 _FTS_READY: dict = {}       # str(path) -> tokenizer_is_hindi_safe (bool)
 
+# `coauthors` (2026-11-09) is the JSON list of a collab post's other handles;
+# indexing it beside `username` is what lets "from: handle" find the posts a
+# handle only co-signed. An index built before the column existed is rebuilt
+# once by ensure_fts (IG_FTS_COLS is the signature it checks).
+IG_FTS_COLS = "caption, username, coauthors"
 _IG_TRIGGERS = """
 CREATE TRIGGER IF NOT EXISTS ig_posts_fts_ai AFTER INSERT ON posts BEGIN
-  INSERT INTO ig_posts_fts(rowid, caption, username) VALUES (new.pk, new.caption, new.username);
+  INSERT INTO ig_posts_fts(rowid, caption, username, coauthors)
+  VALUES (new.pk, new.caption, new.username, new.coauthors);
 END;
 CREATE TRIGGER IF NOT EXISTS ig_posts_fts_ad AFTER DELETE ON posts BEGIN
-  INSERT INTO ig_posts_fts(ig_posts_fts, rowid, caption, username)
-  VALUES ('delete', old.pk, old.caption, old.username);
+  INSERT INTO ig_posts_fts(ig_posts_fts, rowid, caption, username, coauthors)
+  VALUES ('delete', old.pk, old.caption, old.username, old.coauthors);
 END;
-CREATE TRIGGER IF NOT EXISTS ig_posts_fts_au AFTER UPDATE OF caption, username ON posts
-WHEN old.caption IS NOT new.caption OR old.username IS NOT new.username BEGIN
-  INSERT INTO ig_posts_fts(ig_posts_fts, rowid, caption, username)
-  VALUES ('delete', old.pk, old.caption, old.username);
-  INSERT INTO ig_posts_fts(rowid, caption, username) VALUES (new.pk, new.caption, new.username);
+CREATE TRIGGER IF NOT EXISTS ig_posts_fts_au AFTER UPDATE OF caption, username, coauthors ON posts
+WHEN old.caption IS NOT new.caption OR old.username IS NOT new.username
+  OR old.coauthors IS NOT new.coauthors BEGIN
+  INSERT INTO ig_posts_fts(ig_posts_fts, rowid, caption, username, coauthors)
+  VALUES ('delete', old.pk, old.caption, old.username, old.coauthors);
+  INSERT INTO ig_posts_fts(rowid, caption, username, coauthors)
+  VALUES (new.pk, new.caption, new.username, new.coauthors);
 END;
 """
+_IG_TRIGGER_NAMES = ("ig_posts_fts_ai", "ig_posts_fts_ad", "ig_posts_fts_au")
 
 # Facebook's key is TEXT, so the index keeps its own copy keyed by post_id
 # (UNINDEXED): the hidden rowid of `posts` can be renumbered by a VACUUM.
@@ -343,12 +357,28 @@ def ensure_fts(path, kind) -> bool | None:
         if key in _FTS_READY:
             return _FTS_READY[key]
         name = "ig_posts_fts" if kind == "instagram" else "fb_posts_fts"
-        cols = ("caption, username, content='posts', content_rowid='pk'"
+        cols = (f"{IG_FTS_COLS}, content='posts', content_rowid='pk'"
                 if kind == "instagram" else "post_id UNINDEXED, text, page")
         con = sqlite3.connect(str(path), timeout=15)
         try:
             row = con.execute("SELECT sql FROM sqlite_master WHERE name = ?",
                               (name,)).fetchone()
+            if (row is not None and kind == "instagram"
+                    and "coauthors" not in (row[0] or "")):
+                # An index from before the coauthors column: its triggers
+                # would fail on the next insert (unknown column), so the
+                # whole thing is rebuilt once. Same one-off cost as the first
+                # build (~1 s per 200k posts), inside one transaction.
+                con.execute("BEGIN IMMEDIATE")
+                try:
+                    for t in _IG_TRIGGER_NAMES:
+                        con.execute(f"DROP TRIGGER IF EXISTS {t}")
+                    con.execute(f"DROP TABLE IF EXISTS {name}")
+                    con.execute("COMMIT")
+                except Exception:
+                    con.execute("ROLLBACK")
+                    raise
+                row = None
             if row is None:
                 con.execute("BEGIN IMMEDIATE")
                 try:
@@ -575,9 +605,12 @@ def search_ig(path, spec, scope, cursor, want, count, deadline_s, post_scope):
         if spec["to_ms"] is not None:
             where.append("p.taken_at < ?"); args.append(spec["to_ms"] // 1000)
         cols = ("p.pk AS rid, p.taken_at AS ts, p.caption AS text, p.username AS handle, "
-                "p.media_type, p.product_type, p.like_count, p.comment_count, "
+                "p.coauthors, p.media_type, p.product_type, p.like_count, p.comment_count, "
                 "p.play_count, p.thumbnail_url, p.video_url")
-        expr = (fts_expr(spec, "caption", "username", (lambda r: True) if safe else _ascii)
+        # {a b} : term is FTS5's several-columns filter: the author box
+        # matches the primary author or any co-author.
+        expr = (fts_expr(spec, "caption", "{username coauthors}",
+                         (lambda r: True) if safe else _ascii)
                 if safe is not None else None)
         if expr:
             sql = (f"SELECT {cols} FROM ig_posts_fts f CROSS JOIN posts p ON p.pk = f.rowid "
@@ -601,7 +634,8 @@ def search_ig(path, spec, scope, cursor, want, count, deadline_s, post_scope):
                 if kind not in spec["ig_types"]:
                     return None
             if not text_ok(spec, r["text"], text_tags(r["text"]),
-                           text_mentions(r["text"]), r["handle"]):
+                           text_mentions(r["text"]), r["handle"],
+                           store_ig.coauthor_list(r["coauthors"])):
                 return None
             return {"platform": "instagram", "id": r["rid"],
                     "ms": int(r["ts"] or 0) * 1000, "pos": r["rid"]}

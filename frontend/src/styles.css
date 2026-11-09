@@ -361,6 +361,7 @@ header.top .grow { flex: 1; }
 .pfp { width: 36px; height: 36px; border-radius: 50%; flex: none; display: grid; place-items: center; color: #fff; font-weight: 700; font-size: 13.5px; box-shadow: inset 0 0 0 1px rgba(0, 0, 0, 0.06); }
 .chead b { font-size: 13.5px; }
 .chead .handle { color: var(--ink-3); font-size: 12px; }
+.chead .handle.coauth { color: var(--ink-4); }
 .badge { font-size: 10px; font-weight: 700; border-radius: 999px; padding: 2px 8px; letter-spacing: 0.2px; line-height: 1.5; white-space: nowrap; }
 .badge.platform-x { background: color-mix(in srgb, var(--series-1) 13%, transparent); color: var(--series-1); }
 .badge.platform-ig { background: color-mix(in srgb, var(--series-2) 13%, transparent); color: var(--series-2); }

@@ -730,8 +730,11 @@ def _query_ig_as_stream(p):
         where.append("(p.caption LIKE ? OR p.username LIKE ?)")
         params += [f"%{p['q']}%"] * 2
     if p.get("author"):
-        where.append("p.username LIKE ?")
-        params.append(str(p["author"]).lstrip("@") + "%")
+        # Primary author (prefix, as before) or a co-author of a collab post
+        # (exact handle inside the JSON list) — 2026-11-09.
+        _a = str(p["author"]).lstrip("@")
+        where.append("(p.username LIKE ? OR p.coauthors LIKE ?)")
+        params += [_a + "%", '%"' + _a.lower() + '"%']
     if p.get("min_likes"):
         where.append("p.like_count >= ?")
         params.append(int(p["min_likes"]))

@@ -227,6 +227,21 @@ def record(media) -> dict:
         # the same reason as the picture, and it is what the dashboard shows
         # instead of a bare handle once it is known (identity.py).
         "author_name": (str(getattr(u, "full_name", "") or "") if u else ""),
+        # Collab posts (2026-11-09): Instagram credits the post to its author
+        # AND to every `coauthor_producers` UserShort. A post shared this way
+        # sits in both profiles' grids but comes back only from the author's
+        # media feed, so a watched handle that only ever co-posts looked
+        # silent. Same structured data, same request — nothing extra fetched.
+        "coauthors": [
+            {"pk": int(getattr(c, "pk", 0) or 0),
+             "username": str(getattr(c, "username", "") or ""),
+             "avatar": str(getattr(c, "profile_pic_url", "") or ""),
+             "name": str(getattr(c, "full_name", "") or "")}
+            for c in (getattr(media, "coauthor_producers", None) or [])
+            if getattr(c, "username", "")
+            and str(getattr(c, "username", "")).lower()
+            != str(getattr(u, "username", "") or "").lower()
+        ],
     }
 
 
