@@ -1452,6 +1452,39 @@ streamed login is dead; the phone-shaped one (above) is the third door.
 - `/api/handover` is dashboard-only: it is in no API-key allowlist. Recording
   is observational — it must never change a response or fail a request.
 
+### Watch-Tower pulls both Collectors the same way, so the feed contract is the same (2026-11-19)
+
+Watch-Tower runs ONE pull loop against this Collector and Collector2
+(`WT_INTEGRATION_FOR_OLD_COLLECTOR.md`, traced from Collector2's code). Any
+place this Collector answers differently is a place Watch-Tower silently
+gets less. Audited against it on 2026-11-19; these were the differences,
+now closed:
+
+- **A cursor with BOTH `since_collected_ms` and `since_id` is one composite
+  position**: `(collected_ms > C OR (collected_ms = C AND id > I))`, on X,
+  Instagram and Facebook. Watch-Tower sends back both fields of `cursor`.
+  ANDing them as two filters dropped every post collected later with an
+  older id (tested: an X walk returned 15 of 844 rows, an Instagram walk 3
+  of 12). Instagram's `collected_at` is whole seconds, so ties are common
+  there. One field alone keeps its old meaning.
+- **`/api/tweets?platform=facebook` is a Facebook feed.** It used to fall
+  through to the X query and answer X rows under a Facebook request. Now
+  `_query_fb_as_stream`: project-scoped, oldest first on (collected_ms,
+  post_id), shared row shape plus `created_ms`, `collected_ms`, `is_reply` /
+  `is_retweet` / `is_quote` = 0, `streams: ["fb:P:0"]`.
+- **`/api/watchlists` carries a Facebook row for API-key callers**: id
+  `-(1000000+P)`, label `fb:P:0`, a `feed` URL, the pages as members. Never
+  for the dashboard, which draws its own Facebook card.
+- **`GET /api/platforms`** lists every platform and its feed URL template
+  (key-readable).
+- **Every X row and X watchlist row carries `platform: "x"`.** Additive; the
+  frontend already treats a missing platform as X.
+- **The project scope on `/api/tweets` is `tweet_id IN (subquery)`, not a
+  per-row EXISTS.** Same rows; Collector2 measured a 42k-post project going
+  from about 9s to fast.
+
+Before changing any of this, check Collector2 does the same, or change both.
+
 ### Pinned posts lead a profile's feed — they are not "known ground" (2026-11-04)
 
 - An Instagram profile feed opens with up to three PINNED posts, whatever

@@ -182,7 +182,7 @@ API_KEY_READ_PATHS = {
     # X — the collected corpus and the streams that produced it.
     "/api/tweets", "/api/export", "/api/streams", "/api/streams/assignments",
     "/api/projects", "/api/watchlists", "/api/watchlist/xmembers",
-    "/api/identities", "/api/live",
+    "/api/identities", "/api/live", "/api/platforms",
     # Instagram and Facebook — same corpus, other platforms.
     "/api/ig/posts", "/api/ig/status", "/api/fb/posts", "/api/fb/status",
     # Post links tracked for their counters (kind='links' watchlists), as a
@@ -492,6 +492,221 @@ def _ig_stream_project(label) -> int:
         return 0
 
 
+FB_STREAM_PREFIX = "fb:"
+FB_WATCHLIST_OFFSET = 1_000_000      # synthetic FB watchlist id = -(OFFSET + project)
+
+
+def fb_stream_label(project_id) -> str:
+    """`fb:<project>:0`, the Facebook pseudo-stream (same idea as ig:P:0)."""
+    return f"{FB_STREAM_PREFIX}{int(project_id)}:0"
+
+
+def _fb_stream_project(label) -> int:
+    """The project id inside an `fb:P:0` label, or 0 for anything else."""
+    s = str(label or "")
+    if not s.startswith(FB_STREAM_PREFIX):
+        return 0
+    try:
+        return int(s[len(FB_STREAM_PREFIX):].split(":", 1)[0])
+    except ValueError:
+        return 0
+
+
+def _query_fb_as_stream(p):
+    """
+    /api/tweets?platform=facebook (2026-11-19). Collected Facebook posts on
+    the X contract, exactly as Collector2 serves them: project-scoped,
+    oldest-first while cursoring on (collected_ms, post_id), the shared row
+    shape (store_fb.to_feed) plus numeric created_ms / collected_ms, the
+    is_* flags always present, and `streams: ["fb:P:0"]`. A consumer that
+    mirrors X mirrors Facebook with one extra query parameter.
+    """
+    empty = {"total": 0, "rows": []}
+    pid = _project_or_none(p) or _fb_stream_project(p.get("stream"))
+    if not pid:
+        return {**empty, "note": "platform=facebook is project-scoped - "
+                                 "pass project=<id> (or stream=fb:<id>:0)"}
+    if _fb_stream_project(p.get("stream")) not in (0, pid):
+        return {**empty, "note": f"stream {p['stream']} is not in project {pid}"}
+    root = getattr(_CFG, "root", None)
+    rp = (root / "fb_results.db") if root else None
+    if rp is None or not rp.exists():
+        return empty
+    import store_fb
+
+    def given(k):
+        return p.get(k) is not None and str(p.get(k)).strip() != ""
+    where, params = ["project_id = ?"], [pid]
+    if p.get("q"):
+        where.append("(text LIKE ? OR page LIKE ? OR author_name LIKE ?)")
+        params += [f"%{p['q']}%"] * 3
+    if p.get("author"):
+        where.append("page LIKE ?")
+        params.append(str(p["author"]).lstrip("@") + "%")
+    if p.get("min_likes"):
+        where.append("like_count >= ?")
+        params.append(int(p["min_likes"]))
+    if p.get("from_date"):
+        ms = _day_ms(p["from_date"])
+        if ms is not None:
+            where.append("created_ms >= ?")
+            params.append(ms)
+    if p.get("to_date"):
+        ms = _day_ms(p["to_date"])
+        if ms is not None:
+            where.append("created_ms < ?")
+            params.append(ms + 86_400_000)
+    if p.get("since"):
+        ms = store_mod.parse_window(p["since"])
+        if ms:
+            where.append("created_ms >= ?")
+            params.append(int(ms))
+    if p.get("has_media"):
+        where.append("COALESCE(media_json, '[]') NOT IN ('', '[]')")
+
+    # post_id is TEXT, so the tie-break inside one millisecond is a text
+    # order: consistent, which is all a resumable position needs.
+    cursoring = False
+    if given("since_id") and given("since_collected_ms"):
+        where.append("(collected_ms > ? OR (collected_ms = ? AND post_id > ?))")
+        params += [int(p["since_collected_ms"]), int(p["since_collected_ms"]),
+                   str(p["since_id"])]
+        cursoring = True
+    elif given("since_collected_ms"):
+        where.append("collected_ms > ?")
+        params.append(int(p["since_collected_ms"]))
+        cursoring = True
+    elif given("since_id"):
+        # Facebook ids are not time-ordered; this only resumes a walk that
+        # was ordered by id. since_collected_ms is the cursor to use.
+        where.append("post_id > ?")
+        params.append(str(p["since_id"]))
+        cursoring = True
+
+    order = "ASC" if (p.get("order") == "asc" or cursoring) else "DESC"
+    if given("since_collected_ms") or not given("since_id"):
+        order_by = f"collected_ms {order}, post_id {order}"
+    else:
+        order_by = f"post_id {order}"
+    if not cursoring and p.get("sort") == "likes":
+        order_by = "like_count DESC, collected_ms DESC"
+    limit = max(1, min(int(p.get("limit") or 50), 500))
+    offset = max(0, int(p.get("offset") or 0))
+    cond = " AND ".join(where)
+    con = sqlite3.connect(f"file:{rp}?mode=ro", uri=True, timeout=5)
+    con.row_factory = sqlite3.Row
+    try:
+        if cursoring:
+            total = con.execute(
+                f"SELECT COUNT(*) c FROM (SELECT 1 FROM posts WHERE {cond} LIMIT ?)",
+                [*params, limit * 10 + 1]).fetchone()["c"]
+        else:
+            total = con.execute(f"SELECT COUNT(*) c FROM posts WHERE {cond}",
+                                params).fetchone()["c"]
+        rows = con.execute(
+            f"SELECT * FROM posts WHERE {cond} ORDER BY {order_by} LIMIT ? OFFSET ?",
+            [*params, limit, offset]).fetchall()
+    finally:
+        con.close()
+
+    label = fb_stream_label(pid)
+    out_rows = []
+    for r in rows:
+        d = dict(r)
+        f = store_fb.to_feed(d)
+        f["created_ms"] = int(d.get("created_ms") or 0)
+        f["collected_ms"] = int(d.get("collected_ms") or 0)
+        f["author_id"] = str(d.get("page") or "")
+        f["streams"] = [label]
+        for k in ("is_reply", "is_retweet", "is_quote"):
+            f.setdefault(k, 0)
+        out_rows.append(f)
+    # Same avatar fallbacks /api/fb/posts applies.
+    missing = {r["author_username"] for r in out_rows if not r.get("author_avatar")}
+    if missing:
+        xmap = _x_avatars_for(missing)
+        for r in out_rows:
+            if not r.get("author_avatar"):
+                r["author_avatar"] = xmap.get(str(r.get("author_username") or "").lower())
+    _fill_avatars_by_name(out_rows, "fb",
+                          lambda r: str(r.get("author_username") or "").lower())
+    out = {"total": total, "rows": out_rows}
+    if cursoring:
+        out["total_capped"] = total >= limit * 10 + 1
+        out["total_note"] = ("total is a lower bound on a cursor page - page until "
+                             "has_more is false" if out["total_capped"] else
+                             "total is exact")
+    _stamp_labels(out["rows"], pid, "facebook")
+    if rows:
+        last = out_rows[-1]
+        out["cursor"] = {"since_id": last["tweet_id"],
+                         "since_collected_ms": last["collected_ms"]}
+        out["has_more"] = len(rows) == limit and total > limit
+    return out
+
+
+def _fb_pseudo_watchlist(pid: int):
+    """
+    Facebook beside the X lists on /api/watchlists, for API-key callers
+    (2026-11-19, as Collector2): one synthetic row per project that has
+    Facebook pages, id -(1000000+P), stream fb:P:0, a `feed` URL. None when
+    the project has no pages.
+    """
+    root = getattr(_CFG, "root", None)
+    rp = (root / "fb_results.db") if root else None
+    if rp is None or not rp.exists():
+        return None
+    con = sqlite3.connect(f"file:{rp}?mode=ro", uri=True, timeout=5)
+    con.row_factory = sqlite3.Row
+    try:
+        srcs = con.execute(
+            "SELECT label, enabled FROM sources WHERE project_id = ? ORDER BY label",
+            (pid,)).fetchall()
+        if not srcs:
+            return None
+        n = con.execute("SELECT COUNT(*) c FROM posts WHERE project_id = ?",
+                        (pid,)).fetchone()["c"]
+        names = {r["page"]: (r["author_name"], r["author_avatar"]) for r in con.execute(
+            "SELECT page, author_name, author_avatar FROM posts WHERE project_id = ? "
+            "GROUP BY page", (pid,))}
+        try:
+            row = con.execute(
+                "SELECT value FROM settings WHERE key = 'fb_paused'").fetchone()
+            paused = bool(row) and row["value"] == "1"
+        except sqlite3.Error:
+            paused = False
+    except sqlite3.Error:
+        return None
+    finally:
+        con.close()
+    wid = -(FB_WATCHLIST_OFFSET + pid)
+    return {
+        "watchlist_id": wid, "project_id": pid,
+        "name": "Facebook pages", "kind": "facebook", "kind_label": "Facebook",
+        "platform": "facebook", "list_id": None, "owner_handle": None,
+        "created_at": None, "filters": {}, "paused": paused,
+        "feed": f"/api/tweets?platform=facebook&project={pid}",
+        "members": [{"handle": r["label"],
+                     "display_name": (names.get(r["label"]) or (None, None))[0] or r["label"],
+                     "avatar": (names.get(r["label"]) or (None, None))[1]}
+                    for r in srcs if r["enabled"]],
+        "streams": [{"stream_id": wid, "label": fb_stream_label(pid),
+                     "paused": paused, "tweets": n}],
+    }
+
+
+def _platforms_json():
+    """GET /api/platforms (2026-11-19, as Collector2): every platform and its
+    feed URL template, so a consumer can loop over them generically."""
+    return {"platforms": [
+        {"id": "x", "label": "X", "feed": "/api/tweets?project={project}"},
+        {"id": "instagram", "label": "Instagram",
+         "feed": "/api/tweets?platform=instagram&project={project}"},
+        {"id": "facebook", "label": "Facebook",
+         "feed": "/api/tweets?platform=facebook&project={project}"},
+    ]}
+
+
 def _query_tweets(p):
     """Filter the collected tweets. All of this is local; nothing touches X."""
     # Instagram as a stream (2026-09-18): the same endpoint, the same cursor,
@@ -501,6 +716,12 @@ def _query_tweets(p):
     if ((p.get("platform") or "").strip().lower() == "instagram"
             or _ig_stream_project(p.get("stream"))):
         return _query_ig_as_stream(p)
+    # Facebook as a stream (2026-11-19), the same contract as Instagram above
+    # and as Collector2: before this, platform=facebook fell through to the X
+    # query and answered X rows under a Facebook request.
+    if ((p.get("platform") or "").strip().lower() in ("facebook", "fb")
+            or _fb_stream_project(p.get("stream"))):
+        return _query_fb_as_stream(p)
     where, params = ["t.source = 'result'"], []
     joins = ""
 
@@ -518,10 +739,13 @@ def _query_tweets(p):
         except (TypeError, ValueError):
             pid = 0
         if pid:
+            # IN, not a per-row EXISTS (2026-11-19, as Collector2): the
+            # subquery runs once instead of once per candidate tweet. A tweet
+            # two streams hit still appears once, since IN is a set test.
             where.append(
-                "EXISTS (SELECT 1 FROM tweet_hits ph JOIN project_streams ps "
-                "        ON ps.stream_id = ph.stream_id "
-                "        WHERE ph.tweet_id = t.tweet_id AND ps.project_id = ?)")
+                "t.tweet_id IN (SELECT ph.tweet_id FROM tweet_hits ph "
+                "  JOIN project_streams ps ON ps.stream_id = ph.stream_id "
+                "  WHERE ps.project_id = ?)")
             params.append(pid)
 
     if p.get("q"):
@@ -604,12 +828,23 @@ def _query_tweets(p):
     #
     # Saying so here rather than only in the docs: the difference is invisible
     # until a consumer notices it is quietly missing tweets.
+    #
+    # Both together (what Watch-Tower sends back from `cursor`) are ONE
+    # composite position, not two filters (2026-11-19). ANDing them dropped
+    # every tweet collected later with an older id (the late-index trap
+    # above), and collected_ms alone skipped the rest of a millisecond that a
+    # page boundary fell inside. The composite fixes both.
     cursoring = False
-    if p.get("since_id"):
+    if p.get("since_id") and p.get("since_collected_ms"):
+        where.append("(t.collected_ms > ? OR (t.collected_ms = ? AND t.tweet_id > ?))")
+        params += [int(p["since_collected_ms"]), int(p["since_collected_ms"]),
+                   int(p["since_id"])]
+        cursoring = True
+    elif p.get("since_id"):
         where.append("t.tweet_id > ?")
         params.append(int(p["since_id"]))
         cursoring = True
-    if p.get("since_collected_ms"):
+    elif p.get("since_collected_ms"):
         where.append("t.collected_ms > ?")
         params.append(int(p["since_collected_ms"]))
         cursoring = True
@@ -660,6 +895,10 @@ def _query_tweets(p):
         ).fetchall()
 
     out = {"total": total, "rows": [_row_to_json(r) for r in rows]}
+    # Every row names its platform, X included (additive, 2026-11-19): the
+    # handover says "every row has platform" and IG/FB rows always did.
+    for _r in out["rows"]:
+        _r.setdefault("platform", "x")
     if cursoring:
         # `total` on a cursor page is counted at most ten pages ahead (see
         # above), so a consumer reading it as "rows available" sees limit*10+1
@@ -768,12 +1007,22 @@ def _query_ig_as_stream(p):
     # same as on X, where the wire value is the string "0" and truthy.
     def given(k):
         return p.get(k) is not None and str(p.get(k)).strip() != ""
+    # Both together are one composite position (2026-11-19), as on X. It
+    # matters more here: collected_at is whole SECONDS, so a page boundary
+    # inside one second lost the rest of that second on collected_ms alone,
+    # and ANDing pk dropped a late-collected post with an older pk.
     cursoring = False
-    if given("since_id"):
+    if given("since_id") and given("since_collected_ms"):
+        where.append("(p.collected_at * 1000 > ? OR "
+                     "(p.collected_at * 1000 = ? AND p.pk > ?))")
+        params += [int(p["since_collected_ms"]), int(p["since_collected_ms"]),
+                   int(p["since_id"])]
+        cursoring = True
+    elif given("since_id"):
         where.append("p.pk > ?")
         params.append(int(p["since_id"]))
         cursoring = True
-    if given("since_collected_ms"):
+    elif given("since_collected_ms"):
         where.append("p.collected_at * 1000 > ?")
         params.append(int(p["since_collected_ms"]))
         cursoring = True
@@ -2824,7 +3073,7 @@ def _project_delete(body):
     return res
 
 
-def _watchlists_json(q):
+def _watchlists_json(q, every_platform=False):
     try:
         pid = int(q.get("project") or 0)
     except (TypeError, ValueError):
@@ -2846,6 +3095,14 @@ def _watchlists_json(q):
     ig = _ig_pseudo_watchlist(pid)
     if ig:
         wls = list(wls) + [ig]
+    # Facebook for API-key callers only (2026-11-19, as Collector2): the
+    # dashboard builds its own Facebook card and would show this row twice.
+    for w in wls:
+        w.setdefault("platform", "x")
+    if every_platform:
+        fb = _fb_pseudo_watchlist(pid)
+        if fb:
+            wls = list(wls) + [fb]
     return {"watchlists": wls}
 
 
@@ -8215,12 +8472,15 @@ class Handler(BaseHTTPRequestHandler):
                     host=self.server.server_address[0],
                     queue=q.get("queue", "search"),
                 ).to_json())
+            if u.path == "/api/platforms":
+                return self._send(200, _platforms_json())
             if u.path == "/api/tweets":
                 # Instagram lives in ig_results.db; the X guard must not
                 # blank it just because no tweet has been stored yet.
                 if (not _CFG.db_results.exists()
-                        and (q.get("platform") or "").lower() != "instagram"
-                        and not _ig_stream_project(q.get("stream"))):
+                        and (q.get("platform") or "").lower() not in ("instagram", "facebook", "fb")
+                        and not _ig_stream_project(q.get("stream"))
+                        and not _fb_stream_project(q.get("stream"))):
                     return self._send(200, {"total": 0, "rows": []})
                 try:
                     body = _query_tweets(q)
@@ -8244,7 +8504,8 @@ class Handler(BaseHTTPRequestHandler):
             if u.path == "/api/projects":
                 return self._send(200, _projects_json())
             if u.path == "/api/watchlists":
-                return self._send(200, _watchlists_json(q))
+                return self._send(200, _watchlists_json(
+                    q, every_platform=getattr(self, "_via_api_key", False)))
             if u.path == "/api/watchlists/library":
                 return self._send(200, _watchlist_library(q))
             if u.path == "/api/project":
