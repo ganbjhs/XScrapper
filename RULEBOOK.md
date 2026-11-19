@@ -1026,6 +1026,11 @@ runs on the ONE shared event loop, so one stuck request stalled every other.
   Corollary: never put something a REQUEST depends on into `_migrate`. A
   create or link writes its own rows (as `create_watchlist` and the IG list
   attach already do); `_migrate` is for upgrades and eventual cleanup only.
+- **`/api/status` never queues.** Its account-health check runs on the
+  request's own event loop with a 20s cap (`STATUS_HEALTH_TIMEOUT_S`), not on
+  the shared loop, and only one request rebuilds the cached answer: the rest
+  get the previous build instead of waiting (seen: 206-211s per tab while
+  three tabs queued behind one rebuild).
 - **A lookup on a column has an index, or it is a table walk per row.** The
   Instagram sources-to-profiles join (`_ig_pseudo_streams`) matched
   `lower(handle)` with no index and walked all of `profiles` once per source

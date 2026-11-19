@@ -1588,6 +1588,11 @@ def _fill_avatars_by_name(posts, platform, handle_of):
 STATUS_TTL_S = 15
 _STATUS_LOCK = threading.Lock()
 _STATUS_CACHE: dict = {"at": 0.0, "out": None}
+# Only one request rebuilds /api/status at a time; the rest are answered from
+# the last build instead of queueing behind it (2026-11-19: three dashboard
+# tabs waited 206-211s in line for one rebuild).
+_STATUS_BUILD = threading.Lock()
+STATUS_HEALTH_TIMEOUT_S = 20
 
 # The same idea for the other polled numbers (2026-10-02). The Live Feed asks
 # for /api/metrics every 30 s and /api/labels/status every 60 s FROM EVERY
@@ -1630,9 +1635,23 @@ def _status():
     now = time.monotonic()
     with _STATUS_LOCK:
         cached = _STATUS_CACHE["out"]
-        if cached is None or now - _STATUS_CACHE["at"] > STATUS_TTL_S:
-            cached = _status_uncached()
-            _STATUS_CACHE.update(at=time.monotonic(), out=cached)
+        stale = cached is None or now - _STATUS_CACHE["at"] > STATUS_TTL_S
+    if stale:
+        # The first build ever has nothing to fall back on, so it waits;
+        # after that a request that finds a rebuild in progress takes the
+        # previous answer (at most a rebuild old) rather than its turn.
+        if _STATUS_BUILD.acquire(blocking=cached is None):
+            try:
+                with _STATUS_LOCK:
+                    fresh = (_STATUS_CACHE["out"] is not None and
+                             time.monotonic() - _STATUS_CACHE["at"] <= STATUS_TTL_S)
+                    cached = _STATUS_CACHE["out"] if fresh else cached
+                if not fresh:
+                    cached = _status_uncached()
+                    with _STATUS_LOCK:
+                        _STATUS_CACHE.update(at=time.monotonic(), out=cached)
+            finally:
+                _STATUS_BUILD.release()
     out = dict(cached)
 
     try:
@@ -1677,9 +1696,18 @@ def _status_uncached():
         api = auth.open_api(_CFG.db_accounts)
         return await auth.health(api, _CFG)
 
+    # Account health on THIS thread's own event loop, never the shared one
+    # (2026-11-19): behind a busy shared loop it waited minutes. Bounded, so
+    # a slow accounts.db costs the sidebar its account list for one refresh,
+    # not the whole page.
+    def _health_rows():
+        async def go():
+            return await asyncio.wait_for(_accounts(), STATUS_HEALTH_TIMEOUT_S)
+        return asyncio.run(go())
+
     try:
         import guard as _g
-        for r in _run(_accounts()):
+        for r in _health_rows():
             view = _g.AccountView(
                 username=r.username, active=r.active, proxy=r.proxy,
                 error_msg=r.error_msg, has_known_device=r.has_known_device,
