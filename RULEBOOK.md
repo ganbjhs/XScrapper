@@ -1031,6 +1031,15 @@ runs on the ONE shared event loop, so one stuck request stalled every other.
   the shared loop, and only one request rebuilds the cached answer: the rest
   get the previous build instead of waiting (seen: 206-211s per tab while
   three tabs queued behind one rebuild).
+- **A tab's polling GET does not write, and never counts on the shared loop.**
+  `/api/labels/status` seeded the label vocabulary (a write) on every poll
+  from every open tab and ran its three unlabelled counts inside
+  `_with_store`, i.e. on the shared loop. Now it seeds once per project per
+  process (`_LABELS_SEEDED`) and answers through `_read_store`.
+- **A client that hung up is not an error.** `BrokenPipeError` /
+  `ConnectionResetError` while answering is a tab or nginx that gave up;
+  `_send` and the do_GET / do_POST handlers drop it quietly instead of
+  printing a Traceback and then failing again on the 500 reply.
 - **A lookup on a column has an index, or it is a table walk per row.** The
   Instagram sources-to-profiles join (`_ig_pseudo_streams`) matched
   `lower(handle)` with no index and walked all of `profiles` once per source

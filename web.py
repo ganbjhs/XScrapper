@@ -4651,9 +4651,17 @@ def _labels_status_json(q):
         return dict(_NO_PROJECT)
     import classify as cls
 
+    # Seed the default vocabulary once per project per process (it is INSERT
+    # OR IGNORE, so once is all it ever did), then answer read-only on this
+    # request's own thread (2026-11-19). It used to write on every poll from
+    # every open tab and run its three unlabelled counts ON the shared loop,
+    # stalling every other request queued there.
+    if pid not in _LABELS_SEEDED:
+        _with_store(lambda st: st.seed_post_label_categories(pid, cls.DEFAULT_CATEGORIES))
+        _LABELS_SEEDED.add(pid)
+
     def go(st):
         async def run():
-            await st.seed_post_label_categories(pid, cls.DEFAULT_CATEGORIES)
             cfg = await _classify_settings(st)
             labelled = await st.labelled_post_ids(pid)
             run_now = _classify_run_for(pid)
@@ -4691,7 +4699,10 @@ def _labels_status_json(q):
             }
         return run()
 
-    return _with_store(go)
+    return _read_store(go)
+
+
+_LABELS_SEEDED: set = set()
 
 
 def _label_categories_json(q):
@@ -8413,7 +8424,12 @@ class Handler(BaseHTTPRequestHandler):
                    level="ok" if code < 400 else "warn",
                    dedupe=("op", op, ip, code), window=30)
         if not self._head_only:
-            self.wfile.write(data)
+            try:
+                self.wfile.write(data)
+            except (BrokenPipeError, ConnectionResetError):
+                # The client (a browser tab, or nginx for it) gave up before
+                # the answer was ready. Nothing to tell it; not an error here.
+                self.close_connection = True
 
     def do_HEAD(self):
         """
@@ -8635,6 +8651,11 @@ class Handler(BaseHTTPRequestHandler):
                 return self._send(200, accounts_api.handle(
                     "GET", u.path[len("/api/pool"):], None, q))
             return self._send(404, {"error": "not found"})
+        except (BrokenPipeError, ConnectionResetError):
+            # Client hung up mid-answer: answering it again with a 500 only
+            # fails the same way. Not an error on our side (2026-11-19).
+            self.close_connection = True
+            return
         except Exception as e:
             import traceback
             traceback.print_exc()
@@ -8865,6 +8886,9 @@ class Handler(BaseHTTPRequestHandler):
                     _ig_sync_proxies()
                 return self._send(200, res)
             return self._send(404, {"error": "not found"})
+        except (BrokenPipeError, ConnectionResetError):
+            self.close_connection = True
+            return
         except Exception as e:
             import traceback
             traceback.print_exc()
