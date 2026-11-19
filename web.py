@@ -1028,12 +1028,23 @@ def _ig_pseudo_streams() -> list:
             # anywhere); the CDN URL only until ig_avatars.py has fetched it.
             av = ("COALESCE(pr.avatar_local, pr.avatar_url)" if "avatar_local" in cols
                   else "pr.avatar_url")
+            # One profile per source, looked up by primary key when the id is
+            # known and by handle only when it is not (2026-11-19). The old
+            # `LEFT JOIN ... ON (pk match) OR (handle match)` could use no
+            # index, so it walked the whole profiles table for every source,
+            # and a handle shared by two profile rows duplicated the source.
+            def _pick(expr):
+                return (f"CASE WHEN s.platform_id != '' THEN "
+                        f"(SELECT {expr} FROM profiles pr "
+                        f" WHERE pr.user_pk = CAST(s.platform_id AS INTEGER)) "
+                        f"ELSE (SELECT {expr} FROM profiles pr "
+                        f" WHERE lower(pr.handle) = lower(s.value) "
+                        f" ORDER BY pr.updated_at DESC LIMIT 1) END")
             for r in st.db.execute(
                     f"SELECT s.label, s.type, s.value, s.platform_id, s.project_id, s.account, "
-                    f"       s.assigned_account, s.list_id, s.enabled, {av} AS avatar_url, {fn} AS full_name "
-                    f"FROM sources s LEFT JOIN profiles pr ON "
-                    f"  (s.platform_id != '' AND pr.user_pk = CAST(s.platform_id AS INTEGER)) "
-                    f"  OR (s.platform_id = '' AND lower(pr.handle) = lower(s.value)) "
+                    f"       s.assigned_account, s.list_id, s.enabled, "
+                    f"       {_pick(av)} AS avatar_url, {_pick(fn)} AS full_name "
+                    f"FROM sources s "
                     f"WHERE (s.enabled = 1 OR s.label IN (SELECT label FROM ig_list_members "
                     f"  WHERE enabled = 1)) AND s.project_id > 0 "
                     f"ORDER BY s.project_id, s.label"):
@@ -1887,6 +1898,40 @@ def _fb_media_store():
     return _FB_MEDIA
 
 
+def _read_store(fn):
+    """
+    Run one read-only Store coroutine in the CALLING handler thread.
+
+    For GETs that only read (2026-11-19). _with_store opens a writable Store
+    and runs on the one shared event loop, so a single request stuck behind
+    the watcher's write lock held up every other request in the process:
+    the Watchlists page sat on "Loading..." and /api/projects took 74.6s.
+    A mode=ro connection never takes the write lock (WAL readers do not wait
+    for writers) and its own thread means it queues behind nobody. Falls back
+    to _with_store if the method turns out to write.
+    """
+    st = store_mod.Store(_CFG.db_results, _CFG.defaults.keep_entry_json)
+    try:
+        st.db = sqlite3.connect(f"file:{st.path}?mode=ro", uri=True, timeout=5)
+    except sqlite3.Error:
+        return _with_store(fn)
+    st.db.row_factory = sqlite3.Row
+    try:
+        st.fts_enabled = st.db.execute(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' "
+            "AND name = 'tweets_fts'").fetchone() is not None
+
+        async def go():
+            return await fn(st)
+        return asyncio.run(go())
+    except sqlite3.OperationalError as e:
+        if "readonly" in str(e) or "read-only" in str(e):
+            return _with_store(fn)
+        raise
+    finally:
+        st.db.close()
+
+
 def _with_store(fn):
     """Run one coroutine against a writable Store. The read path stays read-only."""
     async def go():
@@ -2643,7 +2688,7 @@ def _handover_uncached(pid: int):
 # a pre-projects database instead of erroring on a missing table.
 
 def _projects_json():
-    return {"projects": _with_store(
+    return {"projects": _read_store(
         lambda st: st.projects(include_archived=True))}
 
 
@@ -2786,7 +2831,7 @@ def _watchlists_json(q):
         pid = 0
     if not pid:
         return {"error": "which project? pass ?project=<id>"}
-    wls = _with_store(lambda st: st.watchlists(pid))
+    wls = _read_store(lambda st: st.watchlists(pid))
     # An X List's members live on x.com, so `members` is empty on those rows
     # and the dashboard could not add the project up ("how many accounts do
     # we follow?" had no answer). Attach what the member cache knows —
@@ -8577,6 +8622,11 @@ def serve(cfg, host="127.0.0.1", port=8765, log=print, behind_proxy=False):
         return EXIT_REFUSED
 
     _start_loop()
+    # The dashboard opens a Store per request: run the schema/migration setup
+    # once (then every 10 min), not on every page load. See Store.open.
+    store_mod.Store.reuse_setup = True
+    import store_ig as _store_ig
+    _store_ig.Store.reuse_setup = True
     # Proxies edited in the dashboard before this join existed are still not
     # in the sessions; bring them across once at every start.
     moved = _ig_sync_proxies(log=log)

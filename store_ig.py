@@ -394,6 +394,10 @@ class Source:
 
 
 class Store:
+    reuse_setup = False
+    SETUP_EVERY_S = 600
+    _setup_at: dict = {}      # path -> monotonic time of the last full open
+
     def __init__(self, path="ig_results.db"):
         self.path = Path(path)
         self.db = None
@@ -407,10 +411,20 @@ class Store:
         # the live path. The write itself is serialised by _wlock.
         self.db = sqlite3.connect(self.path, timeout=10, check_same_thread=False)
         self.db.row_factory = sqlite3.Row
+        # Light reopen (2026-11-19), same as store.Store: the dashboard opts in
+        # with reuse_setup = True so a page load does not rerun the schema and
+        # the cleanup sweeps (all writes) on every request. Collectors keep
+        # the full open every time.
+        key = str(self.path)
+        if self.reuse_setup:
+            done = Store._setup_at.get(key)
+            if done is not None and time.monotonic() - done < self.SETUP_EVERY_S:
+                return self
         _wal(self.db)
         self.db.executescript(SCHEMA)
         self._migrate()
         self.db.commit()
+        Store._setup_at[key] = time.monotonic()
         return self
 
     def _migrate(self) -> None:
@@ -460,6 +474,11 @@ class Store:
             "CREATE INDEX IF NOT EXISTS ix_sources_project ON sources(project_id)")
         self.db.execute(
             "CREATE INDEX IF NOT EXISTS ix_sources_list ON sources(list_id)")
+        # Profile lookup by handle for sources whose id is not resolved yet
+        # (web._ig_pseudo_streams, 2026-11-19). Without it that lookup walked
+        # the whole profiles table once per source on every Watchlists load.
+        self.db.execute(
+            "CREATE INDEX IF NOT EXISTS ix_profiles_handle_lower ON profiles(lower(handle))")
         # Every source of a project sits in a list: the ones written before
         # lists existed (list_id 0) go to the project's default list, created
         # on demand. Idempotent — only list_id 0 rows with a real project move.

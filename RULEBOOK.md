@@ -1003,6 +1003,37 @@ session got opened on a live account (§6, "never signed in twice").
   that is not rebuilt does not ship. `cd frontend && npm run build`, and check
   that `dist/index.html` names the assets that are actually in `dist/assets`.
 
+### A dashboard read never waits on a collector's write (2026-11-19)
+
+The Watchlists page sat on "Loading..." and `/api/projects` was logged at
+74.6s, with bursts of Tracebacks in `xscraper-web`. Cause: every request
+opened a full `store.Store`, and `open()` is not a read. It reruns the schema
+script, `_migrate`'s INSERT OR IGNORE sweeps, the FTS triggers and the
+`schema_version` upsert, all WRITES, so each page load queued for the write
+lock the X watcher holds (busy_timeout 5s per statement). And `_with_store`
+runs on the ONE shared event loop, so one stuck request stalled every other.
+
+- **A GET that only reads uses `_read_store`**: a `mode=ro` connection, run in
+  the handler's own thread, never on the shared loop. WAL readers do not wait
+  for writers. It falls back to `_with_store` if the method turns out to
+  write. `/api/projects` and `/api/watchlists` use it; move other hot reads
+  over the same way.
+- **The dashboard runs store setup once, not per request.** `web.serve` sets
+  `Store.reuse_setup = True` on `store.Store` and `store_ig.Store`: the full
+  open (schema, migrations, cleanup) runs once and then at most every
+  `SETUP_EVERY_S` (600s); in between, open only connects. Collectors leave it
+  False and keep the full open every time, so their behavior is unchanged.
+  Corollary: never put something a REQUEST depends on into `_migrate`. A
+  create or link writes its own rows (as `create_watchlist` and the IG list
+  attach already do); `_migrate` is for upgrades and eventual cleanup only.
+- **A lookup on a column has an index, or it is a table walk per row.** The
+  Instagram sources-to-profiles join (`_ig_pseudo_streams`) matched
+  `lower(handle)` with no index and walked all of `profiles` once per source
+  on every Watchlists load. `ix_profiles_handle_lower` fixes it (869ms to
+  1.6ms on 400 sources x 20k profiles). The join is now one CASE per source:
+  by `user_pk` when the id is known, by handle (newest row) when not, so a
+  handle on two profile rows no longer duplicates the source.
+
 ### The Search page is a deep search over EVERY platform's archive (2026-11-05)
 
 Replaces the 2026-11-04 LIKE version. Code: `search.py` (the work),

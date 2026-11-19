@@ -1222,12 +1222,31 @@ class Store:
         self.db: sqlite3.Connection | None = None
         self.fts_enabled = False
 
+    # Light reopen (2026-11-19). The dashboard opens a Store for every
+    # request, and a full open is not free: the schema script, _migrate's
+    # INSERT OR IGNORE sweeps, the FTS triggers and the schema_version upsert
+    # are all WRITES, so every page load queued for the write lock behind the
+    # X watcher (busy_timeout 5s per statement). /api/projects was seen at
+    # 74.6s. A process that sets reuse_setup = True (web.py does) runs the
+    # full setup once, then at most every SETUP_EVERY_S, and in between only
+    # connects. Collectors leave it False and behave exactly as before.
+    reuse_setup = False
+    SETUP_EVERY_S = 600
+    _setup_at: dict = {}      # path -> (monotonic time of last full setup, fts_enabled)
+
     async def open(self):
         self.db = sqlite3.connect(self.path, isolation_level=None)
         self.db.row_factory = sqlite3.Row
+        self.db.execute("PRAGMA busy_timeout = 5000")
+        self.db.execute("PRAGMA synchronous = NORMAL")
+        self.db.execute("PRAGMA journal_size_limit = 4194304")
+        if self.reuse_setup:
+            done = Store._setup_at.get(self.path)
+            if done and time.monotonic() - done[0] < self.SETUP_EVERY_S:
+                self.fts_enabled = done[1]
+                return self
         self.db.execute("PRAGMA journal_mode = WAL")
         self.db.execute("PRAGMA synchronous = NORMAL")
-        self.db.execute("PRAGMA busy_timeout = 5000")
         # Cap the WAL file: without this a checkpoint recycles the WAL but
         # never shrinks it, so one burst of writes leaves a big -wal file on
         # disk forever. With the limit, any checkpoint that completes truncates
@@ -1241,6 +1260,7 @@ class Store:
             "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
             (str(SCHEMA_VERSION),),
         )
+        Store._setup_at[self.path] = (time.monotonic(), self.fts_enabled)
         return self
 
     def _migrate(self):
