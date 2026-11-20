@@ -1493,9 +1493,25 @@ now closed:
   (key-readable).
 - **Every X row and X watchlist row carries `platform: "x"`.** Additive; the
   frontend already treats a missing platform as X.
-- **The project scope on `/api/tweets` is `tweet_id IN (subquery)`, not a
-  per-row EXISTS.** Same rows; Collector2 measured a 42k-post project going
-  from about 9s to fast.
+- **The project scope on `/api/tweets` depends on the project's size**
+  (corrected 2026-11-20; the 2026-11-19 line said "always IN", and that was
+  wrong for a big project). `IN (every tweet of the project)` makes SQLite
+  gather the whole project, look every tweet up and sort it, for every page:
+  project 8 (News, 1.2M tweets, 2 streams) took 146s for a 20-row cursor
+  page and over 60s for a plain total, and Watch-Tower's News pull timed out
+  from 19 Nov 13:15 IST. Now: a project with more than `PROJECT_WALK_ROWS`
+  (200k) hits, or a cursor with few tweets after it, is WALKED in order
+  (`INDEXED BY ix_tweets_delivery` for a cursor, the primary key for newest
+  first) with an EXISTS check against its stream ids by primary key, so a
+  page costs its own size (measured live: 26.7s to 0.00s). A small project
+  with an old cursor keeps the IN set over its own stream ids. A `stream=`
+  filter is the same EXISTS check, not a join. Rows, order and cursors are
+  identical to before (compared on a 400k-tweet copy).
+- **Totals do not pay for what they do not read.** A composite cursor also
+  sends a plain `collected_ms >= C` so the index seeks to the cursor; counts
+  skip the tweet_raw join unless a filter reads it (`verified`); and an
+  unfiltered project total is counted from tweet_hits alone (0.8s on 1.2M),
+  which equals the tweets count because embedded tweets never get a hit.
 
 Before changing any of this, check Collector2 does the same, or change both.
 

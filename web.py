@@ -707,6 +707,9 @@ def _platforms_json():
     ]}
 
 
+PROJECT_WALK_ROWS = 200_000    # above this, a project is walked in order, not gathered
+
+
 def _query_tweets(p):
     """Filter the collected tweets. All of this is local; nothing touches X."""
     # Instagram as a stream (2026-09-18): the same endpoint, the same cursor,
@@ -724,29 +727,71 @@ def _query_tweets(p):
         return _query_fb_as_stream(p)
     where, params = ["t.source = 'result'"], []
     joins = ""
+    # How the rows are reached (2026-11-20). Project 8 (News: 1.2M tweets
+    # across 2 streams) took 146s for a 20-row cursor page and never finished
+    # without one: an `IN (every tweet of the project)` scope makes SQLite
+    # build the whole project's id list, look every tweet up and sort them,
+    # for every page. A big project is instead walked IN ORDER (collected_ms
+    # index for a cursor, the primary key for newest-first) and each row is
+    # checked against the project's streams by primary key, so a page costs
+    # its own size: 26.7s -> 0.00s measured on the live database. A small
+    # project with an old cursor keeps the set form, which is cheap for it.
+    t_from = "tweets t"
+    plain_project = None       # stream ids, when the project is the ONLY filter
+    scope_marks = None
 
     if p.get("stream"):
-        joins = "JOIN tweet_hits h USING(tweet_id) JOIN streams s USING(stream_id)"
-        where.append("s.label = ?")
-        params.append(p["stream"])
+        # One stream: the same primary-key check as a project, not a join
+        # that starts from every hit the stream ever had.
+        with _connect() as con0:
+            row = con0.execute("SELECT stream_id FROM streams WHERE label = ?",
+                               (p["stream"],)).fetchone()
+        if row is None:
+            where.append("0")
+        else:
+            where.append("EXISTS (SELECT 1 FROM tweet_hits h WHERE h.stream_id = ? "
+                         "AND h.tweet_id = t.tweet_id)")
+            params.append(int(row["stream_id"]))
 
     if p.get("project"):
-        # Everything any of this project's streams collected. EXISTS rather
-        # than a join so a tweet hit by two of the project's streams appears
-        # once, not twice.
+        # Everything any of this project's streams collected, once each.
         try:
             pid = int(p["project"])
         except (TypeError, ValueError):
             pid = 0
         if pid:
-            # IN, not a per-row EXISTS (2026-11-19, as Collector2): the
-            # subquery runs once instead of once per candidate tweet. A tweet
-            # two streams hit still appears once, since IN is a set test.
-            where.append(
-                "t.tweet_id IN (SELECT ph.tweet_id FROM tweet_hits ph "
-                "  JOIN project_streams ps ON ps.stream_id = ph.stream_id "
-                "  WHERE ps.project_id = ?)")
-            params.append(pid)
+            with _connect() as con0:
+                sids = [int(r["stream_id"]) for r in con0.execute(
+                    "SELECT stream_id FROM project_streams WHERE project_id = ?", (pid,))]
+                if not sids:
+                    where.append("0")
+                else:
+                    scope_marks = ",".join(str(x) for x in sids)
+                    big = _ttl_cached(("project_hits_big", pid), 300, lambda: con0.execute(
+                        f"SELECT COUNT(*) c FROM (SELECT 1 FROM tweet_hits "
+                        f"WHERE stream_id IN ({scope_marks}) LIMIT ?)",
+                        (PROJECT_WALK_ROWS + 1,)).fetchone()["c"] > PROJECT_WALK_ROWS)
+                    walk = big
+                    c_ms = p.get("since_collected_ms")
+                    if c_ms and not walk:
+                        # Few tweets past the cursor: walking them is cheap
+                        # whatever the project's size.
+                        walk = con0.execute(
+                            "SELECT COUNT(*) c FROM (SELECT 1 FROM tweets "
+                            "WHERE collected_ms > ? LIMIT ?)",
+                            (int(c_ms), PROJECT_WALK_ROWS + 1)).fetchone()["c"] <= PROJECT_WALK_ROWS
+                    if walk:
+                        where.append(
+                            f"EXISTS (SELECT 1 FROM tweet_hits ph WHERE ph.stream_id "
+                            f"IN ({scope_marks}) AND ph.tweet_id = t.tweet_id)")
+                        if c_ms:
+                            t_from = "tweets t INDEXED BY ix_tweets_delivery"
+                    else:
+                        where.append(
+                            f"t.tweet_id IN (SELECT ph.tweet_id FROM tweet_hits ph "
+                            f"WHERE ph.stream_id IN ({scope_marks}))")
+            if scope_marks and len(where) == 2 and not p.get("stream"):
+                plain_project = scope_marks
 
     if p.get("q"):
         # Free text across the tweet and its author.
@@ -836,9 +881,13 @@ def _query_tweets(p):
     # page boundary fell inside. The composite fixes both.
     cursoring = False
     if p.get("since_id") and p.get("since_collected_ms"):
+        # The plain `>=` is redundant logically but lets the collected_ms
+        # index seek straight to the cursor; the OR alone would be scanned
+        # from the start of the index (2026-11-20).
+        where.append("t.collected_ms >= ?")
         where.append("(t.collected_ms > ? OR (t.collected_ms = ? AND t.tweet_id > ?))")
         params += [int(p["since_collected_ms"]), int(p["since_collected_ms"]),
-                   int(p["since_id"])]
+                   int(p["since_collected_ms"]), int(p["since_id"])]
         cursoring = True
     elif p.get("since_id"):
         where.append("t.tweet_id > ?")
@@ -855,8 +904,16 @@ def _query_tweets(p):
     sql = (f"SELECT t.*, "
            f"  json_extract(COALESCE(r.raw_json, t.raw_json), "
            f"               '$.user.profileImageUrl') AS author_avatar "
-           f"FROM tweets t LEFT JOIN tweet_raw r USING(tweet_id) "
+           f"FROM {t_from} LEFT JOIN tweet_raw r USING(tweet_id) "
            f"{joins} WHERE {' AND '.join(where)}")
+    # The counts skip the tweet_raw join unless a filter reads it (verified
+    # does): joining 1.2M raw payloads only to count rows was pure cost.
+    count_from = (f"{t_from} LEFT JOIN tweet_raw r USING(tweet_id)"
+                  if any("r." in w for w in where) else t_from)
+    # Only the project filter, and no cursor: the total comes from tweet_hits
+    # alone (0.8s on 1.2M) instead of a count over tweets (over 60s).
+    if plain_project and len(where) > 2:
+        plain_project = None
     # A cursor walk has to run oldest-first, or "the last row I got" is not a
     # position you can resume from.
     order = "ASC" if (p.get("order") == "asc" or cursoring) else "DESC"
@@ -878,15 +935,17 @@ def _query_tweets(p):
             # binding). Count at most ten pages beyond this one: exact when
             # small, "more than that" when not, never a full scan.
             total = con.execute(
-                f"SELECT COUNT(*) c FROM (SELECT 1 FROM tweets t "
-                f"LEFT JOIN tweet_raw r USING(tweet_id) "
+                f"SELECT COUNT(*) c FROM (SELECT 1 FROM {count_from} "
                 f"{joins} WHERE {' AND '.join(where)} LIMIT ?)",
                 [*params, limit * 10 + 1]
             ).fetchone()["c"]
+        elif plain_project:
+            total = _ttl_cached(("project_total", plain_project), 60, lambda: con.execute(
+                f"SELECT COUNT(DISTINCT tweet_id) c FROM tweet_hits "
+                f"WHERE stream_id IN ({plain_project})").fetchone()["c"])
         else:
             total = con.execute(
-                f"SELECT COUNT(*) c FROM tweets t "
-                f"LEFT JOIN tweet_raw r USING(tweet_id) "
+                f"SELECT COUNT(*) c FROM {count_from} "
                 f"{joins} WHERE {' AND '.join(where)}", params
             ).fetchone()["c"]
         rows = con.execute(
