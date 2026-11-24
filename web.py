@@ -7145,6 +7145,221 @@ def _ig_session_clear(body):
     return {"ok": True, "username": username, "cleared": res, "lines": lines}
 
 
+def _account_purge(body):
+    """Operator: delete an account COMPLETELY (2026-11-24).
+
+    WHY THIS EXISTS. Pool "Remove" deletes the managed_accounts row in pool.db
+    and nothing else. The collector's own roster row (ig_accounts.db for
+    Instagram, twscrape's accounts.db for X), its session sidecar, its phone,
+    its source ownership and its open decider conditions all stayed, so a
+    removed account came straight back as "Live · not in pool" on Accounts &
+    Sessions, kept its AccountSuspended / checkpoint lines in Network &
+    settings and the Fix panel, and could keep owning sources. "Delete" ends
+    all of it in one step.
+
+    REMOVED (Instagram): the sign-in window if open on it, the session sidecar
+    and its .bak-* copies, the browser profile dirs (profiles/pool_<id>), the
+    ig_accounts.db row, the phone (ig_device_<label>.json) when no other row
+    uses that label, its source ownership in ig_results.db (the sources move
+    to the remaining collectors on the next pass), its open decider conditions
+    and every pool row for it. (X): the twscrape accounts.db row, its pool
+    profile dirs, its decider conditions and its pool rows.
+    KEPT: posts already collected, and the Activity Log history.
+    Facebook runs one session from .env, so it has nothing here to delete.
+    """
+    import glob as _glob
+    import shutil
+    import activity_log
+    plat = (body.get("platform") or "").strip().lower()
+    plat = {"instagram": "ig", "twitter": "x", "facebook": "fb"}.get(plat, plat)
+    if plat not in ("ig", "x"):
+        return {"error": "Delete works for Instagram and X accounts. Facebook runs "
+                         "one session from .env; use Remove on its pool card."}
+    username = (body.get("username") or "").strip().lstrip("@")
+    aid = body.get("account_id")
+    root = _CFG.root
+    norm = lambda v: (v or "").strip().lower().lstrip("@")
+    lines = []
+
+    # Which pool rows, and which login, this delete is about.
+    import pool_link
+    pool_ids, names = [], set()
+    pst = pool_link._open()
+    if pst is not None:
+        try:
+            if aid not in (None, ""):
+                try:
+                    row = pst.get(int(aid))
+                except (KeyError, ValueError, TypeError):
+                    row = None
+                if row is not None and row.platform == plat:
+                    username = username or row.login or row.label
+                    names.update({norm(row.login), norm(row.label)})
+                    pool_ids.append(row.account_id)
+            if username:
+                names.add(norm(username))
+            for r in pst.list(plat):
+                if r.account_id not in pool_ids and (
+                        norm(r.login) in names or norm(r.label) in names):
+                    pool_ids.append(r.account_id)
+        finally:
+            pst.close()
+    if not username:
+        return {"error": "username or account_id is required"}
+    if not re.fullmatch(r"[A-Za-z0-9._-]{1,64}", username):
+        return {"error": f"not a username: {username!r}"}
+    names.add(norm(username))
+    names.discard("")
+
+    # Close the sign-in window first if it is on this account: Chromium must
+    # not be running on a profile that is about to be deleted.
+    try:
+        with _LOGIN_LOCK:
+            busy = (_LOGIN["session"] is not None
+                    and _LOGIN.get("pool_id") in pool_ids)
+        if busy:
+            _login_drop()
+            lines.append("closed the sign-in window that was open on it")
+    except Exception:
+        pass
+
+    out = {"ok": True, "platform": plat, "username": username,
+           "pool_rows": 0, "roster_rows": 0, "files": 0, "sources_freed": 0,
+           "conditions": 0}
+    profiles = Path(_CFG.profiles_dir)
+    base = profiles.resolve() if profiles.exists() else None
+
+    def _rm(p):
+        # Only ever a direct child of the profiles folder.
+        try:
+            if base is None or p.resolve().parent != base:
+                return
+            if p.is_dir():
+                shutil.rmtree(p, ignore_errors=True)
+                out["files"] += 1
+            elif p.exists():
+                p.unlink()
+                out["files"] += 1
+        except OSError as e:
+            lines.append(f"could not delete {p.name} ({type(e).__name__})")
+
+    for pid in pool_ids:
+        _rm(profiles / f"pool_{pid}")
+
+    q = ",".join("?" * len(names))
+    if plat == "ig":
+        import ig
+        ap = root / "ig_accounts.db"
+        hits, labels_left = [], set()
+        if ap.exists():
+            with ig.Store(ap) as st:
+                rows = st.all()
+                hits = [r for r in rows if norm(r["username"]) in names]
+                labels_left = {r.get("label") for r in rows
+                               if norm(r["username"]) not in names}
+                for r in hits:
+                    st.db.execute("DELETE FROM accounts WHERE username = ?",
+                                  (r["username"],))
+                st.db.commit()
+        out["roster_rows"] = len(hits)
+        for u in {r["username"] for r in hits} | names:
+            if re.fullmatch(r"[A-Za-z0-9._-]{1,64}", u):
+                for p in profiles.glob(f"ig_{_glob.escape(u)}.json*"):
+                    _rm(p)
+        for r in hits:
+            lbl = r.get("label") or ""
+            if lbl and lbl not in labels_left and re.fullmatch(r"[A-Za-z0-9._-]+", lbl):
+                _rm(profiles / f"ig_device_{lbl}.json")
+        rp = root / "ig_results.db"
+        if rp.exists():
+            try:
+                con = sqlite3.connect(rp, timeout=10)
+                try:
+                    n = con.execute(
+                        f"UPDATE sources SET assigned_account = '' "
+                        f"WHERE lower(assigned_account) IN ({q})", tuple(names)).rowcount
+                    n += con.execute(
+                        f"UPDATE sources SET account = '' "
+                        f"WHERE lower(account) IN ({q})", tuple(names)).rowcount
+                    con.commit()
+                    out["sources_freed"] = n
+                finally:
+                    con.close()
+            except sqlite3.Error as e:
+                lines.append(f"sources not freed ({type(e).__name__}: {e})")
+        dplats = ("instagram", "ig")
+    else:
+        xp = Path(_CFG.db_accounts)
+        if xp.exists():
+            try:
+                con = sqlite3.connect(xp, timeout=10)
+                try:
+                    out["roster_rows"] = con.execute(
+                        f"DELETE FROM accounts WHERE lower(username) IN ({q})",
+                        tuple(names)).rowcount
+                    con.commit()
+                finally:
+                    con.close()
+            except sqlite3.Error as e:
+                lines.append(f"X session row not deleted ({type(e).__name__}: {e})")
+        left = [a.label for a in _CFG.accounts_for("x")
+                if norm(a.label) in names or norm(a.username) in names]
+        if left:
+            out["note"] = (f"still declared in config.toml as [[accounts]] "
+                           f"{', '.join(left)}; delete that block to drop it "
+                           f"from the list for good")
+        dplats = ("x", "twitter")
+
+    # Open conditions (Fix panel, pager) about this account: the scope is
+    # "<platform>:<account>" or "<platform>:<account>/<source>".
+    scopes = [f"{dp}:{u}" for dp in dplats for u in names]
+    try:
+        con = sqlite3.connect(root / "activity.db", timeout=10)
+        try:
+            for tbl in ("decider_state", "decider_pinged"):
+                try:
+                    have = [r[0] for r in con.execute(f"SELECT scope FROM {tbl}")]
+                except sqlite3.OperationalError:
+                    continue   # not created yet on this host
+                gone = [s for s in have
+                        if any(s.lower() == sc or s.lower().startswith(sc + "/")
+                               for sc in scopes)]
+                for s in gone:
+                    con.execute(f"DELETE FROM {tbl} WHERE scope = ?", (s,))
+                if tbl == "decider_state":
+                    out["conditions"] = len(gone)
+            con.commit()
+        finally:
+            con.close()
+    except sqlite3.Error as e:
+        lines.append(f"conditions not cleared ({type(e).__name__}: {e})")
+
+    # The pool rows last: until here they were how the profile dirs were found.
+    if pool_ids:
+        pst = pool_link._open()
+        if pst is not None:
+            try:
+                for pid in pool_ids:
+                    try:
+                        pst.remove(pid)
+                        out["pool_rows"] += 1
+                    except KeyError:
+                        pass
+            finally:
+                pst.close()
+
+    activity_log.log_event(
+        "instagram" if plat == "ig" else "x",
+        f"@{username}: {'Instagram' if plat == 'ig' else 'X'} account DELETED by "
+        f"operator from the dashboard (pool rows {out['pool_rows']}, session "
+        f"rows {out['roster_rows']}, files {out['files']}, sources freed "
+        f"{out['sources_freed']}, conditions {out['conditions']}); collected "
+        f"posts kept",
+        db=str(root / "activity.db"))
+    out["lines"] = lines
+    return out
+
+
 def _ig_exit_check(body):
     """Operator: where does this account's proxy exit RIGHT NOW? Runs the
     proxy check (no Instagram account request) and records the answer."""
@@ -8756,6 +8971,8 @@ class Handler(BaseHTTPRequestHandler):
                 return self._send(200, _ig_reseed(body))
             if u.path == "/api/ig/session/clear":
                 return self._send(200, _ig_session_clear(body))
+            if u.path == "/api/accounts/purge":
+                return self._send(200, _account_purge(body))
             if u.path == "/api/ig/exit":
                 return self._send(200, _ig_exit_check(body))
             if u.path == "/api/ig/probe":

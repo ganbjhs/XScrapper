@@ -719,8 +719,12 @@ function AccountCard({ a, live, onChanged }) {
   };
 
   const remove = () => {
-    if (!confirm(`Remove ${a.label}? This deletes the account from the pool.`)) return;
+    if (!confirm(`Remove ${a.label} from the pool? Only the pool card goes: its signed-in session stays on the server and shows below as “not in pool”. Use Delete to remove it everywhere.`)) return;
     act(() => api.poolRemove(a.account_id), "removed");
+  };
+  const purge = () => {
+    if (!confirm(`Delete ${a.label} (${a.login}) completely?\n\nThis removes the pool card, its saved session, its phone, its browser profile, its open alerts and its share of sources (they move to the other accounts). Posts already collected are kept.\n\nThis cannot be undone.`)) return;
+    act(() => api.accountPurge({ platform: a.platform, account_id: a.account_id, username: live?.username || a.login }), "deleted");
   };
   const promote = () => act(() => api.poolPromote(a.account_id), "promoted to active");
   const quarantine = () => act(() => api.poolStatus(a.account_id, "quarantined"), "quarantined");
@@ -820,7 +824,8 @@ function AccountCard({ a, live, onChanged }) {
         {a.status !== "quarantined" && a.status !== "dead"
           ? <button onClick={quarantine}>Quarantine</button>
           : <button onClick={revive}>Return to pool</button>}
-        <button onClick={remove} style={{ color: "var(--critical)" }}>Remove</button>
+        <button onClick={remove}>Remove</button>
+        {a.platform !== "fb" && <button onClick={purge} style={{ color: "var(--critical)" }}>Delete</button>}
       </div>
 
       {modal === "detail" && <AccountDetail a={a} live={live} problems={problems} onClose={() => setModal(null)} />}
@@ -834,9 +839,19 @@ function AccountCard({ a, live, onChanged }) {
 
 // A live session that isn't in the pool yet — read-only + "Add to pool"
 
-function OrphanCard({ r, platform, onAdopt }) {
+function OrphanCard({ r, platform, onAdopt, onChanged }) {
   const name = r.username || r.label || "(unknown)";
   const active = !!r.active;
+  const [msg, setMsg] = useState("");
+  const purge = async () => {
+    if (!confirm(`Delete ${name} completely?\n\nIts saved session, phone, browser profile, open alerts and share of sources are removed from the server (sources move to the other accounts). Posts already collected are kept.\n\nThis cannot be undone.`)) return;
+    setMsg("…");
+    try {
+      const res = await api.accountPurge({ platform, username: r.username || r.label });
+      setMsg(res && res.error ? res.error : (res && res.note) || "deleted");
+      onChanged && onChanged();
+    } catch (e) { setMsg(String(e.message || e)); }
+  };
   return (
     <div className="panel" style={{ borderStyle: "dashed" }}>
       <div className="phead">
@@ -855,10 +870,12 @@ function OrphanCard({ r, platform, onAdopt }) {
       </div>
       {(r.reasons || []).map((x, i) => (<div className="kv" key={i}><span>note</span><b>{x}</b></div>))}
       {r.error && <div className="kv"><span>error</span><b className="st-crit">{r.error}</b></div>}
+      {msg && <div className="kv"><span>note</span><b>{msg}</b></div>}
       <div className="cactions">
         <button onClick={() => onAdopt({ platform, label: r.label || name, login: r.username || r.label || "" })}>
           Add to pool
         </button>
+        {platform !== "fb" && <button onClick={purge} style={{ color: "var(--critical)" }}>Delete</button>}
       </div>
     </div>
   );
@@ -930,11 +947,11 @@ function PlatformSection({ platform, title, summary, accounts, orphans, liveFor,
         <>
           <div style={{ color: "var(--ink-3)", fontSize: 12.5, margin: "2px 0 8px" }}>
             Already running — not managed here yet. “Add to pool” brings them under
-            failover &amp; 2FA.
+            failover &amp; 2FA; “Delete” removes a dead one from the server for good.
           </div>
           <div className="cards-grid">
             {orphans.map((r, i) => (
-              <OrphanCard key={r.label || r.username || i} r={r} platform={platform} onAdopt={onAdopt} />
+              <OrphanCard key={r.label || r.username || i} r={r} platform={platform} onAdopt={onAdopt} onChanged={onChanged} />
             ))}
           </div>
         </>

@@ -8700,6 +8700,108 @@ def full_len(r):
     return len(r["refs"])
 
 
+def test_account_purge(tmp):
+    """Delete (2026-11-24): pool Remove left the collector's own session row,
+    sidecar, phone, source ownership and open conditions behind, so a removed
+    or suspended account kept showing up as 'Live · not in pool' and in
+    Network & settings. _account_purge must remove all of it, and nothing of
+    any other account."""
+    import json as _json
+    import sqlite3 as _sq
+    import ig
+    import store_ig
+    import web
+    from store_accounts import AccountStore
+    root = pathlib.Path(tmp)
+    prof = root / "profiles"
+    prof.mkdir(parents=True, exist_ok=True)
+    key = "purge-test-key-0123456789abcdef0123456789"
+    saved_env = {k: os.environ.get(k) for k in ("ACCOUNTS_DB", "ACCOUNTS_SECRET_KEY")}
+    os.environ["ACCOUNTS_DB"] = str(root / "pool.db")
+    os.environ["ACCOUNTS_SECRET_KEY"] = key
+    with AccountStore(str(root / "pool.db"), secret_key=key) as st:
+        gone_id = st.add("ig", "Shoaib", "shoaibakhtar4915")
+        keep_id = st.add("ig", "Priya", "priyamalik6562")
+    with ig.Store(root / "ig_accounts.db") as st:
+        for u, lbl in (("shoaibakhtar4915", "ig_s"), ("priyamalik6562", "ig_p"),
+                       ("sanaakhtar221", "ig_q")):
+            st.save(ig.Session(u, "1", "UA", {"sessionid": "x"}), lbl, active=True)
+    for name in ("ig_shoaibakhtar4915.json", "ig_shoaibakhtar4915.json.bak-1",
+                 "ig_device_ig_s.json", "ig_priyamalik6562.json",
+                 "ig_device_ig_p.json", "ig_sanaakhtar221.json"):
+        (prof / name).write_text(_json.dumps({"meta": {}}))
+    (prof / f"pool_{gone_id}").mkdir()
+    (prof / f"pool_{keep_id}").mkdir()
+    with store_ig.Store(str(root / "ig_results.db")) as st:
+        st.add_source("a1", "user", "a1", project_id=1)
+        st.add_source("a2", "user", "a2", project_id=1)
+    con = _sq.connect(root / "ig_results.db")
+    con.execute("UPDATE sources SET assigned_account='shoaibakhtar4915' WHERE label='a1'")
+    con.execute("UPDATE sources SET assigned_account='priyamalik6562' WHERE label='a2'")
+    con.commit(); con.close()
+    import decider
+    adb = str(root / "activity.db")
+    dst = decider._State(adb)
+    c = dst._con()
+    for scope in ("instagram:shoaibakhtar4915", "instagram:shoaibakhtar4915/a1",
+                  "instagram:priyamalik6562"):
+        c.execute("INSERT INTO decider_state(scope, kind, first_ms, last_ms) "
+                  "VALUES(?, 'checkpoint', 1, 1)", (scope,))
+    c.commit(); c.close()
+
+    class Cfg:
+        pass
+    Cfg.root = root
+    Cfg.profiles_dir = prof
+    Cfg.db_accounts = root / "accounts.db"
+    Cfg.accounts_for = staticmethod(lambda p: [])
+    saved = web._CFG
+    web._CFG = Cfg()
+    try:
+        r = web._account_purge({"platform": "ig", "username": "../etc"})
+        ok("error" in r, "a username with a path in it is refused")
+        r = web._account_purge({"platform": "facebook", "username": "x"})
+        ok("error" in r, "Facebook is refused (one .env session, nothing to delete)")
+        r = web._account_purge({"platform": "ig", "account_id": gone_id})
+        ok(r.get("ok") and r["pool_rows"] == 1 and r["roster_rows"] == 1,
+           f"the pool row and the session row go together ({r})")
+        with ig.Store(root / "ig_accounts.db") as st:
+            left = sorted(x["username"] for x in st.all())
+        ok(left == ["priyamalik6562", "sanaakhtar221"],
+           f"only the deleted account leaves ig_accounts.db ({left})")
+        with AccountStore(str(root / "pool.db"), secret_key=key) as st:
+            ids = [a.account_id for a in st.list("ig")]
+        ok(ids == [keep_id], f"the other pool row stays ({ids})")
+        files = sorted(p.name for p in prof.iterdir())
+        ok(files == sorted(["ig_device_ig_p.json", "ig_priyamalik6562.json",
+                            "ig_sanaakhtar221.json", f"pool_{keep_id}"]),
+           f"its sidecar, backup, phone and browser profile are deleted, nothing else ({files})")
+        con = _sq.connect(root / "ig_results.db")
+        own = dict(con.execute("SELECT label, assigned_account FROM sources"))
+        con.close()
+        ok(own == {"a1": "", "a2": "priyamalik6562"},
+           f"its sources are freed for the next pass, others untouched ({own})")
+        c = _sq.connect(adb)
+        sc = sorted(x[0] for x in c.execute("SELECT scope FROM decider_state"))
+        c.close()
+        ok(sc == ["instagram:priyamalik6562"], f"its open conditions close, others stay ({sc})")
+        # An account that is only live (never pooled) can be deleted by name.
+        r = web._account_purge({"platform": "ig", "username": "@SanaAkhtar221"})
+        ok(r.get("ok") and r["roster_rows"] == 1 and r["pool_rows"] == 0,
+           f"a 'not in pool' account deletes by username, case-insensitively ({r})")
+        ok(not (prof / "ig_sanaakhtar221.json").exists(), "and its sidecar goes too")
+        ui = web._ig_status({})
+        ok([a["username"] for a in ui["accounts"]] == ["priyamalik6562"],
+           "Accounts & Sessions / Network & settings no longer list them")
+    finally:
+        web._CFG = saved
+        for k, v in saved_env.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+
+
 def main():
     root = HERE / ".tmp"
     cwd = os.getcwd()
@@ -8857,6 +8959,9 @@ def main():
         section("naming post links on every platform (Phase 2, step 1)")
         import test_platform_urls
         test_platform_urls.run(None, ok)
+
+        section("account delete (Remove left the session behind)")
+        test_account_purge(fresh("purge"))
 
         section("no undefined names (the import that systemd found first)")
         test_no_undefined_names()

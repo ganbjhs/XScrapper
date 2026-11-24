@@ -1619,6 +1619,26 @@ which has no project — threw the accounts away: every Instagram card said
 Accounts are global. The Accounts page asks with `softError`
 (`api.igAccountsLive`); do not point it back at the project-scoped helper.
 
+### Remove is pool-only; Delete removes an account everywhere (2026-11-24)
+
+- **Pool "Remove" deletes only the `managed_accounts` row.** The collector's
+  own session row (`ig_accounts.db`, or twscrape's `accounts.db` for X) stays,
+  so the account reappears as "Live · not in pool" and keeps its errors in
+  Network & settings and the Fix panel. Its confirm text now says so.
+- **"Delete"** (pool cards and "not in pool" cards, IG and X;
+  `POST /api/accounts/purge`, `web._account_purge`) removes it everywhere:
+  sign-in window if open, sidecar and its `.bak-*`, `profiles/pool_<id>`, the
+  roster row, the phone (`ig_device_<label>.json`) only when no other row uses
+  that label, its source ownership in `ig_results.db` (`account` and
+  `assigned_account` set to '', so the next pass shares them out), its
+  `decider_state`/`decider_pinged` scopes, and every pool row matching its
+  login or label. Collected posts and Activity Log history are kept.
+- Facebook is refused: it runs one `.env` session, there is no row to delete.
+  An X account still declared in `config.toml` is reported in `note`; the
+  block is not edited (config requires at least one `[[accounts]]`).
+- Usernames are checked against `[A-Za-z0-9._-]{1,64}` and only direct
+  children of the profiles folder are ever deleted.
+
 ### A new phone has never been signed in — and a card names the address it shows (2026-10-03)
 
 - **"New phone" clears the session too** (`ig_session.clear_session`): the

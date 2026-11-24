@@ -172,6 +172,11 @@ export const api = {
   poolUpdate: (body) => request("/api/pool/update", { method: "POST", body }),
   poolRemove: (account_id) =>
     request("/api/pool/remove", { method: "POST", body: { account_id } }),
+  // Delete an account COMPLETELY: pool row, collector session row, sidecar,
+  // phone, browser profile, source ownership and open conditions (web.py
+  // _account_purge). Remove above only drops the pool row.
+  accountPurge: (body) =>
+    request("/api/accounts/purge", { method: "POST", body }),
   poolStatus: (account_id, status, health) =>
     request("/api/pool/status", { method: "POST", body: { account_id, status, health } }),
   poolPromote: (account_id) =>
